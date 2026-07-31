@@ -442,8 +442,34 @@ export const {
     const exit = useExit()
     const args = useArgs()
 
+    const BOOTSTRAP_TIMEOUT = 8_000
+
+    async function timed<T>(promise: Promise<T>, label: string): Promise<T> {
+      let timeoutId: ReturnType<typeof setTimeout>
+      try {
+        return await Promise.race([
+          promise,
+          new Promise<T>((_, reject) => {
+            timeoutId = setTimeout(() => reject(new Error(`${label} timed out after ${BOOTSTRAP_TIMEOUT}ms`)), BOOTSTRAP_TIMEOUT)
+          }),
+        ])
+      } finally {
+        clearTimeout(timeoutId)
+      }
+    }
+
+    function withTimeoutFallback<T>(promise: Promise<T>, label: string, fallback: () => T): Promise<T | ReturnType<typeof fallback>> {
+      return timed(promise, label).catch((e) => {
+        const errMsg = e instanceof Error ? e.message : String(e ?? "")
+        if (!errMsg.includes("timed out")) {
+          throw e
+        }
+        console.warn(`Bootstrap ${label} timed out, using fallback`, errMsg)
+        return fallback()
+      })
+    }
+
     async function bootstrap(input: { fatal?: boolean } = {}) {
-      const fatal = input.fatal ?? true
       const workspace = project.workspace.current()
       const projectPromise = project.sync()
       const sessionListPromise = projectPromise.then(() => listSessions())
@@ -461,88 +487,51 @@ export const {
         .catch(() => emptyConsoleState)
       const agentsPromise = sdk.client.app.agents({ workspace }, { throwOnError: true })
       const configPromise = sdk.client.config.get({ workspace }, { throwOnError: true })
-      await Promise.all([
-        providersPromise,
-        providerListPromise,
-        capabilitiesPromise,
-        agentsPromise,
-        configPromise,
-        projectPromise,
-        ...(args.continue ? [sessionListPromise] : []),
+      const [providersResponse, providerListResponse, capabilitiesData, agentsResponse, configResponse] = await Promise.all([
+        withTimeoutFallback(providersPromise, "providers", () => null),
+        withTimeoutFallback(providerListPromise, "provider-list", () => null),
+        withTimeoutFallback(capabilitiesPromise.catch(() => undefined), "capabilities", () => undefined),
+        withTimeoutFallback(agentsPromise, "agents", () => ({ data: [] })),
+        withTimeoutFallback(configPromise, "config", () => ({ data: {} })),
       ])
-        .then(async () => {
-          const providersResponse = providersPromise.then((x) => x.data!)
-          const providerListResponse = providerListPromise.then((x) => x.data!)
-          const capabilitiesResponse = capabilitiesPromise
-          const consoleStateResponse = consoleStatePromise
-          const agentsResponse = agentsPromise.then((x) => x.data ?? [])
-          const configResponse = configPromise.then((x) => x.data!)
-          const sessionListResponse = args.continue ? sessionListPromise : undefined
 
-          return Promise.all([
-            providersResponse,
-            providerListResponse,
-            capabilitiesResponse,
-            consoleStateResponse,
-            agentsResponse,
-            configResponse,
-            ...(sessionListResponse ? [sessionListResponse] : []),
-          ]).then((responses) => {
-            const providers = responses[0]
-            const providerList = responses[1]
-            const capabilities = responses[2]
-            const consoleState = responses[3]
-            const agents = responses[4]
-            const config = responses[5]
-            const sessions = responses[6]
+      if (args.continue) {
+        await withTimeoutFallback(sessionListPromise, "session-list", () => null).catch(() => null)
+      }
+      await projectPromise
 
-            batch(() => {
-              setStore("provider", reconcile(providers.providers))
-              setStore("provider_default", reconcile(providers.default))
-              setStore("provider_next", reconcile(providerList))
-              setStore("capabilities", "experimentalBackgroundSubagents", capabilities?.backgroundSubagents === true)
-              setStore("console_state", reconcile(consoleState))
-              setStore("agent", reconcile(agents))
-              setStore("config", reconcile(config))
-              if (sessions !== undefined) setStore("session", reconcile(sessions))
-            })
-          })
-        })
-        .then(() => {
-          if (store.status !== "complete") setStore("status", "partial")
-          // non-blocking
-          void Promise.all([
-            ...(args.continue ? [] : [sessionListPromise.then((sessions) => setStore("session", reconcile(sessions)))]),
-            consoleStatePromise.then((consoleState) => setStore("console_state", reconcile(consoleState))),
-            sdk.client.command.list({ workspace }).then((x) => setStore("command", reconcile(x.data ?? []))),
-            sdk.client.lsp.status({ workspace }).then((x) => setStore("lsp", reconcile(x.data ?? []))),
-            sdk.client.mcp.status({ workspace }).then((x) => setStore("mcp", reconcile(x.data ?? {}))),
-            sdk.client.experimental.resource
-              .list({ workspace })
-              .then((x) => setStore("mcp_resource", reconcile(x.data ?? {}))),
-            sdk.client.formatter.status({ workspace }).then((x) => setStore("formatter", reconcile(x.data ?? []))),
-            sdk.client.session.status({ workspace }).then((x) => {
-              setStore("session_status", reconcile(x.data ?? {}))
-            }),
-            sdk.client.provider.auth({ workspace }).then((x) => setStore("provider_auth", reconcile(x.data ?? {}))),
-            sdk.client.vcs.get({ workspace }).then((x) => setStore("vcs", reconcile(x.data))),
-            project.workspace.sync(),
-          ]).then(() => {
-            setStore("status", "complete")
-          })
-        })
-        .catch(async (e) => {
-          console.error("tui bootstrap failed", {
-            error: e instanceof Error ? e.message : String(e),
-            name: e instanceof Error ? e.name : undefined,
-            stack: e instanceof Error ? e.stack : undefined,
-          })
-          if (fatal) {
-            exit(e)
-          } else {
-            throw e
-          }
-        })
+      batch(() => {
+        setStore("provider", reconcile(providersResponse?.data?.providers ?? []))
+        setStore("provider_default", reconcile(providersResponse?.data?.default ?? {}))
+        setStore("provider_next", reconcile(providerListResponse?.data ?? { all: [], default: {}, connected: [] }))
+        setStore("capabilities", "experimentalBackgroundSubagents", capabilitiesData?.backgroundSubagents === true)
+        setStore("agent", reconcile(agentsResponse?.data ?? []))
+        setStore("config", reconcile(configResponse?.data))
+      })
+
+      setStore("status", store.status !== "complete" ? "partial" : "complete")
+      void Promise.all([
+        timed(sessionListPromise, "session-list").catch(() => null).then((sessions) => sessions && setStore("session", reconcile(sessions))),
+        consoleStatePromise.then((consoleState) => setStore("console_state", reconcile(consoleState))).catch(() => setStore("console_state", reconcile(emptyConsoleState))),
+        timed(sdk.client.command.list({ workspace }), "commands").catch(() => ({ data: [] })).then((x) => setStore("command", reconcile(x.data ?? []))),
+        timed(sdk.client.lsp.status({ workspace }), "lsp").catch(() => ({ data: [] })).then((x) => setStore("lsp", reconcile(x.data ?? []))),
+        timed(sdk.client.mcp.status({ workspace }), "mcp").catch(() => ({ data: {} })).then((x) => setStore("mcp", reconcile(x.data ?? {}))),
+        sdk.client.experimental.resource
+          .list({ workspace })
+          .then((x) => setStore("mcp_resource", reconcile(x.data ?? {})))
+          .catch(() => {}),
+        sdk.client.formatter.status({ workspace }).then((x) => setStore("formatter", reconcile(x.data ?? []))).catch(() => {}),
+        sdk.client.session.status({ workspace }).then((x) => {
+          setStore("session_status", reconcile(x.data ?? {}))
+        }).catch(() => {}),
+        sdk.client.provider.auth({ workspace }).then((x) => setStore("provider_auth", reconcile(x.data ?? {}))).catch(() => {}),
+        sdk.client.vcs.get({ workspace }).then((x) => setStore("vcs", reconcile(x.data))).catch(() => {}),
+        project.workspace.sync().catch(() => {}),
+      ]).then(() => {
+        setStore("status", "complete")
+      }).catch(() => {
+        console.warn("Bootstrap non-blocking resources failed, continuing with partial state")
+      })
     }
 
     onMount(() => {
