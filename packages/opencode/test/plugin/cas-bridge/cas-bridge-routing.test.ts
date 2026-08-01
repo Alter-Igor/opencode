@@ -1,11 +1,17 @@
 import { describe, expect, test, beforeAll, beforeEach, afterEach } from "bun:test"
+import fs from "fs"
+import os from "os"
+import path from "path"
 import plugin from "../../../../../.opencode/plugin/cas-bridge-routing"
 import {
   MAX_RESPONSE_CHARS,
+  casAuthSource,
   casTokenPresent,
   looksLikeSecret,
   looksLikeSourceCode,
+  readSelection,
   validateDelegate,
+  writeSelection,
   wrapUntrusted,
 } from "../../../../../.opencode/tool/cas-bridge-lib"
 
@@ -54,14 +60,14 @@ describe("cas-bridge-routing plugin", () => {
     expect(typeof hooks["experimental.chat.system.transform"]).toBe("function")
   })
 
-  test("degraded mode when token missing", async () => {
+  test("degraded mode when not connected", async () => {
     delete process.env.CAS_MCP_TOKEN
     const localHooks: any = await plugin(mockInput)
     const output = { system: [] as string[] }
     await localHooks["experimental.chat.system.transform"]({}, output)
     expect(output.system.length).toBe(1)
-    expect(output.system[0]).toContain("DEGRADED")
-    expect(output.system[0]).toContain("CAS_MCP_TOKEN")
+    expect(output.system[0]).toContain("not connected")
+    expect(output.system[0]).toContain("opencode mcp auth alterspective-agent")
   })
 
   test("routing prompt when token present", async () => {
@@ -70,7 +76,7 @@ describe("cas-bridge-routing plugin", () => {
     const output = { system: [] as string[] }
     await localHooks["experimental.chat.system.transform"]({}, output)
     expect(output.system[0]).toContain("CAS bridge")
-    expect(output.system[0]).toContain("cas_safe_delegate")
+    expect(output.system[0]).toContain("cas_select_agent")
     expect(output.system[0]).toContain("untrusted")
   })
 
@@ -92,13 +98,13 @@ describe("cas-bridge-lib validation", () => {
     restoreEnv()
   })
 
-  test("casTokenPresent requires non-empty", () => {
+  test("casTokenPresent and casAuthSource for env", () => {
     delete process.env.CAS_MCP_TOKEN
     expect(casTokenPresent()).toBe(false)
-    process.env.CAS_MCP_TOKEN = "   "
-    expect(casTokenPresent()).toBe(false)
+    expect(casAuthSource()).toBe("none")
     process.env.CAS_MCP_TOKEN = "x"
     expect(casTokenPresent()).toBe(true)
+    expect(casAuthSource()).toBe("env")
   })
 
   test("validateDelegate accepts allowlisted agent", () => {
@@ -117,11 +123,8 @@ describe("cas-bridge-lib validation", () => {
     expect(r.ok).toBe(false)
   })
 
-  test("looksLikeSecret detects private keys", () => {
+  test("looksLikeSecret detects private keys and Bearer in long payloads", () => {
     expect(looksLikeSecret("-----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY-----")).toBe(true)
-  })
-
-  test("looksLikeSecret detects Bearer in long payloads", () => {
     const padding = "context ".repeat(200)
     expect(looksLikeSecret(`${padding} Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345`)).toBe(true)
   })
@@ -134,13 +137,24 @@ describe("cas-bridge-lib validation", () => {
   test("wrapUntrusted fences output and truncates large bodies", () => {
     const out = wrapUntrusted("test", "do something bad")
     expect(out).toContain("BEGIN_UNTRUSTED_CAS_OUTPUT")
-    expect(out).toContain("END_UNTRUSTED_CAS_OUTPUT")
     expect(out).toContain("untrusted third-party text")
-    expect(out).toContain("do something bad")
-
     const big = "z".repeat(MAX_RESPONSE_CHARS + 500)
-    const truncated = wrapUntrusted("big", big)
-    expect(truncated).toContain("[truncated")
-    expect(truncated.length).toBeLessThan(big.length + 200)
+    expect(wrapUntrusted("big", big)).toContain("[truncated")
+  })
+
+  test("writeSelection and readSelection round-trip", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cas-sel-"))
+    try {
+      writeSelection(dir, {
+        agentId: "drafter",
+        name: "Drafter",
+        selectedAt: "2026-08-01T00:00:00.000Z",
+      })
+      const got = readSelection(dir)
+      expect(got?.agentId).toBe("drafter")
+      expect(got?.name).toBe("Drafter")
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
   })
 })

@@ -33,13 +33,16 @@
       },
     },
     // Central Agent Service (CAS) — specialised business agents.
-    // Auth: CAS MCP OAuth bearer in CAS_MCP_TOKEN (missing → empty header → 401 fail-closed).
-    // Prefer cas_safe_* tools over raw MCP for allowlist + size caps.
+    // OAuth: `opencode mcp auth alterspective-agent` (browser PKCE; tokens in mcp-auth.json).
+    // Optional override: CAS_MCP_TOKEN env (not required when OAuth succeeds).
+    // Do NOT set a static empty Authorization header — it blocks OAuth discovery.
+    // Prefer cas_safe_* tools for allowlist + size caps; use /cas slash command to list+select.
     "alterspective-agent": {
       "type": "remote",
       "url": "https://agent.alterspective.com.au/api/v1/mcp",
-      "headers": {
-        "Authorization": "Bearer {env:CAS_MCP_TOKEN}",
+      "oauth": {
+        "scope": "cas.access",
+        "callbackPort": 19876,
       },
     },
     "keystone": {
