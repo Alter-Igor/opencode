@@ -45,7 +45,7 @@ export function looksLikeSourceCode(text: string): boolean {
 export function looksLikeSecret(text: string): boolean {
   if (/-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----/.test(text)) return true
   if (/\b(sk-[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{20,}|xox[baprs]-[a-zA-Z0-9-]{20,})\b/.test(text)) return true
-  if (/\bBearer\s+[A-Za-z0-9\-._~+/]+=*\b/.test(text) && text.length < 500) return true
+  if (/\bBearer\s+[A-Za-z0-9\-._~+/]+=*\b/.test(text)) return true
   return false
 }
 

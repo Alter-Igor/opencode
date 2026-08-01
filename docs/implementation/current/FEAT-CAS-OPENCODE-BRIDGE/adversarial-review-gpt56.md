@@ -242,4 +242,4 @@ Proposed minimum:
 | `cas-drafter` | session creation, send message, start run, get run, cancel own run |
 | `cas-matter-audit` | same, but only an approved audit agent/template |
 | `cas-general` | same, with an explicit approved agent list |
-|
+

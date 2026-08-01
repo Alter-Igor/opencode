@@ -9,7 +9,12 @@ export default tool({
     if (!casTokenPresent()) {
       return "CAS bridge degraded: CAS_MCP_TOKEN is not set. Cannot list agents. Set a CAS MCP bearer (user env) and retry."
     }
-    const result = await callCasMcpTool("cas_list_agents", {})
-    return wrapUntrusted("cas_list_agents", result)
+    try {
+      const result = await callCasMcpTool("cas_list_agents", {})
+      return wrapUntrusted("cas_list_agents", result)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      return `cas_safe_list_agents error: ${message.replace(/Bearer\s+\S+/gi, "Bearer [redacted]")}`
+    }
   },
 })

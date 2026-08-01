@@ -18,9 +18,11 @@
 
 ## Validation observed
 
-```
+From `packages/opencode`:
+
+```shell
 bun test test/plugin/cas-bridge/cas-bridge-routing.test.ts
-11 pass, 0 fail
+# 11 pass, 0 fail
 ```
 
 Live CAS MCP smoke with real `CAS_MCP_TOKEN` not run (token absent on this machine).

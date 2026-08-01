@@ -1,6 +1,7 @@
-import { describe, expect, test, beforeAll, afterEach } from "bun:test"
+import { describe, expect, test, beforeAll, beforeEach, afterEach } from "bun:test"
 import plugin from "../../../../../.opencode/plugin/cas-bridge-routing"
 import {
+  MAX_RESPONSE_CHARS,
   casTokenPresent,
   looksLikeSecret,
   looksLikeSourceCode,
@@ -15,25 +16,38 @@ const originalEnabled = process.env.CAS_BRIDGE_ROUTING_ENABLED
 const originalDisabled = process.env.CAS_BRIDGE_ROUTING_DISABLED
 const originalAllow = process.env.CAS_AGENT_ALLOWLIST
 
+function restoreEnv() {
+  if (originalToken === undefined) delete process.env.CAS_MCP_TOKEN
+  else process.env.CAS_MCP_TOKEN = originalToken
+  if (originalEnabled === undefined) delete process.env.CAS_BRIDGE_ROUTING_ENABLED
+  else process.env.CAS_BRIDGE_ROUTING_ENABLED = originalEnabled
+  if (originalDisabled === undefined) delete process.env.CAS_BRIDGE_ROUTING_DISABLED
+  else process.env.CAS_BRIDGE_ROUTING_DISABLED = originalDisabled
+  if (originalAllow === undefined) delete process.env.CAS_AGENT_ALLOWLIST
+  else process.env.CAS_AGENT_ALLOWLIST = originalAllow
+}
+
+function clearRoutingEnv() {
+  delete process.env.CAS_MCP_TOKEN
+  delete process.env.CAS_BRIDGE_ROUTING_ENABLED
+  delete process.env.CAS_BRIDGE_ROUTING_DISABLED
+  delete process.env.CAS_AGENT_ALLOWLIST
+}
+
 describe("cas-bridge-routing plugin", () => {
   let hooks: any
 
   beforeAll(async () => {
-    delete process.env.CAS_MCP_TOKEN
-    delete process.env.CAS_BRIDGE_ROUTING_ENABLED
-    delete process.env.CAS_BRIDGE_ROUTING_DISABLED
+    clearRoutingEnv()
     hooks = await plugin(mockInput)
   })
 
+  beforeEach(() => {
+    clearRoutingEnv()
+  })
+
   afterEach(() => {
-    if (originalToken === undefined) delete process.env.CAS_MCP_TOKEN
-    else process.env.CAS_MCP_TOKEN = originalToken
-    if (originalEnabled === undefined) delete process.env.CAS_BRIDGE_ROUTING_ENABLED
-    else process.env.CAS_BRIDGE_ROUTING_ENABLED = originalEnabled
-    if (originalDisabled === undefined) delete process.env.CAS_BRIDGE_ROUTING_DISABLED
-    else process.env.CAS_BRIDGE_ROUTING_DISABLED = originalDisabled
-    if (originalAllow === undefined) delete process.env.CAS_AGENT_ALLOWLIST
-    else process.env.CAS_AGENT_ALLOWLIST = originalAllow
+    restoreEnv()
   })
 
   test("returns system.transform hook", () => {
@@ -70,11 +84,12 @@ describe("cas-bridge-routing plugin", () => {
 })
 
 describe("cas-bridge-lib validation", () => {
+  beforeEach(() => {
+    clearRoutingEnv()
+  })
+
   afterEach(() => {
-    if (originalAllow === undefined) delete process.env.CAS_AGENT_ALLOWLIST
-    else process.env.CAS_AGENT_ALLOWLIST = originalAllow
-    if (originalToken === undefined) delete process.env.CAS_MCP_TOKEN
-    else process.env.CAS_MCP_TOKEN = originalToken
+    restoreEnv()
   })
 
   test("casTokenPresent requires non-empty", () => {
@@ -106,15 +121,26 @@ describe("cas-bridge-lib validation", () => {
     expect(looksLikeSecret("-----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY-----")).toBe(true)
   })
 
+  test("looksLikeSecret detects Bearer in long payloads", () => {
+    const padding = "context ".repeat(200)
+    expect(looksLikeSecret(`${padding} Authorization: Bearer abcdefghijklmnopqrstuvwxyz012345`)).toBe(true)
+  })
+
   test("looksLikeSourceCode detects large code dumps", () => {
     const lines = Array.from({ length: 50 }, (_, i) => `import { foo${i} } from "./m${i}"`).join("\n")
     expect(looksLikeSourceCode(lines)).toBe(true)
   })
 
-  test("wrapUntrusted fences output", () => {
+  test("wrapUntrusted fences output and truncates large bodies", () => {
     const out = wrapUntrusted("test", "do something bad")
     expect(out).toContain("BEGIN_UNTRUSTED_CAS_OUTPUT")
     expect(out).toContain("END_UNTRUSTED_CAS_OUTPUT")
+    expect(out).toContain("untrusted third-party text")
     expect(out).toContain("do something bad")
+
+    const big = "z".repeat(MAX_RESPONSE_CHARS + 500)
+    const truncated = wrapUntrusted("big", big)
+    expect(truncated).toContain("[truncated")
+    expect(truncated.length).toBeLessThan(big.length + 200)
   })
 })
