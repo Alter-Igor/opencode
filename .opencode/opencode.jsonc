@@ -1,7 +1,12 @@
 {
   "$schema": "https://opencode.ai/config.json",
   "provider": {},
-  "permission": {},
+  // CAS admin/approval tools must never be exercised from this coding shell.
+  // Tool names: sanitize(server) + "_" + sanitize(tool) → alterspective-agent_cas_*
+  "permission": {
+    "alterspective-agent_cas_resolve_tool_call": "deny",
+    "alterspective-agent_cas_admin_*": "deny",
+  },
   "references": {
     "effect": {
       "repository": "github.com/Effect-TS/effect-smol",
@@ -25,6 +30,16 @@
       "url": "https://rag.alterspective.com.au/mcp",
       "headers": {
         "Authorization": "Bearer {env:ALTERSPECTIVE_RAG_MCP_API_KEY}",
+      },
+    },
+    // Central Agent Service (CAS) — specialised business agents.
+    // Auth: CAS MCP OAuth bearer in CAS_MCP_TOKEN (missing → empty header → 401 fail-closed).
+    // Prefer cas_safe_* tools over raw MCP for allowlist + size caps.
+    "alterspective-agent": {
+      "type": "remote",
+      "url": "https://agent.alterspective.com.au/api/v1/mcp",
+      "headers": {
+        "Authorization": "Bearer {env:CAS_MCP_TOKEN}",
       },
     },
     "keystone": {
