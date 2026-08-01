@@ -7,7 +7,7 @@ export default tool({
   args: {},
   async execute() {
     if (!casTokenPresent()) {
-      return "CAS bridge degraded: CAS_MCP_TOKEN is not set. Cannot list agents. Set a CAS MCP bearer (user env) and retry."
+      return "Not connected to CAS. Run: opencode mcp auth alterspective-agent — then cas_auth_status / cas_safe_list_agents."
     }
     try {
       const result = await callCasMcpTool("cas_list_agents", {})

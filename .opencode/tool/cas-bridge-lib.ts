@@ -1,9 +1,28 @@
 /** Shared helpers for CAS bridge tools. Never log token values. */
 
-/** True when a non-empty CAS bearer is present (value never logged). */
+import fs from "fs"
+import os from "os"
+import path from "path"
+
+export const CAS_MCP_SERVER = "alterspective-agent"
+export const CAS_MCP_URL = "https://agent.alterspective.com.au/api/v1/mcp"
+
+/** True when a non-empty CAS bearer is available (env or OpenCode OAuth store). */
 export function casTokenPresent(): boolean {
-  const token = process.env.CAS_MCP_TOKEN
-  return typeof token === "string" && token.trim().length > 0
+  return Boolean(resolveCasAccessToken())
+}
+
+export function casAuthSource(): "env" | "oauth" | "none" {
+  if (process.env.CAS_MCP_TOKEN?.trim()) return "env"
+  if (readMcpAuthAccessToken(CAS_MCP_SERVER, CAS_MCP_URL)) return "oauth"
+  return "none"
+}
+
+/** Prefer env override, else OpenCode MCP OAuth tokens for alterspective-agent. */
+export function resolveCasAccessToken(): string | undefined {
+  const envToken = process.env.CAS_MCP_TOKEN?.trim()
+  if (envToken) return envToken
+  return readMcpAuthAccessToken(CAS_MCP_SERVER, CAS_MCP_URL)
 }
 
 export const DEFAULT_AGENT_ALLOWLIST = [
@@ -21,8 +40,6 @@ export const MAX_TASK_CHARS = 8_000
 export const MAX_CONTEXT_CHARS = 4_000
 export const MAX_RESPONSE_CHARS = 24_000
 
-const CAS_MCP_URL = "https://agent.alterspective.com.au/api/v1/mcp"
-
 export function agentAllowlist(): string[] {
   const raw = process.env.CAS_AGENT_ALLOWLIST?.trim()
   if (!raw) return [...DEFAULT_AGENT_ALLOWLIST]
@@ -35,7 +52,6 @@ export function agentAllowlist(): string[] {
 export function looksLikeSourceCode(text: string): boolean {
   const lineCount = (text.match(/\n/g) ?? []).length + 1
   const looksLikeCodeLine = /^(import |export |function |class |const |let |var |package |using )/m.test(text)
-  // Many short code lines or a unified diff — keep worktree local
   if (lineCount > 30 && looksLikeCodeLine && text.length > 800) return true
   if (/diff --git |@@ -\d+,\d+ \+\d+,\d+ @@/.test(text) && text.length > 400) return true
   if ((text.match(/```/g) ?? []).length >= 4 && text.length > 3_000) return true
@@ -114,19 +130,91 @@ export function wrapUntrusted(label: string, body: string): string {
   ].join("\n")
 }
 
+/** Project-local preferred CAS agent selection. */
+export function selectionPath(directory: string): string {
+  return path.join(directory, ".opencode", "cas-selection.json")
+}
+
+export type CasSelection = {
+  agentId: string
+  selectedAt: string
+  name?: string
+  description?: string
+}
+
+export function readSelection(directory: string): CasSelection | undefined {
+  try {
+    const raw = fs.readFileSync(selectionPath(directory), "utf8")
+    const parsed = JSON.parse(raw) as CasSelection
+    if (typeof parsed.agentId === "string" && parsed.agentId) return parsed
+  } catch {
+    // absent or invalid
+  }
+  return undefined
+}
+
+export function writeSelection(directory: string, selection: CasSelection): void {
+  const file = selectionPath(directory)
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  fs.writeFileSync(file, JSON.stringify(selection, null, 2) + "\n", "utf8")
+}
+
+function opencodeDataDir(): string {
+  // Match @opencode-ai/core Global.Path.data (xdg-basedir on *nix; Windows uses LOCALAPPDATA)
+  if (process.env.OPENCODE_TEST_HOME) {
+    return path.join(process.env.OPENCODE_TEST_HOME, ".local", "share", "opencode")
+  }
+  if (process.platform === "win32") {
+    const local = process.env.LOCALAPPDATA ?? path.join(os.homedir(), "AppData", "Local")
+    // xdg-basedir on Windows often maps to ~/.local/share
+    const xdg = path.join(os.homedir(), ".local", "share", "opencode")
+    if (fs.existsSync(path.join(xdg, "mcp-auth.json"))) return xdg
+    return path.join(local, "opencode")
+  }
+  const xdg = process.env.XDG_DATA_HOME ?? path.join(os.homedir(), ".local", "share")
+  return path.join(xdg, "opencode")
+}
+
+export function mcpAuthPath(): string {
+  return path.join(opencodeDataDir(), "mcp-auth.json")
+}
+
+type McpAuthEntry = {
+  tokens?: {
+    accessToken?: string
+    refreshToken?: string
+    expiresAt?: number
+    scope?: string
+  }
+  serverUrl?: string
+}
+
+export function readMcpAuthAccessToken(mcpName: string, serverUrl: string): string | undefined {
+  try {
+    const raw = fs.readFileSync(mcpAuthPath(), "utf8")
+    const data = JSON.parse(raw) as Record<string, McpAuthEntry>
+    const entry = data[mcpName]
+    if (!entry?.tokens?.accessToken) return undefined
+    if (entry.serverUrl && normalizeUrl(entry.serverUrl) !== normalizeUrl(serverUrl)) return undefined
+    if (entry.tokens.expiresAt && entry.tokens.expiresAt * 1000 < Date.now()) return undefined
+    return entry.tokens.accessToken
+  } catch {
+    return undefined
+  }
+}
+
+function normalizeUrl(url: string): string {
+  return url.replace(/\/$/, "").toLowerCase()
+}
+
 type JsonRpcResult = {
   result?: unknown
   error?: { message?: string; code?: number }
 }
 
-/**
- * Minimal Streamable-HTTP style JSON-RPC call against CAS MCP.
- * Uses a single POST with initialize+tools/call is not always supported;
- * we do initialize then tools/call with session header when provided.
- */
 export async function callCasMcpTool(name: string, args: Record<string, unknown>): Promise<string> {
-  const token = process.env.CAS_MCP_TOKEN?.trim()
-  if (!token) throw new Error("CAS_MCP_TOKEN is not set")
+  const token = resolveCasAccessToken()
+  if (!token) throw new Error("Not authenticated to CAS. Run: opencode mcp auth alterspective-agent")
 
   const headers: Record<string, string> = {
     Authorization: `Bearer ${token}`,
@@ -141,7 +229,7 @@ export async function callCasMcpTool(name: string, args: Record<string, unknown>
     params: {
       protocolVersion: "2024-11-05",
       capabilities: {},
-      clientInfo: { name: "opencode-cas-bridge", version: "1.0.0" },
+      clientInfo: { name: "opencode-cas-bridge", version: "1.1.0" },
     },
   }
 
@@ -153,7 +241,9 @@ export async function callCasMcpTool(name: string, args: Record<string, unknown>
 
   if (!initRes.ok) {
     if (initRes.status === 401 || initRes.status === 403) {
-      throw new Error(`CAS MCP auth failed (${initRes.status}). Re-mint CAS_MCP_TOKEN (tokens expire ~8h).`)
+      throw new Error(
+        `CAS MCP auth failed (${initRes.status}). Re-authenticate: opencode mcp auth alterspective-agent`,
+      )
     }
     throw new Error(`CAS MCP initialize failed: HTTP ${initRes.status}`)
   }
@@ -161,29 +251,28 @@ export async function callCasMcpTool(name: string, args: Record<string, unknown>
   const sessionId = initRes.headers.get("mcp-session-id") ?? initRes.headers.get("Mcp-Session-Id")
   if (sessionId) headers["mcp-session-id"] = sessionId
 
-  // notifications/initialized (best-effort)
   await fetch(CAS_MCP_URL, {
     method: "POST",
     headers,
     body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
   }).catch(() => undefined)
 
-  const callBody = {
-    jsonrpc: "2.0",
-    id: 2,
-    method: "tools/call",
-    params: { name, arguments: args },
-  }
-
   const callRes = await fetch(CAS_MCP_URL, {
     method: "POST",
     headers,
-    body: JSON.stringify(callBody),
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: { name, arguments: args },
+    }),
   })
 
   if (!callRes.ok) {
     if (callRes.status === 401 || callRes.status === 403) {
-      throw new Error(`CAS MCP auth failed (${callRes.status}). Re-mint CAS_MCP_TOKEN (tokens expire ~8h).`)
+      throw new Error(
+        `CAS MCP auth failed (${callRes.status}). Re-authenticate: opencode mcp auth alterspective-agent`,
+      )
     }
     throw new Error(`CAS MCP tools/call failed: HTTP ${callRes.status}`)
   }
@@ -202,7 +291,6 @@ function parseMaybeSseJson(text: string): JsonRpcResult {
   if (trimmed.startsWith("{")) {
     return JSON.parse(trimmed) as JsonRpcResult
   }
-  // SSE: data: {...}
   const lines = trimmed.split("\n")
   for (const line of lines) {
     const m = line.match(/^data:\s*(.+)$/)
