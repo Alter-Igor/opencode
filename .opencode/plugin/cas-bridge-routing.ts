@@ -62,6 +62,10 @@ Opens a browser; on success tokens are stored under OpenCode's MCP auth store. R
 3. \`cas_select_agent\` — save their choice
 4. \`cas_safe_delegate\` — run a short business task
 
+**Still available without CAS OAuth:**
+- \`cas_pipeline_status\` — public CAS + Synapse \`/health\` (no secrets)
+- \`synapse_probe\` — live gateway routing headers (needs \`SYNAPSE_API_KEY\` / \`GPAAS_API_KEY\`; small paid call)
+
 Continue with local agents + other MCPs until connected.
 `.trim()
 

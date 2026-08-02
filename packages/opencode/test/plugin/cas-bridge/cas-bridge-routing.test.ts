@@ -17,6 +17,7 @@ import {
   formatSynapseProbe,
   looksLikeSecret,
   looksLikeSourceCode,
+  notConnectedMessage,
   parseCasRunListPayload,
   parseCasRunPayload,
   readSelection,
@@ -81,6 +82,8 @@ describe("cas-bridge-routing plugin", () => {
     expect(output.system.length).toBe(1)
     expect(output.system[0]).toContain("not connected")
     expect(output.system[0]).toContain("opencode mcp auth alterspective-agent")
+    expect(output.system[0]).toContain("cas_pipeline_status")
+    expect(output.system[0]).toContain("synapse_probe")
   })
 
   test("routing prompt when token present", async () => {
@@ -305,14 +308,50 @@ describe("cas-bridge insights helpers", () => {
     expect(redactSecrets("Bearer supersecret-token-value")).toContain("[redacted]")
     expect(redactSecrets("key gpaas_abcdefghijklmnop")).toContain("[redacted]")
     const prev = process.env.SYNAPSE_API_KEY
+    const prevG = process.env.GPAAS_API_KEY
+    const prevM = process.env.SYNAPSE_MCP_BEARER_TOKEN
     delete process.env.SYNAPSE_API_KEY
     delete process.env.GPAAS_API_KEY
     delete process.env.SYNAPSE_MCP_BEARER_TOKEN
+    expect(synapseKeySource()).toBe("none")
+    // MCP bearer alone is not an inference key for chat probes
+    process.env.SYNAPSE_MCP_BEARER_TOKEN = "mcp-only"
     expect(synapseKeySource()).toBe("none")
     process.env.GPAAS_API_KEY = "test"
     expect(synapseKeySource()).toBe("GPAAS_API_KEY")
     if (prev === undefined) delete process.env.SYNAPSE_API_KEY
     else process.env.SYNAPSE_API_KEY = prev
-    delete process.env.GPAAS_API_KEY
+    if (prevG === undefined) delete process.env.GPAAS_API_KEY
+    else process.env.GPAAS_API_KEY = prevG
+    if (prevM === undefined) delete process.env.SYNAPSE_MCP_BEARER_TOKEN
+    else process.env.SYNAPSE_MCP_BEARER_TOKEN = prevM
+  })
+
+  test("notConnectedMessage is OAuth-first", () => {
+    delete process.env.CAS_MCP_TOKEN
+    const msg = notConnectedMessage()
+    expect(msg).toContain("opencode mcp auth alterspective-agent")
+    expect(msg).toContain("CAS_MCP_TOKEN")
+  })
+
+  test("formatSynapseProbe mentions cost", () => {
+    const text = formatSynapseProbe({
+      ok: true,
+      status: 200,
+      latencyMs: 10,
+      requestedModel: "auto",
+      headers: {
+        servedModel: "x",
+        raw: {},
+      },
+      correlationId: "c1",
+    })
+    expect(text).toContain("Cost:")
+    expect(text).toContain("tokens")
+  })
+
+  test("parseCasRunPayload refuses invalid-shaped blobs for gate tests", () => {
+    expect(parseCasRunPayload("not json")).toBeUndefined()
+    expect(parseCasRunPayload("{}")).toBeUndefined()
   })
 })

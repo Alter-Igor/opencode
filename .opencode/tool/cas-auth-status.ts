@@ -23,10 +23,13 @@ export default tool({
             "  opencode mcp auth alterspective-agent",
             "That opens a browser login, stores tokens under OpenCode MCP auth, then restart the session.",
             "Optional override: set env CAS_MCP_TOKEN to a bearer (not preferred).",
+            "Without CAS OAuth you can still use cas_pipeline_status and synapse_probe (live=false free).",
           ].join("\n")
-        : source === "oauth"
-          ? "Connected via OpenCode MCP OAuth. Use cas_list_agents (or cas_safe_list_agents) then cas_select_agent."
-          : "Connected via CAS_MCP_TOKEN env. Prefer OAuth: opencode mcp auth alterspective-agent",
+        : source === "oauth-expired"
+          ? "OAuth token expired. Re-run: opencode mcp auth alterspective-agent"
+          : source === "oauth"
+            ? "Connected via OpenCode MCP OAuth. Use cas_safe_list_agents then cas_select_agent."
+            : "Connected via CAS_MCP_TOKEN env. Prefer OAuth: opencode mcp auth alterspective-agent",
     ]
     return lines.join("\n")
   },

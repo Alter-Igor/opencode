@@ -3,7 +3,9 @@ import { tool } from "@opencode-ai/plugin"
 import {
   callCasMcpTool,
   casTokenPresent,
+  notConnectedMessage,
   readSelection,
+  redactSecrets,
   validateDelegate,
   wrapUntrusted,
 } from "./cas-bridge-lib"
@@ -20,9 +22,7 @@ export default tool({
     background: tool.schema.boolean().optional().describe("If true, enqueue and return run handle immediately"),
   },
   async execute(args, ctx) {
-    if (!casTokenPresent()) {
-      return "Not connected to CAS. Run: opencode mcp auth alterspective-agent — then retry."
-    }
+    if (!casTokenPresent()) return notConnectedMessage()
 
     const selected = readSelection(ctx.directory)
     const agentId = (args.agentId?.trim() || selected?.agentId || "").trim()
@@ -49,8 +49,7 @@ export default tool({
       return wrapUntrusted("cas_delegate", result)
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
-      // Never echo token material
-      return `cas_safe_delegate error: ${message.replace(/Bearer\s+\S+/gi, "Bearer [redacted]")}`
+      return `cas_safe_delegate error: ${redactSecrets(message)}`
     }
   },
 })

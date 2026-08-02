@@ -1,6 +1,6 @@
 /// <reference path="../env.d.ts" />
 import { tool } from "@opencode-ai/plugin"
-import { agentAllowlist, casTokenPresent, writeSelection } from "./cas-bridge-lib"
+import { agentAllowlist, casTokenPresent, notConnectedMessage, writeSelection } from "./cas-bridge-lib"
 
 export default tool({
   description: `Select the preferred CAS agent for this project after the user picks one from the list. Saves agentId to .opencode/cas-selection.json. Later cas_safe_delegate can use this default when agentId is omitted (pass the selected id explicitly if unsure).`,
@@ -10,9 +10,7 @@ export default tool({
     description: tool.schema.string().optional().describe("Optional description"),
   },
   async execute(args, ctx) {
-    if (!casTokenPresent()) {
-      return "Not connected to CAS. Run: opencode mcp auth alterspective-agent — then cas_auth_status."
-    }
+    if (!casTokenPresent()) return notConnectedMessage("Then cas_auth_status.")
     const agentId = args.agentId.trim()
     if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(agentId)) {
       return "cas_select_agent refused: agentId must be kebab-case"
