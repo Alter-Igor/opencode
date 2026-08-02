@@ -67,3 +67,14 @@ Live (2026-08-02):
 - Keep **KB-AI-036** updated when bridge tools or hosts change (same PR/session when practical).
 - Optional: tighten primary agent to deny raw `cas_delegate` and force safe tools only.
 - Optional: background poller toast for `childRunId` handles.
+
+## Wave: insights polish (P0/P1)
+
+| Fix | Detail |
+|-----|--------|
+| Auth messages | Shared `notConnectedMessage()`; OAuth-first; `oauth-expired` source |
+| Timeouts | `fetchWithTimeout` on MCP/REST/health/probe |
+| Trace fence | Formatted `cas_safe_run_trace` no longer untrusted-fenced |
+| Degraded prompt | Mentions `cas_pipeline_status` + `synapse_probe` without CAS OAuth |
+| Probe cost | Cost note; `live=false` free health; MCP bearer not used for chat |
+| get_run | Prefers insights formatter + tip toward `cas_safe_run_insights` |

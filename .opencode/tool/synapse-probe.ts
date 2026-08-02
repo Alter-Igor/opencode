@@ -1,16 +1,23 @@
 /// <reference path="../env.d.ts" />
 import { tool } from "@opencode-ai/plugin"
 import {
+  fetchSynapseHealth,
   formatSynapseProbe,
   probeSynapseChat,
   redactSecrets,
   synapseKeyPresent,
   synapseKeySource,
+  SYNAPSE_API_BASE,
+  SYNAPSE_DASHBOARD_URL,
 } from "./cas-bridge-lib"
 
 export default tool({
-  description: `Probe the Synapse AI gateway (synapse2-api) with a tiny chat completion and report how it processed the request: x-synapse-served-model, rate-limit remaining/limit, latency, token usage, optional routing headers. Requires SYNAPSE_API_KEY or GPAAS_API_KEY. model=auto shows local-vs-cloud routing; pin a model id to verify pins.`,
+  description: `Probe the Synapse AI gateway. Default live=true runs a tiny paid chat (~10–20 tokens) and reports x-synapse-served-model, rate limits, latency, usage. Pass live=false for free /health only. Requires SYNAPSE_API_KEY or GPAAS_API_KEY for live probes (not CAS OAuth; not SYNAPSE_MCP_BEARER_TOKEN).`,
   args: {
+    live: tool.schema
+      .boolean()
+      .optional()
+      .describe("If false, only hit /health (free). Default true = small paid chat completion for routing headers."),
     model: tool.schema
       .string()
       .optional()
@@ -28,12 +35,35 @@ export default tool({
       .describe("Optional x-privacy-tier: cloud-ok | local-only"),
   },
   async execute(args) {
+    const live = args.live !== false
+
+    if (!live) {
+      try {
+        const h = await fetchSynapseHealth()
+        return [
+          "Synapse health (free — no chat completion)",
+          `• status: ${h.status ?? "?"}`,
+          `• version: ${h.version ?? "?"} sha=${h.sha ?? "?"}`,
+          `• label: ${h.label ?? h.environment ?? "?"}`,
+          `• API: ${SYNAPSE_API_BASE}`,
+          `• dashboard: ${SYNAPSE_DASHBOARD_URL}`,
+          `• inference key for live probe: ${synapseKeySource() === "none" ? "missing" : "present via " + synapseKeySource()}`,
+          "",
+          "Pass live=true (default) for x-synapse-served-model + rate limits (small paid call).",
+        ].join("\n")
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        return `synapse_probe health error: ${redactSecrets(message)}`
+      }
+    }
+
     if (!synapseKeyPresent()) {
       return [
-        "synapse_probe: no Synapse API key.",
+        "synapse_probe: no Synapse inference API key for live chat.",
         "Set SYNAPSE_API_KEY or GPAAS_API_KEY (named gpaas_/gpapp_ PAT from Keystone / vault).",
-        "CAS OAuth alone is not enough — Synapse uses a different credential than agent.alterspective.com.au.",
+        "CAS OAuth alone is not enough. SYNAPSE_MCP_BEARER_TOKEN is MCP-scoped and is not used for chat.",
         `Current key source: ${synapseKeySource()}`,
+        "Tip: call with live=false for free /health only.",
       ].join("\n")
     }
 

@@ -4,6 +4,7 @@ import {
   callCasMcpTool,
   casTokenPresent,
   formatRunList,
+  notConnectedMessage,
   parseCasRunListPayload,
   redactSecrets,
   wrapUntrusted,
@@ -21,9 +22,7 @@ export default tool({
     limit: tool.schema.number().optional().describe("Max rows (1–100, default 20)"),
   },
   async execute(args) {
-    if (!casTokenPresent()) {
-      return "Not connected to CAS. Run: opencode mcp auth alterspective-agent — then retry."
-    }
+    if (!casTokenPresent()) return notConnectedMessage()
 
     const status = args.status?.trim()
     if (status && !(RUN_STATUSES as readonly string[]).includes(status)) {

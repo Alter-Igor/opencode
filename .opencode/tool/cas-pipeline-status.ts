@@ -10,7 +10,7 @@ import {
 } from "./cas-bridge-lib"
 
 export default tool({
-  description: `Show OpenCode → CAS → Synapse pipeline health: CAS version/gateway model/Langfuse, Synapse API health, and whether your CAS OAuth + Synapse API keys are present. No secrets returned. Use before debugging slow/failed agent runs.`,
+  description: `Show OpenCode → CAS → Synapse pipeline health: CAS version/gateway model/Langfuse, Synapse API health, and whether your CAS OAuth + Synapse API keys are present. No secrets returned. Works without CAS OAuth (public /health). Use before debugging slow/failed agent runs.`,
   args: {},
   async execute() {
     let cas
@@ -32,18 +32,22 @@ export default tool({
     const casAuth = casAuthSource()
     const synAuth = synapseKeySource()
 
+    const casAuthLabel =
+      casAuth === "none"
+        ? "not connected (opencode mcp auth alterspective-agent)"
+        : casAuth === "oauth-expired"
+          ? "oauth expired — re-run: opencode mcp auth alterspective-agent"
+          : casAuth === "oauth"
+            ? "oauth (mcp-auth.json)"
+            : "env CAS_MCP_TOKEN"
+
     try {
       return formatPipelineStatus({
         cas,
         casError: casError ? redactSecrets(casError) : undefined,
         synapse,
         synapseError: synapseError ? redactSecrets(synapseError) : undefined,
-        casAuth:
-          casAuth === "none"
-            ? "not connected (opencode mcp auth alterspective-agent)"
-            : casAuth === "oauth"
-              ? "oauth (mcp-auth.json)"
-              : "env CAS_MCP_TOKEN",
+        casAuth: casAuthLabel,
         synapseAuth:
           synAuth === "none"
             ? "missing (set SYNAPSE_API_KEY or GPAAS_API_KEY for synapse_probe)"

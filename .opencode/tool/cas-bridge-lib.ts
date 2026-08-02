@@ -24,15 +24,46 @@ export const RUN_STATUSES = [
 
 export type RunStatus = (typeof RUN_STATUSES)[number]
 
+/** Network timeouts for bridge outbound calls (ms). */
+export const FETCH_TIMEOUT_HEALTH_MS = 5_000
+export const FETCH_TIMEOUT_MCP_MS = 20_000
+export const FETCH_TIMEOUT_REST_MS = 20_000
+export const FETCH_TIMEOUT_PROBE_MS = 15_000
+
 /** True when a non-empty CAS bearer is available (env or OpenCode OAuth store). */
 export function casTokenPresent(): boolean {
   return Boolean(resolveCasAccessToken())
 }
 
-export function casAuthSource(): "env" | "oauth" | "none" {
+export type CasAuthSource = "env" | "oauth" | "oauth-expired" | "none"
+
+/**
+ * Credential provenance for operator-facing status.
+ * `oauth-expired` = tokens present but past expiresAt (re-auth needed).
+ */
+export function casAuthSource(): CasAuthSource {
   if (process.env.CAS_MCP_TOKEN?.trim()) return "env"
-  if (readMcpAuthAccessToken(CAS_MCP_SERVER, CAS_MCP_URL)) return "oauth"
+  const oauth = readMcpAuthAccessTokenDetailed(CAS_MCP_SERVER, CAS_MCP_URL)
+  if (oauth.token) return "oauth"
+  if (oauth.expired) return "oauth-expired"
   return "none"
+}
+
+/** Shared OAuth-first message when CAS tools cannot run. */
+export function notConnectedMessage(hint?: string): string {
+  const source = casAuthSource()
+  const tail = hint ? ` ${hint}` : ""
+  if (source === "oauth-expired") {
+    return (
+      "CAS OAuth token expired. Re-authenticate: opencode mcp auth alterspective-agent — then retry." +
+      tail
+    )
+  }
+  return (
+    "Not connected to CAS. Run: opencode mcp auth alterspective-agent — then retry." +
+    " (Optional override: env CAS_MCP_TOKEN.)" +
+    tail
+  )
 }
 
 /** Prefer env override, else OpenCode MCP OAuth tokens for alterspective-agent. */
@@ -40,6 +71,26 @@ export function resolveCasAccessToken(): string | undefined {
   const envToken = process.env.CAS_MCP_TOKEN?.trim()
   if (envToken) return envToken
   return readMcpAuthAccessToken(CAS_MCP_SERVER, CAS_MCP_URL)
+}
+
+/** fetch with AbortController timeout; never logs credentials. */
+export async function fetchWithTimeout(
+  url: string,
+  init: RequestInit | undefined,
+  timeoutMs: number,
+): Promise<Response> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    return await fetch(url, { ...init, signal: controller.signal })
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      throw new Error(`Request timed out after ${timeoutMs} ms: ${url.replace(/\?.*$/, "")}`)
+    }
+    throw err
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 export const DEFAULT_AGENT_ALLOWLIST = [
@@ -207,16 +258,27 @@ type McpAuthEntry = {
 }
 
 export function readMcpAuthAccessToken(mcpName: string, serverUrl: string): string | undefined {
+  return readMcpAuthAccessTokenDetailed(mcpName, serverUrl).token
+}
+
+export function readMcpAuthAccessTokenDetailed(
+  mcpName: string,
+  serverUrl: string,
+): { token?: string; expired: boolean } {
   try {
     const raw = fs.readFileSync(mcpAuthPath(), "utf8")
     const data = JSON.parse(raw) as Record<string, McpAuthEntry>
     const entry = data[mcpName]
-    if (!entry?.tokens?.accessToken) return undefined
-    if (entry.serverUrl && normalizeUrl(entry.serverUrl) !== normalizeUrl(serverUrl)) return undefined
-    if (entry.tokens.expiresAt && entry.tokens.expiresAt * 1000 < Date.now()) return undefined
-    return entry.tokens.accessToken
+    if (!entry?.tokens?.accessToken) return { expired: false }
+    if (entry.serverUrl && normalizeUrl(entry.serverUrl) !== normalizeUrl(serverUrl)) {
+      return { expired: false }
+    }
+    if (entry.tokens.expiresAt && entry.tokens.expiresAt * 1000 < Date.now()) {
+      return { expired: true }
+    }
+    return { token: entry.tokens.accessToken, expired: false }
   } catch {
-    return undefined
+    return { expired: false }
   }
 }
 
@@ -250,11 +312,15 @@ export async function callCasMcpTool(name: string, args: Record<string, unknown>
     },
   }
 
-  const initRes = await fetch(CAS_MCP_URL, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(initBody),
-  })
+  const initRes = await fetchWithTimeout(
+    CAS_MCP_URL,
+    {
+      method: "POST",
+      headers,
+      body: JSON.stringify(initBody),
+    },
+    FETCH_TIMEOUT_MCP_MS,
+  )
 
   if (!initRes.ok) {
     if (initRes.status === 401 || initRes.status === 403) {
@@ -268,22 +334,30 @@ export async function callCasMcpTool(name: string, args: Record<string, unknown>
   const sessionId = initRes.headers.get("mcp-session-id") ?? initRes.headers.get("Mcp-Session-Id")
   if (sessionId) headers["mcp-session-id"] = sessionId
 
-  await fetch(CAS_MCP_URL, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
-  }).catch(() => undefined)
+  await fetchWithTimeout(
+    CAS_MCP_URL,
+    {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+    },
+    FETCH_TIMEOUT_MCP_MS,
+  ).catch(() => undefined)
 
-  const callRes = await fetch(CAS_MCP_URL, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: 2,
-      method: "tools/call",
-      params: { name, arguments: args },
-    }),
-  })
+  const callRes = await fetchWithTimeout(
+    CAS_MCP_URL,
+    {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: { name, arguments: args },
+      }),
+    },
+    FETCH_TIMEOUT_MCP_MS,
+  )
 
   if (!callRes.ok) {
     if (callRes.status === 401 || callRes.status === 403) {
@@ -352,13 +426,17 @@ export async function callCasRest(
     }
   }
 
-  const res = await fetch(url.toString(), {
-    method: init?.method ?? "GET",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: "application/json",
+  const res = await fetchWithTimeout(
+    url.toString(),
+    {
+      method: init?.method ?? "GET",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/json",
+      },
     },
-  })
+    FETCH_TIMEOUT_REST_MS,
+  )
 
   const text = await res.text()
   if (!res.ok) {
@@ -403,7 +481,11 @@ export type CasHealthSnapshot = {
 }
 
 export async function fetchCasHealth(): Promise<CasHealthSnapshot> {
-  const res = await fetch(CAS_HEALTH_URL, { headers: { Accept: "application/json" } })
+  const res = await fetchWithTimeout(
+    CAS_HEALTH_URL,
+    { headers: { Accept: "application/json" } },
+    FETCH_TIMEOUT_HEALTH_MS,
+  )
   if (!res.ok) throw new Error(`CAS /health failed: HTTP ${res.status}`)
   return (await res.json()) as CasHealthSnapshot
 }
@@ -417,18 +499,21 @@ export type SynapseHealthSnapshot = {
 }
 
 export async function fetchSynapseHealth(): Promise<SynapseHealthSnapshot> {
-  const res = await fetch(SYNAPSE_HEALTH_URL, { headers: { Accept: "application/json" } })
+  const res = await fetchWithTimeout(
+    SYNAPSE_HEALTH_URL,
+    { headers: { Accept: "application/json" } },
+    FETCH_TIMEOUT_HEALTH_MS,
+  )
   if (!res.ok) throw new Error(`Synapse /health failed: HTTP ${res.status}`)
   return (await res.json()) as SynapseHealthSnapshot
 }
 
-/** Prefer dedicated Synapse keys; never return CAS OAuth tokens here. */
+/**
+ * Prefer dedicated Synapse inference keys for chat/completions probes.
+ * Do not use SYNAPSE_MCP_BEARER_TOKEN here — that is MCP-scoped, not chat.
+ */
 export function resolveSynapseApiKey(): string | undefined {
-  const candidates = [
-    process.env.SYNAPSE_API_KEY,
-    process.env.GPAAS_API_KEY,
-    process.env.SYNAPSE_MCP_BEARER_TOKEN,
-  ]
+  const candidates = [process.env.SYNAPSE_API_KEY, process.env.GPAAS_API_KEY]
   for (const c of candidates) {
     const t = c?.trim()
     if (t) return t
@@ -440,10 +525,9 @@ export function synapseKeyPresent(): boolean {
   return Boolean(resolveSynapseApiKey())
 }
 
-export function synapseKeySource(): "SYNAPSE_API_KEY" | "GPAAS_API_KEY" | "SYNAPSE_MCP_BEARER_TOKEN" | "none" {
+export function synapseKeySource(): "SYNAPSE_API_KEY" | "GPAAS_API_KEY" | "none" {
   if (process.env.SYNAPSE_API_KEY?.trim()) return "SYNAPSE_API_KEY"
   if (process.env.GPAAS_API_KEY?.trim()) return "GPAAS_API_KEY"
-  if (process.env.SYNAPSE_MCP_BEARER_TOKEN?.trim()) return "SYNAPSE_MCP_BEARER_TOKEN"
   return "none"
 }
 
@@ -530,15 +614,19 @@ export async function probeSynapseChat(input: SynapseProbeInput = {}): Promise<S
   if (input.privacyTier) headers["x-privacy-tier"] = input.privacyTier
 
   const started = Date.now()
-  const res = await fetch(`${SYNAPSE_API_BASE}/v1/chat/completions`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      model: requestedModel,
-      max_tokens: maxTokens,
-      messages: [{ role: "user", content: prompt }],
-    }),
-  })
+  const res = await fetchWithTimeout(
+    `${SYNAPSE_API_BASE}/v1/chat/completions`,
+    {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: requestedModel,
+        max_tokens: maxTokens,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    },
+    FETCH_TIMEOUT_PROBE_MS,
+  )
   const latencyMs = Date.now() - started
   const probeHeaders = extractSynapseHeaders(res.headers)
   const text = await res.text()
@@ -612,6 +700,7 @@ export function formatSynapseProbe(result: SynapseProbeResult): string {
     result.contentPreview ? `• reply preview: ${JSON.stringify(result.contentPreview)}` : undefined,
     result.error ? `• error: ${result.error}` : undefined,
     "",
+    "Cost: this is a small paid chat completion (typically ~10–20 tokens).",
     "Note: CAS agent turns spend tokens on this same Synapse gateway (CAS health.gateway.baseUrl).",
     `Dashboard: ${SYNAPSE_DASHBOARD_URL}`,
   ]
