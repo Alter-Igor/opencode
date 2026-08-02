@@ -5,7 +5,24 @@ import os from "os"
 import path from "path"
 
 export const CAS_MCP_SERVER = "alterspective-agent"
-export const CAS_MCP_URL = "https://agent.alterspective.com.au/api/v1/mcp"
+export const CAS_BASE_URL = "https://agent.alterspective.com.au"
+export const CAS_MCP_URL = `${CAS_BASE_URL}/api/v1/mcp`
+export const CAS_HEALTH_URL = `${CAS_BASE_URL}/health`
+export const SYNAPSE_API_BASE = "https://synapse2-api.alterspective.com.au"
+export const SYNAPSE_HEALTH_URL = `${SYNAPSE_API_BASE}/health`
+export const SYNAPSE_DASHBOARD_URL = "https://synapse.alterspective.com.au"
+
+export const RUN_STATUSES = [
+  "queued",
+  "running",
+  "suspended",
+  "succeeded",
+  "failed",
+  "cancelled",
+  "budget_exceeded",
+] as const
+
+export type RunStatus = (typeof RUN_STATUSES)[number]
 
 /** True when a non-empty CAS bearer is available (env or OpenCode OAuth store). */
 export function casTokenPresent(): boolean {
@@ -317,4 +334,592 @@ function formatToolResult(result: unknown): string {
     return texts
   }
   return JSON.stringify(result, null, 2)
+}
+
+/** Authenticated CAS REST call (same bearer as MCP). Never logs the token. */
+export async function callCasRest(
+  path: string,
+  init?: { method?: string; query?: Record<string, string | number | undefined> },
+): Promise<unknown> {
+  const token = resolveCasAccessToken()
+  if (!token) throw new Error("Not authenticated to CAS. Run: opencode mcp auth alterspective-agent")
+
+  const url = new URL(path.startsWith("http") ? path : `${CAS_BASE_URL}${path}`)
+  if (init?.query) {
+    for (const [k, v] of Object.entries(init.query)) {
+      if (v === undefined || v === "") continue
+      url.searchParams.set(k, String(v))
+    }
+  }
+
+  const res = await fetch(url.toString(), {
+    method: init?.method ?? "GET",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/json",
+    },
+  })
+
+  const text = await res.text()
+  if (!res.ok) {
+    if (res.status === 401 || res.status === 403) {
+      throw new Error(
+        `CAS REST auth failed (${res.status}). Re-authenticate: opencode mcp auth alterspective-agent`,
+      )
+    }
+    let detail = text.slice(0, 400)
+    try {
+      const err = JSON.parse(text) as { error?: { message?: string; code?: string }; correlation_id?: string }
+      detail = [err.error?.code, err.error?.message, err.correlation_id ? `correlation_id=${err.correlation_id}` : ""]
+        .filter(Boolean)
+        .join(" — ")
+    } catch {
+      // keep raw slice
+    }
+    throw new Error(`CAS REST ${res.status}: ${detail}`)
+  }
+
+  if (!text.trim()) return null
+  return JSON.parse(text) as unknown
+}
+
+export type CasHealthSnapshot = {
+  status?: string
+  service?: string
+  version?: string
+  sha?: string
+  environment?: string
+  environmentLabel?: string
+  llm?: string
+  knowledgeHealthy?: boolean
+  gateway?: { baseUrl?: string; endpoint?: string; model?: string }
+  observability?: { langfuse?: boolean; metrics?: string }
+  skillLearning?: {
+    captureEnabled?: boolean
+    capturedLessons?: number
+    modelHealth?: { distillerModel?: string; reviewerModel?: string; unservable?: unknown }
+  }
+  toolSources?: string[]
+}
+
+export async function fetchCasHealth(): Promise<CasHealthSnapshot> {
+  const res = await fetch(CAS_HEALTH_URL, { headers: { Accept: "application/json" } })
+  if (!res.ok) throw new Error(`CAS /health failed: HTTP ${res.status}`)
+  return (await res.json()) as CasHealthSnapshot
+}
+
+export type SynapseHealthSnapshot = {
+  status?: string
+  version?: string
+  sha?: string
+  label?: string
+  environment?: string
+}
+
+export async function fetchSynapseHealth(): Promise<SynapseHealthSnapshot> {
+  const res = await fetch(SYNAPSE_HEALTH_URL, { headers: { Accept: "application/json" } })
+  if (!res.ok) throw new Error(`Synapse /health failed: HTTP ${res.status}`)
+  return (await res.json()) as SynapseHealthSnapshot
+}
+
+/** Prefer dedicated Synapse keys; never return CAS OAuth tokens here. */
+export function resolveSynapseApiKey(): string | undefined {
+  const candidates = [
+    process.env.SYNAPSE_API_KEY,
+    process.env.GPAAS_API_KEY,
+    process.env.SYNAPSE_MCP_BEARER_TOKEN,
+  ]
+  for (const c of candidates) {
+    const t = c?.trim()
+    if (t) return t
+  }
+  return undefined
+}
+
+export function synapseKeyPresent(): boolean {
+  return Boolean(resolveSynapseApiKey())
+}
+
+export function synapseKeySource(): "SYNAPSE_API_KEY" | "GPAAS_API_KEY" | "SYNAPSE_MCP_BEARER_TOKEN" | "none" {
+  if (process.env.SYNAPSE_API_KEY?.trim()) return "SYNAPSE_API_KEY"
+  if (process.env.GPAAS_API_KEY?.trim()) return "GPAAS_API_KEY"
+  if (process.env.SYNAPSE_MCP_BEARER_TOKEN?.trim()) return "SYNAPSE_MCP_BEARER_TOKEN"
+  return "none"
+}
+
+export type SynapseProbeHeaders = {
+  servedModel?: string
+  rateLimitLimit?: string
+  rateLimitRemaining?: string
+  rateLimitReset?: string
+  routingReason?: string
+  routingOverride?: string
+  routingPrivacyLocked?: string
+  requestId?: string
+  correlationId?: string
+  retryAfter?: string
+  raw: Record<string, string>
+}
+
+/** Pull the interesting Synapse/GPaaS response headers into a typed bag. */
+export function extractSynapseHeaders(headers: Headers): SynapseProbeHeaders {
+  const pick = (name: string) => headers.get(name) ?? headers.get(name.toLowerCase()) ?? undefined
+  const raw: Record<string, string> = {}
+  headers.forEach((value, key) => {
+    if (/^x-|^rate|^retry-after$/i.test(key)) raw[key.toLowerCase()] = value
+  })
+  return {
+    servedModel: pick("x-synapse-served-model"),
+    rateLimitLimit: pick("x-ratelimit-limit"),
+    rateLimitRemaining: pick("x-ratelimit-remaining"),
+    rateLimitReset: pick("x-ratelimit-reset"),
+    routingReason: pick("x-routing-reason"),
+    routingOverride: pick("x-routing-override"),
+    routingPrivacyLocked: pick("x-routing-privacy-locked"),
+    requestId: pick("x-request-id"),
+    correlationId: pick("x-correlation-id"),
+    retryAfter: pick("retry-after"),
+    raw,
+  }
+}
+
+export type SynapseProbeResult = {
+  ok: boolean
+  status: number
+  latencyMs: number
+  requestedModel: string
+  bodyModel?: string
+  usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }
+  contentPreview?: string
+  error?: string
+  headers: SynapseProbeHeaders
+  correlationId: string
+}
+
+export type SynapseProbeInput = {
+  model?: string
+  prompt?: string
+  maxTokens?: number
+  taskType?: string
+  qualityTier?: "economy" | "balanced" | "premium"
+  privacyTier?: "cloud-ok" | "local-only"
+  correlationId?: string
+}
+
+/**
+ * Minimal Synapse chat completion used purely for routing/usage telemetry.
+ * Caps max_tokens so probes stay cheap.
+ */
+export async function probeSynapseChat(input: SynapseProbeInput = {}): Promise<SynapseProbeResult> {
+  const key = resolveSynapseApiKey()
+  if (!key) throw new Error("No Synapse API key (set SYNAPSE_API_KEY or GPAAS_API_KEY)")
+
+  const correlationId = input.correlationId?.trim() || `opencode-probe-${Date.now()}`
+  const requestedModel = input.model?.trim() || "auto"
+  const maxTokens = Math.min(Math.max(input.maxTokens ?? 16, 1), 64)
+  const prompt = (input.prompt?.trim() || "Reply with exactly: pong").slice(0, 500)
+
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${key}`,
+    "Content-Type": "application/json",
+    Accept: "application/json",
+    "x-correlation-id": correlationId,
+  }
+  if (input.taskType?.trim()) headers["x-task-type"] = input.taskType.trim()
+  if (input.qualityTier) headers["x-quality-tier"] = input.qualityTier
+  if (input.privacyTier) headers["x-privacy-tier"] = input.privacyTier
+
+  const started = Date.now()
+  const res = await fetch(`${SYNAPSE_API_BASE}/v1/chat/completions`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model: requestedModel,
+      max_tokens: maxTokens,
+      messages: [{ role: "user", content: prompt }],
+    }),
+  })
+  const latencyMs = Date.now() - started
+  const probeHeaders = extractSynapseHeaders(res.headers)
+  const text = await res.text()
+
+  if (!res.ok) {
+    let error = text.slice(0, 400)
+    try {
+      const j = JSON.parse(text) as { error?: { message?: string; code?: string } }
+      error = [j.error?.code, j.error?.message].filter(Boolean).join(" — ") || error
+    } catch {
+      // keep slice
+    }
+    return {
+      ok: false,
+      status: res.status,
+      latencyMs,
+      requestedModel,
+      error,
+      headers: probeHeaders,
+      correlationId,
+    }
+  }
+
+  let bodyModel: string | undefined
+  let usage: SynapseProbeResult["usage"]
+  let contentPreview: string | undefined
+  try {
+    const j = JSON.parse(text) as {
+      model?: string
+      usage?: SynapseProbeResult["usage"]
+      choices?: Array<{ message?: { content?: string } }>
+    }
+    bodyModel = j.model
+    usage = j.usage
+    const content = j.choices?.[0]?.message?.content
+    if (typeof content === "string") contentPreview = content.slice(0, 120)
+  } catch {
+    contentPreview = text.slice(0, 120)
+  }
+
+  return {
+    ok: true,
+    status: res.status,
+    latencyMs,
+    requestedModel,
+    bodyModel,
+    usage,
+    contentPreview,
+    headers: probeHeaders,
+    correlationId,
+  }
+}
+
+export function formatSynapseProbe(result: SynapseProbeResult): string {
+  const h = result.headers
+  const lines = [
+    "Synapse request processing insights",
+    `• ok: ${result.ok} (HTTP ${result.status}, ${result.latencyMs} ms)`,
+    `• requested model: ${result.requestedModel}`,
+    `• served model (x-synapse-served-model): ${h.servedModel ?? result.bodyModel ?? "(not reported)"}`,
+    result.bodyModel && result.bodyModel !== h.servedModel ? `• body.model: ${result.bodyModel}` : undefined,
+    `• correlation id: ${result.correlationId}`,
+    h.requestId ? `• request id: ${h.requestId}` : undefined,
+    `• rate limit: ${h.rateLimitRemaining ?? "?"} remaining of ${h.rateLimitLimit ?? "?"}${h.rateLimitReset ? ` (reset ${h.rateLimitReset})` : ""}`,
+    h.routingReason ? `• routing reason: ${h.routingReason}` : undefined,
+    h.routingOverride ? `• routing override: ${h.routingOverride}` : undefined,
+    h.routingPrivacyLocked ? `• privacy locked: ${h.routingPrivacyLocked}` : undefined,
+    result.usage
+      ? `• tokens: prompt=${result.usage.prompt_tokens ?? "?"} completion=${result.usage.completion_tokens ?? "?"} total=${result.usage.total_tokens ?? "?"}`
+      : undefined,
+    result.contentPreview ? `• reply preview: ${JSON.stringify(result.contentPreview)}` : undefined,
+    result.error ? `• error: ${result.error}` : undefined,
+    "",
+    "Note: CAS agent turns spend tokens on this same Synapse gateway (CAS health.gateway.baseUrl).",
+    `Dashboard: ${SYNAPSE_DASHBOARD_URL}`,
+  ]
+  return lines.filter((l) => l !== undefined).join("\n")
+}
+
+/** A CAS run row as returned by cas_get_run / cas_list_runs (fields optional — shape drifts). */
+export type CasRunRow = {
+  id?: string
+  sessionId?: string
+  userId?: string
+  status?: string
+  trigger?: string
+  title?: string
+  templateId?: string
+  parentRunId?: string
+  loopTurns?: number
+  promptTokens?: number
+  completionTokens?: number
+  maxTurns?: number
+  maxTokens?: number
+  error?: string
+  correlationId?: string
+  tenantLabel?: string
+  createdAt?: string
+  startedAt?: string
+  endedAt?: string
+  childRunIds?: string[]
+  budget?: unknown
+}
+
+export function durationMs(start?: string, end?: string): number | undefined {
+  if (!start) return undefined
+  const a = Date.parse(start)
+  if (Number.isNaN(a)) return undefined
+  const b = end ? Date.parse(end) : Date.now()
+  if (Number.isNaN(b)) return undefined
+  return Math.max(0, b - a)
+}
+
+export function formatDuration(ms: number | undefined): string {
+  if (ms === undefined) return "—"
+  if (ms < 1000) return `${ms} ms`
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)} s`
+  return `${(ms / 60_000).toFixed(1)} min`
+}
+
+export function formatRunInsights(run: CasRunRow, opts?: { includeRaw?: boolean }): string {
+  const totalTokens =
+    typeof run.promptTokens === "number" && typeof run.completionTokens === "number"
+      ? run.promptTokens + run.completionTokens
+      : undefined
+  const wall = durationMs(run.startedAt ?? run.createdAt, run.endedAt)
+  const lines = [
+    "CAS run insights",
+    `• runId: ${run.id ?? "(unknown)"}`,
+    `• status: ${run.status ?? "—"}`,
+    run.templateId ? `• agent/template: ${run.templateId}` : "• agent/template: (auto / unscoped)",
+    run.trigger ? `• trigger: ${run.trigger}` : undefined,
+    run.title ? `• title: ${run.title.slice(0, 100)}` : undefined,
+    `• sessionId: ${run.sessionId ?? "—"}`,
+    run.correlationId
+      ? `• correlationId: ${run.correlationId}  ← thread this through logs / Langfuse / Synapse`
+      : "• correlationId: (not set)",
+    `• loop turns: ${run.loopTurns ?? "—"}` +
+      (run.maxTurns !== undefined ? ` / max ${run.maxTurns}` : ""),
+    `• tokens (CAS→Synapse spend): prompt=${run.promptTokens ?? "?"} completion=${run.completionTokens ?? "?"}` +
+      (totalTokens !== undefined ? ` total=${totalTokens}` : "") +
+      (run.maxTokens !== undefined ? ` (budget maxTokens=${run.maxTokens})` : ""),
+    `• wall time: ${formatDuration(wall)}` +
+      (run.startedAt ? ` (started ${run.startedAt})` : "") +
+      (run.endedAt ? ` → ended ${run.endedAt}` : ""),
+    run.tenantLabel ? `• tenant: ${run.tenantLabel}` : undefined,
+    run.parentRunId ? `• parent run: ${run.parentRunId}` : undefined,
+    run.childRunIds?.length ? `• child runs: ${run.childRunIds.join(", ")}` : undefined,
+    run.error ? `• error: ${run.error}` : undefined,
+    "",
+    "How Synapse fits in: every CAS LLM turn calls the gateway at health.gateway.baseUrl",
+    `(${SYNAPSE_API_BASE}). Token totals above are the Synapse bill for this run.`,
+    "Next: cas_safe_run_trace for step-level events, or synapse_probe for live routing headers.",
+  ]
+  const body = lines.filter((l) => l !== undefined).join("\n")
+  if (!opts?.includeRaw) return body
+  return body + "\n\n--- raw run ---\n" + JSON.stringify(run, null, 2)
+}
+
+export function formatRunList(runs: CasRunRow[]): string {
+  if (!runs.length) {
+    return "No CAS runs found for this principal (try cas_safe_delegate first, or widen filters)."
+  }
+  const header = ["CAS recent runs (newest first)", `• count: ${runs.length}`, ""]
+  const rows = runs.map((r, i) => {
+    const total =
+      typeof r.promptTokens === "number" && typeof r.completionTokens === "number"
+        ? r.promptTokens + r.completionTokens
+        : undefined
+    const wall = formatDuration(durationMs(r.startedAt ?? r.createdAt, r.endedAt))
+    return [
+      `${i + 1}. ${r.id ?? "?"}`,
+      `   status=${r.status ?? "—"}  agent=${r.templateId ?? "auto"}  turns=${r.loopTurns ?? "—"}  tokens=${total ?? "—"}  wall=${wall}`,
+      r.title ? `   title: ${r.title.slice(0, 80)}` : undefined,
+      r.correlationId ? `   correlationId: ${r.correlationId}` : undefined,
+    ]
+      .filter(Boolean)
+      .join("\n")
+  })
+  return [...header, ...rows, "", "Inspect one: cas_safe_run_insights runId=<id>  |  cas_safe_run_trace runId=<id>"].join(
+    "\n",
+  )
+}
+
+/** Best-effort: MCP tool text may be JSON run, {run}, or fenced structuredContent. */
+export function parseCasRunPayload(text: string): CasRunRow | undefined {
+  const tryObj = (raw: string): CasRunRow | undefined => {
+    try {
+      const v = JSON.parse(raw) as unknown
+      if (!v || typeof v !== "object") return undefined
+      const o = v as Record<string, unknown>
+      if (o.run && typeof o.run === "object") return o.run as CasRunRow
+      if (typeof o.id === "string" || typeof o.status === "string") return o as CasRunRow
+      if (o.data && typeof o.data === "object") {
+        const d = o.data as Record<string, unknown>
+        if (d.run && typeof d.run === "object") return d.run as CasRunRow
+        if (typeof d.id === "string") return d as CasRunRow
+      }
+    } catch {
+      return undefined
+    }
+    return undefined
+  }
+
+  const direct = tryObj(text.trim())
+  if (direct) return direct
+
+  const fence = text.match(/structuredContent:\s*([\s\S]+)$/)
+  if (fence?.[1]) {
+    const fromFence = tryObj(fence[1].trim())
+    if (fromFence) return fromFence
+  }
+
+  const jsonBlob = text.match(/\{[\s\S]*"id"\s*:\s*"[^"]+"[\s\S]*\}/)
+  if (jsonBlob?.[0]) return tryObj(jsonBlob[0])
+  return undefined
+}
+
+export function parseCasRunListPayload(text: string): CasRunRow[] {
+  const tryList = (raw: string): CasRunRow[] | undefined => {
+    try {
+      const v = JSON.parse(raw) as unknown
+      if (Array.isArray(v)) return v as CasRunRow[]
+      if (v && typeof v === "object") {
+        const o = v as Record<string, unknown>
+        if (Array.isArray(o.runs)) return o.runs as CasRunRow[]
+        if (o.data && typeof o.data === "object") {
+          const d = o.data as Record<string, unknown>
+          if (Array.isArray(d.runs)) return d.runs as CasRunRow[]
+          if (Array.isArray(d)) return d as CasRunRow[]
+        }
+      }
+    } catch {
+      return undefined
+    }
+    return undefined
+  }
+
+  const direct = tryList(text.trim())
+  if (direct) return direct
+  const fence = text.match(/structuredContent:\s*([\s\S]+)$/)
+  if (fence?.[1]) {
+    const fromFence = tryList(fence[1].trim())
+    if (fromFence) return fromFence
+  }
+  return []
+}
+
+export type CasTraceEvent = {
+  type?: string
+  at?: string
+  timestamp?: string
+  toolName?: string
+  name?: string
+  [key: string]: unknown
+}
+
+export function formatRunTrace(payload: unknown): string {
+  const root = payload as {
+    data?: { run?: CasRunRow; events?: CasTraceEvent[] }
+    run?: CasRunRow
+    events?: CasTraceEvent[]
+    meta?: { eventCount?: number; isOperator?: boolean }
+  }
+  const run = root.data?.run ?? root.run
+  const events = root.data?.events ?? root.events ?? []
+  const eventCount = root.meta?.eventCount ?? events.length
+
+  const head = run
+    ? formatRunInsights(run)
+    : "CAS run trace (run row missing — events only)"
+
+  if (!events.length) {
+    return [
+      head,
+      "",
+      "Step trace: (no events)",
+      "Either durable tracing is empty for this run, or the turn had no tool/LLM steps recorded.",
+    ].join("\n")
+  }
+
+  const typeCounts = new Map<string, number>()
+  for (const e of events) {
+    const t = String(e.type ?? e.name ?? "unknown")
+    typeCounts.set(t, (typeCounts.get(t) ?? 0) + 1)
+  }
+  const summary = [...typeCounts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([t, n]) => `${t}×${n}`)
+    .join(", ")
+
+  const steps = events.slice(0, 40).map((e, i) => {
+    const t = String(e.type ?? e.name ?? "event")
+    const when = e.at ?? e.timestamp ?? ""
+    const tool = e.toolName ? ` tool=${e.toolName}` : ""
+    const extraKeys = Object.keys(e)
+      .filter((k) => !["type", "name", "at", "timestamp", "toolName"].includes(k))
+      .slice(0, 4)
+    const extras = extraKeys.length
+      ? " " +
+        extraKeys
+          .map((k) => {
+            const v = e[k]
+            const s = typeof v === "string" ? v.slice(0, 60) : JSON.stringify(v)?.slice(0, 60)
+            return `${k}=${s}`
+          })
+          .join(" ")
+      : ""
+    return `${i + 1}. [${t}]${when ? ` @ ${when}` : ""}${tool}${extras}`
+  })
+
+  const more = events.length > 40 ? `\n… +${events.length - 40} more events` : ""
+
+  return [
+    head,
+    "",
+    `Step trace (${eventCount} events): ${summary}`,
+    "Prompt → tool selection → tool call/result → response (audit model).",
+    "",
+    ...steps,
+    more,
+    "",
+    "These steps are CAS-side. Underlying LLM routing lives on Synapse (synapse_probe / dashboard).",
+  ]
+    .filter((l) => l !== undefined)
+    .join("\n")
+}
+
+export function formatPipelineStatus(input: {
+  cas?: CasHealthSnapshot
+  casError?: string
+  synapse?: SynapseHealthSnapshot
+  synapseError?: string
+  casAuth: string
+  synapseAuth: string
+}): string {
+  const cas = input.cas
+  const syn = input.synapse
+  return [
+    "OpenCode → CAS → Synapse pipeline status",
+    "",
+    "### CAS (Central Agent Service)",
+    input.casError
+      ? `• health: ERROR — ${input.casError}`
+      : [
+          `• health: ${cas?.status ?? "?"} (${cas?.environmentLabel ?? cas?.environment ?? "?"})`,
+          `• version: ${cas?.version ?? "?"} sha=${cas?.sha ?? "?"}`,
+          `• llm backend: ${cas?.llm ?? "?"}`,
+          `• knowledge healthy: ${cas?.knowledgeHealthy ?? "?"}`,
+          `• gateway (Synapse): ${cas?.gateway?.baseUrl ?? "?"} ${cas?.gateway?.endpoint ?? ""} model=${cas?.gateway?.model ?? "?"}`,
+          `• observability: langfuse=${cas?.observability?.langfuse ?? "?"} metrics=${cas?.observability?.metrics ?? "?"}`,
+          cas?.skillLearning
+            ? `• skill learning: enabled=${cas.skillLearning.captureEnabled} lessons=${cas.skillLearning.capturedLessons ?? 0}`
+            : undefined,
+          cas?.toolSources?.length ? `• tool sources: ${cas.toolSources.join(", ")}` : undefined,
+        ]
+          .filter(Boolean)
+          .join("\n"),
+    `• your CAS auth: ${input.casAuth}`,
+    "",
+    "### Synapse (AI gateway — where CAS spends LLM tokens)",
+    input.synapseError
+      ? `• health: ERROR — ${input.synapseError}`
+      : [
+          `• health: ${syn?.status ?? "?"} label=${syn?.label ?? syn?.environment ?? "?"}`,
+          `• version: ${syn?.version ?? "?"} sha=${syn?.sha ?? "?"}`,
+          `• API: ${SYNAPSE_API_BASE}`,
+          `• dashboard: ${SYNAPSE_DASHBOARD_URL}`,
+        ].join("\n"),
+    `• your Synapse key: ${input.synapseAuth}`,
+    "",
+    "### Insight tools",
+    "• cas_safe_list_runs — recent CAS runs + token rollups",
+    "• cas_safe_run_insights — status / tokens / correlationId / wall time",
+    "• cas_safe_run_trace — durable step events (prompt→tools→response)",
+    "• synapse_probe — live x-synapse-served-model + rate limits + usage",
+  ].join("\n")
+}
+
+export function redactSecrets(message: string): string {
+  return message
+    .replace(/Bearer\s+\S+/gi, "Bearer [redacted]")
+    .replace(/\b(sk-|ghp_|gpaas_|gpapp_)[A-Za-z0-9._-]{8,}/g, "[redacted]")
 }

@@ -1,9 +1,10 @@
 # FEAT-CAS-OPENCODE-BRIDGE — Plan (revised post adversarial review)
 
-**Status:** Ready to implement (Option B-hardened)  
-**Date:** 2026-08-01  
+**Status:** Implemented (waves 1–3); see [status.md](./status.md) and [INDEX.md](./INDEX.md)  
+**Date:** 2026-08-01 (plan); insights 2026-08-02  
 **Repos:** `opencode` fork only (prefer `.opencode/` + docs + tests)  
 **Adversarial reviewers:** `claude-fable-5`, `openai/gpt-5.6-sol` via Synapse v2  
+**AIO product doc:** [KB-AI-036](https://markdown.alterspective.com.au/a/Alterspective-IO/Alterspective-Intelligence/main/Reference/AI/Capabilities/KB-AI-036-OpenCode-Alterspective-Fork-And-CAS-Bridge.md)  
 
 ## Goal
 

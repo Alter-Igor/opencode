@@ -1,5 +1,8 @@
 # CAS OAuth connect + list + select (wave 2)
 
+**Canonical overview (AIO):** [KB-AI-036](https://markdown.alterspective.com.au/a/Alterspective-IO/Alterspective-Intelligence/main/Reference/AI/Capabilities/KB-AI-036-OpenCode-Alterspective-Fork-And-CAS-Bridge.md)  
+**Pack index:** [INDEX.md](./INDEX.md)
+
 ## User flow
 
 1. Terminal: `opencode mcp auth alterspective-agent`  

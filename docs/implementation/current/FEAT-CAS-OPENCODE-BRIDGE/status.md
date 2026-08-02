@@ -1,9 +1,12 @@
 # FEAT-CAS-OPENCODE-BRIDGE — Status
 
-**Last updated:** 2026-08-01  
-**Phase:** Implemented on branch `cas-opencode-bridge` (not yet merged)
+**Last updated:** 2026-08-02  
+**Phase:** Bridge + OAuth select merged; insights wave on `cas-synapse-insights`  
+**AIO (what we are doing with OpenCode):** [KB-AI-036](https://markdown.alterspective.com.au/a/Alterspective-IO/Alterspective-Intelligence/main/Reference/AI/Capabilities/KB-AI-036-OpenCode-Alterspective-Fork-And-CAS-Bridge.md)
 
-## Delivered
+## Delivered waves
+
+### Wave 1 — Safe CAS bridge
 
 | Item | Path |
 |------|------|
@@ -16,25 +19,51 @@
 | Tests | `packages/opencode/test/plugin/cas-bridge/` |
 | AGENTS.md note | fork-local bullet |
 
+### Wave 2 — OAuth connect / list / select
+
+| Item | Path |
+|------|------|
+| OAuth flow notes | `oauth-select.md` |
+| Tools | `cas-auth-status`, `cas-select-agent`, selection file |
+| Slash | `/cas` |
+| CAS issuer fix | alterspective-agent prod (issuer host `.com.au`) |
+
+### Wave 3 — Synapse / run insights (2026-08-02)
+
+| Item | Path |
+|------|------|
+| Insights design | `insights.md` |
+| Index (this pack) | `INDEX.md` |
+| Pipeline / list / insights / trace / probe | `.opencode/tool/cas-pipeline-status.ts`, `cas-safe-list-runs.ts`, `cas-safe-run-insights.ts`, `cas-safe-run-trace.ts`, `synapse-probe.ts` |
+| Lib helpers | `.opencode/tool/cas-bridge-lib.ts` (REST, health, formatters, Synapse probe) |
+| Slash command | `.opencode/command/cas-insights.md` |
+| Routing prompt | observability table in `plugin/cas-bridge-routing.ts` |
+| AIO article | `KB-AI-036` in Alterspective-Intelligence |
+
 ## Validation observed
 
-From `packages/opencode`:
+From `packages/opencode` (insights wave):
 
 ```shell
 bun test test/plugin/cas-bridge/cas-bridge-routing.test.ts
-# 11 pass, 0 fail
+# 20 pass, 0 fail
 ```
 
-Live CAS MCP smoke with real `CAS_MCP_TOKEN` not run (token absent on this machine).
+Live (2026-08-02):
+
+- CAS `/health` PROD `1.0.161` / `23e7ae1`, gateway → `synapse2-api.alterspective.com.au`
+- `synapse_probe` `model=auto` → `x-synapse-served-model: qwen3-next-80b`, rate limit 119/120
 
 ## Enable
 
-1. Mint CAS MCP OAuth bearer for `https://agent.alterspective.com.au/api/v1/mcp`.
-2. Set user env `CAS_MCP_TOKEN` (optional `CAS_AGENT_ALLOWLIST=drafter,matter-audit,...`).
-3. Restart `opencodealt`.
-4. Use `@cas-delegate` / `@cas-drafter` / `@cas-matter-audit` or `cas_safe_delegate`.
+1. `opencode mcp auth alterspective-agent` (preferred) **or** set `CAS_MCP_TOKEN`.
+2. Optional: `CAS_AGENT_ALLOWLIST=drafter,matter-audit,...`
+3. Optional for probe: `SYNAPSE_API_KEY` or `GPAAS_API_KEY` (vault — never commit values).
+4. Restart OpenCode (`opencodealt`).
+5. `/cas` to connect list select; `/cas-insights` for pipeline + runs + Synapse routing.
 
 ## Follow-ups
 
-- CAS OAuth issuer/refresh (CAS repo).
+- Keep **KB-AI-036** updated when bridge tools or hosts change (same PR/session when practical).
 - Optional: tighten primary agent to deny raw `cas_delegate` and force safe tools only.
+- Optional: background poller toast for `childRunId` handles.
