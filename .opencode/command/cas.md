@@ -15,6 +15,7 @@ Follow this flow strictly:
 4. Present agents as a clear numbered list: `agentId`, name, description, autonomy if present.
 5. Ask which agent they want (by number or id). When they choose, call **cas_select_agent**.
 6. If they already have a task in $ARGUMENTS or the conversation, call **cas_safe_delegate** with a short self-contained task (no source dumps). Otherwise wait for their task.
+7. After a run (or if they ask how it was processed), offer **cas_safe_run_insights** / **cas_safe_run_trace**, or `/cas-insights` for full pipeline + Synapse routing visibility.
 
 Arguments from the user: $ARGUMENTS
 
