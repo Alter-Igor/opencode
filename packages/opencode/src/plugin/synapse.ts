@@ -9,7 +9,8 @@ export const KEYSTONE_REGISTER = `${KEYSTONE_ISSUER}/api/oauth/register`
 export const KEYSTONE_AUTHORIZE = `${KEYSTONE_ISSUER}/api/oauth/authorize`
 export const KEYSTONE_TOKEN = `${KEYSTONE_ISSUER}/api/oidc/token`
 export const SYNAPSE_DEFAULT_INFERENCE_URL = "https://synapse2-api.alterspective.com.au/v1"
-export const OAUTH_SCOPES = "openid profile email rag:read rag:write mcp:gpaas"
+export const SYNAPSE_AUDIENCE = "synapse"
+export const OAUTH_SCOPES = "openid profile email synapse:models:read synapse:inference:invoke"
 export const OAUTH_PORT = 1459
 export const OAUTH_REDIRECT_PATH = "/auth/callback"
 export const ACCESS_TOKEN_REFRESH_SKEW_MS = 120_000
@@ -109,6 +110,7 @@ export function buildAuthorizeUrl(
     state: string
     authorizeUrl?: string
     scope?: string
+    audience?: string
   },
 ): string {
   const endpoint = input.authorizeUrl || KEYSTONE_AUTHORIZE
@@ -116,6 +118,7 @@ export function buildAuthorizeUrl(
     response_type: "code",
     client_id: input.clientId,
     redirect_uri: input.redirectUri,
+    audience: input.audience || SYNAPSE_AUDIENCE,
     scope: input.scope || OAUTH_SCOPES,
     code_challenge: input.pkce.challenge,
     code_challenge_method: "S256",
@@ -131,6 +134,7 @@ export async function exchangeCodeForTokens(
     redirectUri: string
     verifier: string
     tokenUrl?: string
+    audience?: string
   },
   fetcher: typeof fetch = fetch,
 ): Promise<{
@@ -153,6 +157,7 @@ export async function exchangeCodeForTokens(
       code: input.code,
       redirect_uri: input.redirectUri,
       code_verifier: input.verifier,
+      audience: input.audience || SYNAPSE_AUDIENCE,
     }),
   })
   const body = (await response.json().catch(() => ({}))) as {
@@ -178,6 +183,7 @@ export async function refreshKeystoneToken(
     clientId: string
     refreshToken: string
     tokenUrl?: string
+    audience?: string
   },
   fetcher: typeof fetch = fetch,
 ): Promise<{
@@ -197,6 +203,7 @@ export async function refreshKeystoneToken(
       grant_type: "refresh_token",
       client_id: input.clientId,
       refresh_token: input.refreshToken,
+      audience: input.audience || SYNAPSE_AUDIENCE,
     }),
   })
   const body = (await response.json().catch(() => ({}))) as {
@@ -219,10 +226,12 @@ interface SynapsePluginOptions {
   tokenUrl?: string
   registerUrl?: string
   inferenceUrl?: string
+  audience?: string
 }
 
 export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePluginOptions): Promise<Hooks> {
   const inferenceUrl = options?.inferenceUrl || process.env.SYNAPSE_BASE_URL || SYNAPSE_DEFAULT_INFERENCE_URL
+  const audience = options?.audience || SYNAPSE_AUDIENCE
 
   return {
     auth: {
@@ -259,6 +268,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                 clientId,
                 refreshToken,
                 tokenUrl: options?.tokenUrl,
+                audience,
               })
               accessToken = refreshed.access_token
               const newRefresh = refreshed.refresh_token || refreshToken
@@ -320,6 +330,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
               pkce,
               state,
               authorizeUrl: options?.authorizeUrl,
+              audience,
             })
 
             let server: ReturnType<typeof createServer> | undefined
@@ -373,6 +384,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                     redirectUri: redirect,
                     verifier: pkce.verifier,
                     tokenUrl: options?.tokenUrl,
+                    audience,
                   })
 
                   return {

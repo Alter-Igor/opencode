@@ -7,6 +7,7 @@ import {
   refreshKeystoneToken,
   registerKeystoneClient,
   SynapseAuthPlugin,
+  SYNAPSE_AUDIENCE,
 } from "../../src/plugin/synapse"
 
 function makeJwt(payload: object): string {
@@ -43,7 +44,7 @@ test("returns false for invalid token strings", () => {
   expect(accessTokenIsExpiring(undefined, 0)).toBe(false)
 })
 
-test("builds valid Keystone OAuth URL", () => {
+test("builds valid Keystone OAuth URL with audience=synapse", () => {
   const pkce = { verifier: "ver-123", challenge: "chal-456" }
   const urlString = buildAuthorizeUrl({
     clientId: "client-abc",
@@ -57,18 +58,25 @@ test("builds valid Keystone OAuth URL", () => {
   expect(url.searchParams.get("response_type")).toBe("code")
   expect(url.searchParams.get("client_id")).toBe("client-abc")
   expect(url.searchParams.get("redirect_uri")).toBe("http://127.0.0.1:1459/auth/callback")
+  expect(url.searchParams.get("audience")).toBe(SYNAPSE_AUDIENCE)
+  expect(url.searchParams.get("scope")).toContain("synapse:inference:invoke")
   expect(url.searchParams.get("code_challenge")).toBe("chal-456")
   expect(url.searchParams.get("code_challenge_method")).toBe("S256")
   expect(url.searchParams.get("state")).toBe("state-789")
 })
 
 test("registers client and exchanges token successfully with mock fetcher", async () => {
-  const mockFetch: typeof fetch = async (input) => {
+  let requestedAudience = ""
+  const mockFetch: typeof fetch = async (input, init) => {
     const url = String(input)
     if (url.includes("/register")) {
       return new Response(JSON.stringify({ client_id: "test-client-id" }), { status: 200 })
     }
     if (url.includes("/token")) {
+      const body = typeof init?.body === "string" ? init.body : (init?.body as any)?.toString()
+      const searchParams = new URLSearchParams(body)
+      requestedAudience = searchParams.get("audience") || ""
+
       return new Response(
         JSON.stringify({
           access_token: "test-access-token",
@@ -95,6 +103,7 @@ test("registers client and exchanges token successfully with mock fetcher", asyn
   )
   expect(tokens.access_token).toBe("test-access-token")
   expect(tokens.refresh_token).toBe("test-refresh-token")
+  expect(requestedAudience).toBe("synapse")
 
   const refreshed = await refreshKeystoneToken(
     {
