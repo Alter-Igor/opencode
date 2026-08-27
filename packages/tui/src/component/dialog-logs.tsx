@@ -25,10 +25,20 @@ export function DialogLogs() {
   const [selectedDetail, setSelectedDetail] = createSignal<string | null>(null)
   const [authStatus, setAuthStatus] = createSignal<string>("Authenticated (Keystone SSO)")
 
-  const logPath = "C:\\Users\\IgorJericevich\\.local\\share\\opencode\\log\\opencode.log"
-  const diagPath = "C:\\Users\\IgorJericevich\\.local\\share\\opencode\\log\\diagnostics.log"
+  const homeDir = process.env.USERPROFILE || process.env.HOME || "~"
+  const logPath = `${homeDir}\\.local\\share\\opencode\\log\\opencode.log`
+  const diagPath = `${homeDir}\\.local\\share\\opencode\\log\\diagnostics.log`
+  const learningsPath = `${homeDir}\\.local\\share\\opencode\\learnings.json`
 
   const items = createMemo<DiagnosticItem[]>(() => [
+    {
+      id: "health-onprem",
+      title: "On-Premises GPU Cluster ($0 Cost)",
+      description: "Qwen3 Coder / Spark / Nvidia Pro 6000",
+      category: "System Health",
+      status: "ok",
+      detail: "On-Premises Resilience:\n- GPU Cluster: Active\n- Models: Qwen3 Coder Next, Ornith 35B, Qwen 27B\n- Cost: $0 (unlimited tokens)\n- Auto-Fallback: Enabled on quota/credit limit",
+    },
     {
       id: "health-synapse",
       title: "Synapse AI Gateway",
@@ -60,6 +70,14 @@ export function DialogLogs() {
       category: "Log Files",
       status: "info",
       detail: `Diagnostics Log File:\n${diagPath}\n\nPress Enter to copy this path to your clipboard.`,
+    },
+    {
+      id: "log-learnings",
+      title: "Learned Rules & Memory Log",
+      description: `Path: ${learningsPath}`,
+      category: "Log Files",
+      status: "info",
+      detail: `Learnings & Rules Memory File:\n${learningsPath}\n\nPress Enter to copy this path to your clipboard.`,
     },
   ])
 
@@ -101,7 +119,12 @@ export function DialogLogs() {
         options={options()}
         onSelect={(opt) => {
           if (opt.value.category === "Log Files") {
-            const path = opt.value.id === "log-main" ? logPath : diagPath
+            const path =
+              opt.value.id === "log-main"
+                ? logPath
+                : opt.value.id === "log-learnings"
+                  ? learningsPath
+                  : diagPath
             void clipboard.write?.(path)
             toast.show({
               title: "Path copied!",
