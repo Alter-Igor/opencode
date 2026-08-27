@@ -14,6 +14,7 @@ import { useTuiConfig } from "../config"
 import { useTheme } from "../context/theme"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { HomeSessionDestinationProvider } from "./home/session-destination"
+import { RagWarningBanner } from "../component/rag-warning"
 
 let once = false
 const placeholder = {
@@ -86,6 +87,7 @@ export function Home() {
         </box>
         <box height={1} minHeight={0} flexShrink={1} />
         <box width="100%" maxWidth={promptMaxWidth()} zIndex={1000} paddingTop={1} flexShrink={0}>
+          <RagWarningBanner />
           <pluginRuntime.Slot name="home_prompt" mode="replace" ref={bind}>
             <Prompt ref={bind} right={<pluginRuntime.Slot name="home_prompt_right" />} placeholders={placeholder} />
           </pluginRuntime.Slot>

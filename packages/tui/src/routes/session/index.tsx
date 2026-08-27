@@ -38,6 +38,7 @@ import type {
   SessionStatus,
 } from "@opencode-ai/sdk/v2"
 import { useLocal } from "../../context/local"
+import { RagWarningBanner } from "../../component/rag-warning"
 import { Locale } from "../../util/locale"
 import { webSearchProviderLabel } from "../../util/tool-display"
 import { useRenderer, useTerminalDimensions, type JSX } from "@opentui/solid"
@@ -1310,6 +1311,7 @@ export function Session() {
                 <Show when={session()?.parentID}>
                   <SubagentFooter />
                 </Show>
+                <RagWarningBanner />
                 <Show when={visible()}>
                   <pluginRuntime.Slot
                     name="session_prompt"
