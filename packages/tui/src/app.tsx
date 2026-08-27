@@ -43,6 +43,7 @@ import { DialogModel } from "./component/dialog-model"
 import { useConnected } from "./component/use-connected"
 import { DialogMcp } from "./component/dialog-mcp"
 import { DialogKeystone } from "./component/dialog-keystone"
+import { DialogLogs } from "./component/dialog-logs"
 import { DialogStatus } from "./component/dialog-status"
 import { DialogDebug } from "./component/dialog-debug"
 import { DialogThemeList } from "./component/dialog-theme-list"
@@ -775,6 +776,16 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
           dialog.replace(() => <DialogProviderList />)
         },
         category: "Provider",
+      },
+      {
+        name: "session.logs",
+        title: "Diagnostics & Logs",
+        slashName: "logs",
+        slashAliases: ["log", "diagnostics", "debug"],
+        run: () => {
+          dialog.replace(() => <DialogLogs />)
+        },
+        category: "Session",
       },
       ...(sync.data.console_state.switchableOrgCount > 1
         ? [
