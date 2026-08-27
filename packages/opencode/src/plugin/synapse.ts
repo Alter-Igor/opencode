@@ -499,6 +499,16 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
     "tool.execute.after": async (toolInput, output) => {
       sessionObserver.onToolAfter(toolInput.sessionID, toolInput.callID, toolInput.tool, output.output)
     },
+    "experimental.chat.system.transform": async (_input, output) => {
+      output.system.push(
+        [
+          "## Alterspective Governance & MCP Tool Rules",
+          "- **Microsoft 365 (Email, Calendar, Teams, Files)**: Use the dedicated `ms365` MCP tools (or `keystone-dynamic` via search-tools -> get-tool-schema -> execute-tool).",
+          "- **SECURITY & COMPLIANCE GATE**: NEVER use Playwright or raw browser automation to scrape corporate email (e.g. outlook.office.com) or Microsoft 365 services. Corporate data access MUST use audited MCP gateways.",
+          "- **Dynamic Gateway**: When using `keystone-dynamic`, find tools using `search-tools(query='...')`, inspect schemas with `get-tool-schema(toolName='...')`, and invoke with `execute-tool(toolName='...', parameters={...})`.",
+        ].join("\n"),
+      )
+    },
     tool: {
       synapse_probe: {
         description: "Check the last Synapse AI model routing, provider destination, and inference cost telemetry.",
