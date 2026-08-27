@@ -42,7 +42,7 @@ export interface SessionRetrospective {
 
 export interface DiagnosticLogEntry {
   timestamp: string
-  type: "INFERENCE_REQUEST" | "INFERENCE_RESPONSE" | "INFERENCE_ERROR" | "TOOL_EXECUTION" | "AUTH_EVENT"
+  type: "INFERENCE_REQUEST" | "INFERENCE_RESPONSE" | "INFERENCE_ERROR" | "TOOL_EXECUTION" | "AUTH_EVENT" | "FALLBACK_TRIGGERED"
   sessionId?: string
   details: Record<string, any>
   error?: string

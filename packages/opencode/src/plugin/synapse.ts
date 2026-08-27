@@ -410,35 +410,82 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
               try {
                 const normalizedMessages = sanitizeMessagesForSynapse(rawMessages)
 
-                const mcpRes = await fetch("https://synapse-mcp.alterspective.com.au/mcp", {
-                  method: "POST",
-                  headers: {
-                    "Content-Type": "application/json",
-                    Accept: "application/json, text/event-stream",
-                    Authorization: `Bearer ${activeToken}`,
-                  },
-                  body: JSON.stringify({
-                    jsonrpc: "2.0",
-                    id: Date.now(),
-                    method: "tools/call",
-                    params: {
-                      name: "chat",
-                      arguments: {
-                        messages: normalizedMessages,
-                        ...(requestBodyJson?.model && requestBodyJson.model !== "auto"
-                          ? { model: requestBodyJson.model }
-                          : {}),
-                        taskType: "code",
-                        ...(typeof requestBodyJson?.max_tokens === "number"
-                          ? { maxTokens: requestBodyJson.max_tokens }
-                          : {}),
+                const callMcp = async (args: Record<string, any>) => {
+                  return await fetch("https://synapse-mcp.alterspective.com.au/mcp", {
+                    method: "POST",
+                    headers: {
+                      "Content-Type": "application/json",
+                      Accept: "application/json, text/event-stream",
+                      Authorization: `Bearer ${activeToken}`,
+                    },
+                    body: JSON.stringify({
+                      jsonrpc: "2.0",
+                      id: Date.now(),
+                      method: "tools/call",
+                      params: {
+                        name: "chat",
+                        arguments: args,
+                      },
+                    }),
+                  })
+                }
+
+                let chatArgs: Record<string, any> = {
+                  messages: normalizedMessages,
+                  ...(requestBodyJson?.model && requestBodyJson.model !== "auto"
+                    ? { model: requestBodyJson.model }
+                    : {}),
+                  taskType: "code",
+                  ...(typeof requestBodyJson?.max_tokens === "number"
+                    ? { maxTokens: requestBodyJson.max_tokens }
+                    : {}),
+                }
+
+                let mcpRes = await callMcp(chatArgs)
+                let rawText = mcpRes.ok ? await mcpRes.text() : ""
+
+                const isCreditOrRateError = (text: string, status: number) => {
+                  if (status === 402 || status === 429 || status === 503) return true
+                  return /quota|credit|rate_limit|exceeded|balance|payment|insufficient/i.test(text)
+                }
+
+                let fallbackApplied = false
+                if (!mcpRes.ok || isCreditOrRateError(rawText, mcpRes.status)) {
+                  sessionObserver.logDiagnostic(
+                    {
+                      timestamp: new Date().toISOString(),
+                      type: "FALLBACK_TRIGGERED",
+                      details: {
+                        reason: "Cloud provider credit/rate limit detected — switching to Synapse On-Premises",
+                        initialModel: requestBodyJson?.model,
                       },
                     },
-                  }),
-                })
+                    input.directory,
+                  )
+
+                  // Automatic Fallback to Synapse On-Premises ($0 cost)
+                  chatArgs = {
+                    messages: normalizedMessages,
+                    model: "qwen/qwen3-coder-next",
+                    privacyTier: "local-only",
+                    taskType: "code",
+                    ...(typeof requestBodyJson?.max_tokens === "number"
+                      ? { maxTokens: requestBodyJson.max_tokens }
+                      : {}),
+                  }
+
+                  const fallbackRes = await callMcp(chatArgs)
+                  if (fallbackRes.ok) {
+                    const fallbackText = await fallbackRes.text()
+                    if (!isCreditOrRateError(fallbackText, fallbackRes.status)) {
+                      mcpRes = fallbackRes
+                      rawText = fallbackText
+                      fallbackApplied = true
+                    }
+                  }
+                }
 
                 if (mcpRes.ok) {
-                  const rawText = await mcpRes.text()
                   let parsedContent = ""
                   let servedModel = "synapse-auto"
                   let usage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
@@ -519,6 +566,10 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
 
                   // Strip leading newline artifacts if model responded with \n\n
                   parsedContent = parsedContent.replace(/^\n+/, "")
+
+                  if (fallbackApplied) {
+                    parsedContent = `[Notice: Cloud provider limit reached. Seamlessly switched to Synapse On-Premises ($0 cost).]\n\n${parsedContent}`
+                  }
 
                   sessionObserver.logDiagnostic(
                     {
