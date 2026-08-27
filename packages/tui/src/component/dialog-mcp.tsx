@@ -3,11 +3,13 @@ import { useLocal } from "../context/local"
 import { useSync } from "../context/sync"
 import { map, pipe, sortBy } from "remeda"
 import { DialogSelect, type DialogSelectRef, type DialogSelectOption } from "../ui/dialog-select"
+import { useDialog } from "../ui/dialog"
 import { useTheme } from "../context/theme"
 import { TextAttributes } from "@opentui/core"
 import { useSDK } from "../context/sdk"
+import { DialogKeystone } from "./dialog-keystone"
 
-function Status(props: { enabled: boolean; loading: boolean; status?: string }) {
+function Status(props: { enabled: boolean; loading: boolean; status?: string; name?: string }) {
   const { theme } = useTheme()
   if (props.loading) {
     return <span style={{ fg: theme.textMuted }}>⋯ Loading</span>
@@ -17,6 +19,9 @@ function Status(props: { enabled: boolean; loading: boolean; status?: string }) 
   }
   if (props.status === "failed") {
     return <span style={{ fg: theme.error }}>✕ Failed</span>
+  }
+  if (props.name === "keystone-dynamic") {
+    return <span style={{ fg: theme.success, attributes: TextAttributes.BOLD }}>✓ Enabled (Enter to view tools)</span>
   }
   if (props.enabled) {
     return <span style={{ fg: theme.success, attributes: TextAttributes.BOLD }}>✓ Enabled</span>
@@ -28,6 +33,7 @@ export function DialogMcp() {
   const local = useLocal()
   const sync = useSync()
   const sdk = useSDK()
+  const dialog = useDialog()
   const [, setRef] = createSignal<DialogSelectRef<unknown>>()
   const [loading, setLoading] = createSignal<string | null>(null)
 
@@ -43,7 +49,6 @@ export function DialogMcp() {
   })
 
   const options = createMemo(() => {
-    // Track sync data and loading state to trigger re-render when they change
     const mcpData = (sync.data.mcp ?? {}) as Record<string, { status: string }>
     const configMcp = (sync.data.config?.mcp ?? {}) as Record<string, unknown>
     const allKeys = Array.from(new Set([...Object.keys(configMcp), ...Object.keys(mcpData)]))
@@ -58,7 +63,14 @@ export function DialogMcp() {
           value: name,
           title: name,
           description: serverStatus.status === "failed" ? "failed" : serverStatus.status,
-          footer: <Status enabled={local.mcp.isEnabled(name)} loading={loadingMcp === name} status={serverStatus.status} />,
+          footer: (
+            <Status
+              enabled={local.mcp.isEnabled(name)}
+              loading={loadingMcp === name}
+              status={serverStatus.status}
+              name={name}
+            />
+          ),
           category: undefined,
         }
       }),
@@ -70,18 +82,14 @@ export function DialogMcp() {
       command: "dialog.mcp.toggle",
       title: "toggle",
       onTrigger: async (option: DialogSelectOption<string>) => {
-        // Prevent toggling while an operation is already in progress
         if (loading() !== null) return
 
         setLoading(option.value)
         try {
           await local.mcp.toggle(option.value)
-          // Refresh MCP status from server
           const status = await sdk.client.mcp.status()
           if (status.data) {
             sync.set("mcp", status.data)
-          } else {
-            console.error("Failed to refresh MCP status: no data returned")
           }
         } catch (error) {
           console.error("Failed to toggle MCP:", error)
@@ -119,6 +127,27 @@ export function DialogMcp() {
       actions={actions()}
       onSelect={async (option) => {
         if (!option) return
+        if (option.value === "keystone-dynamic") {
+          const serverStatus = sync.data.mcp[option.value]
+          if (serverStatus?.status === "needs_auth" || serverStatus?.status === "needs_client_registration") {
+            setLoading(option.value)
+            try {
+              await sdk.client.mcp.auth.authenticate({ name: option.value })
+              const status = await sdk.client.mcp.status()
+              if (status.data) {
+                sync.set("mcp", status.data)
+              }
+            } catch (error) {
+              console.error("Failed to authenticate MCP:", error)
+            } finally {
+              setLoading(null)
+            }
+            return
+          }
+          dialog.replace(() => <DialogKeystone />)
+          return
+        }
+
         const serverStatus = sync.data.mcp[option.value]
         if (serverStatus?.status === "needs_auth" || serverStatus?.status === "needs_client_registration") {
           setLoading(option.value)

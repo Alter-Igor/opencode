@@ -42,6 +42,7 @@ import { PermissionProvider } from "./context/permission"
 import { DialogModel } from "./component/dialog-model"
 import { useConnected } from "./component/use-connected"
 import { DialogMcp } from "./component/dialog-mcp"
+import { DialogKeystone } from "./component/dialog-keystone"
 import { DialogStatus } from "./component/dialog-status"
 import { DialogDebug } from "./component/dialog-debug"
 import { DialogThemeList } from "./component/dialog-theme-list"
@@ -699,6 +700,15 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
         slashName: "mcp",
         run: () => {
           dialog.replace(() => <DialogMcp />)
+        },
+      },
+      {
+        name: "keystone.tools",
+        title: "Keystone Dynamic Tools & Services",
+        category: "Agent",
+        slashName: "keystone",
+        run: () => {
+          dialog.replace(() => <DialogKeystone />)
         },
       },
       {
