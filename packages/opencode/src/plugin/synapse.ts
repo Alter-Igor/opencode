@@ -425,9 +425,13 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                       name: "chat",
                       arguments: {
                         messages: normalizedMessages,
-                        model: requestBodyJson?.model === "auto" ? undefined : requestBodyJson?.model,
-                        temperature: requestBodyJson?.temperature,
-                        maxTokens: requestBodyJson?.max_tokens,
+                        ...(requestBodyJson?.model && requestBodyJson.model !== "auto"
+                          ? { model: requestBodyJson.model }
+                          : {}),
+                        taskType: "code",
+                        ...(typeof requestBodyJson?.max_tokens === "number"
+                          ? { maxTokens: requestBodyJson.max_tokens }
+                          : {}),
                       },
                     },
                   }),
@@ -444,12 +448,37 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                   for (const chunk of sseChunks) {
                     try {
                       const data = JSON.parse(chunk.trim())
+                      if (data.isError || data.result?.isError || data.result?.structuredContent?.error || data.error) {
+                        const errObj = data.result?.structuredContent?.error || data.error || data.result?.content?.[0]?.text
+                        const errMsg = typeof errObj === "string" ? errObj : errObj?.message || JSON.stringify(errObj)
+                        sessionObserver.logDiagnostic(
+                          {
+                            timestamp: new Date().toISOString(),
+                            type: "INFERENCE_ERROR",
+                            error: `Synapse Error: ${errMsg}`,
+                            details: { error: errObj },
+                          },
+                          input.directory,
+                        )
+                        return new Response(
+                          JSON.stringify({ error: { message: errMsg, type: "invalid_request_error" } }),
+                          {
+                            status: 400,
+                            headers: { "Content-Type": "application/json" },
+                          },
+                        )
+                      }
+
                       if (data.result?.structuredContent?.content) {
                         parsedContent = data.result.structuredContent.content
                       } else if (data.result?.content?.[0]?.text) {
                         try {
                           const inner = JSON.parse(data.result.content[0].text)
-                          parsedContent = inner.content || data.result.content[0].text
+                          if (inner.content) {
+                            parsedContent = inner.content
+                          } else if (!inner.error) {
+                            parsedContent = data.result.content[0].text
+                          }
                         } catch {
                           parsedContent = data.result.content[0].text
                         }
@@ -476,7 +505,11 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                       } else if (data.result?.content?.[0]?.text) {
                         try {
                           const inner = JSON.parse(data.result.content[0].text)
-                          parsedContent = inner.content || data.result.content[0].text
+                          if (inner.content) {
+                            parsedContent = inner.content
+                          } else if (!inner.error) {
+                            parsedContent = data.result.content[0].text
+                          }
                         } catch {
                           parsedContent = data.result.content[0].text
                         }
