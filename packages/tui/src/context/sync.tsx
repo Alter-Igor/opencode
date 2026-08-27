@@ -521,7 +521,24 @@ export const {
         consoleStatePromise.then((consoleState) => setStore("console_state", reconcile(consoleState))).catch(() => setStore("console_state", reconcile(emptyConsoleState))),
         timed(sdk.client.command.list({ workspace }), "commands").catch(() => ({ data: [] })).then((x) => setStore("command", reconcile(x.data ?? []))),
         timed(sdk.client.lsp.status({ workspace }), "lsp").catch(() => ({ data: [] })).then((x) => setStore("lsp", reconcile(x.data ?? []))),
-        timed(sdk.client.mcp.status({ workspace }), "mcp").catch(() => ({ data: {} })).then((x) => setStore("mcp", reconcile(x.data ?? {}))),
+        timed(sdk.client.mcp.status({ workspace }), "mcp")
+          .catch(() => ({ data: {} }))
+          .then((x) => {
+            const data = x.data ?? {}
+            setStore("mcp", reconcile(data))
+            const keystone = (data as Record<string, { status?: string } | undefined>)["keystone-dynamic"]
+            if (keystone?.status === "needs_auth" || keystone?.status === "needs_client_registration") {
+              void sdk.client.mcp.auth
+                .authenticate({ name: "keystone-dynamic", workspace })
+                .then(async () => {
+                  const refreshed = await sdk.client.mcp.status({ workspace })
+                  if (refreshed.data) {
+                    setStore("mcp", reconcile(refreshed.data))
+                  }
+                })
+                .catch(() => {})
+            }
+          }),
         sdk.client.experimental.resource
           .list({ workspace })
           .then((x) => setStore("mcp_resource", reconcile(x.data ?? {})))

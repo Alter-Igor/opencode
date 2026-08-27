@@ -1,7 +1,7 @@
-import { createMemo, createSignal } from "solid-js"
+import { createMemo, createSignal, onMount } from "solid-js"
 import { useLocal } from "../context/local"
 import { useSync } from "../context/sync"
-import { map, pipe, entries, sortBy } from "remeda"
+import { map, pipe, sortBy } from "remeda"
 import { DialogSelect, type DialogSelectRef, type DialogSelectOption } from "../ui/dialog-select"
 import { useTheme } from "../context/theme"
 import { TextAttributes } from "@opentui/core"
@@ -31,22 +31,37 @@ export function DialogMcp() {
   const [, setRef] = createSignal<DialogSelectRef<unknown>>()
   const [loading, setLoading] = createSignal<string | null>(null)
 
+  onMount(async () => {
+    try {
+      const status = await sdk.client.mcp.status()
+      if (status.data) {
+        sync.set("mcp", status.data)
+      }
+    } catch (err) {
+      console.error("Failed to refresh MCP status in dialog:", err)
+    }
+  })
+
   const options = createMemo(() => {
     // Track sync data and loading state to trigger re-render when they change
-    const mcpData = sync.data.mcp
+    const mcpData = (sync.data.mcp ?? {}) as Record<string, { status: string }>
+    const configMcp = (sync.data.config?.mcp ?? {}) as Record<string, unknown>
+    const allKeys = Array.from(new Set([...Object.keys(configMcp), ...Object.keys(mcpData)]))
     const loadingMcp = loading()
 
     return pipe(
-      mcpData ?? {},
-      entries(),
-      sortBy(([name]) => name),
-      map(([name, status]) => ({
-        value: name,
-        title: name,
-        description: status.status === "failed" ? "failed" : status.status,
-        footer: <Status enabled={local.mcp.isEnabled(name)} loading={loadingMcp === name} status={status.status} />,
-        category: undefined,
-      })),
+      allKeys,
+      sortBy((name) => name),
+      map((name) => {
+        const serverStatus = mcpData[name] ?? { status: "connecting" }
+        return {
+          value: name,
+          title: name,
+          description: serverStatus.status === "failed" ? "failed" : serverStatus.status,
+          footer: <Status enabled={local.mcp.isEnabled(name)} loading={loadingMcp === name} status={serverStatus.status} />,
+          category: undefined,
+        }
+      }),
     )
   })
 
