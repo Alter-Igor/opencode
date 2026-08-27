@@ -416,6 +416,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                 const callMcp = async (args: Record<string, any>) => {
                   return await fetch("https://synapse-mcp.alterspective.com.au/mcp", {
                     method: "POST",
+                    signal: init?.signal,
                     headers: {
                       "Content-Type": "application/json",
                       Accept: "application/json, text/event-stream",
@@ -610,6 +611,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                         // 2. Content chunks (stream words for responsive TUI)
                         const words = parsedContent.match(/\S+|\s+/g) || [parsedContent]
                         for (const word of words) {
+                          if (init?.signal?.aborted) return
                           const wordChunk = {
                             id: `chatcmpl-${Date.now()}`,
                             object: "chat.completion.chunk",
@@ -991,8 +993,25 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
         },
         async execute(args) {
           if (!args.code || !args.code.trim()) {
-            return "Please provide code content to review."
+            return "Please provide code content or a file path to review."
           }
+
+          let codeToReview = args.code
+          let effectiveContext = args.context
+
+          // Auto-File Resolution: If args.code is a path to an existing file, load its content
+          const trimmed = args.code.trim()
+          if (!trimmed.includes("\n") && (trimmed.includes(".") || trimmed.includes("/") || trimmed.includes("\\"))) {
+            try {
+              const targetPath = path.isAbsolute(trimmed)
+                ? trimmed
+                : path.join(input.directory || process.cwd(), trimmed)
+              const fileContent = await fs.readFile(targetPath, "utf8")
+              codeToReview = fileContent
+              effectiveContext = effectiveContext ? `${effectiveContext} (File: ${trimmed})` : `File: ${trimmed}`
+            } catch {}
+          }
+
           let token = ""
           try {
             const homedir = os.homedir()
@@ -1013,7 +1032,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
             },
             {
               role: "user",
-              content: `${args.context ? `Context: ${args.context}\n\n` : ""}Code to review:\n\`\`\`\n${args.code}\n\`\`\``,
+              content: `${effectiveContext ? `Context: ${effectiveContext}\n\n` : ""}Code to review:\n\`\`\`\n${codeToReview}\n\`\`\``,
             },
           ]
 

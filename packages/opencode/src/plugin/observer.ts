@@ -277,6 +277,17 @@ class SessionObserverManager {
     learning: Omit<SessionLearning, "id" | "timestamp">,
     workspaceDir?: string,
   ): Promise<SessionLearning> {
+    const normalizedText = learning.lesson.trim().toLowerCase()
+    const existingIndex = this.sessionLearnings.findIndex(
+      (l) => l.lesson.trim().toLowerCase() === normalizedText,
+    )
+    if (existingIndex !== -1) {
+      // Update existing entry timestamp and return without duplicating
+      const existing = this.sessionLearnings[existingIndex]
+      existing.timestamp = new Date().toISOString()
+      return existing
+    }
+
     const entry: SessionLearning = {
       id: `learn_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
       timestamp: new Date().toISOString(),
