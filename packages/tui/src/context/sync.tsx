@@ -480,9 +480,7 @@ export const {
       const projectPromise = project.sync()
       const sessionListPromise = projectPromise.then(() => listSessions())
 
-      // blocking - include session.list when continuing a session
-      const providersPromise = sdk.client.config.providers({ workspace }, { throwOnError: true })
-      const providerListPromise = sdk.client.provider.list({ workspace }, { throwOnError: true })
+      // Fast initial bootstrap for instant TUI startup
       const capabilitiesPromise = sdk.client.experimental.capabilities
         .get({ workspace }, { throwOnError: true })
         .then((x) => x.data)
@@ -493,9 +491,7 @@ export const {
         .catch(() => emptyConsoleState)
       const agentsPromise = sdk.client.app.agents({ workspace }, { throwOnError: true })
       const configPromise = sdk.client.config.get({ workspace }, { throwOnError: true })
-      const [providersResponse, providerListResponse, capabilitiesData, agentsResponse, configResponse] = await Promise.all([
-        withTimeoutFallback(providersPromise, "providers", () => null),
-        withTimeoutFallback(providerListPromise, "provider-list", () => null),
+      const [capabilitiesData, agentsResponse, configResponse] = await Promise.all([
         withTimeoutFallback(capabilitiesPromise.catch(() => undefined), "capabilities", () => undefined),
         withTimeoutFallback(agentsPromise, "agents", () => ({ data: [] as never, request: {} as never, response: {} as never })),
         withTimeoutFallback(configPromise, "config", () => ({ data: {} as never, request: {} as never, response: {} as never })),
@@ -506,10 +502,27 @@ export const {
       }
       await projectPromise
 
+      // Pre-populate configured providers (e.g. Synapse) instantly from config
+      const initialConfigProviders = Object.entries(configResponse?.data?.provider ?? {}).map(([id, p]: [string, any]) => ({
+        id,
+        name: p.name ?? id,
+        models: Object.fromEntries(
+          Object.entries(p.models ?? {}).map(([modelId, m]: [string, any]) => [
+            modelId,
+            {
+              id: modelId,
+              name: m.name ?? modelId,
+              status: "active",
+              providerID: id,
+              release_date: "",
+              cost: { input: 0, output: 0 },
+            },
+          ]),
+        ),
+      }))
+
       batch(() => {
-        setStore("provider", reconcile(providersResponse?.data?.providers ?? []))
-        setStore("provider_default", reconcile(providersResponse?.data?.default ?? {}))
-        setStore("provider_next", reconcile(providerListResponse?.data ?? { all: [], default: {}, connected: [] }))
+        setStore("provider", reconcile(initialConfigProviders as never))
         setStore("capabilities", "experimentalBackgroundSubagents", capabilitiesData?.backgroundSubagents === true)
         setStore("agent", reconcile(agentsResponse?.data ?? []))
         setStore("config", reconcile(configResponse?.data))
@@ -519,6 +532,17 @@ export const {
       void Promise.all([
         timed(sessionListPromise, "session-list").catch(() => null).then((sessions) => sessions && setStore("session", reconcile(sessions))),
         consoleStatePromise.then((consoleState) => setStore("console_state", reconcile(consoleState))).catch(() => setStore("console_state", reconcile(emptyConsoleState))),
+        sdk.client.config.providers({ workspace }).then((res) => {
+          if (res.data?.providers && res.data.providers.length > 0) {
+            setStore("provider", reconcile(res.data.providers))
+            setStore("provider_default", reconcile(res.data.default ?? {}))
+          }
+        }).catch(() => {}),
+        sdk.client.provider.list({ workspace }).then((res) => {
+          if (res.data) {
+            setStore("provider_next", reconcile(res.data))
+          }
+        }).catch(() => {}),
         timed(sdk.client.command.list({ workspace }), "commands").catch(() => ({ data: [] })).then((x) => setStore("command", reconcile(x.data ?? []))),
         timed(sdk.client.lsp.status({ workspace }), "lsp").catch(() => ({ data: [] })).then((x) => setStore("lsp", reconcile(x.data ?? []))),
         timed(sdk.client.mcp.status({ workspace }), "mcp")
