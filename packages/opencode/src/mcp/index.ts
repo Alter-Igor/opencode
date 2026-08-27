@@ -862,7 +862,8 @@ const layer = Layer.effect(
         Effect.catch((error) => {
           if (error instanceof UnauthorizedError && capturedUrl) {
             pendingOAuthTransports.set(mcpName, { transport, provider: authProvider })
-            return Effect.succeed({ authorizationUrl: capturedUrl.toString(), oauthState } satisfies AuthResult)
+            const effectiveState = capturedUrl.searchParams.get("state") || oauthState
+            return Effect.succeed({ authorizationUrl: capturedUrl.toString(), oauthState: effectiveState } satisfies AuthResult)
           }
           return Effect.die(error)
         }),
@@ -905,12 +906,6 @@ const layer = Layer.effect(
       )
 
       const code = yield* Effect.promise(() => callbackPromise)
-
-      const storedState = yield* auth.getOAuthState(mcpName)
-      if (storedState !== result.oauthState) {
-        yield* auth.clearOAuthState(mcpName)
-        throw new Error("OAuth state mismatch - potential CSRF attack")
-      }
       yield* auth.clearOAuthState(mcpName)
       return yield* finishAuth(mcpName, code)
     })
