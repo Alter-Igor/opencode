@@ -6,6 +6,7 @@
     "moduleResolution": "bundler",
     "jsx": "preserve",
     "jsxImportSource": "react",
-    "types": ["@cloudflare/workers-types", "bun", "node"]
-  }
+    "types": ["@cloudflare/workers-types", "node"]
+  },
+  "exclude": ["src/**/*.test.ts"]
 }
