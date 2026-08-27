@@ -67,7 +67,7 @@ test("builds valid Keystone OAuth URL with audience=synapse", () => {
 
 test("registers client and exchanges token successfully with mock fetcher", async () => {
   let requestedAudience = ""
-  const mockFetch: typeof fetch = async (input, init) => {
+  const mockFetch: any = async (input: any, init: any) => {
     const url = String(input)
     if (url.includes("/register")) {
       return new Response(JSON.stringify({ client_id: "test-client-id" }), { status: 200 })

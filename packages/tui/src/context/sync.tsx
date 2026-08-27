@@ -451,7 +451,7 @@ export const {
     const BOOTSTRAP_TIMEOUT = 8_000
 
     async function timed<T>(promise: Promise<T>, label: string): Promise<T> {
-      let timeoutId: ReturnType<typeof setTimeout>
+      let timeoutId: ReturnType<typeof setTimeout> | undefined
       try {
         return await Promise.race([
           promise,
@@ -460,7 +460,7 @@ export const {
           }),
         ])
       } finally {
-        clearTimeout(timeoutId)
+        if (timeoutId !== undefined) clearTimeout(timeoutId)
       }
     }
 
@@ -497,8 +497,8 @@ export const {
         withTimeoutFallback(providersPromise, "providers", () => null),
         withTimeoutFallback(providerListPromise, "provider-list", () => null),
         withTimeoutFallback(capabilitiesPromise.catch(() => undefined), "capabilities", () => undefined),
-        withTimeoutFallback(agentsPromise, "agents", () => ({ data: [] })),
-        withTimeoutFallback(configPromise, "config", () => ({ data: {} })),
+        withTimeoutFallback(agentsPromise, "agents", () => ({ data: [] as never, request: {} as never, response: {} as never })),
+        withTimeoutFallback(configPromise, "config", () => ({ data: {} as never, request: {} as never, response: {} as never })),
       ])
 
       if (args.continue) {
