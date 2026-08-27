@@ -494,6 +494,38 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
       }
     },
     "tool.execute.before": async (toolInput, output) => {
+      // 1. Policy Enforcement: Block raw browser scraping of corporate email / M365
+      if (toolInput.tool.includes("playwright") || toolInput.tool.includes("browser")) {
+        const url = String(output.args?.url || output.args?.Url || "").toLowerCase()
+        const blocked = [
+          "outlook.office.com",
+          "outlook.live.com",
+          "login.microsoftonline.com",
+          "teams.microsoft.com",
+          "sharepoint.com",
+        ]
+        if (blocked.some((domain) => url.includes(domain))) {
+          throw new Error(
+            `[SECURITY & COMPLIANCE GATE] Direct browser automation to corporate service '${url}' is blocked. Corporate data access must go through the audited 'keystone-dynamic' MCP gateway (use search-tools -> get-tool-schema -> execute-tool).`,
+          )
+        }
+      }
+
+      // 2. Keystone Dynamic Tool Name Normalization
+      if (
+        (toolInput.tool.includes("execute-tool") || toolInput.tool.includes("execute_tool")) &&
+        output.args?.toolName
+      ) {
+        let name = String(output.args.toolName).trim()
+        name = name.replace(/^(mcp__)?keystone[-_]dynamic[-_]/i, "")
+        if (name === "search_tools" || name === "searchTools" || name === "search") {
+          name = "search-tools"
+        } else if (name === "get_tool_schema" || name === "getToolSchema" || name === "schema") {
+          name = "get-tool-schema"
+        }
+        output.args.toolName = name
+      }
+
       sessionObserver.onToolBefore(toolInput.sessionID, toolInput.callID, toolInput.tool, output.args)
     },
     "tool.execute.after": async (toolInput, output) => {
@@ -502,10 +534,14 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
     "experimental.chat.system.transform": async (_input, output) => {
       output.system.push(
         [
-          "## Alterspective Governance & MCP Tool Rules",
-          "- **Microsoft 365 (Email, Calendar, Teams, Files)**: Use the dedicated `ms365` MCP tools (or `keystone-dynamic` via search-tools -> get-tool-schema -> execute-tool).",
-          "- **SECURITY & COMPLIANCE GATE**: NEVER use Playwright or raw browser automation to scrape corporate email (e.g. outlook.office.com) or Microsoft 365 services. Corporate data access MUST use audited MCP gateways.",
-          "- **Dynamic Gateway**: When using `keystone-dynamic`, find tools using `search-tools(query='...')`, inspect schemas with `get-tool-schema(toolName='...')`, and invoke with `execute-tool(toolName='...', parameters={...})`.",
+          "## Mandatory Keystone Dynamic MCP Gateway Instructions",
+          "All corporate MCP tools (Microsoft 365 Email/Calendar/Teams, Keystone Admin, RAG, CRM, etc.) are centralized in `keystone-dynamic`.",
+          "To access corporate tools:",
+          "1. SEARCH: Call `keystone-dynamic_search-tools` with `{\"query\": \"mail\"}` or `{\"query\": \"email\"}` or `{\"query\": \"calendar\"}`.",
+          "2. SCHEMA: Call `keystone-dynamic_get-tool-schema` with `{\"toolName\": \"<exact_name_from_search>\"}`.",
+          "3. EXECUTE: Call `keystone-dynamic_execute-tool` with `{\"toolName\": \"<exact_name>\", \"arguments\": { ... }}`.",
+          "- STRICT RULE: Do NOT guess tool names (e.g. `m365__list-emails` is invalid). Always search first with `search-tools`.",
+          "- STRICT SECURITY GATE: NEVER use Playwright / browser tools to navigate to `outlook.office.com`, `login.microsoftonline.com`, or other corporate web apps. All corporate operations MUST use Keystone to maintain audit compliance.",
         ].join("\n"),
       )
     },
