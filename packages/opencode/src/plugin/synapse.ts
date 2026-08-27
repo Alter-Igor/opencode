@@ -3,7 +3,7 @@ import { createServer } from "http"
 import open from "open"
 import { OauthCallbackPage } from "@opencode-ai/core/oauth/page"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
-import { sessionObserver } from "./observer"
+import { sessionObserver, sanitizeJsonSchemaForOpenAI } from "./observer"
 
 export const KEYSTONE_ISSUER = "https://identity.alterspective.com.au"
 export const KEYSTONE_REGISTER = `${KEYSTONE_ISSUER}/api/oauth/register`
@@ -352,7 +352,60 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
               headers.set("x-task-type", "code")
               headers.set("User-Agent", `opencode/${InstallationVersion}`)
 
-              const response = await fetch(requestInput, { ...init, headers })
+              // Sanitize body and log request
+              let requestBodyJson: any = null
+              let sanitizedBody = init?.body
+              if (typeof init?.body === "string") {
+                try {
+                  requestBodyJson = JSON.parse(init.body)
+                  if (requestBodyJson.tools && Array.isArray(requestBodyJson.tools)) {
+                    for (const t of requestBodyJson.tools) {
+                      if (t.function?.parameters) {
+                        t.function.parameters = sanitizeJsonSchemaForOpenAI(t.function.parameters)
+                      }
+                    }
+                    sanitizedBody = JSON.stringify(requestBodyJson)
+                  }
+                  sessionObserver.logDiagnostic(
+                    {
+                      timestamp: new Date().toISOString(),
+                      type: "INFERENCE_REQUEST",
+                      details: {
+                        model: requestBodyJson.model,
+                        messagesCount: requestBodyJson.messages?.length,
+                        toolsCount: requestBodyJson.tools?.length,
+                        toolNames: requestBodyJson.tools?.map((x: any) => x.function?.name),
+                      },
+                    },
+                    input.directory,
+                  )
+                } catch {}
+              }
+
+              const response = await fetch(requestInput, { ...init, body: sanitizedBody, headers })
+
+              if (!response.ok) {
+                let errorBody = ""
+                try {
+                  const cloned = response.clone()
+                  errorBody = await cloned.text()
+                } catch {}
+                sessionObserver.logDiagnostic(
+                  {
+                    timestamp: new Date().toISOString(),
+                    type: "INFERENCE_ERROR",
+                    error: `HTTP ${response.status}: ${errorBody || response.statusText}`,
+                    details: {
+                      status: response.status,
+                      statusText: response.statusText,
+                      errorBody,
+                      model: requestBodyJson?.model,
+                      requestPreview: requestBodyJson ? JSON.stringify(requestBodyJson).slice(0, 1000) : undefined,
+                    },
+                  },
+                  input.directory,
+                )
+              }
               const servedModel = response.headers.get("x-synapse-served-model")
               const costUsd = response.headers.get("x-synapse-cost-usd")
               const routedProvider = response.headers.get("x-synapse-routed-provider")
@@ -568,6 +621,17 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
             return "No session retrospectives have completed yet."
           }
           return JSON.stringify(retros.slice(0, 5), null, 2)
+        },
+      },
+      session_diagnostics: {
+        description: "Inspect recent inference requests, errors, and session diagnostic logs.",
+        args: {},
+        async execute() {
+          const logs = sessionObserver.getDiagnosticLogs()
+          if (logs.length === 0) {
+            return "No diagnostic log entries recorded yet."
+          }
+          return JSON.stringify(logs.slice(0, 10), null, 2)
         },
       },
     },
