@@ -392,24 +392,53 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                   let servedModel = "synapse-auto"
                   let usage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
 
-                  const match = rawText.match(/data:\s*(\{.*\})/m)
-                  if (match) {
+                  // Extract all data: payloads cleanly from multiline MCP SSE stream
+                  const sseChunks = rawText.split(/(?:^|\n)data:\s*/g).filter(Boolean)
+                  for (const chunk of sseChunks) {
                     try {
-                      const data = JSON.parse(match[1])
-                      const structured = data.result?.structuredContent
-                      if (structured) {
-                        parsedContent = structured.content || ""
-                        servedModel = structured.servedModel || servedModel
-                        if (structured.usage) {
-                          usage = {
-                            prompt_tokens: structured.usage.promptTokens || 0,
-                            completion_tokens: structured.usage.completionTokens || 0,
-                            total_tokens: structured.usage.totalTokens || 0,
-                          }
+                      const data = JSON.parse(chunk.trim())
+                      if (data.result?.structuredContent?.content) {
+                        parsedContent = data.result.structuredContent.content
+                      } else if (data.result?.content?.[0]?.text) {
+                        try {
+                          const inner = JSON.parse(data.result.content[0].text)
+                          parsedContent = inner.content || data.result.content[0].text
+                        } catch {
+                          parsedContent = data.result.content[0].text
+                        }
+                      }
+                      if (data.result?.structuredContent?.servedModel) {
+                        servedModel = data.result.structuredContent.servedModel
+                      }
+                      if (data.result?.structuredContent?.usage) {
+                        const u = data.result.structuredContent.usage
+                        usage = {
+                          prompt_tokens: u.promptTokens || 0,
+                          completion_tokens: u.completionTokens || 0,
+                          total_tokens: u.totalTokens || 0,
                         }
                       }
                     } catch {}
                   }
+
+                  if (!parsedContent) {
+                    try {
+                      const data = JSON.parse(rawText)
+                      if (data.result?.structuredContent?.content) {
+                        parsedContent = data.result.structuredContent.content
+                      } else if (data.result?.content?.[0]?.text) {
+                        try {
+                          const inner = JSON.parse(data.result.content[0].text)
+                          parsedContent = inner.content || data.result.content[0].text
+                        } catch {
+                          parsedContent = data.result.content[0].text
+                        }
+                      }
+                    } catch {}
+                  }
+
+                  // Strip leading newline artifacts if model responded with \n\n
+                  parsedContent = parsedContent.replace(/^\n+/, "")
 
                   latestSynapseServing = {
                     model: servedModel,
@@ -420,22 +449,40 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                     const encoder = new TextEncoder()
                     const stream = new ReadableStream({
                       start(controller) {
-                        const chunk1 = JSON.stringify({
+                        // 1. Initial role chunk
+                        const roleChunk = {
                           id: `chatcmpl-${Date.now()}`,
                           object: "chat.completion.chunk",
                           created: Math.floor(Date.now() / 1000),
                           model: servedModel,
-                          choices: [{ index: 0, delta: { content: parsedContent }, finish_reason: null }],
-                        })
-                        const chunk2 = JSON.stringify({
+                          choices: [{ index: 0, delta: { role: "assistant", content: "" }, logprobs: null, finish_reason: null }],
+                        }
+                        controller.enqueue(encoder.encode(`data: ${JSON.stringify(roleChunk)}\n\n`))
+
+                        // 2. Content chunks (stream words for responsive TUI)
+                        const words = parsedContent.match(/\S+|\s+/g) || [parsedContent]
+                        for (const word of words) {
+                          const wordChunk = {
+                            id: `chatcmpl-${Date.now()}`,
+                            object: "chat.completion.chunk",
+                            created: Math.floor(Date.now() / 1000),
+                            model: servedModel,
+                            choices: [{ index: 0, delta: { content: word }, logprobs: null, finish_reason: null }],
+                          }
+                          controller.enqueue(encoder.encode(`data: ${JSON.stringify(wordChunk)}\n\n`))
+                        }
+
+                        // 3. Final stop chunk
+                        const stopChunk = {
                           id: `chatcmpl-${Date.now()}`,
                           object: "chat.completion.chunk",
                           created: Math.floor(Date.now() / 1000),
                           model: servedModel,
-                          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+                          choices: [{ index: 0, delta: {}, logprobs: null, finish_reason: "stop" }],
                           usage,
-                        })
-                        controller.enqueue(encoder.encode(`data: ${chunk1}\n\ndata: ${chunk2}\n\ndata: [DONE]\n\n`))
+                        }
+                        controller.enqueue(encoder.encode(`data: ${JSON.stringify(stopChunk)}\n\n`))
+                        controller.enqueue(encoder.encode("data: [DONE]\n\n"))
                         controller.close()
                       },
                     })
@@ -443,8 +490,9 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                     return new Response(stream, {
                       status: 200,
                       headers: {
-                        "Content-Type": "text/event-stream",
+                        "Content-Type": "text/event-stream; charset=utf-8",
                         "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
                         "x-synapse-served-model": servedModel,
                       },
                     })
