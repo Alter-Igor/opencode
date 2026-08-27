@@ -931,6 +931,9 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
           "## On-Premises Quality & Code Buddy Reviewer",
           "You have access to the free on-premises specialist tool `synapse_buddy_review`.",
           "When you write code, add functions, or make non-trivial edits, call `synapse_buddy_review` with your code snippet or diff to get an instant ($0 cost) audit for syntax, security vulnerabilities, and logic flaws before declaring complete.",
+          "",
+          "## On-Premises Swarm Explorer & Sub-Agents",
+          "For large research tasks, codebase migrations, or surveying multiple directories, launch parallel sub-agents using the `task` tool (`explore`, `gemini`, `coder`, `fable`, `glm`, `sol`) to divide and conquer concurrently at $0 on-prem cost.",
         ].join("\n"),
       )
     },
