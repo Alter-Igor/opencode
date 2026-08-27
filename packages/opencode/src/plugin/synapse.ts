@@ -364,17 +364,24 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
             const rawMessages = requestBodyJson?.messages || (requestBodyJson?.prompt ? [{ role: "user", content: requestBodyJson.prompt }] : [])
             if (activeToken.startsWith("eyJ") && rawMessages.length > 0) {
               try {
-                const normalizedMessages = rawMessages.map((m: any) => ({
-                  role: m.role || "user",
-                  content:
+                const normalizedMessages = rawMessages.map((m: any) => {
+                  const role =
+                    m.role === "developer"
+                      ? "system"
+                      : ["system", "user", "assistant"].includes(m.role)
+                        ? m.role
+                        : "user"
+                  const text = (
                     typeof m.content === "string"
                       ? m.content
                       : Array.isArray(m.content)
                         ? m.content
                             .map((c: any) => (typeof c === "string" ? c : c.text || JSON.stringify(c)))
                             .join("\n")
-                        : String(m.content ?? ""),
-                }))
+                        : String(m.content ?? "")
+                  ).trim()
+                  return { role, content: text || " " }
+                })
 
                 const mcpRes = await fetch("https://synapse-mcp.alterspective.com.au/mcp", {
                   method: "POST",
