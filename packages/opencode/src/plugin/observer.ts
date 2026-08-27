@@ -271,6 +271,71 @@ class SessionObserverManager {
     } catch {}
   }
 
+  private sessionLearnings: SessionLearning[] = []
+
+  public async recordLearning(
+    learning: Omit<SessionLearning, "id" | "timestamp">,
+    workspaceDir?: string,
+  ): Promise<SessionLearning> {
+    const entry: SessionLearning = {
+      id: `learn_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      timestamp: new Date().toISOString(),
+      ...learning,
+    }
+    this.sessionLearnings.unshift(entry)
+    if (this.sessionLearnings.length > 100) this.sessionLearnings.pop()
+
+    // Persist to central learnings.json
+    try {
+      const homeDir = process.env.USERPROFILE || process.env.HOME || ""
+      if (homeDir) {
+        const centralDir = path.join(homeDir, ".local", "share", "opencode")
+        await fs.mkdir(centralDir, { recursive: true })
+        const centralFile = path.join(centralDir, "learnings.json")
+        let existing: SessionLearning[] = []
+        try {
+          existing = JSON.parse(await fs.readFile(centralFile, "utf8"))
+        } catch {}
+        existing.unshift(entry)
+        await fs.writeFile(centralFile, JSON.stringify(existing.slice(0, 100), null, 2), "utf8")
+      }
+    } catch {}
+
+    // Persist to workspace if available
+    if (workspaceDir) {
+      try {
+        const wsDir = path.join(workspaceDir, ".system_generated", "logs")
+        await fs.mkdir(wsDir, { recursive: true })
+        const wsFile = path.join(wsDir, "learnings.json")
+        let existing: SessionLearning[] = []
+        try {
+          existing = JSON.parse(await fs.readFile(wsFile, "utf8"))
+        } catch {}
+        existing.unshift(entry)
+        await fs.writeFile(wsFile, JSON.stringify(existing.slice(0, 100), null, 2), "utf8")
+      } catch {}
+    }
+    return entry
+  }
+
+  public async getRecentLearnings(limit = 5): Promise<SessionLearning[]> {
+    if (this.sessionLearnings.length > 0) {
+      return this.sessionLearnings.slice(0, limit)
+    }
+    try {
+      const homeDir = process.env.USERPROFILE || process.env.HOME || ""
+      if (homeDir) {
+        const centralFile = path.join(homeDir, ".local", "share", "opencode", "learnings.json")
+        const content = JSON.parse(await fs.readFile(centralFile, "utf8"))
+        if (Array.isArray(content)) {
+          this.sessionLearnings = content
+          return this.sessionLearnings.slice(0, limit)
+        }
+      }
+    } catch {}
+    return []
+  }
+
   public getLatestRetrospectives(): SessionRetrospective[] {
     return this.latestRetrospectives
   }
@@ -278,6 +343,14 @@ class SessionObserverManager {
   public getDiagnosticLogs(): DiagnosticLogEntry[] {
     return this.diagnosticLogs
   }
+}
+
+export interface SessionLearning {
+  id: string
+  timestamp: string
+  lesson: string
+  context?: string
+  source: "user_feedback" | "buddy_review" | "auto_correction" | "session_retro"
 }
 
 export const sessionObserver = new SessionObserverManager()

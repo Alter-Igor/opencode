@@ -923,6 +923,16 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
       sessionObserver.onToolAfter(toolInput.sessionID, toolInput.callID, toolInput.tool, output.output)
     },
     "experimental.chat.system.transform": async (_input, output) => {
+      const recentLearnings = await sessionObserver.getRecentLearnings(5)
+      const learningsBlock =
+        recentLearnings.length > 0
+          ? [
+              "",
+              "## Learned Operating Rules & Past Corrections (DO NOT REPEAT THESE MISTAKES):",
+              ...recentLearnings.map((l) => `- ${l.lesson}`),
+            ]
+          : []
+
       output.system.push(
         [
           "## Mandatory Keystone Dynamic MCP Gateway Instructions",
@@ -940,10 +950,35 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
           "",
           "## On-Premises Swarm Explorer & Sub-Agents",
           "For large research tasks, codebase migrations, or surveying multiple directories, launch parallel sub-agents using the `task` tool (`explore`, `gemini`, `coder`, `fable`, `glm`, `sol`) to divide and conquer concurrently at $0 on-prem cost.",
+          ...learningsBlock,
         ].join("\n"),
       )
     },
     tool: {
+      synapse_record_learning: tool({
+        description:
+          "Record a learned rule, mistake correction, or user preference into persistent memory so the AI remembers and adheres to it in all future sessions.",
+        args: {
+          lesson: tool.schema
+            .string()
+            .describe("The actionable lesson or correction (e.g. 'Always run typecheck before finishing')."),
+          context: tool.schema.string().optional().describe("Optional context or file where this applies."),
+        },
+        async execute(args) {
+          if (!args.lesson || !args.lesson.trim()) {
+            return "Please provide a valid lesson description."
+          }
+          await sessionObserver.recordLearning(
+            {
+              lesson: args.lesson.trim(),
+              context: args.context,
+              source: "user_feedback",
+            },
+            input.directory,
+          )
+          return `✅ Successfully recorded rule: "${args.lesson}". This knowledge is stored and will automatically guide future sessions.`
+        },
+      }),
       synapse_buddy_review: tool({
         description:
           "Run an instant, $0-cost on-premises code review using the Synapse Coder specialist. Checks code snippets or files for syntax errors, SQL injection, broken imports, and security defects.",
@@ -1029,7 +1064,21 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
               }
             }
 
-            return content.trim() || "Buddy review completed: No issues found."
+            const finalContent = content.trim() || "Buddy review completed: No issues found."
+
+            // If issues were detected, auto-record the correction learning
+            if (finalContent.includes("ISSUES") || finalContent.includes("ISSUE DETECTED")) {
+              void sessionObserver.recordLearning(
+                {
+                  lesson: `Buddy Review finding in ${args.context || "code"}: ${finalContent.slice(0, 150)}...`,
+                  context: args.context,
+                  source: "buddy_review",
+                },
+                input.directory,
+              )
+            }
+
+            return finalContent
           } catch (err: any) {
             return `Buddy review error: ${err.message}`
           }
