@@ -1,4 +1,4 @@
-import { createMemo, createSignal } from "solid-js"
+import { createMemo, createSignal, onMount } from "solid-js"
 import { useLocal } from "../context/local"
 import { map, pipe, flatMap, entries, filter, sortBy, take } from "remeda"
 import { DialogSelect } from "../ui/dialog-select"
@@ -8,12 +8,26 @@ import { DialogVariant } from "./dialog-variant"
 import * as fuzzysort from "fuzzysort"
 import { useConnected } from "./use-connected"
 import { useSync } from "../context/sync"
+import { useSDK } from "../context/sdk"
 
 export function DialogModel(props: { providerID?: string }) {
   const local = useLocal()
   const sync = useSync()
+  const sdk = useSDK()
   const dialog = useDialog()
   const [query, setQuery] = createSignal("")
+
+  onMount(async () => {
+    try {
+      const res = await sdk.client.config.providers()
+      if (res.data?.providers && res.data.providers.length > 0) {
+        sync.set("provider", res.data.providers as never)
+        if (res.data.default) {
+          sync.set("provider_default", res.data.default as never)
+        }
+      }
+    } catch {}
+  })
 
   const connected = useConnected()
   const providers = createDialogProviderOptions()
@@ -26,24 +40,53 @@ export function DialogModel(props: { providerID?: string }) {
     const favorites = connected() ? local.model.favorite() : []
     const recents = local.model.recent()
 
+    const configProviders = (sync.data.config?.provider ?? {}) as Record<
+      string,
+      { name?: string; models?: Record<string, { name?: string }> }
+    >
+    const configProviderList = Object.entries(configProviders).map(([id, p]) => ({
+      id,
+      name: p.name ?? id,
+      models: Object.fromEntries(
+        Object.entries(p.models ?? {}).map(([modelId, m]) => [
+          modelId,
+          {
+            id: modelId,
+            name: m.name ?? modelId,
+            status: "active",
+            providerID: id,
+            release_date: "",
+            cost: { input: 0, output: 0 },
+          },
+        ]),
+      ),
+    }))
+
+    const availableProviders = [
+      ...sync.data.provider,
+      ...configProviderList.filter((cp) => !sync.data.provider.some((p) => p.id === cp.id)),
+    ]
+
     function toOptions(items: typeof favorites, category: string) {
       if (!showSections) return []
       return items.flatMap((item) => {
-        const provider = sync.data.provider.find((provider) => provider.id === item.providerID)
+        const provider = availableProviders.find((provider) => provider.id === item.providerID)
         if (!provider) return []
-        const model = provider.models[item.modelID]
+        const model = (provider.models as Record<string, { id?: string; name?: string; cost?: { input?: number } }>)[
+          item.modelID
+        ]
         if (!model) return []
         return [
           {
             key: item,
-            value: { providerID: provider.id, modelID: model.id },
+            value: { providerID: provider.id, modelID: model.id ?? item.modelID },
             title: model.name ?? item.modelID,
             description: provider.name,
             category,
-            disabled: provider.id === "opencode" && model.id.includes("-nano"),
+            disabled: provider.id === "opencode" && (model.id ?? item.modelID).includes("-nano"),
             footer: model.cost?.input === 0 && provider.id === "opencode" ? "Free" : undefined,
             onSelect: () => {
-              onSelect(provider.id, model.id)
+              onSelect(provider.id, model.id ?? item.modelID)
             },
           },
         ]
@@ -59,8 +102,9 @@ export function DialogModel(props: { providerID?: string }) {
     )
 
     const providerOptions = pipe(
-      sync.data.provider,
+      availableProviders,
       sortBy(
+        (provider) => provider.id !== "synapse",
         (provider) => provider.id !== "opencode",
         (provider) => provider.name,
       ),

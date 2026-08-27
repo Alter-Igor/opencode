@@ -448,7 +448,7 @@ export const {
     const exit = useExit()
     const args = useArgs()
 
-    const BOOTSTRAP_TIMEOUT = 8_000
+    const BOOTSTRAP_TIMEOUT = 30_000
 
     async function timed<T>(promise: Promise<T>, label: string): Promise<T> {
       let timeoutId: ReturnType<typeof setTimeout> | undefined
