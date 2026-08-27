@@ -289,6 +289,74 @@ export function sanitizeMessagesForSynapse(
   return result
 }
 
+export interface ParsedToolCall {
+  index: number
+  id: string
+  type: "function"
+  function: {
+    name: string
+    arguments: string
+  }
+}
+
+export function extractToolCallsFromModelOutput(text: string): {
+  toolCalls: ParsedToolCall[]
+  cleanText: string
+} {
+  const toolCalls: ParsedToolCall[] = []
+  let cleanText = text
+  let idx = 0
+
+  // 1. XML-style <tool_call> tags
+  const xmlRegex = /<tool_call>([\s\S]*?)<\/tool_call>/gi
+  let match: RegExpExecArray | null
+  while ((match = xmlRegex.exec(text)) !== null) {
+    try {
+      const parsed = JSON.parse(match[1].trim())
+      const name = parsed.name || parsed.tool || parsed.function
+      const args = parsed.arguments || parsed.parameters || parsed.args || {}
+      if (name) {
+        toolCalls.push({
+          index: idx++,
+          id: `call_${Date.now()}_${idx}`,
+          type: "function",
+          function: {
+            name: String(name),
+            arguments: typeof args === "string" ? args : JSON.stringify(args),
+          },
+        })
+      }
+    } catch {}
+  }
+
+  // 2. Markdown fenced code blocks: ```tool_call or ```json with {"name": ...}
+  const fenceRegex = /```(?:tool_call|tool|json)?\s*\n?(\{\s*"name"[\s\S]*?\})\s*\n?```/gi
+  while ((match = fenceRegex.exec(text)) !== null) {
+    try {
+      const parsed = JSON.parse(match[1].trim())
+      const name = parsed.name || parsed.tool || parsed.function
+      const args = parsed.arguments || parsed.parameters || parsed.args || {}
+      if (name) {
+        toolCalls.push({
+          index: idx++,
+          id: `call_${Date.now()}_${idx}`,
+          type: "function",
+          function: {
+            name: String(name),
+            arguments: typeof args === "string" ? args : JSON.stringify(args),
+          },
+        })
+      }
+    } catch {}
+  }
+
+  if (toolCalls.length > 0) {
+    cleanText = text.replace(xmlRegex, "").replace(fenceRegex, "").trim()
+  }
+
+  return { toolCalls, cleanText }
+}
+
 interface SynapsePluginOptions {
   authorizeUrl?: string
   tokenUrl?: string
@@ -594,6 +662,8 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                     timestamp: Date.now(),
                   }
 
+                  const { toolCalls, cleanText } = extractToolCallsFromModelOutput(parsedContent)
+
                   if (requestBodyJson.stream) {
                     const encoder = new TextEncoder()
                     const stream = new ReadableStream({
@@ -609,26 +679,59 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                         controller.enqueue(encoder.encode(`data: ${JSON.stringify(roleChunk)}\n\n`))
 
                         // 2. Content chunks (stream words for responsive TUI)
-                        const words = parsedContent.match(/\S+|\s+/g) || [parsedContent]
-                        for (const word of words) {
-                          if (init?.signal?.aborted) return
-                          const wordChunk = {
-                            id: `chatcmpl-${Date.now()}`,
-                            object: "chat.completion.chunk",
-                            created: Math.floor(Date.now() / 1000),
-                            model: servedModel,
-                            choices: [{ index: 0, delta: { content: word }, logprobs: null, finish_reason: null }],
+                        if (cleanText) {
+                          const words = cleanText.match(/\S+|\s+/g) || [cleanText]
+                          for (const word of words) {
+                            if (init?.signal?.aborted) return
+                            const wordChunk = {
+                              id: `chatcmpl-${Date.now()}`,
+                              object: "chat.completion.chunk",
+                              created: Math.floor(Date.now() / 1000),
+                              model: servedModel,
+                              choices: [{ index: 0, delta: { content: word }, logprobs: null, finish_reason: null }],
+                            }
+                            controller.enqueue(encoder.encode(`data: ${JSON.stringify(wordChunk)}\n\n`))
                           }
-                          controller.enqueue(encoder.encode(`data: ${JSON.stringify(wordChunk)}\n\n`))
                         }
 
-                        // 3. Final stop chunk
+                        // 3. Emit tool_calls if any were requested by the model
+                        if (toolCalls.length > 0) {
+                          for (const tc of toolCalls) {
+                            if (init?.signal?.aborted) return
+                            const toolChunk = {
+                              id: `chatcmpl-${Date.now()}`,
+                              object: "chat.completion.chunk",
+                              created: Math.floor(Date.now() / 1000),
+                              model: servedModel,
+                              choices: [
+                                {
+                                  index: 0,
+                                  delta: {
+                                    tool_calls: [tc],
+                                  },
+                                  logprobs: null,
+                                  finish_reason: null,
+                                },
+                              ],
+                            }
+                            controller.enqueue(encoder.encode(`data: ${JSON.stringify(toolChunk)}\n\n`))
+                          }
+                        }
+
+                        // 4. Final stop chunk with proper finish_reason
                         const stopChunk = {
                           id: `chatcmpl-${Date.now()}`,
                           object: "chat.completion.chunk",
                           created: Math.floor(Date.now() / 1000),
                           model: servedModel,
-                          choices: [{ index: 0, delta: {}, logprobs: null, finish_reason: "stop" }],
+                          choices: [
+                            {
+                              index: 0,
+                              delta: {},
+                              logprobs: null,
+                              finish_reason: toolCalls.length > 0 ? "tool_calls" : "stop",
+                            },
+                          ],
                           usage,
                         }
                         controller.enqueue(encoder.encode(`data: ${JSON.stringify(stopChunk)}\n\n`))
@@ -656,8 +759,12 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                     choices: [
                       {
                         index: 0,
-                        message: { role: "assistant", content: parsedContent },
-                        finish_reason: "stop",
+                        message: {
+                          role: "assistant",
+                          content: cleanText || (toolCalls.length > 0 ? null : ""),
+                          ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+                        },
+                        finish_reason: toolCalls.length > 0 ? "tool_calls" : "stop",
                       },
                     ],
                     usage,
@@ -952,6 +1059,15 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
           "",
           "## On-Premises Swarm Explorer & Sub-Agents",
           "For large research tasks, codebase migrations, or surveying multiple directories, launch parallel sub-agents using the `task` tool (`explore`, `gemini`, `coder`, `fable`, `glm`, `sol`) to divide and conquer concurrently at $0 on-prem cost.",
+          "",
+          "## Mandatory Tool Execution Protocol",
+          "You are equipped with tools: `read`, `edit`, `write`, `glob`, `grep`, `bash`, `task`, `alterspective-rag`, `keystone-dynamic`, `synapse_buddy_review`, etc.",
+          "When you need to view files, edit code, execute commands, or search, ALWAYS execute the real tool rather than just talking about it.",
+          "To invoke a tool, output:",
+          "<tool_call>",
+          '{"name": "<tool_name>", "arguments": { ... }}',
+          "</tool_call>",
+          "Execute tools immediately to take real action.",
           ...learningsBlock,
         ].join("\n"),
       )
