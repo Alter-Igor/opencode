@@ -48,6 +48,30 @@ export interface DiagnosticLogEntry {
   error?: string
 }
 
+export function redactSensitiveData(data: any): any {
+  if (!data || typeof data !== "object") return data
+  if (Array.isArray(data)) return data.map(redactSensitiveData)
+  const redacted: Record<string, any> = {}
+  for (const [key, value] of Object.entries(data)) {
+    const lowerKey = key.toLowerCase()
+    if (
+      lowerKey.includes("token") ||
+      lowerKey.includes("secret") ||
+      lowerKey.includes("password") ||
+      lowerKey.includes("authorization") ||
+      lowerKey.includes("apikey") ||
+      lowerKey.includes("api_key")
+    ) {
+      redacted[key] = "[REDACTED]"
+    } else if (typeof value === "object" && value !== null) {
+      redacted[key] = redactSensitiveData(value)
+    } else {
+      redacted[key] = value
+    }
+  }
+  return redacted
+}
+
 export function sanitizeJsonSchemaForOpenAI(schema: any): any {
   if (!schema || typeof schema !== "object") return schema
   if (Array.isArray(schema)) {
@@ -55,7 +79,7 @@ export function sanitizeJsonSchemaForOpenAI(schema: any): any {
   }
   const clean: Record<string, any> = {}
   for (const [key, value] of Object.entries(schema)) {
-    if (key === "propertyNames" || key === "$schema") continue
+    if (key === "propertyNames" || key === "$schema" || key === "$defs" || key === "definitions") continue
     if (typeof value === "object" && value !== null) {
       clean[key] = sanitizeJsonSchemaForOpenAI(value)
     } else {
@@ -82,11 +106,15 @@ class SessionObserverManager {
   private diagnosticLogs: DiagnosticLogEntry[] = []
 
   public logDiagnostic(entry: DiagnosticLogEntry, workspaceDir?: string) {
-    this.diagnosticLogs.unshift(entry)
+    const safeEntry: DiagnosticLogEntry = {
+      ...entry,
+      details: redactSensitiveData(entry.details || {}),
+    }
+    this.diagnosticLogs.unshift(safeEntry)
     if (this.diagnosticLogs.length > 200) {
       this.diagnosticLogs.pop()
     }
-    void this.persistDiagnosticLog(entry, workspaceDir)
+    void this.persistDiagnosticLog(safeEntry, workspaceDir)
   }
 
   private async persistDiagnosticLog(entry: DiagnosticLogEntry, workspaceDir?: string) {

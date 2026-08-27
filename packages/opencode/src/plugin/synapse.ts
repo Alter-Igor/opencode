@@ -881,18 +881,24 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
     "tool.execute.before": async (toolInput, output) => {
       // 1. Policy Enforcement: Block raw browser scraping of corporate email / M365
       if (toolInput.tool.includes("playwright") || toolInput.tool.includes("browser")) {
-        const url = String(output.args?.url || output.args?.Url || "").toLowerCase()
-        const blocked = [
-          "outlook.office.com",
-          "outlook.live.com",
-          "login.microsoftonline.com",
-          "teams.microsoft.com",
-          "sharepoint.com",
-        ]
-        if (blocked.some((domain) => url.includes(domain))) {
-          throw new Error(
-            `[SECURITY & COMPLIANCE GATE] Direct browser automation to corporate service '${url}' is blocked. Corporate data access must go through the audited 'keystone-dynamic' MCP gateway (use search-tools -> get-tool-schema -> execute-tool).`,
-          )
+        const rawUrl = String(output.args?.url || output.args?.Url || "")
+        try {
+          const parsed = new URL(rawUrl)
+          const host = parsed.hostname.toLowerCase()
+          const blockedDomains = [
+            "office.com",
+            "live.com",
+            "microsoftonline.com",
+            "sharepoint.com",
+            "graph.microsoft.com",
+          ]
+          if (blockedDomains.some((d) => host === d || host.endsWith(`.${d}`))) {
+            throw new Error(
+              `[SECURITY & COMPLIANCE GATE] Direct browser automation to corporate service '${rawUrl}' is blocked. Corporate data access must go through the audited 'keystone-dynamic' MCP gateway (use search-tools -> get-tool-schema -> execute-tool).`,
+            )
+          }
+        } catch (e: any) {
+          if (e.message.startsWith("[SECURITY & COMPLIANCE GATE]")) throw e
         }
       }
 
