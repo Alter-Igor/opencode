@@ -3,6 +3,7 @@ import { createServer } from "http"
 import open from "open"
 import { OauthCallbackPage } from "@opencode-ai/core/oauth/page"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
+import { sessionObserver } from "./observer"
 
 export const KEYSTONE_ISSUER = "https://identity.alterspective.com.au"
 export const KEYSTONE_REGISTER = `${KEYSTONE_ISSUER}/api/oauth/register`
@@ -484,6 +485,20 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
         },
       ],
     },
+    event: async ({ event }) => {
+      if (event.type === "session.idle" || event.type === "session.deleted") {
+        const sessionID = (event.properties as any)?.sessionID || (event.properties as any)?.id
+        if (sessionID) {
+          await sessionObserver.finalizeSessionRetrospective(sessionID, input.directory)
+        }
+      }
+    },
+    "tool.execute.before": async (toolInput, output) => {
+      sessionObserver.onToolBefore(toolInput.sessionID, toolInput.callID, toolInput.tool, output.args)
+    },
+    "tool.execute.after": async (toolInput, output) => {
+      sessionObserver.onToolAfter(toolInput.sessionID, toolInput.callID, toolInput.tool, output.output)
+    },
     tool: {
       synapse_probe: {
         description: "Check the last Synapse AI model routing, provider destination, and inference cost telemetry.",
@@ -496,6 +511,17 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
           const providerText = latestSynapseServing.provider ? ` via ${latestSynapseServing.provider}` : ""
           const latencyText = latestSynapseServing.latencyMs ? ` (${latestSynapseServing.latencyMs}ms)` : ""
           return `Active Synapse Model: ${latestSynapseServing.model}${providerText}${latencyText}${costText}`
+        },
+      },
+      session_retrospective_summary: {
+        description: "Retrieve recent session retrospectives, learning points, and compliance/audit bypass warnings.",
+        args: {},
+        async execute() {
+          const retros = sessionObserver.getLatestRetrospectives()
+          if (retros.length === 0) {
+            return "No session retrospectives have completed yet."
+          }
+          return JSON.stringify(retros.slice(0, 5), null, 2)
         },
       },
     },
