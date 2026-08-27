@@ -232,6 +232,7 @@ interface SynapsePluginOptions {
 export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePluginOptions): Promise<Hooks> {
   const inferenceUrl = options?.inferenceUrl || process.env.SYNAPSE_BASE_URL || SYNAPSE_DEFAULT_INFERENCE_URL
   const audience = options?.audience || SYNAPSE_AUDIENCE
+  let refreshPromise: Promise<{ access_token: string; refresh_token?: string; expires_in?: number }> | undefined
 
   return {
     auth: {
@@ -258,44 +259,81 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
         }
 
         if (authData.type === "oauth") {
-          let accessToken = authData.access
-          const refreshToken = authData.refresh
-          const clientId = (authData as any).metadata?.clientId || (authData as any).clientId
-
-          if (accessTokenIsExpiring(accessToken) && refreshToken && clientId) {
-            try {
-              const refreshed = await refreshKeystoneToken({
-                clientId,
-                refreshToken,
-                tokenUrl: options?.tokenUrl,
-                audience,
-              })
-              accessToken = refreshed.access_token
-              const newRefresh = refreshed.refresh_token || refreshToken
-              const expiresMs = refreshed.expires_in ? Date.now() + refreshed.expires_in * 1000 : authData.expires
-
-              await input.client.auth
-                .set({
-                  path: { id: "synapse" },
-                  body: {
-                    type: "oauth",
-                    access: accessToken,
-                    refresh: newRefresh,
-                    expires: expiresMs,
-                    enterpriseUrl: inferenceUrl,
-                  },
-                })
-                .catch(() => {})
-            } catch {
-              // Best effort refresh; fallback to existing token
-            }
-          }
-
           return {
-            apiKey: accessToken,
+            apiKey: "oauth-synapse-bearer",
             baseURL: inferenceUrl,
-            headers: {
-              "x-task-type": "code",
+            async fetch(requestInput: RequestInfo | URL, init?: RequestInit) {
+              let currentAuth = await getAuth()
+              if (currentAuth.type !== "oauth") return fetch(requestInput, init)
+
+              const clientId = (currentAuth as any).metadata?.clientId || (currentAuth as any).clientId || "ai-office-cli"
+              const refreshToken = currentAuth.refresh
+              const isExpiring =
+                !currentAuth.expires ||
+                currentAuth.expires - Date.now() <= ACCESS_TOKEN_REFRESH_SKEW_MS ||
+                accessTokenIsExpiring(currentAuth.access)
+
+              if (isExpiring && refreshToken) {
+                if (!refreshPromise) {
+                  refreshPromise = refreshKeystoneToken({
+                    clientId,
+                    refreshToken,
+                    tokenUrl: options?.tokenUrl,
+                    audience,
+                  })
+                    .then(async (tokens) => {
+                      const refreshedExpires = Date.now() + (tokens.expires_in ?? 3600) * 1000
+                      const refreshedRefresh = tokens.refresh_token || refreshToken
+                      await input.client.auth
+                        .set({
+                          path: { id: "synapse" },
+                          body: {
+                            type: "oauth",
+                            access: tokens.access_token,
+                            refresh: refreshedRefresh,
+                            expires: refreshedExpires,
+                            enterpriseUrl: inferenceUrl,
+                          },
+                        })
+                        .catch(() => {})
+                      return tokens
+                    })
+                    .finally(() => {
+                      refreshPromise = undefined
+                    })
+                }
+
+                try {
+                  const refreshed = await refreshPromise
+                  currentAuth = {
+                    ...currentAuth,
+                    access: refreshed.access_token,
+                    refresh: refreshed.refresh_token || refreshToken,
+                    expires: Date.now() + (refreshed.expires_in ?? 3600) * 1000,
+                  }
+                } catch {
+                  // If refresh fails, fall back to current token
+                }
+              }
+
+              const headers = new Headers(requestInput instanceof Request ? requestInput.headers : undefined)
+              if (init?.headers) {
+                const entries =
+                  init.headers instanceof Headers
+                    ? init.headers.entries()
+                    : Array.isArray(init.headers)
+                      ? init.headers
+                      : Object.entries(init.headers as Record<string, string | undefined>)
+                for (const [key, value] of entries) {
+                  if (value !== undefined) headers.set(key, String(value))
+                }
+              }
+
+              headers.set("authorization", `Bearer ${currentAuth.access}`)
+              headers.set("x-task-type", "code")
+              headers.set("User-Agent", `opencode/${InstallationVersion}`)
+
+              return fetch(requestInput, { ...init, headers })
             },
           }
         }
