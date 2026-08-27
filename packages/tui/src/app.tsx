@@ -756,9 +756,21 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
       },
       {
         name: "provider.connect",
-        title: "Connect provider",
+        title: "Connect provider / Log in",
         suggested: !connected(),
         slashName: "connect",
+        slashAliases: ["login", "signin", "auth"],
+        run: () => {
+          dialog.replace(() => <DialogProviderList />)
+        },
+        category: "Provider",
+      },
+      {
+        name: "provider.login",
+        title: "Log in to provider",
+        suggested: !connected(),
+        slashName: "login",
+        slashAliases: ["signin", "auth"],
         run: () => {
           dialog.replace(() => <DialogProviderList />)
         },

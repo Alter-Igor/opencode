@@ -17,6 +17,7 @@ import { useBindings } from "../keymap"
 import { useClipboard } from "../context/clipboard"
 
 const PROVIDER_PRIORITY: Record<string, number> = {
+  synapse: -1,
   opencode: 0,
   "opencode-go": 1,
   openai: 2,
@@ -59,6 +60,7 @@ export function providerOptions(list: { id: string; name: string }[]): ProviderO
         value: provider.id,
         providerID: provider.id,
         description: {
+          synapse: "(Recommended) Alterspective AI Gateway",
           opencode: "(Recommended)",
           anthropic: "(API key)",
           openai: "(ChatGPT Plus/Pro or API key)",
