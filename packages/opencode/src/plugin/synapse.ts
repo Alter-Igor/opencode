@@ -361,8 +361,21 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
             }
 
             // If authenticating via Keystone JWT token, execute through Synapse MCP bridge
-            if (activeToken.startsWith("eyJ") && requestBodyJson?.messages) {
+            const rawMessages = requestBodyJson?.messages || (requestBodyJson?.prompt ? [{ role: "user", content: requestBodyJson.prompt }] : [])
+            if (activeToken.startsWith("eyJ") && rawMessages.length > 0) {
               try {
+                const normalizedMessages = rawMessages.map((m: any) => ({
+                  role: m.role || "user",
+                  content:
+                    typeof m.content === "string"
+                      ? m.content
+                      : Array.isArray(m.content)
+                        ? m.content
+                            .map((c: any) => (typeof c === "string" ? c : c.text || JSON.stringify(c)))
+                            .join("\n")
+                        : String(m.content ?? ""),
+                }))
+
                 const mcpRes = await fetch("https://synapse-mcp.alterspective.com.au/mcp", {
                   method: "POST",
                   headers: {
@@ -377,10 +390,10 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                     params: {
                       name: "chat",
                       arguments: {
-                        messages: requestBodyJson.messages,
-                        model: requestBodyJson.model === "auto" ? undefined : requestBodyJson.model,
-                        temperature: requestBodyJson.temperature,
-                        maxTokens: requestBodyJson.max_tokens,
+                        messages: normalizedMessages,
+                        model: requestBodyJson?.model === "auto" ? undefined : requestBodyJson?.model,
+                        temperature: requestBodyJson?.temperature,
+                        maxTokens: requestBodyJson?.max_tokens,
                       },
                     },
                   }),
@@ -439,6 +452,20 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
 
                   // Strip leading newline artifacts if model responded with \n\n
                   parsedContent = parsedContent.replace(/^\n+/, "")
+
+                  sessionObserver.logDiagnostic(
+                    {
+                      timestamp: new Date().toISOString(),
+                      type: "INFERENCE_RESPONSE",
+                      details: {
+                        model: servedModel,
+                        contentLength: parsedContent.length,
+                        contentSnippet: parsedContent.slice(0, 200),
+                        isStreaming: Boolean(requestBodyJson.stream),
+                      },
+                    },
+                    input.directory,
+                  )
 
                   latestSynapseServing = {
                     model: servedModel,
