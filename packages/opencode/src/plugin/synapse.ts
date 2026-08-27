@@ -242,6 +242,50 @@ export async function refreshKeystoneToken(
   }
 }
 
+export function sanitizeMessagesForSynapse(
+  rawMessages: Array<{ role?: string; content?: any }>,
+): Array<{ role: "system" | "user" | "assistant"; content: string }> {
+  let combinedSystemPrompt = ""
+  const conversation: Array<{ role: "user" | "assistant"; content: string }> = []
+
+  for (let i = 0; i < rawMessages.length; i++) {
+    const m = rawMessages[i]
+    const role = m.role || "user"
+    const text = (
+      typeof m.content === "string"
+        ? m.content
+        : Array.isArray(m.content)
+          ? m.content
+              .map((c: any) => (typeof c === "string" ? c : c.text || JSON.stringify(c)))
+              .join("\n")
+          : String(m.content ?? "")
+    ).trim()
+
+    if (role === "system" || role === "developer") {
+      if (conversation.length === 0) {
+        combinedSystemPrompt = combinedSystemPrompt ? combinedSystemPrompt + "\n\n" + text : text
+      } else {
+        conversation.push({ role: "user", content: `[System context: ${text || " "}]` })
+      }
+    } else {
+      const validRole = role === "assistant" ? "assistant" : "user"
+      conversation.push({ role: validRole, content: text || " " })
+    }
+  }
+
+  const result: Array<{ role: "system" | "user" | "assistant"; content: string }> = []
+  if (combinedSystemPrompt) {
+    result.push({ role: "system", content: combinedSystemPrompt })
+  }
+  result.push(...conversation)
+
+  if (!result.some((m) => m.role === "user")) {
+    result.push({ role: "user", content: " " })
+  }
+
+  return result
+}
+
 interface SynapsePluginOptions {
   authorizeUrl?: string
   tokenUrl?: string
@@ -364,24 +408,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
             const rawMessages = requestBodyJson?.messages || (requestBodyJson?.prompt ? [{ role: "user", content: requestBodyJson.prompt }] : [])
             if (activeToken.startsWith("eyJ") && rawMessages.length > 0) {
               try {
-                const normalizedMessages = rawMessages.map((m: any) => {
-                  const role =
-                    m.role === "developer"
-                      ? "system"
-                      : ["system", "user", "assistant"].includes(m.role)
-                        ? m.role
-                        : "user"
-                  const text = (
-                    typeof m.content === "string"
-                      ? m.content
-                      : Array.isArray(m.content)
-                        ? m.content
-                            .map((c: any) => (typeof c === "string" ? c : c.text || JSON.stringify(c)))
-                            .join("\n")
-                        : String(m.content ?? "")
-                  ).trim()
-                  return { role, content: text || " " }
-                })
+                const normalizedMessages = sanitizeMessagesForSynapse(rawMessages)
 
                 const mcpRes = await fetch("https://synapse-mcp.alterspective.com.au/mcp", {
                   method: "POST",
