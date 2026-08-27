@@ -10,8 +10,9 @@ export const KEYSTONE_REGISTER = `${KEYSTONE_ISSUER}/api/oauth/register`
 export const KEYSTONE_AUTHORIZE = `${KEYSTONE_ISSUER}/api/oauth/authorize`
 export const KEYSTONE_TOKEN = `${KEYSTONE_ISSUER}/api/oidc/token`
 export const SYNAPSE_DEFAULT_INFERENCE_URL = "https://synapse2-api.alterspective.com.au/v1"
-export const SYNAPSE_AUDIENCE = "synapse"
-export const OAUTH_SCOPES = "openid profile email synapse:models:read synapse:inference:invoke"
+export const SYNAPSE_RESOURCE = "https://synapse-mcp.alterspective.com.au/mcp"
+export const SYNAPSE_AUDIENCE = SYNAPSE_RESOURCE
+export const OAUTH_SCOPES = "mcp:gpaas"
 export const OAUTH_PORT = 1459
 export const OAUTH_REDIRECT_PATH = "/auth/callback"
 export const ACCESS_TOKEN_REFRESH_SKEW_MS = 120_000
@@ -39,44 +40,38 @@ export interface PkceCodes {
   challenge: string
 }
 
+export function base64UrlEncode(buffer: Uint8Array): string {
+  const base64 = Buffer.from(buffer).toString("base64")
+  return base64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")
+}
+
 export async function generatePKCE(): Promise<PkceCodes> {
-  const verifier = generateRandomString(64)
-  const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier))
-  return { verifier, challenge: base64UrlEncode(hash) }
-}
-
-function generateRandomString(length: number): string {
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
-  return Array.from(crypto.getRandomValues(new Uint8Array(length)))
-    .map((b) => chars[b % chars.length])
-    .join("")
-}
-
-function base64UrlEncode(buffer: ArrayBuffer): string {
-  const binary = String.fromCharCode(...new Uint8Array(buffer))
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")
+  const array = new Uint8Array(32)
+  crypto.getRandomValues(array)
+  const verifier = base64UrlEncode(array)
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier))
+  const challenge = base64UrlEncode(new Uint8Array(digest))
+  return { verifier, challenge }
 }
 
 export function generateState(): string {
-  return base64UrlEncode(crypto.getRandomValues(new Uint8Array(32)).buffer)
+  const array = new Uint8Array(24)
+  crypto.getRandomValues(array)
+  return base64UrlEncode(array)
 }
 
 export function redirectUri(port = OAUTH_PORT): string {
-  return `http://127.0.0.1:${port}${OAUTH_REDIRECT_PATH}`
+  return `http://localhost:${port}${OAUTH_REDIRECT_PATH}`
 }
 
-export function parseJwtPayload(token: string): Record<string, unknown> | undefined {
-  if (!token || typeof token !== "string") return undefined
-  const parts = token.split(".")
-  if (parts.length < 2) return undefined
+export function parseJwtPayload(token: string): Record<string, unknown> | null {
   try {
-    const raw = parts[1].replace(/-/g, "+").replace(/_/g, "/")
-    const padded = raw.padEnd(raw.length + ((4 - (raw.length % 4)) % 4), "=")
-    const json = atob(padded)
-    const parsed = JSON.parse(json)
-    return typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : undefined
+    const parts = token.split(".")
+    if (parts.length < 2) return null
+    const payload = Buffer.from(parts[1], "base64url").toString("utf8")
+    return JSON.parse(payload) as Record<string, unknown>
   } catch {
-    return undefined
+    return null
   }
 }
 
@@ -134,14 +129,14 @@ export function buildAuthorizeUrl(
   },
 ): string {
   const endpoint = input.authorizeUrl || KEYSTONE_AUTHORIZE
-  const targetResource = input.resource || "https://synapse2-api.alterspective.com.au/v1"
+  const targetResource = input.resource || SYNAPSE_RESOURCE
+  const targetScope = input.scope || OAUTH_SCOPES
   const params = new URLSearchParams({
     response_type: "code",
     client_id: input.clientId,
     redirect_uri: input.redirectUri,
     resource: targetResource,
-    audience: input.audience || targetResource,
-    scope: input.scope || "openid profile email",
+    scope: targetScope,
     code_challenge: input.pkce.challenge,
     code_challenge_method: "S256",
     state: input.state,
@@ -167,7 +162,7 @@ export async function exchangeCodeForTokens(
   scope?: string
 }> {
   const endpoint = input.tokenUrl || KEYSTONE_TOKEN
-  const targetResource = input.resource || "https://synapse2-api.alterspective.com.au/v1"
+  const targetResource = input.resource || SYNAPSE_RESOURCE
   const response = await fetcher(endpoint, {
     method: "POST",
     headers: {
@@ -182,7 +177,6 @@ export async function exchangeCodeForTokens(
       redirect_uri: input.redirectUri,
       code_verifier: input.verifier,
       resource: targetResource,
-      audience: input.audience || targetResource,
     }),
   })
   const body = (await response.json().catch(() => ({}))) as {
@@ -218,7 +212,7 @@ export async function refreshKeystoneToken(
   expires_in?: number
 }> {
   const endpoint = input.tokenUrl || KEYSTONE_TOKEN
-  const targetResource = input.resource || "https://synapse2-api.alterspective.com.au/v1"
+  const targetResource = input.resource || SYNAPSE_RESOURCE
   const response = await fetcher(endpoint, {
     method: "POST",
     headers: {
@@ -231,7 +225,6 @@ export async function refreshKeystoneToken(
       client_id: input.clientId,
       refresh_token: input.refreshToken,
       resource: targetResource,
-      audience: input.audience || targetResource,
     }),
   })
   const body = (await response.json().catch(() => ({}))) as {
