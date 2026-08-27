@@ -979,6 +979,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
           try {
             const res = await fetch("https://synapse-mcp.alterspective.com.au/mcp", {
               method: "POST",
+              signal: AbortSignal.timeout(30_000),
               headers: {
                 "Content-Type": "application/json",
                 Accept: "application/json, text/event-stream",
