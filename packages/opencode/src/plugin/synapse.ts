@@ -468,25 +468,45 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                 if (reqUrl.pathname === OAUTH_REDIRECT_PATH) {
                   const queryCode = reqUrl.searchParams.get("code")
                   const queryState = reqUrl.searchParams.get("state")
+                  const queryError = reqUrl.searchParams.get("error")
+                  const queryErrorDescription = reqUrl.searchParams.get("error_description")
+
+                  if (queryError) {
+                    res.writeHead(200, { "Content-Type": "text/html" })
+                    res.end(
+                      OauthCallbackPage.error(queryErrorDescription || queryError, {
+                        provider: "Keystone (Synapse)",
+                      }),
+                    )
+                    reject(new Error(queryErrorDescription || queryError))
+                    return
+                  }
 
                   if (queryState !== state) {
                     res.writeHead(400, { "Content-Type": "text/html" })
-                    res.end("<h1>State mismatch</h1><p>Please try logging in again.</p>")
+                    res.end(
+                      OauthCallbackPage.error("State mismatch. Please try logging in again.", {
+                        provider: "Keystone (Synapse)",
+                      }),
+                    )
                     reject(new Error("OAuth state mismatch"))
                     return
                   }
 
                   if (!queryCode) {
                     res.writeHead(400, { "Content-Type": "text/html" })
-                    res.end("<h1>Missing authorization code</h1>")
+                    res.end(
+                      OauthCallbackPage.error("Missing authorization code.", {
+                        provider: "Keystone (Synapse)",
+                      }),
+                    )
                     reject(new Error("Missing authorization code"))
                     return
                   }
 
                   res.writeHead(200, { "Content-Type": "text/html" })
                   res.end(
-                    OauthCallbackPage.bootstrap({
-                      tokenPath: "/auth/token",
+                    OauthCallbackPage.success({
                       provider: "Keystone (Synapse)",
                     }),
                   )
