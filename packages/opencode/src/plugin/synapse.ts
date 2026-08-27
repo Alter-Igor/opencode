@@ -130,15 +130,18 @@ export function buildAuthorizeUrl(
     authorizeUrl?: string
     scope?: string
     audience?: string
+    resource?: string
   },
 ): string {
   const endpoint = input.authorizeUrl || KEYSTONE_AUTHORIZE
+  const targetResource = input.resource || "https://synapse2-api.alterspective.com.au/v1"
   const params = new URLSearchParams({
     response_type: "code",
     client_id: input.clientId,
     redirect_uri: input.redirectUri,
-    audience: input.audience || SYNAPSE_AUDIENCE,
-    scope: input.scope || OAUTH_SCOPES,
+    resource: targetResource,
+    audience: input.audience || targetResource,
+    scope: input.scope || "openid profile email",
     code_challenge: input.pkce.challenge,
     code_challenge_method: "S256",
     state: input.state,
@@ -154,6 +157,7 @@ export async function exchangeCodeForTokens(
     verifier: string
     tokenUrl?: string
     audience?: string
+    resource?: string
   },
   fetcher: typeof fetch = fetch,
 ): Promise<{
@@ -163,6 +167,7 @@ export async function exchangeCodeForTokens(
   scope?: string
 }> {
   const endpoint = input.tokenUrl || KEYSTONE_TOKEN
+  const targetResource = input.resource || "https://synapse2-api.alterspective.com.au/v1"
   const response = await fetcher(endpoint, {
     method: "POST",
     headers: {
@@ -176,7 +181,8 @@ export async function exchangeCodeForTokens(
       code: input.code,
       redirect_uri: input.redirectUri,
       code_verifier: input.verifier,
-      audience: input.audience || SYNAPSE_AUDIENCE,
+      resource: targetResource,
+      audience: input.audience || targetResource,
     }),
   })
   const body = (await response.json().catch(() => ({}))) as {
@@ -203,6 +209,7 @@ export async function refreshKeystoneToken(
     refreshToken: string
     tokenUrl?: string
     audience?: string
+    resource?: string
   },
   fetcher: typeof fetch = fetch,
 ): Promise<{
@@ -211,6 +218,7 @@ export async function refreshKeystoneToken(
   expires_in?: number
 }> {
   const endpoint = input.tokenUrl || KEYSTONE_TOKEN
+  const targetResource = input.resource || "https://synapse2-api.alterspective.com.au/v1"
   const response = await fetcher(endpoint, {
     method: "POST",
     headers: {
@@ -222,7 +230,8 @@ export async function refreshKeystoneToken(
       grant_type: "refresh_token",
       client_id: input.clientId,
       refresh_token: input.refreshToken,
-      audience: input.audience || SYNAPSE_AUDIENCE,
+      resource: targetResource,
+      audience: input.audience || targetResource,
     }),
   })
   const body = (await response.json().catch(() => ({}))) as {
