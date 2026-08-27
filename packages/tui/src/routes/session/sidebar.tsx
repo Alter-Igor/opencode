@@ -8,6 +8,7 @@ import { usePluginRuntime } from "../../plugin/runtime"
 
 import { getScrollAcceleration } from "../../util/scroll"
 import { WorkspaceLabel } from "../../component/workspace-label"
+import { KeystoneServicesPanel } from "../../component/keystone-services-panel"
 
 export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
   const pluginRuntime = usePluginRuntime()
@@ -83,6 +84,7 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
               </box>
             </pluginRuntime.Slot>
             <pluginRuntime.Slot name="sidebar_content" session_id={props.sessionID} />
+            <KeystoneServicesPanel />
           </box>
         </scrollbox>
 
