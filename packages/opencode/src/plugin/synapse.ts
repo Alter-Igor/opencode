@@ -15,6 +15,24 @@ export const OAUTH_PORT = 1459
 export const OAUTH_REDIRECT_PATH = "/auth/callback"
 export const ACCESS_TOKEN_REFRESH_SKEW_MS = 120_000
 
+export interface SynapseServingTelemetry {
+  model: string
+  provider?: string
+  costUsd?: string
+  latencyMs?: string
+  timestamp: number
+}
+
+let latestSynapseServing: SynapseServingTelemetry | undefined
+
+export function getLatestSynapseServing(): SynapseServingTelemetry | undefined {
+  return latestSynapseServing
+}
+
+export function setLatestSynapseServing(telemetry: SynapseServingTelemetry | undefined): void {
+  latestSynapseServing = telemetry
+}
+
 export interface PkceCodes {
   verifier: string
   challenge: string
@@ -333,7 +351,23 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
               headers.set("x-task-type", "code")
               headers.set("User-Agent", `opencode/${InstallationVersion}`)
 
-              return fetch(requestInput, { ...init, headers })
+              const response = await fetch(requestInput, { ...init, headers })
+              const servedModel = response.headers.get("x-synapse-served-model")
+              const costUsd = response.headers.get("x-synapse-cost-usd")
+              const routedProvider = response.headers.get("x-synapse-routed-provider")
+              const latencyMs = response.headers.get("x-synapse-latency-ms")
+
+              if (servedModel) {
+                latestSynapseServing = {
+                  model: servedModel,
+                  provider: routedProvider ?? undefined,
+                  costUsd: costUsd ?? undefined,
+                  latencyMs: latencyMs ?? undefined,
+                  timestamp: Date.now(),
+                }
+              }
+
+              return response
             },
           }
         }
@@ -449,6 +483,21 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
           label: "Paste Synapse API Key",
         },
       ],
+    },
+    tool: {
+      synapse_probe: {
+        description: "Check the last Synapse AI model routing, provider destination, and inference cost telemetry.",
+        args: {},
+        async execute() {
+          if (!latestSynapseServing) {
+            return "Synapse is connected. No inference requests have completed in this session yet."
+          }
+          const costText = latestSynapseServing.costUsd ? ` | Cost: $${latestSynapseServing.costUsd}` : ""
+          const providerText = latestSynapseServing.provider ? ` via ${latestSynapseServing.provider}` : ""
+          const latencyText = latestSynapseServing.latencyMs ? ` (${latestSynapseServing.latencyMs}ms)` : ""
+          return `Active Synapse Model: ${latestSynapseServing.model}${providerText}${latencyText}${costText}`
+        },
+      },
     },
   }
 }

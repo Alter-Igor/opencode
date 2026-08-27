@@ -116,7 +116,7 @@ describe("SynapseAuthPlugin", () => {
     expect(refreshed.access_token).toBe("test-access-token")
   })
 
-  test("exposes synapse provider with oauth and api methods", async () => {
+  test("exposes synapse provider with oauth and api methods, and synapse_probe tool", async () => {
     const pluginInput = {
       client: {} as never,
       project: {} as never,
@@ -132,5 +132,9 @@ describe("SynapseAuthPlugin", () => {
     expect(hooks.auth?.methods.length).toBe(2)
     expect(hooks.auth?.methods[0].type).toBe("oauth")
     expect(hooks.auth?.methods[1].type).toBe("api")
+    expect(hooks.tool?.synapse_probe).toBeDefined()
+
+    const probeEmpty = await hooks.tool!.synapse_probe.execute({}, {} as never)
+    expect(probeEmpty).toContain("Synapse is connected")
   })
 })
