@@ -7,10 +7,16 @@ import { useTheme } from "../context/theme"
 import { TextAttributes } from "@opentui/core"
 import { useSDK } from "../context/sdk"
 
-function Status(props: { enabled: boolean; loading: boolean }) {
+function Status(props: { enabled: boolean; loading: boolean; status?: string }) {
   const { theme } = useTheme()
   if (props.loading) {
     return <span style={{ fg: theme.textMuted }}>⋯ Loading</span>
+  }
+  if (props.status === "needs_auth" || props.status === "needs_client_registration") {
+    return <span style={{ fg: theme.warning, attributes: TextAttributes.BOLD }}>⚡ Needs Auth (Enter to sign in)</span>
+  }
+  if (props.status === "failed") {
+    return <span style={{ fg: theme.error }}>✕ Failed</span>
   }
   if (props.enabled) {
     return <span style={{ fg: theme.success, attributes: TextAttributes.BOLD }}>✓ Enabled</span>
@@ -38,7 +44,7 @@ export function DialogMcp() {
         value: name,
         title: name,
         description: status.status === "failed" ? "failed" : status.status,
-        footer: <Status enabled={local.mcp.isEnabled(name)} loading={loadingMcp === name} />,
+        footer: <Status enabled={local.mcp.isEnabled(name)} loading={loadingMcp === name} status={status.status} />,
         category: undefined,
       })),
     )
@@ -69,6 +75,25 @@ export function DialogMcp() {
         }
       },
     },
+    {
+      command: "dialog.mcp.auth",
+      title: "sign in",
+      onTrigger: async (option: DialogSelectOption<string>) => {
+        if (loading() !== null) return
+        setLoading(option.value)
+        try {
+          await sdk.client.mcp.auth.authenticate({ name: option.value })
+          const status = await sdk.client.mcp.status()
+          if (status.data) {
+            sync.set("mcp", status.data)
+          }
+        } catch (error) {
+          console.error("Failed to authenticate MCP:", error)
+        } finally {
+          setLoading(null)
+        }
+      },
+    },
   ])
 
   return (
@@ -77,8 +102,23 @@ export function DialogMcp() {
       title="MCPs"
       options={options()}
       actions={actions()}
-      onSelect={(_option) => {
-        // Don't close on select, only on escape
+      onSelect={async (option) => {
+        if (!option) return
+        const serverStatus = sync.data.mcp[option.value]
+        if (serverStatus?.status === "needs_auth" || serverStatus?.status === "needs_client_registration") {
+          setLoading(option.value)
+          try {
+            await sdk.client.mcp.auth.authenticate({ name: option.value })
+            const status = await sdk.client.mcp.status()
+            if (status.data) {
+              sync.set("mcp", status.data)
+            }
+          } catch (error) {
+            console.error("Failed to authenticate MCP:", error)
+          } finally {
+            setLoading(null)
+          }
+        }
       }}
     />
   )
