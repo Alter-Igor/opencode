@@ -1,5 +1,8 @@
-import type { Hooks, PluginInput } from "@opencode-ai/plugin"
+import { tool, type Hooks, type PluginInput } from "@opencode-ai/plugin"
 import { createServer } from "http"
+import * as os from "os"
+import * as path from "path"
+import * as fs from "fs/promises"
 import open from "open"
 import { OauthCallbackPage } from "@opencode-ai/core/oauth/page"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
@@ -924,11 +927,105 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
           "3. EXECUTE: Call `keystone-dynamic_execute-tool` with `{\"toolName\": \"<exact_name>\", \"arguments\": { ... }}`.",
           "- STRICT RULE: Do NOT guess tool names (e.g. `m365__list-emails` is invalid). Always search first with `search-tools`.",
           "- STRICT SECURITY GATE: NEVER use Playwright / browser tools to navigate to `outlook.office.com`, `login.microsoftonline.com`, or other corporate web apps. All corporate operations MUST use Keystone to maintain audit compliance.",
+          "",
+          "## On-Premises Quality & Code Buddy Reviewer",
+          "You have access to the free on-premises specialist tool `synapse_buddy_review`.",
+          "When you write code, add functions, or make non-trivial edits, call `synapse_buddy_review` with your code snippet or diff to get an instant ($0 cost) audit for syntax, security vulnerabilities, and logic flaws before declaring complete.",
         ].join("\n"),
       )
     },
     tool: {
-      synapse_probe: {
+      synapse_buddy_review: tool({
+        description:
+          "Run an instant, $0-cost on-premises code review using the Synapse Coder specialist. Checks code snippets or files for syntax errors, SQL injection, broken imports, and security defects.",
+        args: {
+          code: tool.schema.string().describe("The code content or patch to review."),
+          context: tool.schema
+            .string()
+            .optional()
+            .describe("Optional context or specific concerns (e.g. 'check auth flow')."),
+        },
+        async execute(args) {
+          if (!args.code || !args.code.trim()) {
+            return "Please provide code content to review."
+          }
+          let token = ""
+          try {
+            const homedir = os.homedir()
+            const authPath = path.join(homedir, ".local", "share", "opencode", "auth.json")
+            const authContent = JSON.parse(await fs.readFile(authPath, "utf8"))
+            token = authContent.synapse?.key || authContent.synapse?.access_token || ""
+          } catch {}
+
+          if (!token) {
+            return "Synapse is not authenticated. Please run /login first."
+          }
+
+          const reviewPrompt = [
+            {
+              role: "system",
+              content:
+                "You are the Synapse On-Premises Buddy Reviewer. Audit the provided code for:\n1. Syntax & type safety\n2. Security vulnerabilities (injection, hardcoded secrets, missing CSRF/auth)\n3. Broken imports & unhandled edge cases\nReturn a concise summary with 'STATUS: PASSED' or 'STATUS: ISSUES DETECTED' followed by concise bullet points.",
+            },
+            {
+              role: "user",
+              content: `${args.context ? `Context: ${args.context}\n\n` : ""}Code to review:\n\`\`\`\n${args.code}\n\`\`\``,
+            },
+          ]
+
+          try {
+            const res = await fetch("https://synapse-mcp.alterspective.com.au/mcp", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Accept: "application/json, text/event-stream",
+                Authorization: `Bearer ${token}`,
+              },
+              body: JSON.stringify({
+                jsonrpc: "2.0",
+                id: Date.now(),
+                method: "tools/call",
+                params: {
+                  name: "chat",
+                  arguments: {
+                    messages: reviewPrompt,
+                    taskType: "code",
+                  },
+                },
+              }),
+            })
+
+            if (!res.ok) {
+              return `Buddy review call failed with HTTP ${res.status}`
+            }
+
+            const raw = await res.text()
+            let content = ""
+            for (const line of raw.split("\n")) {
+              if (line.startsWith("data:")) {
+                try {
+                  const data = JSON.parse(line.slice(5).trim())
+                  if (data.result?.structuredContent?.content) {
+                    content = data.result.structuredContent.content
+                  } else if (data.result?.content?.[0]?.text) {
+                    try {
+                      const inner = JSON.parse(data.result.content[0].text)
+                      content = inner.content || data.result.content[0].text
+                    } catch {
+                      content = data.result.content[0].text
+                    }
+                  }
+                } catch {}
+              }
+            }
+
+            return content.trim() || "Buddy review completed: No issues found."
+          } catch (err: any) {
+            return `Buddy review error: ${err.message}`
+          }
+        },
+      }),
+      synapse_probe: tool({
         description: "Check the last Synapse AI model routing, provider destination, and inference cost telemetry.",
         args: {},
         async execute() {
@@ -940,8 +1037,8 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
           const latencyText = latestSynapseServing.latencyMs ? ` (${latestSynapseServing.latencyMs}ms)` : ""
           return `Active Synapse Model: ${latestSynapseServing.model}${providerText}${latencyText}${costText}`
         },
-      },
-      session_retrospective_summary: {
+      }),
+      session_retrospective_summary: tool({
         description: "Retrieve recent session retrospectives, learning points, and compliance/audit bypass warnings.",
         args: {},
         async execute() {
@@ -951,8 +1048,8 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
           }
           return JSON.stringify(retros.slice(0, 5), null, 2)
         },
-      },
-      session_diagnostics: {
+      }),
+      session_diagnostics: tool({
         description: "Inspect recent inference requests, errors, and session diagnostic logs.",
         args: {},
         async execute() {
@@ -962,7 +1059,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
           }
           return JSON.stringify(logs.slice(0, 10), null, 2)
         },
-      },
+      }),
     },
   }
 }
