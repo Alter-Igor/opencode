@@ -11,6 +11,8 @@ import { usePluginRuntime } from "../plugin/runtime"
 import { useEditorContext } from "../context/editor"
 import { useTerminalDimensions } from "@opentui/solid"
 import { useTuiConfig } from "../config"
+import { useTheme } from "../context/theme"
+import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { HomeSessionDestinationProvider } from "./home/session-destination"
 
 let once = false
@@ -30,6 +32,7 @@ export function Home() {
   const editor = useEditorContext()
   const dimensions = useTerminalDimensions()
   const tuiConfig = useTuiConfig()
+  const { theme } = useTheme()
   const promptMaxWidth = createMemo(() => {
     const configured = tuiConfig.prompt?.max_width
     if (configured === "auto") return Math.max(75, Math.floor(dimensions().width * 0.7))
@@ -39,6 +42,7 @@ export function Home() {
 
   onMount(() => {
     editor.clearSelection()
+    promptRef.set(ref())
   })
 
   const bind = (r: PromptRef | undefined) => {
@@ -72,10 +76,13 @@ export function Home() {
       <box flexGrow={1} alignItems="center" paddingLeft={2} paddingRight={2}>
         <box flexGrow={1} minHeight={0} />
         <box height={4} minHeight={0} flexShrink={1} />
-        <box width="100%" alignItems="flex-start" paddingLeft={4} flexShrink={0}>
+        <box width="100%" alignItems="flex-start" paddingLeft={4} flexShrink={0} flexDirection="row" gap={2}>
           <pluginRuntime.Slot name="home_logo" mode="replace">
             <Logo />
           </pluginRuntime.Slot>
+          <text fg={theme.textMuted}>
+            <span style={{ fg: theme.success }}>●</span> {InstallationVersion}
+          </text>
         </box>
         <box height={1} minHeight={0} flexShrink={1} />
         <box width="100%" maxWidth={promptMaxWidth()} zIndex={1000} paddingTop={1} flexShrink={0}>
