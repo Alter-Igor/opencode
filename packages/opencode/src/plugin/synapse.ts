@@ -269,169 +269,283 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
           }
         }
 
-        if (authData.type === "api") {
-          return {
-            apiKey: authData.key,
-            baseURL: inferenceUrl,
-            headers: {
-              "x-task-type": "code",
-            },
-          }
-        }
+        const resolvedKey = authData.type === "api" ? authData.key : authData.type === "oauth" ? authData.access : ""
+        const isJwtToken = resolvedKey.startsWith("eyJ")
 
-        if (authData.type === "oauth") {
-          return {
-            apiKey: "oauth-synapse-bearer",
-            baseURL: inferenceUrl,
-            async fetch(requestInput: RequestInfo | URL, init?: RequestInit) {
-              let currentAuth = await getAuth()
-              if (currentAuth.type !== "oauth") return fetch(requestInput, init)
+        return {
+          apiKey: isJwtToken ? "oauth-synapse-bearer" : resolvedKey,
+          baseURL: inferenceUrl,
+          async fetch(requestInput: RequestInfo | URL, init?: RequestInit) {
+            let currentAuth = await getAuth()
+            let activeToken =
+              currentAuth.type === "api"
+                ? currentAuth.key
+                : currentAuth.type === "oauth"
+                  ? currentAuth.access
+                  : ""
 
-              const clientId = (currentAuth as any).metadata?.clientId || (currentAuth as any).clientId || "ai-office-cli"
-              const refreshToken = currentAuth.refresh
-              const isExpiring =
-                !currentAuth.expires ||
-                currentAuth.expires - Date.now() <= ACCESS_TOKEN_REFRESH_SKEW_MS ||
-                accessTokenIsExpiring(currentAuth.access)
+            const meta = (currentAuth as any).metadata || {}
+            const clientId = meta.clientId || "ai-office-cli"
+            const refreshToken = meta.refreshToken || (currentAuth.type === "oauth" ? currentAuth.refresh : undefined)
+            const expires = Number(meta.expiresAt || (currentAuth.type === "oauth" ? currentAuth.expires : 0))
 
-              if (isExpiring && refreshToken) {
-                if (!refreshPromise) {
-                  refreshPromise = refreshKeystoneToken({
-                    clientId,
-                    refreshToken,
-                    tokenUrl: options?.tokenUrl,
-                    audience,
-                  })
-                    .then(async (tokens) => {
-                      const refreshedExpires = Date.now() + (tokens.expires_in ?? 3600) * 1000
-                      const refreshedRefresh = tokens.refresh_token || refreshToken
-                      await input.client.auth
-                        .set({
-                          path: { id: "synapse" },
-                          body: {
-                            type: "oauth",
-                            access: tokens.access_token,
-                            refresh: refreshedRefresh,
-                            expires: refreshedExpires,
-                            enterpriseUrl: inferenceUrl,
+            const isExpiring = !expires || expires - Date.now() <= ACCESS_TOKEN_REFRESH_SKEW_MS || accessTokenIsExpiring(activeToken)
+
+            if (isExpiring && refreshToken) {
+              if (!refreshPromise) {
+                refreshPromise = refreshKeystoneToken({
+                  clientId,
+                  refreshToken,
+                  tokenUrl: options?.tokenUrl,
+                  audience,
+                })
+                  .then(async (tokens) => {
+                    const refreshedExpires = Date.now() + (tokens.expires_in ?? 3600) * 1000
+                    const refreshedRefresh = tokens.refresh_token || refreshToken
+                    activeToken = tokens.access_token
+                    await input.client.auth
+                      .set({
+                        path: { id: "synapse" },
+                        body: {
+                          type: "api",
+                          key: tokens.access_token,
+                          metadata: {
+                            clientId,
+                            refreshToken: refreshedRefresh,
+                            expiresAt: String(refreshedExpires),
                           },
-                        })
-                        .catch(() => {})
-                      return tokens
-                    })
-                    .finally(() => {
-                      refreshPromise = undefined
-                    })
-                }
-
-                try {
-                  const refreshed = await refreshPromise
-                  currentAuth = {
-                    ...currentAuth,
-                    access: refreshed.access_token,
-                    refresh: refreshed.refresh_token || refreshToken,
-                    expires: Date.now() + (refreshed.expires_in ?? 3600) * 1000,
-                  }
-                } catch {
-                  // If refresh fails, fall back to current token
-                }
+                        },
+                      })
+                      .catch(() => {})
+                    return tokens
+                  })
+                  .finally(() => {
+                    refreshPromise = undefined
+                  })
               }
 
-              const headers = new Headers(requestInput instanceof Request ? requestInput.headers : undefined)
-              if (init?.headers) {
-                const entries =
-                  init.headers instanceof Headers
-                    ? init.headers.entries()
-                    : Array.isArray(init.headers)
-                      ? init.headers
-                      : Object.entries(init.headers as Record<string, string | undefined>)
-                for (const [key, value] of entries) {
-                  if (value !== undefined) headers.set(key, String(value))
-                }
-              }
+              try {
+                const refreshed = await refreshPromise
+                activeToken = refreshed.access_token
+              } catch {}
+            }
 
-              headers.set("authorization", `Bearer ${currentAuth.access}`)
-              headers.set("x-task-type", "code")
-              headers.set("User-Agent", `opencode/${InstallationVersion}`)
-
-              // Sanitize body and log request
-              let requestBodyJson: any = null
-              let sanitizedBody = init?.body
-              if (typeof init?.body === "string") {
-                try {
-                  requestBodyJson = JSON.parse(init.body)
-                  if (requestBodyJson.tools && Array.isArray(requestBodyJson.tools)) {
-                    for (const t of requestBodyJson.tools) {
-                      if (t.function?.parameters) {
-                        t.function.parameters = sanitizeJsonSchemaForOpenAI(t.function.parameters)
-                      }
+            // Parse request body for logging and tool sanitization
+            let requestBodyJson: any = null
+            let sanitizedBody = init?.body
+            if (typeof init?.body === "string") {
+              try {
+                requestBodyJson = JSON.parse(init.body)
+                if (requestBodyJson.tools && Array.isArray(requestBodyJson.tools)) {
+                  for (const t of requestBodyJson.tools) {
+                    if (t.function?.parameters) {
+                      t.function.parameters = sanitizeJsonSchemaForOpenAI(t.function.parameters)
                     }
-                    sanitizedBody = JSON.stringify(requestBodyJson)
                   }
-                  sessionObserver.logDiagnostic(
-                    {
-                      timestamp: new Date().toISOString(),
-                      type: "INFERENCE_REQUEST",
-                      details: {
-                        model: requestBodyJson.model,
-                        messagesCount: requestBodyJson.messages?.length,
-                        toolsCount: requestBodyJson.tools?.length,
-                        toolNames: requestBodyJson.tools?.map((x: any) => x.function?.name),
-                      },
-                    },
-                    input.directory,
-                  )
-                } catch {}
-              }
-
-              const response = await fetch(requestInput, { ...init, body: sanitizedBody, headers })
-
-              if (!response.ok) {
-                let errorBody = ""
-                try {
-                  const cloned = response.clone()
-                  errorBody = await cloned.text()
-                } catch {}
+                  sanitizedBody = JSON.stringify(requestBodyJson)
+                }
                 sessionObserver.logDiagnostic(
                   {
                     timestamp: new Date().toISOString(),
-                    type: "INFERENCE_ERROR",
-                    error: `HTTP ${response.status}: ${errorBody || response.statusText}`,
+                    type: "INFERENCE_REQUEST",
                     details: {
-                      status: response.status,
-                      statusText: response.statusText,
-                      errorBody,
-                      model: requestBodyJson?.model,
-                      requestPreview: requestBodyJson ? JSON.stringify(requestBodyJson).slice(0, 1000) : undefined,
+                      model: requestBodyJson.model,
+                      messagesCount: requestBodyJson.messages?.length,
+                      toolsCount: requestBodyJson.tools?.length,
+                      toolNames: requestBodyJson.tools?.map((x: any) => x.function?.name),
                     },
                   },
                   input.directory,
                 )
-              }
-              const servedModel = response.headers.get("x-synapse-served-model")
-              const costUsd = response.headers.get("x-synapse-cost-usd")
-              const routedProvider = response.headers.get("x-synapse-routed-provider")
-              const latencyMs = response.headers.get("x-synapse-latency-ms")
+              } catch {}
+            }
 
-              if (servedModel) {
-                latestSynapseServing = {
-                  model: servedModel,
-                  provider: routedProvider ?? undefined,
-                  costUsd: costUsd ?? undefined,
-                  latencyMs: latencyMs ?? undefined,
-                  timestamp: Date.now(),
+            // If authenticating via Keystone JWT token, execute through Synapse MCP bridge
+            if (activeToken.startsWith("eyJ") && requestBodyJson?.messages) {
+              try {
+                const mcpRes = await fetch("https://synapse-mcp.alterspective.com.au/mcp", {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/json",
+                    Accept: "application/json, text/event-stream",
+                    Authorization: `Bearer ${activeToken}`,
+                  },
+                  body: JSON.stringify({
+                    jsonrpc: "2.0",
+                    id: Date.now(),
+                    method: "tools/call",
+                    params: {
+                      name: "chat",
+                      arguments: {
+                        messages: requestBodyJson.messages,
+                        model: requestBodyJson.model === "auto" ? undefined : requestBodyJson.model,
+                        temperature: requestBodyJson.temperature,
+                        maxTokens: requestBodyJson.max_tokens,
+                      },
+                    },
+                  }),
+                })
+
+                if (mcpRes.ok) {
+                  const rawText = await mcpRes.text()
+                  let parsedContent = ""
+                  let servedModel = "synapse-auto"
+                  let usage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+
+                  const match = rawText.match(/data:\s*(\{.*\})/m)
+                  if (match) {
+                    try {
+                      const data = JSON.parse(match[1])
+                      const structured = data.result?.structuredContent
+                      if (structured) {
+                        parsedContent = structured.content || ""
+                        servedModel = structured.servedModel || servedModel
+                        if (structured.usage) {
+                          usage = {
+                            prompt_tokens: structured.usage.promptTokens || 0,
+                            completion_tokens: structured.usage.completionTokens || 0,
+                            total_tokens: structured.usage.totalTokens || 0,
+                          }
+                        }
+                      }
+                    } catch {}
+                  }
+
+                  latestSynapseServing = {
+                    model: servedModel,
+                    timestamp: Date.now(),
+                  }
+
+                  if (requestBodyJson.stream) {
+                    const encoder = new TextEncoder()
+                    const stream = new ReadableStream({
+                      start(controller) {
+                        const chunk1 = JSON.stringify({
+                          id: `chatcmpl-${Date.now()}`,
+                          object: "chat.completion.chunk",
+                          created: Math.floor(Date.now() / 1000),
+                          model: servedModel,
+                          choices: [{ index: 0, delta: { content: parsedContent }, finish_reason: null }],
+                        })
+                        const chunk2 = JSON.stringify({
+                          id: `chatcmpl-${Date.now()}`,
+                          object: "chat.completion.chunk",
+                          created: Math.floor(Date.now() / 1000),
+                          model: servedModel,
+                          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+                          usage,
+                        })
+                        controller.enqueue(encoder.encode(`data: ${chunk1}\n\ndata: ${chunk2}\n\ndata: [DONE]\n\n`))
+                        controller.close()
+                      },
+                    })
+
+                    return new Response(stream, {
+                      status: 200,
+                      headers: {
+                        "Content-Type": "text/event-stream",
+                        "Cache-Control": "no-cache",
+                        "x-synapse-served-model": servedModel,
+                      },
+                    })
+                  }
+
+                  const resObj = {
+                    id: `chatcmpl-${Date.now()}`,
+                    object: "chat.completion",
+                    created: Math.floor(Date.now() / 1000),
+                    model: servedModel,
+                    choices: [
+                      {
+                        index: 0,
+                        message: { role: "assistant", content: parsedContent },
+                        finish_reason: "stop",
+                      },
+                    ],
+                    usage,
+                  }
+
+                  return new Response(JSON.stringify(resObj), {
+                    status: 200,
+                    headers: {
+                      "Content-Type": "application/json",
+                      "x-synapse-served-model": servedModel,
+                    },
+                  })
                 }
+              } catch (err: any) {
+                sessionObserver.logDiagnostic(
+                  {
+                    timestamp: new Date().toISOString(),
+                    type: "INFERENCE_ERROR",
+                    error: `Synapse MCP bridge error: ${err.message || String(err)}`,
+                    details: { error: String(err) },
+                  },
+                  input.directory,
+                )
               }
+            }
 
-              return response
-            },
-          }
-        }
+            // Fallback to direct REST API with Authorization / x-api-key headers
+            const headers = new Headers(requestInput instanceof Request ? requestInput.headers : undefined)
+            if (init?.headers) {
+              const entries =
+                init.headers instanceof Headers
+                  ? init.headers.entries()
+                  : Array.isArray(init.headers)
+                    ? init.headers
+                    : Object.entries(init.headers as Record<string, string | undefined>)
+              for (const [key, value] of entries) {
+                if (value !== undefined) headers.set(key, String(value))
+              }
+            }
 
-        return {
-          baseURL: inferenceUrl,
-          headers: {
-            "x-task-type": "code",
+            headers.set("authorization", `Bearer ${activeToken}`)
+            headers.set("x-api-key", activeToken)
+            headers.set("x-task-type", "code")
+            headers.set("User-Agent", `opencode/${InstallationVersion}`)
+
+            const response = await fetch(requestInput, { ...init, body: sanitizedBody, headers })
+
+            if (!response.ok) {
+              let errorBody = ""
+              try {
+                const cloned = response.clone()
+                errorBody = await cloned.text()
+              } catch {}
+              sessionObserver.logDiagnostic(
+                {
+                  timestamp: new Date().toISOString(),
+                  type: "INFERENCE_ERROR",
+                  error: `HTTP ${response.status}: ${errorBody || response.statusText}`,
+                  details: {
+                    status: response.status,
+                    statusText: response.statusText,
+                    errorBody,
+                    model: requestBodyJson?.model,
+                    requestPreview: requestBodyJson ? JSON.stringify(requestBodyJson).slice(0, 1000) : undefined,
+                  },
+                },
+                input.directory,
+              )
+            }
+
+            const servedModel = response.headers.get("x-synapse-served-model")
+            const costUsd = response.headers.get("x-synapse-cost-usd")
+            const routedProvider = response.headers.get("x-synapse-routed-provider")
+            const latencyMs = response.headers.get("x-synapse-latency-ms")
+
+            if (servedModel) {
+              latestSynapseServing = {
+                model: servedModel,
+                provider: routedProvider ?? undefined,
+                costUsd: costUsd ?? undefined,
+                latencyMs: latencyMs ?? undefined,
+                timestamp: Date.now(),
+              }
+            }
+
+            return response
           },
         }
       },
