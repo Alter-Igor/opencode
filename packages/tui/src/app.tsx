@@ -693,6 +693,15 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
         },
       },
       {
+        name: "mcp.list.singular",
+        title: "Toggle MCPs",
+        category: "Agent",
+        slashName: "mcp",
+        run: () => {
+          dialog.replace(() => <DialogMcp />)
+        },
+      },
+      {
         name: "agent.cycle",
         title: "Agent cycle",
         category: "Agent",
