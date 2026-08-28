@@ -307,51 +307,55 @@ export function extractToolCallsFromModelOutput(text: string): {
   let cleanText = text
   let idx = 0
 
+  const pushCall = (item: any) => {
+    if (!item || typeof item !== "object") return
+    let name = item.name || item.tool || item.function
+    if (!name) return
+    name = String(name).trim().replace(/^(mcp__|tools\/)/, "")
+    const args = item.arguments || item.parameters || item.args || {}
+    toolCalls.push({
+      index: idx++,
+      id: `call_${Date.now()}_${idx}`,
+      type: "function",
+      function: {
+        name,
+        arguments: typeof args === "string" ? args : JSON.stringify(args),
+      },
+    })
+  }
+
   // 1. XML-style <tool_call> tags
   const xmlRegex = /<tool_call>([\s\S]*?)<\/tool_call>/gi
   let match: RegExpExecArray | null
   while ((match = xmlRegex.exec(text)) !== null) {
     try {
       const parsed = JSON.parse(match[1].trim())
-      const name = parsed.name || parsed.tool || parsed.function
-      const args = parsed.arguments || parsed.parameters || parsed.args || {}
-      if (name) {
-        toolCalls.push({
-          index: idx++,
-          id: `call_${Date.now()}_${idx}`,
-          type: "function",
-          function: {
-            name: String(name),
-            arguments: typeof args === "string" ? args : JSON.stringify(args),
-          },
-        })
+      if (Array.isArray(parsed)) {
+        parsed.forEach(pushCall)
+      } else {
+        pushCall(parsed)
       }
     } catch {}
   }
 
   // 2. Markdown fenced code blocks: ```tool_call or ```json with {"name": ...}
-  const fenceRegex = /```(?:tool_call|tool|json)?\s*\n?(\{\s*"name"[\s\S]*?\})\s*\n?```/gi
+  const fenceRegex = /```(?:tool_call|tool|json)?\s*\n?(\[\s*\{[\s\S]*?\}\s*\]|\{\s*"name"[\s\S]*?\})\s*\n?```/gi
   while ((match = fenceRegex.exec(text)) !== null) {
     try {
       const parsed = JSON.parse(match[1].trim())
-      const name = parsed.name || parsed.tool || parsed.function
-      const args = parsed.arguments || parsed.parameters || parsed.args || {}
-      if (name) {
-        toolCalls.push({
-          index: idx++,
-          id: `call_${Date.now()}_${idx}`,
-          type: "function",
-          function: {
-            name: String(name),
-            arguments: typeof args === "string" ? args : JSON.stringify(args),
-          },
-        })
+      if (Array.isArray(parsed)) {
+        parsed.forEach(pushCall)
+      } else {
+        pushCall(parsed)
       }
     } catch {}
   }
 
   if (toolCalls.length > 0) {
-    cleanText = text.replace(xmlRegex, "").replace(fenceRegex, "").trim()
+    cleanText = text
+      .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, "")
+      .replace(/```(?:tool_call|tool|json)?\s*\n?(\[\s*\{[\s\S]*?\}\s*\]|\{\s*"name"[\s\S]*?\})\s*\n?```/gi, "")
+      .trim()
   }
 
   return { toolCalls, cleanText }
@@ -1117,15 +1121,20 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
 
           // Auto-File Resolution: If args.code is a path to an existing file, load its content
           const trimmed = args.code.trim()
-          if (!trimmed.includes("\n") && (trimmed.includes(".") || trimmed.includes("/") || trimmed.includes("\\"))) {
+          const cleanPath = trimmed.replace(/^file:\/\/\/?/, "").replace(/^["']|["']$/g, "").trim()
+          if (!cleanPath.includes("\n") && (cleanPath.includes(".") || cleanPath.includes("/") || cleanPath.includes("\\"))) {
             try {
-              const targetPath = path.isAbsolute(trimmed)
-                ? trimmed
-                : path.join(input.directory || process.cwd(), trimmed)
+              const targetPath = path.isAbsolute(cleanPath)
+                ? cleanPath
+                : path.join(input.directory || process.cwd(), cleanPath)
               const fileContent = await fs.readFile(targetPath, "utf8")
               codeToReview = fileContent
-              effectiveContext = effectiveContext ? `${effectiveContext} (File: ${trimmed})` : `File: ${trimmed}`
+              effectiveContext = effectiveContext ? `${effectiveContext} (File: ${cleanPath})` : `File: ${cleanPath}`
             } catch {}
+          }
+
+          if (codeToReview.length > 50_000) {
+            codeToReview = codeToReview.slice(0, 50_000) + "\n\n...[Truncated for Review]"
           }
 
           let token = ""

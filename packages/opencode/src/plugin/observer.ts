@@ -49,6 +49,11 @@ export interface DiagnosticLogEntry {
 }
 
 export function redactSensitiveData(data: any): any {
+  if (typeof data === "string") {
+    return data
+      .replace(/Bearer\s+eyJ[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.?[A-Za-z0-9-_.+/=]*/gi, "Bearer [REDACTED_JWT]")
+      .replace(/(?:key|token|secret|password|authorization)\s*[:=]\s*["']?[A-Za-z0-9-_]{8,}["']?/gi, "$1: [REDACTED]")
+  }
   if (!data || typeof data !== "object") return data
   if (Array.isArray(data)) return data.map(redactSensitiveData)
   const redacted: Record<string, any> = {}
@@ -66,7 +71,7 @@ export function redactSensitiveData(data: any): any {
     } else if (typeof value === "object" && value !== null) {
       redacted[key] = redactSensitiveData(value)
     } else {
-      redacted[key] = value
+      redacted[key] = typeof value === "string" ? redactSensitiveData(value) : value
     }
   }
   return redacted
@@ -296,7 +301,7 @@ class SessionObserverManager {
     this.sessionLearnings.unshift(entry)
     if (this.sessionLearnings.length > 100) this.sessionLearnings.pop()
 
-    // Persist to central learnings.json
+    // Persist to central learnings.json with disk-level deduplication
     try {
       const homeDir = process.env.USERPROFILE || process.env.HOME || ""
       if (homeDir) {
@@ -307,12 +312,14 @@ class SessionObserverManager {
         try {
           existing = JSON.parse(await fs.readFile(centralFile, "utf8"))
         } catch {}
-        existing.unshift(entry)
-        await fs.writeFile(centralFile, JSON.stringify(existing.slice(0, 100), null, 2), "utf8")
+        if (!existing.some((e) => e.lesson.trim().toLowerCase() === normalizedText)) {
+          existing.unshift(entry)
+          await fs.writeFile(centralFile, JSON.stringify(existing.slice(0, 100), null, 2), "utf8")
+        }
       }
     } catch {}
 
-    // Persist to workspace if available
+    // Persist to workspace if available with deduplication
     if (workspaceDir) {
       try {
         const wsDir = path.join(workspaceDir, ".system_generated", "logs")
@@ -322,8 +329,10 @@ class SessionObserverManager {
         try {
           existing = JSON.parse(await fs.readFile(wsFile, "utf8"))
         } catch {}
-        existing.unshift(entry)
-        await fs.writeFile(wsFile, JSON.stringify(existing.slice(0, 100), null, 2), "utf8")
+        if (!existing.some((e) => e.lesson.trim().toLowerCase() === normalizedText)) {
+          existing.unshift(entry)
+          await fs.writeFile(wsFile, JSON.stringify(existing.slice(0, 100), null, 2), "utf8")
+        }
       } catch {}
     }
     return entry
