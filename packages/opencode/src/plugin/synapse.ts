@@ -302,6 +302,47 @@ export interface ParsedToolCall {
   }
 }
 
+export function normalizeToolName(name: string): string {
+  let clean = String(name).trim().replace(/^(mcp__|tools\/|functions\.)/, "")
+
+  // Map RAG tools: e.g. rag_ask -> alterspective-rag_rag_ask
+  if (clean.startsWith("rag_") || clean.startsWith("rag-")) {
+    return `alterspective-rag_${clean.replace(/-/g, "_")}`
+  }
+  if (clean === "rag" || clean === "ask_rag") {
+    return "alterspective-rag_rag_ask"
+  }
+  if (clean === "search_rag") {
+    return "alterspective-rag_rag_search"
+  }
+
+  // Map Playwright / browser tools: e.g. browser_click -> playwright_browser_click
+  if (clean.startsWith("browser_") || clean.startsWith("browser-") || clean.startsWith("playwright_")) {
+    const suffix = clean.replace(/^(playwright_|browser_)/, "")
+    return `playwright_browser_${suffix.replace(/-/g, "_")}`
+  }
+
+  // Map Keystone tools
+  if (clean === "search_tools" || clean === "searchTools" || clean === "search-tools") {
+    return "keystone-dynamic_search-tools"
+  }
+  if (clean === "get_tool_schema" || clean === "getToolSchema" || clean === "get-tool-schema") {
+    return "keystone-dynamic_get-tool-schema"
+  }
+  if (clean === "execute_tool" || clean === "executeTool" || clean === "execute-tool") {
+    return "keystone-dynamic_execute-tool"
+  }
+
+  // Map common aliases
+  if (clean === "read_file" || clean === "readFile" || clean === "cat") return "read"
+  if (clean === "write_file" || clean === "writeFile") return "write"
+  if (clean === "edit_file" || clean === "editFile") return "edit"
+  if (clean === "find_files" || clean === "find") return "glob"
+  if (clean === "search_text" || clean === "search") return "grep"
+
+  return clean
+}
+
 export function extractToolCallsFromModelOutput(text: string): {
   toolCalls: ParsedToolCall[]
   cleanText: string
@@ -312,9 +353,9 @@ export function extractToolCallsFromModelOutput(text: string): {
 
   const pushCall = (item: any) => {
     if (!item || typeof item !== "object") return
-    let name = item.name || item.tool || item.function
-    if (!name) return
-    name = String(name).trim().replace(/^(mcp__|tools\/)/, "")
+    const rawName = item.name || item.tool || item.function
+    if (!rawName) return
+    const name = normalizeToolName(rawName)
     const args = item.arguments || item.parameters || item.args || {}
     toolCalls.push({
       index: idx++,
@@ -1073,6 +1114,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
           "2. WINDOWS POWERSHELL RULES: When using `bash` on Windows, do NOT use Linux utilities (`head`, `tail`, `grep`, `ls`, `cat`). Use PowerShell native commands (`Select-Object -First N`, `Select-String`, `Get-ChildItem`, `Get-Content`).",
           "3. CONTINUOUS EXECUTION: NEVER end your turn saying 'Let me check...' or 'Let me search...' without calling the tool! Always output `<tool_call>` in the same turn.",
           "4. FINISH THE JOB: Continue executing tools step-by-step until the requested task is completely done. Only stop when the full work is finished and verified.",
+          "5. EXACT TOOL NAMES & ERROR RECOVERY: Use registered tool names (`alterspective-rag_rag_ask`, `alterspective-rag_rag_search`, `keystone-dynamic_execute-tool`, `read`, `write`, `edit`). If a tool fails, immediately recover and continue in the same turn without stopping.",
           "To invoke a tool, output:",
           "<tool_call>",
           '{"name": "<tool_name>", "arguments": { ... }}',
