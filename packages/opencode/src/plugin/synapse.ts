@@ -270,6 +270,9 @@ export function sanitizeMessagesForSynapse(
       } else {
         conversation.push({ role: "user", content: `[System context: ${text || " "}]` })
       }
+    } else if (role === "tool") {
+      const toolName = (m as any).name || (m as any).tool || "tool"
+      conversation.push({ role: "user", content: `[Tool Result for ${toolName}]:\n${text || "(no output)"}` })
     } else {
       const validRole = role === "assistant" ? "assistant" : "user"
       conversation.push({ role: validRole, content: text || " " })
@@ -1066,7 +1069,10 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
           "",
           "## Mandatory Tool Execution Protocol",
           "You are equipped with tools: `read`, `edit`, `write`, `glob`, `grep`, `bash`, `task`, `alterspective-rag`, `keystone-dynamic`, `synapse_buddy_review`, etc.",
-          "When you need to view files, edit code, execute commands, or search, ALWAYS execute the real tool rather than just talking about it.",
+          "1. PREFER NATIVE TOOLS: Always use `read`, `write`, `edit`, `glob`, `grep` directly instead of executing shell commands via `bash` for file reading and writing.",
+          "2. WINDOWS POWERSHELL RULES: When using `bash` on Windows, do NOT use Linux utilities (`head`, `tail`, `grep`, `ls`, `cat`). Use PowerShell native commands (`Select-Object -First N`, `Select-String`, `Get-ChildItem`, `Get-Content`).",
+          "3. CONTINUOUS EXECUTION: NEVER end your turn saying 'Let me check...' or 'Let me search...' without calling the tool! Always output `<tool_call>` in the same turn.",
+          "4. FINISH THE JOB: Continue executing tools step-by-step until the requested task is completely done. Only stop when the full work is finished and verified.",
           "To invoke a tool, output:",
           "<tool_call>",
           '{"name": "<tool_name>", "arguments": { ... }}',
