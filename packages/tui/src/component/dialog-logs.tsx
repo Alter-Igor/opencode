@@ -104,13 +104,13 @@ export function DialogLogs() {
     <Show
       when={!selectedDetail()}
       fallback={
-        <div style={{ padding: "1" }}>
-          <div style={{ color: theme.accent, "font-weight": "bold", "margin-bottom": "1" }}>
-            Diagnostic Details
-          </div>
-          <pre style={{ color: theme.text, "margin-bottom": "1" }}>{selectedDetail()}</pre>
-          <div style={{ color: theme.textMuted }}>Press Escape or Back to return to log list.</div>
-        </div>
+        <box padding={1} flexDirection="column">
+          <text fg={theme.accent}>
+            <b>Diagnostic Details</b>
+          </text>
+          <text fg={theme.text}>{selectedDetail()}</text>
+          <text fg={theme.textMuted}>Press Escape or Back to return to log list.</text>
+        </box>
       }
     >
       <DialogSelect
