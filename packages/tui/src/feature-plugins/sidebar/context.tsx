@@ -17,8 +17,10 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
   const cost = createMemo(() => session()?.cost ?? 0)
 
   const state = createMemo(() => {
-    const last = msg().findLast((item): item is AssistantMessage => item.role === "assistant" && item.tokens.output > 0)
-    if (!last) {
+    const last = msg().findLast(
+      (item): item is AssistantMessage => item.role === "assistant" && (item.tokens?.output ?? 0) > 0,
+    )
+    if (!last || !last.tokens) {
       return {
         tokens: 0,
         percent: null,
@@ -26,7 +28,11 @@ function View(props: { api: TuiPluginApi; session_id: string }) {
     }
 
     const tokens =
-      last.tokens.input + last.tokens.output + last.tokens.reasoning + last.tokens.cache.read + last.tokens.cache.write
+      (last.tokens.input ?? 0) +
+      (last.tokens.output ?? 0) +
+      (last.tokens.reasoning ?? 0) +
+      (last.tokens.cache?.read ?? 0) +
+      (last.tokens.cache?.write ?? 0)
     const model = props.api.state.provider.find((item) => item.id === last.providerID)?.models[last.modelID]
     const limitContext = model?.limit?.context
     return {

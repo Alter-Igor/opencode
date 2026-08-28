@@ -32,11 +32,17 @@ export function SubagentFooter() {
 
   const usage = createMemo(() => {
     const msg = messages()
-    const last = msg.findLast((item): item is AssistantMessage => item.role === "assistant" && item.tokens.output > 0)
-    if (!last) return
+    const last = msg.findLast(
+      (item): item is AssistantMessage => item.role === "assistant" && (item.tokens?.output ?? 0) > 0,
+    )
+    if (!last || !last.tokens) return
 
     const tokens =
-      last.tokens.input + last.tokens.output + last.tokens.reasoning + last.tokens.cache.read + last.tokens.cache.write
+      (last.tokens.input ?? 0) +
+      (last.tokens.output ?? 0) +
+      (last.tokens.reasoning ?? 0) +
+      (last.tokens.cache?.read ?? 0) +
+      (last.tokens.cache?.write ?? 0)
     if (tokens <= 0) return
 
     const model = sync.data.provider.find((item) => item.id === last.providerID)?.models[last.modelID]
