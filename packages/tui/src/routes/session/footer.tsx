@@ -82,6 +82,11 @@ export function Footer() {
                 {mcp()} MCP
               </text>
             </Show>
+            <Show when={sync.data.provider.some((p) => p.id === "synapse")}>
+              <text fg={theme.text}>
+                <span style={{ fg: theme.success }}>⚡</span> Synapse ($0)
+              </text>
+            </Show>
             <text fg={theme.textMuted}>/status</text>
           </Match>
         </Switch>
