@@ -119,7 +119,7 @@ export function findContextLimit(
   providerID: ProviderV2.ID,
   modelID: ModelV2.ID,
 ): number | undefined {
-  return providers[providerID]?.models[modelID]?.limit.context
+  return providers[providerID]?.models[modelID]?.limit?.context
 }
 
 export const contextLimitLoaderLayer = Layer.effect(

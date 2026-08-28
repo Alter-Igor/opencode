@@ -40,7 +40,8 @@ export function SubagentFooter() {
     if (tokens <= 0) return
 
     const model = sync.data.provider.find((item) => item.id === last.providerID)?.models[last.modelID]
-    const pct = model?.limit.context ? `${Math.round((tokens / model.limit.context) * 100)}%` : undefined
+    const limitContext = model?.limit?.context
+    const pct = limitContext ? `${Math.round((tokens / limitContext) * 100)}%` : undefined
     const cost = session()?.cost ?? 0
 
     const money = new Intl.NumberFormat("en-US", {
