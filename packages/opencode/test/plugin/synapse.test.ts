@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import {
   accessTokenIsExpiring,
+  extractToolCallsFromModelOutput,
   buildAuthorizeUrl,
   exchangeCodeForTokens,
   parseJwtPayload,
@@ -174,5 +175,38 @@ describe('normalizeSystemMessages', () => {
       { role: 'user', content: 'hi' },
     ]
     expect(normalizeSystemMessages(msgs)).toBe(msgs)
+  })
+})
+describe("extractToolCallsFromModelOutput", () => {
+  const TC = "<" + "tool_call>"
+  const TCE = "<" + "/tool_call>"
+  const INV = "<" + ">"
+  const INVE = "<" + "/>"
+  const FN = "<" + "function="
+  const FNC = "<" + "/function>"
+  const PR = "<" + "parameter="
+  const PRC = "<" + "/parameter>"
+
+  test("parses JSON tool_call tags", () => {
+    const out = extractToolCallsFromModelOutput(
+      `Working. ${TC}{"name": "read", "arguments": {"filePath": "a.ts"}}${TCE}`,
+    )
+    expect(out.toolCalls.length).toBe(1)
+    expect(out.toolCalls[0].function.name).toBe("read")
+    expect(out.cleanText).toBe("Working.")
+  })
+
+  test("parses Cline-style function blocks", () => {
+    const block = FN + "read>\n" + PR + "filePath>\nC:\\x\\a.ts\n" + PRC + "\n" + FNC
+    const out = extractToolCallsFromModelOutput(INV + "\n" + block + "\n" + INV)
+    expect(out.toolCalls.length).toBe(1)
+    expect(out.toolCalls[0].function.name).toBe("read")
+    expect(JSON.parse(out.toolCalls[0].function.arguments)).toEqual({ filePath: "C:\\x\\a.ts" })
+    expect(out.cleanText).toBe("")
+  })
+
+  test("normalizes rag tool aliases inside text calls", () => {
+    const out = extractToolCallsFromModelOutput(`${TC}{"name": "rag_ask", "arguments": {"question": "q"}}${TCE}`)
+    expect(out.toolCalls[0].function.name).toBe("alterspective-rag_rag_ask")
   })
 })

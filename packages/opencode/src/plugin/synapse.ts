@@ -426,10 +426,33 @@ export function extractToolCallsFromModelOutput(text: string): {
     } catch {}
   }
 
+  // 3. Cline/Kimi-style function blocks - on-prem models drift to this
+  // format when mimicking their training data. Tag literals are built by
+  // concatenation so this source file stays free of raw marker sequences.
+  const fnOpen = "<" + "function="
+  const fnClose = "<" + "/function" + ">"
+  const pOpen = "<" + "parameter="
+  const pClose = "<" + "/parameter" + ">"
+  const fnScan = new RegExp(fnOpen + "([^\\s>]+)>([\\s\\S]*?)" + fnClose, "gi")
+  let fnMatch: RegExpExecArray | null
+  while ((fnMatch = fnScan.exec(text)) !== null) {
+    const params: Record<string, string> = {}
+    const pScan = new RegExp(pOpen + "([^\\s>]+)>([\\s\\S]*?)" + pClose, "gi")
+    let pMatch: RegExpExecArray | null
+    while ((pMatch = pScan.exec(fnMatch[2])) !== null) {
+      params[pMatch[1]] = pMatch[2].trim()
+    }
+    pushCall({ name: fnMatch[1], arguments: params })
+  }
+
   if (toolCalls.length > 0) {
+    const stripFn = new RegExp(fnOpen + "[^\\s>]+>([\\s\\S]*?)" + fnClose, "gi")
     cleanText = text
       .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, "")
       .replace(/```(?:tool_call|tool|json)?\s*\n?(\[\s*\{[\s\S]*?\}\s*\]|\{\s*"name"[\s\S]*?\})\s*\n?```/gi, "")
+      .replace(stripFn, "")
+      .replace(/<\/?tool_call>/gi, "")
+      .replace(/<\/?>/g, "")
       .trim()
   }
 
@@ -448,6 +471,9 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
   const inferenceUrl = options?.inferenceUrl || process.env.SYNAPSE_BASE_URL || SYNAPSE_DEFAULT_INFERENCE_URL
   const audience = options?.audience || SYNAPSE_AUDIENCE
   let refreshPromise: Promise<{ access_token: string; refresh_token?: string; expires_in?: number }> | undefined
+  // Set by the auth loader per request: true when the credential is a Keystone
+  // JWT (MCP bridge path, text tool-call protocol), false on the native REST path.
+  let bridgeMode = false
 
   return {
     auth: {
@@ -465,6 +491,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
 
         const resolvedKey = authData.type === "api" ? authData.key : authData.type === "oauth" ? authData.access : ""
         const isJwtToken = resolvedKey.startsWith("eyJ")
+        bridgeMode = isJwtToken
 
         return {
           apiKey: isJwtToken ? "oauth-synapse-bearer" : resolvedKey,
@@ -1146,14 +1173,20 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
           "You are equipped with tools: `read`, `edit`, `write`, `glob`, `grep`, `bash`, `task`, `alterspective-rag`, `keystone-dynamic`, `synapse_buddy_review`, etc.",
           "1. PREFER NATIVE TOOLS: Always use `read`, `write`, `edit`, `glob`, `grep` directly instead of executing shell commands via `bash` for file reading and writing.",
           "2. WINDOWS POWERSHELL RULES: When using `bash` on Windows, do NOT use Linux utilities (`head`, `tail`, `grep`, `ls`, `cat`). Use PowerShell native commands (`Select-Object -First N`, `Select-String`, `Get-ChildItem`, `Get-Content`).",
-          "3. CONTINUOUS EXECUTION: NEVER end your turn saying 'Let me check...' or 'Let me search...' without calling the tool! Always output `<tool_call>` in the same turn.",
+          "3. CONTINUOUS EXECUTION: NEVER end your turn saying 'Let me check...' or 'Let me search...' without calling the tool in the same turn.",
           "4. FINISH THE JOB: Continue executing tools step-by-step until the requested task is completely done. Only stop when the full work is finished and verified.",
           "5. EXACT TOOL NAMES & ERROR RECOVERY: Use registered tool names (`alterspective-rag_rag_ask`, `alterspective-rag_rag_search`, `keystone-dynamic_execute-tool`, `read`, `write`, `edit`). If a tool fails, immediately recover and continue in the same turn without stopping.",
-          "To invoke a tool, output:",
-          "<tool_call>",
-          '{"name": "<tool_name>", "arguments": { ... }}',
-          "</tool_call>",
-          "Execute tools immediately to take real action.",
+          ...(bridgeMode
+            ? [
+                "To invoke a tool, output:",
+                "<" + "tool_call>",
+                '{"name": "<tool_name>", "arguments": { ... }}',
+                "<" + "/tool_call>",
+                "Execute tools immediately to take real action.",
+              ]
+            : [
+                "Invoke tools ONLY through your native function calling. NEVER write tool calls as text - text tool calls are never executed.",
+              ]),
           ...learningsBlock,
         ].join("\n"),
       )
