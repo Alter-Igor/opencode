@@ -946,7 +946,10 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
               )
             }
 
-            const response = await fetch(requestInput, { ...init, body: sanitizedBody, headers })
+            const response = await fetch(requestInput, { ...init, body: sanitizedBody, headers }).catch((err: unknown) => {
+              escalations.recordFailure(sessionKey, "provider-error")
+              throw err
+            })
             if (response.ok) escalations.recordSuccess(sessionKey)
 
             if (!response.ok) {

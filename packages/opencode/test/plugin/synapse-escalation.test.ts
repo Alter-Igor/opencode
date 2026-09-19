@@ -7,10 +7,15 @@ import {
 } from "../../src/plugin/synapse-escalation"
 
 describe("declaredTier", () => {
-  test("maps named models to their declared tiers", () => {
+  test("maps exact model ids to their declared tiers", () => {
     expect(declaredTier("synapse/openai/gpt-5.6-sol")).toBe("premium")
     expect(declaredTier("anthropic/claude-opus-5")).toBe("premium")
     expect(declaredTier("z-ai/glm-5.3")).toBe("economy")
+  })
+
+  test("variant ids are NOT matched by substring - declare or stay unknown", () => {
+    expect(declaredTier("z-ai/glm-5.3-fast")).toBeUndefined()
+    expect(declaredTier("anthropic/claude-opus-5-turbo")).toBeUndefined()
   })
 
   test("unknown and auto models have no declared tier", () => {
@@ -28,14 +33,22 @@ describe("bumpTier", () => {
 })
 
 describe("EscalationTracker", () => {
-  test("escalates once after 2 consecutive same-class failures", () => {
+  test("escalates once after 2 consecutive same-class failures, then must be re-earned", () => {
     const t = new EscalationTracker()
     t.recordFailure("s1", "provider-error")
     expect(t.resolveTier("s1", "balanced")).toBe("balanced")
     t.recordFailure("s1", "provider-error")
     expect(t.resolveTier("s1", "balanced")).toBe("premium")
-    // AIESC-03: must be re-earned - the next request is back at base.
     expect(t.resolveTier("s1", "balanced")).toBe("balanced")
+    // A granted escalation clears the human-gate flag.
+    expect(t.atCap("s1")).toBe(false)
+  })
+
+  test("escalates from an economy base", () => {
+    const t = new EscalationTracker()
+    t.recordFailure("s1", "empty-content")
+    t.recordFailure("s1", "empty-content")
+    expect(t.resolveTier("s1", "economy")).toBe("balanced")
   })
 
   test("a different failure class restarts the count", () => {
@@ -46,40 +59,50 @@ describe("EscalationTracker", () => {
     expect(t.resolveTier("s1", "balanced")).toBe("premium")
   })
 
-  test("success clears the consecutive counter", () => {
+  test("success clears the consecutive counter and the exhausted flag", () => {
     const t = new EscalationTracker()
     t.recordFailure("s1", "provider-error")
     t.recordSuccess("s1")
     t.recordFailure("s1", "provider-error")
     expect(t.resolveTier("s1", "balanced")).toBe("balanced")
+    expect(t.atCap("s1")).toBe(false)
   })
 
-  test("caps at 2 auto-escalations per session and flags the human gate", () => {
-    const t = new EscalationTracker()
-    for (let round = 0; round < 3; round++) {
-      t.recordFailure("s1", "provider-error")
-      t.recordFailure("s1", "provider-error")
-      const tier = t.resolveTier("s1", "balanced")
-      if (round < 2) expect(tier).toBe("premium")
-      else expect(tier).toBe("balanced")
-    }
-    t.recordFailure("s1", "provider-error")
-    t.recordFailure("s1", "provider-error")
-    expect(t.atCap("s1")).toBe(true)
-  })
-
-  test("AIESC-04: local-only never escalates across the privacy gate", () => {
+  test("AIESC-04: local-only does NOT consume the streak - evidence is kept", () => {
     const t = new EscalationTracker()
     t.recordFailure("s1", "provider-error")
     t.recordFailure("s1", "provider-error")
     expect(t.resolveTier("s1", "balanced", { localOnly: true })).toBe("balanced")
+    expect(t.atCap("s1")).toBe(true)
+    // A later cloud-ok request still gets the earned escalation.
+    expect(t.resolveTier("s1", "balanced")).toBe("premium")
+    expect(t.atCap("s1")).toBe(false)
   })
 
-  test("AIESC-05: premium base has nowhere to escalate to", () => {
+  test("caps at 2 auto-escalations, then flags the human gate without wiping evidence", () => {
+    const t = new EscalationTracker()
+    for (let round = 0; round < 2; round++) {
+      t.recordFailure("s1", "provider-error")
+      t.recordFailure("s1", "provider-error")
+      expect(t.resolveTier("s1", "balanced")).toBe("premium")
+    }
+    t.recordFailure("s1", "provider-error")
+    t.recordFailure("s1", "provider-error")
+    expect(t.resolveTier("s1", "balanced")).toBe("balanced")
+    expect(t.atCap("s1")).toBe(true)
+    const snap = t.snapshot("s1")
+    expect(snap.escalations).toBe(2)
+    expect(snap.maxEscalations).toBe(2)
+    expect(snap.consecutiveFailures).toEqual({ cls: "provider-error", count: 2 })
+    expect(snap.exhausted).toBe(true)
+  })
+
+  test("premium base has nowhere to escalate - human gate fires, no silent no-op", () => {
     const t = new EscalationTracker()
     t.recordFailure("s1", "malformed-output")
     t.recordFailure("s1", "malformed-output")
     expect(t.resolveTier("s1", "premium")).toBe("premium")
+    expect(t.atCap("s1")).toBe(true)
   })
 
   test("sessions are isolated", () => {
@@ -88,18 +111,23 @@ describe("EscalationTracker", () => {
     t.recordFailure("s1", "provider-error")
     t.recordFailure("s2", "provider-error")
     expect(t.resolveTier("s2", "balanced")).toBe("balanced")
+    expect(t.snapshot("s2").escalations).toBe(0)
     expect(t.resolveTier("s1", "balanced")).toBe("premium")
   })
 })
 
 describe("classifyFailure", () => {
-  test("maps gateway responses to AIESC-02 classes", () => {
+  test("status outranks message text", () => {
+    expect(classifyFailure(503, "upstream schema error")).toBe("provider-error")
     expect(classifyFailure(502, "")).toBe("provider-error")
+  })
+
+  test("classifies gateway bodies by content when status is not 5xx", () => {
     expect(classifyFailure(200, "upstream overloaded")).toBe("provider-error")
     expect(classifyFailure(200, "model returned empty content")).toBe("empty-content")
-    expect(classifyFailure(400, '{"message":"System message must be at the beginning.","type":"invalid_request_error"}')).toBe(
-      "malformed-output",
-    )
+    expect(
+      classifyFailure(400, '{"message":"System message must be at the beginning.","type":"invalid_request_error"}'),
+    ).toBe("malformed-output")
     expect(classifyFailure(401, "no creds")).toBe("other")
   })
 })
