@@ -245,6 +245,37 @@ export async function refreshKeystoneToken(
   }
 }
 
+// vLLM-based on-prem backends reject any system message that is not at index 0
+// ("System message must be at the beginning."). opencode emits the provider header
+// and plugin system blocks as separate leading system messages — collapse every
+// system/developer message into exactly one message at the front.
+export function normalizeSystemMessages(
+  messages: Array<{ role?: unknown; content?: unknown }>,
+): Array<{ role?: unknown; content?: unknown }> {
+  const systemTexts: string[] = []
+  const rest: Array<{ role?: unknown; content?: unknown }> = []
+  let systemTemplate: { role?: unknown; content?: unknown } | undefined
+
+  for (const m of messages) {
+    if (m.role === "system" || m.role === "developer") {
+      systemTemplate ??= m
+      const text =
+        typeof m.content === "string"
+          ? m.content
+          : Array.isArray(m.content)
+            ? m.content.map((c: any) => (typeof c === "string" ? c : c?.text || "")).join("\n")
+            : String(m.content ?? "")
+      if (text.trim()) systemTexts.push(text)
+    } else {
+      rest.push(m)
+    }
+  }
+
+  if (systemTexts.length === 0) return messages
+  if (systemTexts.length === 1 && messages[0] === systemTemplate) return messages
+  return [{ ...systemTemplate, role: "system", content: systemTexts.join("\n\n") }, ...rest]
+}
+
 export function sanitizeMessagesForSynapse(
   rawMessages: Array<{ role?: string; content?: any }>,
 ): Array<{ role: "system" | "user" | "assistant"; content: string }> {
@@ -505,8 +536,11 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                       t.function.parameters = sanitizeJsonSchemaForOpenAI(t.function.parameters)
                     }
                   }
-                  sanitizedBody = JSON.stringify(requestBodyJson)
                 }
+                if (Array.isArray(requestBodyJson.messages)) {
+                  requestBodyJson.messages = normalizeSystemMessages(requestBodyJson.messages)
+                }
+                sanitizedBody = JSON.stringify(requestBodyJson)
                 sessionObserver.logDiagnostic(
                   {
                     timestamp: new Date().toISOString(),

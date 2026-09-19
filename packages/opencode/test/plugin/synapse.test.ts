@@ -5,9 +5,11 @@ import {
   exchangeCodeForTokens,
   parseJwtPayload,
   refreshKeystoneToken,
+  normalizeSystemMessages,
   registerKeystoneClient,
   SynapseAuthPlugin,
   SYNAPSE_AUDIENCE,
+  SYNAPSE_RESOURCE,
 } from "../../src/plugin/synapse"
 
 function makeJwt(payload: object): string {
@@ -45,7 +47,7 @@ describe("SynapseAuthPlugin", () => {
     expect(accessTokenIsExpiring(undefined, 0)).toBe(false)
   })
 
-  test("builds valid Keystone OAuth URL with audience=synapse", () => {
+  test("builds valid Keystone OAuth URL with resource=SYNAPSE_RESOURCE", () => {
     const pkce = { verifier: "ver-123", challenge: "chal-456" }
     const urlString = buildAuthorizeUrl({
       clientId: "client-abc",
@@ -59,15 +61,15 @@ describe("SynapseAuthPlugin", () => {
     expect(url.searchParams.get("response_type")).toBe("code")
     expect(url.searchParams.get("client_id")).toBe("client-abc")
     expect(url.searchParams.get("redirect_uri")).toBe("http://127.0.0.1:1459/auth/callback")
-    expect(url.searchParams.get("audience")).toBe(SYNAPSE_AUDIENCE)
-    expect(url.searchParams.get("scope")).toContain("synapse:inference:invoke")
+    expect(url.searchParams.get("resource")).toBe(SYNAPSE_RESOURCE)
+    expect(url.searchParams.get("scope")).toContain("mcp:gpaas")
     expect(url.searchParams.get("code_challenge")).toBe("chal-456")
     expect(url.searchParams.get("code_challenge_method")).toBe("S256")
     expect(url.searchParams.get("state")).toBe("state-789")
   })
 
   test("registers client and exchanges token successfully with mock fetcher", async () => {
-    let requestedAudience = ""
+    let requestedResource = ""
     const mockFetch: any = async (input: any, init: any) => {
       const url = String(input)
       if (url.includes("/register")) {
@@ -76,7 +78,7 @@ describe("SynapseAuthPlugin", () => {
       if (url.includes("/token")) {
         const body = typeof init?.body === "string" ? init.body : (init?.body as any)?.toString()
         const searchParams = new URLSearchParams(body)
-        requestedAudience = searchParams.get("audience") || ""
+        requestedResource = searchParams.get("resource") || ""
 
         return new Response(
           JSON.stringify({
@@ -104,7 +106,7 @@ describe("SynapseAuthPlugin", () => {
     )
     expect(tokens.access_token).toBe("test-access-token")
     expect(tokens.refresh_token).toBe("test-refresh-token")
-    expect(requestedAudience).toBe("synapse")
+    expect(requestedResource).toBe(SYNAPSE_RESOURCE)
 
     const refreshed = await refreshKeystoneToken(
       {
@@ -136,5 +138,41 @@ describe("SynapseAuthPlugin", () => {
 
     const probeEmpty = await hooks.tool!.synapse_probe.execute({}, {} as never)
     expect(probeEmpty).toContain("Synapse is connected")
+  })
+})
+describe('normalizeSystemMessages', () => {
+  test('collapses multiple leading system messages into one', () => {
+    const out = normalizeSystemMessages([
+      { role: 'system', content: 'header' },
+      { role: 'system', content: 'block A' },
+      { role: 'system', content: 'block B' },
+      { role: 'user', content: 'hi' },
+    ])
+    expect(out.length).toBe(2)
+    expect(out[0].role).toBe('system')
+    expect(out[0].content).toContain('header')
+    expect(out[0].content).toContain('block A')
+    expect(out[0].content).toContain('block B')
+    expect(out[1]).toEqual({ role: 'user', content: 'hi' })
+  })
+
+  test('moves a mid-conversation system message to the single leading system', () => {
+    const out = normalizeSystemMessages([
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: 'yo' },
+      { role: 'system', content: 'late note' },
+    ])
+    expect(out.length).toBe(3)
+    expect(out[0].role).toBe('system')
+    expect(out[0].content).toContain('late note')
+    expect(out[2].role).toBe('assistant')
+  })
+
+  test('leaves a single leading system message untouched', () => {
+    const msgs = [
+      { role: 'system', content: 'only' },
+      { role: 'user', content: 'hi' },
+    ]
+    expect(normalizeSystemMessages(msgs)).toBe(msgs)
   })
 })
