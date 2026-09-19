@@ -6,6 +6,9 @@
   "permission": {
     "alterspective-agent_cas_resolve_tool_call": "deny",
     "alterspective-agent_cas_admin_*": "deny",
+    // 49 per-agent shortcuts duplicate keystone-dynamic cas_0ab2b1__agent_* (BFA-007).
+    // Keep the cas-safe-* bridge here (not proxied by the dynamic connection).
+    "alterspective-agent_agent_*": "deny",
   },
   "references": {
     "effect": {
@@ -46,33 +49,35 @@
       },
     },
     "keystone": {
+      // Disabled 2026-09-19: ~102 static tool schemas duplicated by keystone-dynamic
+      // (BFA-007 — route AI-tool MCP access through Keystone /mcp/dynamic).
       "type": "remote",
       "url": "https://identity.alterspective.com.au/api/mcp",
       "headers": {
         "Authorization": "Bearer {env:KEYSTONE_AI_ADMIN_API_KEY}",
       },
+      "enabled": false,
     },
     "timely": {
       "type": "remote",
       "url": "https://timely-mcp.alterspective.com.au/mcp",
     },
     "sharedo": {
+      // Disabled 2026-09-19: Sharedo tenants are Keystone credential providers
+      // and reachable via keystone-dynamic (BFA-007). The direct remote MCP asked
+      // for a second, separate sign-in.
       "type": "remote",
       "url": "https://sharedo-api.alterspective.com.au/mcp",
+      "enabled": false,
     },
     "vault-local": {
       "type": "local",
       "command": ["node", "C:/GitHub/vault-mcp/dist/index.js"],
       "enabled": true,
     },
-    "azure-devops": {
-      "type": "local",
-      "command": ["npx", "-y", "azure-devops-mcp"],
-      "enabled": true,
-      "environment": {
-        "AZURE_DEVOPS_PAT": "{env:AZURE_DEVOPS_PAT}",
-      },
-    },
+    // azure-devops removed 2026-09-19: local npx server died without AZURE_DEVOPS_PAT
+    // (-32000). Follow-up: onboard Azure DevOps as a Keystone credential provider +
+    // AI Connection so it is reached via keystone-dynamic (BFA-007), not a per-repo PAT.
   },
   "tools": {
     "github-triage": false,
