@@ -157,7 +157,7 @@ class SessionObserverManager {
   }
 
   public onToolAfter(sessionId: string, callId: string, tool: string, output: unknown) {
-    const text = typeof output === "string" ? output : JSON.stringify(output)
+    const text = typeof output === "string" ? output : output == null ? "" : JSON.stringify(output) ?? ""
     const records = this.trajectories.get(sessionId) ?? []
     const record = records.find((r) => r.callId === callId)
     const isError =
@@ -375,4 +375,5 @@ export interface SessionLearning {
 }
 
 export const sessionObserver = new SessionObserverManager()
+
 

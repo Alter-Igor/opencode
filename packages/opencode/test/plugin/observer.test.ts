@@ -2,13 +2,13 @@ import { describe, expect, test } from "bun:test"
 import { sessionObserver } from "../../src/plugin/observer"
 
 describe("SessionObserverManager.onToolAfter", () => {
-  test("records a tool call with string output", () => {
+  test("records a tool call with string output", async () => {
     const sessionId = "obs-str-1"
     const callId = "call-str-1"
     sessionObserver.onToolBefore(sessionId, callId, "read", { filePath: "/tmp/a.md" })
     sessionObserver.onToolAfter(sessionId, callId, "read", "file contents here")
 
-    const retro = sessionObserver.getLatestRetrospectives()[0]
+    const retro = await sessionObserver.finalizeSessionRetrospective(sessionId)
     if (!retro) throw new Error("no retrospective found")
     expect(retro.totalToolCalls).toBe(1)
     expect(retro.toolsUsed).toEqual(["read"])
@@ -74,3 +74,4 @@ describe("SessionObserverManager.onToolAfter", () => {
     expect(retro!.totalToolCalls).toBe(3)
   })
 })
+
