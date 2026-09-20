@@ -452,11 +452,11 @@ export function extractToolCallsFromModelOutput(text: string): {
     pushCall({ name: fnMatch[1], arguments: params })
   }
 
-  // 4. Tolerant fallback: a tool-call block closed by a MISMATCHED tag
-  // (observed on-prem drift). A string-aware, stack-based JSON scanner keeps
-  // braces inside JSON strings from terminating the payload early, and array
-  // payloads are supported too.
-  const callOpen = "<" + "tool_call" + ">"
+  // 4. Tolerant fallback: a tool-call block whose tags are malformed -
+  // mismatched close, a stray "<" before the payload, or an open tag missing
+  // its ">". A string-aware, stack-based JSON scanner keeps braces inside JSON
+  // strings from terminating the payload early; array payloads are supported.
+  const callOpen = "<" + "tool_call"
   const findJsonEnd = (src: string, start: number): number => {
     const QUOTE = String.fromCharCode(34)
     const stack: string[] = []
