@@ -7,6 +7,7 @@ import open from "open"
 import { OauthCallbackPage } from "@opencode-ai/core/oauth/page"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { sessionObserver, sanitizeJsonSchemaForOpenAI } from "./observer"
+import { EscalationTracker, declaredTier, classifyFailure } from "./synapse-escalation"
 
 export const KEYSTONE_ISSUER = "https://identity.alterspective.com.au"
 export const KEYSTONE_REGISTER = `${KEYSTONE_ISSUER}/api/oauth/register`
@@ -29,6 +30,9 @@ export interface SynapseServingTelemetry {
 }
 
 let latestSynapseServing: SynapseServingTelemetry | undefined
+
+// AIESC-001: observer-owned escalation state (session-keyed; directory fallback).
+const escalations = new EscalationTracker()
 
 export function getLatestSynapseServing(): SynapseServingTelemetry | undefined {
   return latestSynapseServing
@@ -554,6 +558,8 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
             // Parse request body for logging and tool sanitization
             let requestBodyJson: any = null
             let sanitizedBody = init?.body
+            // AIESC-02: escalation is observer-owned; key by session when known.
+            const sessionKey = new Headers(init?.headers as HeadersInit).get("x-opencode-session") || input.directory
             if (typeof init?.body === "string") {
               try {
                 requestBodyJson = JSON.parse(init.body)
@@ -587,6 +593,9 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
             // If authenticating via Keystone JWT token, execute through Synapse MCP bridge
             const rawMessages = requestBodyJson?.messages || (requestBodyJson?.prompt ? [{ role: "user", content: requestBodyJson.prompt }] : [])
             if (activeToken.startsWith("eyJ") && rawMessages.length > 0) {
+                // The bridge chat tool has no tier knob; evaluate the tracker so a
+                // persistently failing bridge session still reaches the human gate (AIESC-03).
+                escalations.resolveTier(sessionKey, "premium")
               try {
                 const normalizedMessages = sanitizeMessagesForSynapse(rawMessages)
 
@@ -688,6 +697,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                           },
                           input.directory,
                         )
+                        escalations.recordFailure(sessionKey, classifyFailure(mcpRes.status, errMsg))
                         return new Response(
                           JSON.stringify({ error: { message: errMsg, type: "invalid_request_error" } }),
                           {
@@ -748,6 +758,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                   // Strip leading newline artifacts if model responded with \n\n
                   parsedContent = parsedContent.replace(/^\n+/, "")
 
+
                   if (fallbackApplied) {
                     parsedContent = `[Notice: Cloud provider limit reached. Seamlessly switched to Synapse On-Premises ($0 cost).]\n\n${parsedContent}`
                   }
@@ -772,6 +783,9 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                   }
 
                   const { toolCalls, cleanText } = extractToolCallsFromModelOutput(parsedContent)
+                  if (parsedContent.trim() && (toolCalls.length > 0 || cleanText.trim())) escalations.recordSuccess(sessionKey)
+                  else if (!parsedContent.trim()) escalations.recordFailure(sessionKey, "empty-content")
+                  else escalations.recordFailure(sessionKey, "malformed-output")
 
                   if (requestBodyJson.stream) {
                     const encoder = new TextEncoder()
@@ -919,7 +933,43 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
             headers.set("x-task-type", "code")
             headers.set("User-Agent", `opencode/${InstallationVersion}`)
 
-            const response = await fetch(requestInput, { ...init, body: sanitizedBody, headers })
+            // AIESC-01/02: declared tier per model; observer-owned one-request bump.
+            const baseTier = declaredTier(requestBodyJson?.model) ?? "balanced"
+            const appliedTier = escalations.resolveTier(sessionKey, baseTier, {
+              localOnly: headers.get("x-privacy-tier") === "local-only",
+            })
+            headers.set("x-quality-tier", appliedTier)
+            if (appliedTier !== baseTier) {
+              sessionObserver.logDiagnostic(
+                {
+                  timestamp: new Date().toISOString(),
+                  type: "ESCALATION",
+                  details: { from: baseTier, to: appliedTier, ...escalations.snapshot(sessionKey) },
+                },
+                input.directory,
+              )
+            }
+
+            const response = await fetch(requestInput, { ...init, body: sanitizedBody, headers }).catch((err: unknown) => {
+              escalations.recordFailure(sessionKey, "provider-error")
+              throw err
+            })
+            if (response.ok) {
+              // A 200 with empty content must not clear the failure streak (AIESC-02).
+              // SSE streams are consumed downstream by the SDK; only buffered JSON bodies are checked here.
+              const contentType = response.headers.get("content-type") || ""
+              if (contentType.includes("application/json")) {
+                const wire = await response.clone().json().catch(() => undefined)
+                const message = wire?.choices?.[0]?.message
+                const meaningful =
+                  (message?.tool_calls?.length ?? 0) > 0 ||
+                  (typeof message?.content === "string" && message.content.trim().length > 0)
+                if (meaningful) escalations.recordSuccess(sessionKey)
+                else escalations.recordFailure(sessionKey, "empty-content")
+              } else {
+                escalations.recordSuccess(sessionKey)
+              }
+            }
 
             if (!response.ok) {
               let errorBody = ""
@@ -942,6 +992,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                 },
                 input.directory,
               )
+              escalations.recordFailure(sessionKey, classifyFailure(response.status, errorBody))
             }
 
             const servedModel = response.headers.get("x-synapse-served-model")
@@ -1137,11 +1188,19 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
 
       sessionObserver.onToolBefore(toolInput.sessionID, toolInput.callID, toolInput.tool, output.args)
     },
+    "chat.headers": async (headerInput, headerOutput) => {
+      headerOutput.headers["x-opencode-session"] = headerInput.sessionID
+    },
     "tool.execute.after": async (toolInput, output) => {
       sessionObserver.onToolAfter(toolInput.sessionID, toolInput.callID, toolInput.tool, output.output)
     },
     "experimental.chat.system.transform": async (_input, output) => {
       const recentLearnings = await sessionObserver.getRecentLearnings(5)
+      if (escalations.atCap(_input.sessionID ?? input.directory)) {
+        output.system.push(
+          "AIESC-03: automatic escalation budget is exhausted for this session. Do NOT retry the same request shape. Present the failure evidence to the user and ask how to proceed.",
+        )
+      }
       const learningsBlock =
         recentLearnings.length > 0
           ? [
@@ -1381,3 +1440,4 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
     },
   }
 }
+
