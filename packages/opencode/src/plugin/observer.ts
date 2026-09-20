@@ -156,23 +156,24 @@ class SessionObserverManager {
     this.trajectories.set(sessionId, records)
   }
 
-  public onToolAfter(sessionId: string, callId: string, tool: string, output: string) {
+  public onToolAfter(sessionId: string, callId: string, tool: string, output: unknown) {
+    const text = typeof output === "string" ? output : output == null ? "" : JSON.stringify(output) ?? ""
     const records = this.trajectories.get(sessionId) ?? []
     const record = records.find((r) => r.callId === callId)
     const isError =
-      output.includes("Error:") ||
-      output.includes("error:") ||
-      output.includes("Failed to") ||
-      output.includes("Unauthorized") ||
-      output.includes("timed out")
+      text.includes("Error:") ||
+      text.includes("error:") ||
+      text.includes("Failed to") ||
+      text.includes("Unauthorized") ||
+      text.includes("timed out")
 
     if (record) {
       record.endTime = Date.now()
       record.durationMs = record.endTime - record.startTime
-      record.outputSnippet = output.slice(0, 300)
+      record.outputSnippet = text.slice(0, 300)
       record.isError = isError
       if (isError) {
-        record.errorMessage = output.slice(0, 200)
+        record.errorMessage = text.slice(0, 200)
       }
     }
   }
@@ -374,4 +375,5 @@ export interface SessionLearning {
 }
 
 export const sessionObserver = new SessionObserverManager()
+
 
