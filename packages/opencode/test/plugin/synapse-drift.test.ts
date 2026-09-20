@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { extractToolCallsFromModelOutput } from "../../src/plugin/synapse"
+import { extractMcpChatContent, extractToolCallsFromModelOutput } from "../../src/plugin/synapse"
 
 const OPEN = "<" + "tool_call" + ">"
 const CLOSE = "<" + "/tool_call" + ">"
@@ -67,5 +67,23 @@ describe("extractToolCallsFromModelOutput tolerant close", () => {
       toolName: "keystone_admin_d0d11f__list-orgs",
       arguments: {},
     })
+  })
+})
+
+describe("extractMcpChatContent", () => {
+  test("reads structuredContent.content from an SSE payload", () => {
+    const sse = 'event: message\ndata: ' + JSON.stringify({ result: { structuredContent: { content: "hello" } }, jsonrpc: "2.0", id: 1 })
+    expect(extractMcpChatContent(sse)).toBe("hello")
+  })
+
+  test("unwraps JSON-in-text payloads", () => {
+    const sse = "data: " + JSON.stringify({ result: { content: [{ type: "text", text: JSON.stringify({ content: "unwrapped" }) }] } })
+    expect(extractMcpChatContent(sse)).toBe("unwrapped")
+  })
+
+  test("falls back to raw text and empty string", () => {
+    const sse = "data: " + JSON.stringify({ result: { content: [{ type: "text", text: "plain" }] } })
+    expect(extractMcpChatContent(sse)).toBe("plain")
+    expect(extractMcpChatContent("garbage")).toBe("")
   })
 })

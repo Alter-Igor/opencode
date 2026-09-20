@@ -529,6 +529,28 @@ export function extractToolCallsFromModelOutput(text: string): {
   return { toolCalls, cleanText }
 }
 
+// Pull the assistant content out of an MCP tools/call SSE payload (same shape
+// the main bridge parse loop reads). Returns "" when there is no usable content.
+export function extractMcpChatContent(rawText: string): string {
+  for (const chunk of rawText.split(/(?:^|\n)data:\s*/g).filter(Boolean)) {
+    try {
+      const data = JSON.parse(chunk.trim())
+      const direct = data.result?.structuredContent?.content
+      if (typeof direct === "string" && direct) return direct
+      const text = data.result?.content?.[0]?.text
+      if (typeof text === "string" && text) {
+        try {
+          const inner = JSON.parse(text)
+          if (typeof inner?.content === "string" && inner.content) return inner.content
+        } catch {
+          return text
+        }
+      }
+    } catch {}
+  }
+  return ""
+}
+
 interface SynapsePluginOptions {
   authorizeUrl?: string
   tokenUrl?: string
@@ -848,7 +870,48 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                     timestamp: Date.now(),
                   }
 
-                  const { toolCalls, cleanText } = extractToolCallsFromModelOutput(parsedContent)
+                  const extracted = extractToolCallsFromModelOutput(parsedContent)
+                  let toolCalls = extracted.toolCalls
+                  let cleanText = extracted.cleanText
+
+                  // Drift repair (#20, plugin-local): the model attempted a text tool
+                  // call that did not parse. Echo it back and re-ask ONCE for a clean
+                  // call; adopt the retry only if it yields real tool calls.
+                  const markupCount0 = (parsedContent.match(new RegExp("<" + "tool_call|<" + "function=", "gi")) || []).length
+                  if (markupCount0 > toolCalls.length && !init?.signal?.aborted && Array.isArray(chatArgs.messages)) {
+                    const repairMessages = [
+                      ...chatArgs.messages,
+                      { role: "assistant", content: parsedContent },
+                      {
+                        role: "user",
+                        content:
+                          "Your previous reply attempted a tool call as text and the payload was malformed. Call the tool again: output ONLY the tool-call block with valid JSON (escape quotes inside strings). No prose.",
+                      },
+                    ]
+                    try {
+                      const retryRes = await callMcp({ ...chatArgs, messages: repairMessages })
+                      if (retryRes.ok) {
+                        const retryContent = extractMcpChatContent(await retryRes.text())
+                        if (retryContent) {
+                          const retryExtracted = extractToolCallsFromModelOutput(retryContent)
+                          if (retryExtracted.toolCalls.length > 0) {
+                            parsedContent = retryContent
+                            toolCalls = retryExtracted.toolCalls
+                            cleanText = retryExtracted.cleanText
+                            sessionObserver.logDiagnostic(
+                              {
+                                timestamp: new Date().toISOString(),
+                                type: "ESCALATION",
+                                details: { kind: "drift-repair", recovered: true, calls: retryExtracted.toolCalls.length },
+                              },
+                              input.directory,
+                            )
+                          }
+                        }
+                      }
+                    } catch {}
+                  }
+
                   const markupCount = (parsedContent.match(new RegExp("<" + "tool_call|<" + "function=", "gi")) || []).length
                   if (parsedContent.trim() && markupCount <= toolCalls.length && (toolCalls.length > 0 || cleanText.trim())) escalations.recordSuccess(sessionKey)
                   else if (!parsedContent.trim()) escalations.recordFailure(sessionKey, "empty-content")
