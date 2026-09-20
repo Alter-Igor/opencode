@@ -405,9 +405,11 @@ export function extractToolCallsFromModelOutput(text: string): {
   }
 
   // 1. XML-style <tool_call> tags
+  const consumed: Array<[number, number]> = []
   const xmlRegex = /<tool_call>([\s\S]*?)<\/tool_call>/gi
   let match: RegExpExecArray | null
   while ((match = xmlRegex.exec(text)) !== null) {
+    consumed.push([match.index, match.index + match[0].length])
     try {
       const parsed = JSON.parse(match[1].trim())
       if (Array.isArray(parsed)) {
@@ -450,12 +452,63 @@ export function extractToolCallsFromModelOutput(text: string): {
     pushCall({ name: fnMatch[1], arguments: params })
   }
 
+  // 4. Tolerant fallback: a tool-call block closed by a MISMATCHED tag
+  // (observed on-prem drift). A string-aware, stack-based JSON scanner keeps
+  // braces inside JSON strings from terminating the payload early, and array
+  // payloads are supported too.
+  const callOpen = "<" + "tool_call" + ">"
+  const findJsonEnd = (src: string, start: number): number => {
+    const QUOTE = String.fromCharCode(34)
+    const stack: string[] = []
+    let inString = false
+    let escaped = false
+    for (let j = start; j < src.length; j++) {
+      const ch = src[j]
+      if (inString) {
+        if (escaped) escaped = false
+        else if (ch === "\\") escaped = true
+        else if (ch === QUOTE) inString = false
+        continue
+      }
+      if (ch === QUOTE) inString = true
+      else if (ch === "{" || ch === "[") stack.push(ch === "{" ? "}" : "]")
+      else if (ch === "}" || ch === "]") {
+        if (stack.pop() !== ch) return -1
+        if (stack.length === 0) return j
+      }
+    }
+    return -1
+  }
+  let cursor = 0
+  while ((cursor = text.toLowerCase().indexOf(callOpen, cursor)) !== -1) {
+    if (consumed.some(([a, b]) => cursor >= a && cursor < b)) {
+      cursor += callOpen.length
+      continue
+    }
+    const after = text.slice(cursor + callOpen.length)
+    const offset = after.search(/[\[{]/)
+    if (offset === -1) break
+    const payloadStart = cursor + callOpen.length + offset
+    const payloadEnd = findJsonEnd(text, payloadStart)
+    if (payloadEnd === -1) {
+      cursor = payloadStart + 1
+      continue
+    }
+    try {
+      const parsed = JSON.parse(text.slice(payloadStart, payloadEnd + 1))
+      if (Array.isArray(parsed)) parsed.forEach(pushCall)
+      else pushCall(parsed)
+    } catch {}
+    cursor = payloadEnd
+  }
+
   if (toolCalls.length > 0) {
     const stripFn = new RegExp(fnOpen + "[^\\s>]+>([\\s\\S]*?)" + fnClose, "gi")
     cleanText = text
       .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, "")
       .replace(/```(?:tool_call|tool|json)?\s*\n?(\[\s*\{[\s\S]*?\}\s*\]|\{\s*"name"[\s\S]*?\})\s*\n?```/gi, "")
       .replace(stripFn, "")
+      .replace(new RegExp(callOpen + "[\\s\\S]*?(?:<\\/?[a-z_]+>[\\s]*)+", "gi"), "")
       .replace(/<\/?tool_call>/gi, "")
       .replace(/<\/?>/g, "")
       .trim()
@@ -784,7 +837,8 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                   }
 
                   const { toolCalls, cleanText } = extractToolCallsFromModelOutput(parsedContent)
-                  if (parsedContent.trim() && (toolCalls.length > 0 || cleanText.trim())) escalations.recordSuccess(sessionKey)
+                  const markupCount = (parsedContent.match(new RegExp("<" + "tool_call|<" + "function=", "gi")) || []).length
+                  if (parsedContent.trim() && markupCount <= toolCalls.length && (toolCalls.length > 0 || cleanText.trim())) escalations.recordSuccess(sessionKey)
                   else if (!parsedContent.trim()) escalations.recordFailure(sessionKey, "empty-content")
                   else escalations.recordFailure(sessionKey, "malformed-output")
 
