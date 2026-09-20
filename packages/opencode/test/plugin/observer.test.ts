@@ -14,17 +14,16 @@ describe("SessionObserverManager.onToolAfter", () => {
     expect(retro.toolsUsed).toEqual(["read"])
   })
 
-  test("identifies error patterns in string output", () => {
+  test("flags MCP tool failures in the retrospective", async () => {
     const sessionId = "obs-err-1"
     const callId = "call-err-1"
-    sessionObserver.onToolBefore(sessionId, callId, "keystone-dynamic_execute-tool", {})
-    sessionObserver.onToolAfter(sessionId, callId, "keystone-dynamic_execute-tool", "Error: Unauthorized")
+    sessionObserver.onToolBefore(sessionId, callId, "mcp__keystone__execute-tool", {})
+    sessionObserver.onToolAfter(sessionId, callId, "mcp__keystone__execute-tool", "Error: Unauthorized")
 
-    const records = sessionObserver.getDiagnosticLogs()
-    const mcpErrors = records.filter((r) => r.details?.type === "MCP_TOOL_FAILURE")
-    // Expect at least one MCP failure detection on finalize
-    const retro = sessionObserver.finalizeSessionRetrospective(sessionId)
-    // Should not throw — the key regression test
+    const retro = await sessionObserver.finalizeSessionRetrospective(sessionId)
+    expect(retro).not.toBeNull()
+    const anomaly = retro!.anomalies.find((a) => a.type === "MCP_TOOL_FAILURE")
+    expect(anomaly?.tool).toBe("mcp__keystone__execute-tool")
   })
 
   test("handles non-string output (CallToolResult from MCP catalog)", async () => {
