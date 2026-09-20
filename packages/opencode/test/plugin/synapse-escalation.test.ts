@@ -142,3 +142,18 @@ describe("bounded storage", () => {
     expect(t.snapshot("evidence").consecutiveFailures).toEqual({ cls: "provider-error", count: 2 })
   })
 })
+
+  test("storage bound holds when every session carries evidence", () => {
+    const t = new EscalationTracker()
+    for (let i = 0; i < 100; i++) {
+      t.recordFailure(`evidence-${i}`, "provider-error")
+      t.recordFailure(`evidence-${i}`, "provider-error")
+    }
+    // Overflow session gets a throwaway state: no budget, no growth.
+    t.recordFailure("overflow", "provider-error")
+    t.recordFailure("overflow", "provider-error")
+    expect(t.resolveTier("overflow", "balanced")).toBe("balanced")
+    expect(t.snapshot("overflow").consecutiveFailures).toBeNull()
+    // Original evidence survives - nothing was silently evicted.
+    expect(t.snapshot("evidence-0").consecutiveFailures).toEqual({ cls: "provider-error", count: 2 })
+  })

@@ -42,18 +42,21 @@ export class EscalationTracker {
   constructor(private maxEscalations = 2) {}
 
   private state(key: string): SessionState {
-    let s = this.sessions.get(key)
-    if (!s) {
-      if (this.sessions.size >= EscalationTracker.MAX_SESSIONS) {
-        // Never evict a session with live evidence or an open human gate;
-        // bounded storage must not silently reset an active escalation budget.
-        const evictable = this.sessions.entries().find(([, v]) => !v.failures && !v.exhausted)
-        if (evictable) this.sessions.delete(evictable[0])
+    const existing = this.sessions.get(key)
+    if (existing) return existing
+    if (this.sessions.size >= EscalationTracker.MAX_SESSIONS) {
+      // Never evict a session with live evidence or an open human gate.
+      const evictable = this.sessions.entries().find(([, v]) => !v.failures && !v.exhausted)
+      if (evictable) this.sessions.delete(evictable[0])
+      else {
+        // Bound preserved with no evictable entry: the overflow session gets a
+        // throwaway state - no escalation budget, no map growth (fail closed).
+        return { failures: null, escalations: 0, exhausted: false }
       }
-      s = { failures: null, escalations: 0, exhausted: false }
-      this.sessions.set(key, s)
     }
-    return s
+    const fresh: SessionState = { failures: null, escalations: 0, exhausted: false }
+    this.sessions.set(key, fresh)
+    return fresh
   }
 
   recordFailure(key: string, cls: FailureClass) {
