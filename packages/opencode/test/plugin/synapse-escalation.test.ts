@@ -4,6 +4,7 @@ import {
   classifyFailure,
   declaredTier,
   EscalationTracker,
+  malformedToolCallFromEvent,
 } from "../../src/plugin/synapse-escalation"
 
 describe("declaredTier", () => {
@@ -157,3 +158,60 @@ describe("bounded storage", () => {
     // Original evidence survives - nothing was silently evicted.
     expect(t.snapshot("evidence-0").consecutiveFailures).toEqual({ cls: "provider-error", count: 2 })
   })
+
+describe("malformedToolCallFromEvent", () => {
+  test("detects the NoSuchToolError tool part and returns the session key", () => {
+    const sessionID = malformedToolCallFromEvent({
+      type: "message.part.updated",
+      properties: {
+        part: {
+          type: "tool",
+          sessionID: "ses_1",
+          state: {
+            status: "error",
+            error: "Model tried to call unavailable tool '[object Object]'. Available tools: read",
+          },
+        },
+      },
+    })
+    expect(sessionID?.sessionID).toBe("ses_1")
+  })
+
+  test("ignores non-tool, non-error, and unrelated-error parts", () => {
+    expect(malformedToolCallFromEvent({ type: "session.idle", properties: {} })).toBeUndefined()
+    expect(
+      malformedToolCallFromEvent({ type: "message.part.updated", properties: { part: { type: "text", text: "x" } } }),
+    ).toBeUndefined()
+    expect(
+      malformedToolCallFromEvent({
+        type: "message.part.updated",
+        properties: { part: { type: "tool", state: { status: "error", error: "User rejected" } } },
+      }),
+    ).toBeUndefined()
+  })
+
+  test("charges the failure to the tracker (2 drifts escalate the session)", () => {
+    const t = new EscalationTracker()
+    for (const _ of [1, 2]) {
+      const key = malformedToolCallFromEvent({
+        type: "message.part.updated",
+        properties: {
+          part: { type: "tool", sessionID: "ses_9", state: { status: "error", error: "no such tool 'x'" } },
+        },
+      })
+      if (key) t.recordFailure(key.sessionID, "malformed-output")
+    }
+    expect(t.resolveTier("ses_9", "balanced")).toBe("premium")
+  })
+})
+
+describe("release", () => {
+  test("session.deleted frees the slot and its evidence", () => {
+    const t = new EscalationTracker()
+    t.recordFailure("s9", "provider-error")
+    t.recordFailure("s9", "provider-error")
+    t.release("s9")
+    expect(t.snapshot("s9").consecutiveFailures).toBeNull()
+    expect(t.snapshot("s9").escalations).toBe(0)
+  })
+})
