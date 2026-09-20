@@ -1,4 +1,4 @@
-﻿import { tool, type Hooks, type PluginInput } from "@opencode-ai/plugin"
+import { tool, type Hooks, type PluginInput } from "@opencode-ai/plugin"
 import { createServer } from "http"
 import * as os from "os"
 import * as path from "path"
@@ -252,7 +252,7 @@ export async function refreshKeystoneToken(
 
 // vLLM-based on-prem backends reject any system message that is not at index 0
 // ("System message must be at the beginning."). opencode emits the provider header
-// and plugin system blocks as separate leading system messages â€” collapse every
+// and plugin system blocks as separate leading system messages — collapse every
 // system/developer message into exactly one message at the front.
 export function normalizeSystemMessages(
   messages: Array<{ role?: unknown; content?: unknown }>,
@@ -453,36 +453,53 @@ export function extractToolCallsFromModelOutput(text: string): {
   }
 
   // 4. Tolerant fallback: a tool-call block closed by a MISMATCHED tag
-  // (observed on-prem drift: wrong closing tags after the JSON). Brace-matches
-  // the JSON payload instead of trusting the closing tag.
+  // (observed on-prem drift). A string-aware, stack-based JSON scanner keeps
+  // braces inside JSON strings from terminating the payload early, and array
+  // payloads are supported too.
   const callOpen = "<" + "tool_call" + ">"
+  const findJsonEnd = (src: string, start: number): number => {
+    const QUOTE = String.fromCharCode(34)
+    const stack: string[] = []
+    let inString = false
+    let escaped = false
+    for (let j = start; j < src.length; j++) {
+      const ch = src[j]
+      if (inString) {
+        if (escaped) escaped = false
+        else if (ch === "\\") escaped = true
+        else if (ch === QUOTE) inString = false
+        continue
+      }
+      if (ch === QUOTE) inString = true
+      else if (ch === "{" || ch === "[") stack.push(ch === "{" ? "}" : "]")
+      else if (ch === "}" || ch === "]") {
+        if (stack.pop() !== ch) return -1
+        if (stack.length === 0) return j
+      }
+    }
+    return -1
+  }
   let cursor = 0
   while ((cursor = text.toLowerCase().indexOf(callOpen, cursor)) !== -1) {
     if (consumed.some(([a, b]) => cursor >= a && cursor < b)) {
       cursor += callOpen.length
       continue
     }
-    const braceStart = text.indexOf("{", cursor)
-    if (braceStart === -1) break
-    let depth = 0
-    let braceEnd = -1
-    for (let j = braceStart; j < text.length; j++) {
-      if (text[j] === "{") depth++
-      else if (text[j] === "}") {
-        depth--
-        if (depth === 0) {
-          braceEnd = j
-          break
-        }
-      }
+    const after = text.slice(cursor + callOpen.length)
+    const offset = after.search(/[\[{]/)
+    if (offset === -1) break
+    const payloadStart = cursor + callOpen.length + offset
+    const payloadEnd = findJsonEnd(text, payloadStart)
+    if (payloadEnd === -1) {
+      cursor = payloadStart + 1
+      continue
     }
-    if (braceEnd === -1) break
     try {
-      const parsed = JSON.parse(text.slice(braceStart, braceEnd + 1))
+      const parsed = JSON.parse(text.slice(payloadStart, payloadEnd + 1))
       if (Array.isArray(parsed)) parsed.forEach(pushCall)
       else pushCall(parsed)
     } catch {}
-    cursor = braceEnd
+    cursor = payloadEnd
   }
 
   if (toolCalls.length > 0) {
@@ -683,7 +700,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                       timestamp: new Date().toISOString(),
                       type: "FALLBACK_TRIGGERED",
                       details: {
-                        reason: "Cloud provider credit/rate limit detected â€” switching to Synapse On-Premises",
+                        reason: "Cloud provider credit/rate limit detected — switching to Synapse On-Premises",
                         initialModel: requestBodyJson?.model,
                       },
                     },
@@ -820,8 +837,8 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                   }
 
                   const { toolCalls, cleanText } = extractToolCallsFromModelOutput(parsedContent)
-                  const driftMarkup = new RegExp("<" + "tool_call|<" + "function=", "i").test(parsedContent)
-                  if (parsedContent.trim() && (toolCalls.length > 0 || (cleanText.trim() && !driftMarkup))) escalations.recordSuccess(sessionKey)
+                  const markupCount = (parsedContent.match(new RegExp("<" + "tool_call|<" + "function=", "gi")) || []).length
+                  if (parsedContent.trim() && markupCount <= toolCalls.length && (toolCalls.length > 0 || cleanText.trim())) escalations.recordSuccess(sessionKey)
                   else if (!parsedContent.trim()) escalations.recordFailure(sessionKey, "empty-content")
                   else escalations.recordFailure(sessionKey, "malformed-output")
 
@@ -1329,7 +1346,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
             },
             input.directory,
           )
-          return `âœ… Successfully recorded rule: "${args.lesson}". This knowledge is stored and will automatically guide future sessions.`
+          return `✅ Successfully recorded rule: "${args.lesson}". This knowledge is stored and will automatically guide future sessions.`
         },
       }),
       synapse_buddy_review: tool({
