@@ -36,4 +36,21 @@ describe("extractToolCallsFromModelOutput tolerant close", () => {
     expect(out.toolCalls[0].function.name).toBe("bash")
     expect(JSON.parse(out.toolCalls[0].function.arguments)).toEqual({ command: 'echo "a}b{"' })
   })
+
+  test("recovers the exact live-drift shape: open tag missing its '>' and a stray '<' before the payload", () => {
+    const NO_GT = "<" + "tool_call"
+    const out = extractToolCallsFromModelOutput(
+      `Bonjour.\n${NO_GT}\n<{"name": "keystone-dynamic", "arguments": {"action": "search-tools", "query": "list-orgs"}}\n${CLOSE}`,
+    )
+    expect(out.toolCalls.length).toBe(1)
+    expect(out.toolCalls[0].function.name).toBe("keystone-dynamic")
+    expect(JSON.parse(out.toolCalls[0].function.arguments)).toEqual({ action: "search-tools", query: "list-orgs" })
+    expect(out.cleanText).toBe("Bonjour.")
+  })
+
+  test("does not false-match longer tag names like tool_calls or tool_calling", () => {
+    const prose = "<" + "tool_calls" + ">{\"name\": \"read\"}</" + "tool_calls" + "> and <" + "tool_calling" + ">"
+    const out = extractToolCallsFromModelOutput(prose)
+    expect(out.toolCalls.length).toBe(0)
+  })
 })
