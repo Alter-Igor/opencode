@@ -7,7 +7,7 @@ import open from "open"
 import { OauthCallbackPage } from "@opencode-ai/core/oauth/page"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { sessionObserver, sanitizeJsonSchemaForOpenAI } from "./observer"
-import { EscalationTracker, declaredTier, classifyFailure } from "./synapse-escalation"
+import { EscalationTracker, declaredTier, classifyFailure, malformedToolCallFromEvent } from "./synapse-escalation"
 
 export const KEYSTONE_ISSUER = "https://identity.alterspective.com.au"
 export const KEYSTONE_REGISTER = `${KEYSTONE_ISSUER}/api/oauth/register`
@@ -33,6 +33,7 @@ let latestSynapseServing: SynapseServingTelemetry | undefined
 
 // AIESC-001: observer-owned escalation state (session-keyed; directory fallback).
 const escalations = new EscalationTracker()
+const countedMalformedParts = new Set<string>()
 
 export function getLatestSynapseServing(): SynapseServingTelemetry | undefined {
   return latestSynapseServing
@@ -1140,11 +1141,25 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
       ],
     },
     event: async ({ event }) => {
-      if (event.type === "session.idle" || event.type === "session.deleted") {
-        const sessionID = (event.properties as any)?.sessionID || (event.properties as any)?.id
-        if (sessionID) {
-          await sessionObserver.finalizeSessionRetrospective(sessionID, input.directory)
+      const sessionID =
+        event.type === "session.idle" || event.type === "session.deleted"
+          ? ((event.properties as any)?.sessionID || (event.properties as any)?.id)
+          : undefined
+      if (sessionID && (event.type === "session.idle" || event.type === "session.deleted")) {
+        await sessionObserver.finalizeSessionRetrospective(sessionID, input.directory)
+      }
+      // AIESC follow-up (#15): completed sessions free their tracker slot.
+      if (sessionID && event.type === "session.deleted") escalations.release(sessionID)
+      // AIESC-02: a malformed native tool call (200 response, garbage tool name) is
+      // invisible to the HTTP hooks; charge it here, deduped per part id.
+      const hit = malformedToolCallFromEvent(event as { type: string; properties?: any })
+      if (hit) {
+        if (hit.partID) {
+          if (countedMalformedParts.has(hit.partID)) return
+          countedMalformedParts.add(hit.partID)
+          if (countedMalformedParts.size > 500) countedMalformedParts.clear()
         }
+        escalations.recordFailure(hit.sessionID, "malformed-output")
       }
     },
     "tool.execute.before": async (toolInput, output) => {
@@ -1188,6 +1203,8 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
 
       sessionObserver.onToolBefore(toolInput.sessionID, toolInput.callID, toolInput.tool, output.args)
     },
+    // AIESC-02: a malformed native tool call (200 response, garbage tool name)
+    // is a quality failure the HTTP-level hooks cannot see. Charge it here.
     "chat.headers": async (headerInput, headerOutput) => {
       headerOutput.headers["x-opencode-session"] = headerInput.sessionID
     },
@@ -1440,4 +1457,5 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
     },
   }
 }
+
 

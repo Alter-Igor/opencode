@@ -95,6 +95,12 @@ export class EscalationTracker {
     return target
   }
 
+  // Release a completed session slot (session.deleted) so the bound holds without
+  // evicting live evidence.
+  release(key: string) {
+    this.sessions.delete(key)
+  }
+
   // AIESC-03 human gate: failures persist while escalation is impossible.
   atCap(key: string): boolean {
     return this.state(key).exhausted
@@ -120,4 +126,24 @@ export function classifyFailure(status: number, message?: string): FailureClass 
   if (/provider|upstream|overload|bad gateway|service unavailable/i.test(text)) return "provider-error"
   return "other"
 }
+
+
+// Detect the AI-SDK NoSuchToolError surface: a native tool call whose name
+// arrived malformed (observed when an on-prem server converts the model's
+// XML-style drift into a tool_call delta with a garbage name). Returns the
+// session key to charge the failure to, or undefined for any other event.
+export function malformedToolCallFromEvent(event: {
+  type: string
+  properties?: any
+}): { sessionID: string; partID?: string } | undefined {
+  if (event.type !== "message.part.updated") return undefined
+  const part = event.properties?.part
+  if (!part || part.type !== "tool" || part.state?.status !== "error") return undefined
+  const error = typeof part.state.error === "string" ? part.state.error : ""
+  if (!/tried to call unavailable tool|no such tool/i.test(error)) return undefined
+  const sessionID = part.sessionID ?? event.properties?.sessionID
+  if (!sessionID) return undefined
+  return { sessionID, partID: typeof part.id === "string" ? part.id : undefined }
+}
+
 
