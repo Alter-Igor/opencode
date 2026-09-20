@@ -47,4 +47,10 @@ describe("extractToolCallsFromModelOutput tolerant close", () => {
     expect(JSON.parse(out.toolCalls[0].function.arguments)).toEqual({ action: "search-tools", query: "list-orgs" })
     expect(out.cleanText).toBe("Bonjour.")
   })
+
+  test("does not false-match longer tag names like tool_calls or tool_calling", () => {
+    const prose = "<" + "tool_calls" + ">{\"name\": \"read\"}</" + "tool_calls" + "> and <" + "tool_calling" + ">"
+    const out = extractToolCallsFromModelOutput(prose)
+    expect(out.toolCalls.length).toBe(0)
+  })
 })

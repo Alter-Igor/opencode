@@ -481,6 +481,13 @@ export function extractToolCallsFromModelOutput(text: string): {
   }
   let cursor = 0
   while ((cursor = text.toLowerCase().indexOf(callOpen, cursor)) !== -1) {
+    // Require a delimiter after the tag name so <tool_calls / <tool_calling
+    // prose does not false-match the relaxed open tag.
+    const next = text[cursor + callOpen.length]
+    if (next !== undefined && /[a-z0-9_]/i.test(next)) {
+      cursor += callOpen.length
+      continue
+    }
     if (consumed.some(([a, b]) => cursor >= a && cursor < b)) {
       cursor += callOpen.length
       continue
