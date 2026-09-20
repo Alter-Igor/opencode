@@ -1157,7 +1157,10 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
         if (hit.partID) {
           if (countedMalformedParts.has(hit.partID)) return
           countedMalformedParts.add(hit.partID)
-          if (countedMalformedParts.size > 500) countedMalformedParts.clear()
+          if (countedMalformedParts.size > 500) {
+          const oldestCounted = countedMalformedParts.values().next().value
+          if (oldestCounted !== undefined) countedMalformedParts.delete(oldestCounted)
+        }
         }
         escalations.recordFailure(hit.sessionID, "malformed-output")
       }
@@ -1457,5 +1460,6 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
     },
   }
 }
+
 
 
