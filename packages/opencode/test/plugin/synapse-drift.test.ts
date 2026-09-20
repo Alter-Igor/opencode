@@ -5,6 +5,8 @@ const OPEN = "<" + "tool_call" + ">"
 const CLOSE = "<" + "/tool_call" + ">"
 const WRONG = "<" + "/result" + ">"
 const WRONG2 = "<" + "/function_calls" + ">"
+const PARAM_CLOSE = "<" + "/parameter" + ">"
+const FN_CLOSE = "<" + "/function" + ">"
 const BS = String.fromCharCode(92)
 
 describe("extractToolCallsFromModelOutput tolerant close", () => {
@@ -49,8 +51,21 @@ describe("extractToolCallsFromModelOutput tolerant close", () => {
   })
 
   test("does not false-match longer tag names like tool_calls or tool_calling", () => {
-    const prose = "<" + "tool_calls" + ">{\"name\": \"read\"}</" + "tool_calls" + "> and <" + "tool_calling" + ">"
+    const prose = "<" + "tool_calls" + '>{""name"": ""read""}</' + "tool_calls" + "> and <" + "tool_calling" + ">"
     const out = extractToolCallsFromModelOutput(prose)
     expect(out.toolCalls.length).toBe(0)
+  })
+
+  test("recovers a well-formed block whose interior has junk before the close (live payload)", () => {
+    const junk = PARAM_CLOSE + " " + FN_CLOSE
+    const out = extractToolCallsFromModelOutput(
+      `${OPEN} {"name": "keystone-dynamic_execute-tool", "arguments": {"toolName": "keystone_admin_d0d11f__list-orgs", "arguments": {}}} ${junk} ${CLOSE}`,
+    )
+    expect(out.toolCalls.length).toBe(1)
+    expect(out.toolCalls[0].function.name).toBe("keystone-dynamic_execute-tool")
+    expect(JSON.parse(out.toolCalls[0].function.arguments)).toEqual({
+      toolName: "keystone_admin_d0d11f__list-orgs",
+      arguments: {},
+    })
   })
 })
