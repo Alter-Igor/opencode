@@ -45,8 +45,10 @@ export class EscalationTracker {
     let s = this.sessions.get(key)
     if (!s) {
       if (this.sessions.size >= EscalationTracker.MAX_SESSIONS) {
-        const oldest = this.sessions.keys().next().value
-        if (oldest !== undefined) this.sessions.delete(oldest)
+        // Never evict a session with live evidence or an open human gate;
+        // bounded storage must not silently reset an active escalation budget.
+        const evictable = this.sessions.entries().find(([, v]) => !v.failures && !v.exhausted)
+        if (evictable) this.sessions.delete(evictable[0])
       }
       s = { failures: null, escalations: 0, exhausted: false }
       this.sessions.set(key, s)
@@ -115,3 +117,4 @@ export function classifyFailure(status: number, message?: string): FailureClass 
   if (/provider|upstream|overload|bad gateway|service unavailable/i.test(text)) return "provider-error"
   return "other"
 }
+

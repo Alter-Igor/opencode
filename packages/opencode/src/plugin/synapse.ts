@@ -593,6 +593,9 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
             // If authenticating via Keystone JWT token, execute through Synapse MCP bridge
             const rawMessages = requestBodyJson?.messages || (requestBodyJson?.prompt ? [{ role: "user", content: requestBodyJson.prompt }] : [])
             if (activeToken.startsWith("eyJ") && rawMessages.length > 0) {
+                // The bridge chat tool has no tier knob; evaluate the tracker so a
+                // persistently failing bridge session still reaches the human gate (AIESC-03).
+                escalations.resolveTier(sessionKey, "premium")
               try {
                 const normalizedMessages = sanitizeMessagesForSynapse(rawMessages)
 
@@ -755,8 +758,6 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                   // Strip leading newline artifacts if model responded with \n\n
                   parsedContent = parsedContent.replace(/^\n+/, "")
 
-                  if (parsedContent) escalations.recordSuccess(sessionKey)
-                  else escalations.recordFailure(sessionKey, "empty-content")
 
                   if (fallbackApplied) {
                     parsedContent = `[Notice: Cloud provider limit reached. Seamlessly switched to Synapse On-Premises ($0 cost).]\n\n${parsedContent}`
@@ -782,6 +783,9 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                   }
 
                   const { toolCalls, cleanText } = extractToolCallsFromModelOutput(parsedContent)
+                  if (parsedContent.trim() && (toolCalls.length > 0 || cleanText.trim())) escalations.recordSuccess(sessionKey)
+                  else if (!parsedContent.trim()) escalations.recordFailure(sessionKey, "empty-content")
+                  else escalations.recordFailure(sessionKey, "malformed-output")
 
                   if (requestBodyJson.stream) {
                     const encoder = new TextEncoder()
@@ -950,7 +954,22 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
               escalations.recordFailure(sessionKey, "provider-error")
               throw err
             })
-            if (response.ok) escalations.recordSuccess(sessionKey)
+            if (response.ok) {
+              // A 200 with empty content must not clear the failure streak (AIESC-02).
+              // SSE streams are consumed downstream by the SDK; only buffered JSON bodies are checked here.
+              const contentType = response.headers.get("content-type") || ""
+              if (contentType.includes("application/json")) {
+                const wire = await response.clone().json().catch(() => undefined)
+                const message = wire?.choices?.[0]?.message
+                const meaningful =
+                  (message?.tool_calls?.length ?? 0) > 0 ||
+                  (typeof message?.content === "string" && message.content.trim().length > 0)
+                if (meaningful) escalations.recordSuccess(sessionKey)
+                else escalations.recordFailure(sessionKey, "empty-content")
+              } else {
+                escalations.recordSuccess(sessionKey)
+              }
+            }
 
             if (!response.ok) {
               let errorBody = ""

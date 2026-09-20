@@ -131,3 +131,14 @@ describe("classifyFailure", () => {
     expect(classifyFailure(401, "no creds")).toBe("other")
   })
 })
+
+describe("bounded storage", () => {
+  test("never evicts a session carrying failure evidence", () => {
+    const t = new EscalationTracker()
+    t.recordFailure("evidence", "provider-error")
+    t.recordFailure("evidence", "provider-error")
+    for (let i = 0; i < 150; i++) t.recordFailure(`filler-${i}`, "other")
+    // The evidence session must survive; fillers are evicted instead.
+    expect(t.snapshot("evidence").consecutiveFailures).toEqual({ cls: "provider-error", count: 2 })
+  })
+})
