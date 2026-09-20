@@ -532,9 +532,14 @@ export function extractToolCallsFromModelOutput(text: string): {
 // Pull the assistant content out of an MCP tools/call SSE payload (same shape
 // the main bridge parse loop reads). Returns "" when there is no usable content.
 export function extractMcpChatContent(rawText: string): string {
-  for (const chunk of rawText.split(/(?:^|\n)data:\s*/g).filter(Boolean)) {
+  for (const event of rawText.split(/\r?\n\r?\n/)) {
+    const dataLines = event
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).replace(/^ /, ""))
+    if (dataLines.length === 0) continue
     try {
-      const data = JSON.parse(chunk.trim())
+      const data = JSON.parse(dataLines.join("\n"))
       const direct = data.result?.structuredContent?.content
       if (typeof direct === "string" && direct) return direct
       const text = data.result?.content?.[0]?.text
@@ -878,7 +883,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                   // call that did not parse. Echo it back and re-ask ONCE for a clean
                   // call; adopt the retry only if it yields real tool calls.
                   const markupCount0 = (parsedContent.match(new RegExp("<" + "tool_call|<" + "function=", "gi")) || []).length
-                  if (markupCount0 > toolCalls.length && !init?.signal?.aborted && Array.isArray(chatArgs.messages)) {
+                  if (markupCount0 > 0 && toolCalls.length === 0 && !init?.signal?.aborted && Array.isArray(chatArgs.messages)) {
                     const repairMessages = [
                       ...chatArgs.messages,
                       { role: "assistant", content: parsedContent },
