@@ -409,7 +409,7 @@ export function extractToolCallsFromModelOutput(text: string): {
   const xmlRegex = /<tool_call>([\s\S]*?)<\/tool_call>/gi
   let match: RegExpExecArray | null
   while ((match = xmlRegex.exec(text)) !== null) {
-    consumed.push([match.index, match.index + match[0].length])
+    const before = toolCalls.length
     try {
       const parsed = JSON.parse(match[1].trim())
       if (Array.isArray(parsed)) {
@@ -418,6 +418,11 @@ export function extractToolCallsFromModelOutput(text: string): {
         pushCall(parsed)
       }
     } catch {}
+    // Only claim the range when it actually parsed. A block with junk inside
+    // the tags (e.g. stray closing tags before the real close) must stay
+    // unconsumed so the tolerant brace-matching scanner (pattern 4) can
+    // recover the embedded JSON payload.
+    if (toolCalls.length > before) consumed.push([match.index, match.index + match[0].length])
   }
 
   // 2. Markdown fenced code blocks: ```tool_call or ```json with {"name": ...}
