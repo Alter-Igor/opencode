@@ -171,4 +171,23 @@ describe("vision proxy", () => {
     expect(calls[0].body.messages[0].content[1].image_url.url).toBe("data:image/jpeg;base64,AQID")
     expect(calls[1].body.messages[0].content[1].image_url.url).toBe("https://example.com/a.png")
   })
+
+  test("normalises any ArrayBuffer view (DataView), not just Uint8Array", async () => {
+    stubFetch({
+      ok: true,
+      json: async () => ({ choices: [{ message: { content: "ok" } }] }),
+    } as Partial<Response>)
+
+    const bytes = new Uint8Array([1, 2, 3])
+    const view = new DataView(bytes.buffer, 0, 3)
+    const message = {
+      role: "user",
+      content: [{ type: "file", mediaType: "image/png", data: view }],
+    } as unknown as ModelMessage
+
+    await proxyUnsupportedImages([message], textOnlyModel, proxyConfig, undefined, undefined)
+
+    expect(calls.length).toBe(1)
+    expect(calls[0].body.messages[0].content[1].image_url.url).toBe("data:image/png;base64,AQID")
+  })
 })

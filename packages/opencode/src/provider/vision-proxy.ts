@@ -1,4 +1,4 @@
-import type { ModelMessage } from "ai"
+﻿import type { ModelMessage } from "ai"
 import type * as Provider from "./provider"
 
 export interface VisionProxyConfig {
@@ -58,8 +58,10 @@ function toDataUrl(value: unknown, mediaType = "image/png"): string | null {
   if (typeof Buffer !== "undefined" && Buffer.isBuffer(value)) {
     return toBase64DataUrl(value, mediaType)
   }
-  if (value && typeof value === "object" && "byteLength" in value) {
-    return toBase64DataUrl(value as Uint8Array, mediaType)
+  if (ArrayBuffer.isView(value)) {
+    // Any view (Uint8Array, Buffer, DataView, ...) - normalise to a byte range
+    // over its own buffer rather than casting the view itself.
+    return toBase64DataUrl(new Uint8Array(value.buffer, value.byteOffset, value.byteLength), mediaType)
   }
   return null
 }
