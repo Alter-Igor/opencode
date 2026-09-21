@@ -10,6 +10,7 @@ import {
   registerKeystoneClient,
   SynapseAuthPlugin,
   SYNAPSE_AUDIENCE,
+  audienceIsSynapse,
   SYNAPSE_RESOURCE,
 } from "../../src/plugin/synapse"
 
@@ -48,7 +49,7 @@ describe("SynapseAuthPlugin", () => {
     expect(accessTokenIsExpiring(undefined, 0)).toBe(false)
   })
 
-  test("builds valid Keystone OAuth URL with resource=SYNAPSE_RESOURCE", () => {
+  test("builds valid Keystone OAuth URL with audience=synapse", () => {
     const pkce = { verifier: "ver-123", challenge: "chal-456" }
     const urlString = buildAuthorizeUrl({
       clientId: "client-abc",
@@ -62,7 +63,7 @@ describe("SynapseAuthPlugin", () => {
     expect(url.searchParams.get("response_type")).toBe("code")
     expect(url.searchParams.get("client_id")).toBe("client-abc")
     expect(url.searchParams.get("redirect_uri")).toBe("http://127.0.0.1:1459/auth/callback")
-    expect(url.searchParams.get("resource")).toBe(SYNAPSE_RESOURCE)
+    expect(url.searchParams.get("audience")).toBe("synapse")
     expect(url.searchParams.get("scope")).toContain("mcp:gpaas")
     expect(url.searchParams.get("code_challenge")).toBe("chal-456")
     expect(url.searchParams.get("code_challenge_method")).toBe("S256")
@@ -70,7 +71,7 @@ describe("SynapseAuthPlugin", () => {
   })
 
   test("registers client and exchanges token successfully with mock fetcher", async () => {
-    let requestedResource = ""
+    let requestedAudience = ""
     const mockFetch: any = async (input: any, init: any) => {
       const url = String(input)
       if (url.includes("/register")) {
@@ -79,7 +80,7 @@ describe("SynapseAuthPlugin", () => {
       if (url.includes("/token")) {
         const body = typeof init?.body === "string" ? init.body : (init?.body as any)?.toString()
         const searchParams = new URLSearchParams(body)
-        requestedResource = searchParams.get("resource") || ""
+        requestedAudience = searchParams.get("audience") || ""
 
         return new Response(
           JSON.stringify({
@@ -107,7 +108,7 @@ describe("SynapseAuthPlugin", () => {
     )
     expect(tokens.access_token).toBe("test-access-token")
     expect(tokens.refresh_token).toBe("test-refresh-token")
-    expect(requestedResource).toBe(SYNAPSE_RESOURCE)
+    expect(requestedAudience).toBe("synapse")
 
     const refreshed = await refreshKeystoneToken(
       {
@@ -208,5 +209,24 @@ describe("extractToolCallsFromModelOutput", () => {
   test("normalizes rag tool aliases inside text calls", () => {
     const out = extractToolCallsFromModelOutput(`${TC}{"name": "rag_ask", "arguments": {"question": "q"}}${TCE}`)
     expect(out.toolCalls[0].function.name).toBe("alterspective-rag_rag_ask")
+  })
+})
+
+describe("audienceIsSynapse", () => {
+  test("true for a synapse-audience Keystone JWT", () => {
+    expect(audienceIsSynapse(makeJwt({ aud: "synapse", sub: "keystone:entra:abc" }))).toBe(true)
+  })
+
+  test("true when aud is an array containing synapse", () => {
+    expect(audienceIsSynapse(makeJwt({ aud: ["synapse", "other"] }))).toBe(true)
+  })
+
+  test("false for an MCP-resource audience token (must use the bridge)", () => {
+    expect(audienceIsSynapse(makeJwt({ aud: "https://synapse-mcp.alterspective.com.au/mcp" }))).toBe(false)
+  })
+
+  test("false for non-JWT tokens", () => {
+    expect(audienceIsSynapse("sk-static-key")).toBe(false)
+    expect(audienceIsSynapse(undefined)).toBe(false)
   })
 })
