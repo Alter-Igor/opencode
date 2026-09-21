@@ -15,7 +15,10 @@ export const KEYSTONE_AUTHORIZE = `${KEYSTONE_ISSUER}/api/oauth/authorize`
 export const KEYSTONE_TOKEN = `${KEYSTONE_ISSUER}/api/oidc/token`
 export const SYNAPSE_DEFAULT_INFERENCE_URL = "https://synapse2-api.alterspective.com.au/v1"
 export const SYNAPSE_RESOURCE = "https://synapse-mcp.alterspective.com.au/mcp"
-export const SYNAPSE_AUDIENCE = SYNAPSE_RESOURCE
+// /v1 inference and /mcp both admit a token minted for the `synapse` app audience
+// (ADR-0076 pass-through). A resource-URI audience is rejected by /v1, which is why
+// the fork previously fell back to the MCP bridge (which cannot carry tool schemas).
+export const SYNAPSE_AUDIENCE = "synapse"
 export const OAUTH_SCOPES = "mcp:gpaas"
 export const OAUTH_PORT = 1459
 export const OAUTH_REDIRECT_PATH = "/auth/callback"
@@ -83,6 +86,18 @@ export function parseJwtPayload(token: string): Record<string, unknown> | null {
   }
 }
 
+/**
+ * True when a Keystone JWT was minted for the `synapse` app audience, which the
+ * REST inference plane admits (ADR-0076 pass-through). A token minted for the MCP
+ * resource URI is only good for the MCP facade, so it must take the bridge path -
+ * where no tool schemas exist and models can only guess text tool calls.
+ */
+export function audienceIsSynapse(token: string | undefined): boolean {
+  if (!token || !token.startsWith("eyJ")) return false
+  const aud = parseJwtPayload(token)?.aud
+  return aud === "synapse" || (Array.isArray(aud) && aud.includes("synapse"))
+}
+
 export function accessTokenIsExpiring(token: string | undefined, skewMs = ACCESS_TOKEN_REFRESH_SKEW_MS): boolean {
   if (!token) return false
   const payload = parseJwtPayload(token)
@@ -137,13 +152,13 @@ export function buildAuthorizeUrl(
   },
 ): string {
   const endpoint = input.authorizeUrl || KEYSTONE_AUTHORIZE
-  const targetResource = input.resource || SYNAPSE_RESOURCE
+  const targetAudience = input.audience || SYNAPSE_AUDIENCE
   const targetScope = input.scope || OAUTH_SCOPES
   const params = new URLSearchParams({
     response_type: "code",
     client_id: input.clientId,
     redirect_uri: input.redirectUri,
-    resource: targetResource,
+    audience: targetAudience,
     scope: targetScope,
     code_challenge: input.pkce.challenge,
     code_challenge_method: "S256",
@@ -170,7 +185,7 @@ export async function exchangeCodeForTokens(
   scope?: string
 }> {
   const endpoint = input.tokenUrl || KEYSTONE_TOKEN
-  const targetResource = input.resource || SYNAPSE_RESOURCE
+  const targetAudience = input.audience || SYNAPSE_AUDIENCE
   const response = await fetcher(endpoint, {
     method: "POST",
     headers: {
@@ -184,7 +199,7 @@ export async function exchangeCodeForTokens(
       code: input.code,
       redirect_uri: input.redirectUri,
       code_verifier: input.verifier,
-      resource: targetResource,
+      audience: targetAudience,
     }),
   })
   const body = (await response.json().catch(() => ({}))) as {
@@ -220,7 +235,7 @@ export async function refreshKeystoneToken(
   expires_in?: number
 }> {
   const endpoint = input.tokenUrl || KEYSTONE_TOKEN
-  const targetResource = input.resource || SYNAPSE_RESOURCE
+  const targetAudience = input.audience || SYNAPSE_AUDIENCE
   const response = await fetcher(endpoint, {
     method: "POST",
     headers: {
@@ -232,7 +247,7 @@ export async function refreshKeystoneToken(
       grant_type: "refresh_token",
       client_id: input.clientId,
       refresh_token: input.refreshToken,
-      resource: targetResource,
+      audience: targetAudience,
     }),
   })
   const body = (await response.json().catch(() => ({}))) as {
@@ -685,7 +700,12 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
 
             // If authenticating via Keystone JWT token, execute through Synapse MCP bridge
             const rawMessages = requestBodyJson?.messages || (requestBodyJson?.prompt ? [{ role: "user", content: requestBodyJson.prompt }] : [])
-            if (activeToken.startsWith("eyJ") && rawMessages.length > 0) {
+            // Route by audience. A token minted for the `synapse` app audience is
+            // admitted by the REST plane, which carries native tool schemas. Only a
+            // token minted for the MCP resource URI (older logins) falls back to the
+            // MCP bridge - which cannot carry tool schemas, so models there can only
+            // guess text tool calls.
+            if (activeToken.startsWith("eyJ") && !audienceIsSynapse(activeToken) && rawMessages.length > 0) {
                 // The bridge chat tool has no tier knob; evaluate the tracker so a
                 // persistently failing bridge session still reaches the human gate (AIESC-03).
                 escalations.resolveTier(sessionKey, "premium")
