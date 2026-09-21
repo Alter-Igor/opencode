@@ -1,4 +1,4 @@
-import type { ModelMessage } from "ai"
+﻿import type { ModelMessage } from "ai"
 import type * as Provider from "./provider"
 
 export interface VisionProxyConfig {
@@ -16,6 +16,12 @@ const DEFAULT_VISION_BASE_URL = "https://openrouter.ai/api"
 interface ImageLike {
   type: string
   image?: unknown
+  /**
+   * AI SDK `LanguageModelV3FilePart` carries its payload on `data`. The
+   * middleware that calls us runs after `convertToLanguageModelPrompt`, so
+   * this — not `image`/`url` — is the shape we actually see at runtime.
+   */
+  data?: unknown
   url?: unknown
   mediaType?: string
   filename?: string
@@ -36,41 +42,39 @@ function toBase64DataUrl(data: Uint8Array | ArrayBuffer | Buffer, mimeType = "im
   return `data:${mimeType};base64,${base64}`
 }
 
+function toDataUrl(value: unknown, mediaType = "image/png"): string | null {
+  if (typeof value === "string") {
+    if (value.startsWith("data:")) return value
+    if (value.startsWith("http://") || value.startsWith("https://")) return value
+    return `data:${mediaType};base64,${value}`
+  }
+  if (value instanceof URL) {
+    const urlStr = value.toString()
+    return urlStr
+  }
+  if (value instanceof Uint8Array || value instanceof ArrayBuffer) {
+    return toBase64DataUrl(value, mediaType)
+  }
+  if (typeof Buffer !== "undefined" && Buffer.isBuffer(value)) {
+    return toBase64DataUrl(value, mediaType)
+  }
+  if (ArrayBuffer.isView(value)) {
+    // Any view (Uint8Array, Buffer, DataView, ...) - normalise to a byte range
+    // over its own buffer rather than casting the view itself.
+    return toBase64DataUrl(new Uint8Array(value.buffer, value.byteOffset, value.byteLength), mediaType)
+  }
+  return null
+}
+
 function extractImageData(part: ImageLike): string | null {
   if (part.type === "image") {
-    const img = part.image
-    if (typeof img === "string") {
-      if (img.startsWith("data:")) return img
-      return `data:image/png;base64,${img}`
-    }
-    if (img instanceof Uint8Array || img instanceof ArrayBuffer) {
-      return toBase64DataUrl(img)
-    }
-    if (typeof Buffer !== "undefined" && Buffer.isBuffer(img)) {
-      return toBase64DataUrl(img)
-    }
-    if (img && typeof img === "object" && "byteLength" in img) {
-      return toBase64DataUrl(img as Uint8Array)
-    }
+    return toDataUrl(part.image, part.mediaType ?? "image/png")
   }
 
   if (part.type === "file" && part.mediaType?.startsWith("image/")) {
-    const url = part.url
-    if (typeof url === "string") {
-      if (url.startsWith("data:")) return url
-      return url
-    }
-    if (url instanceof URL) {
-      const urlStr = url.toString()
-      if (urlStr.startsWith("data:")) return urlStr
-      return urlStr
-    }
-    if (url instanceof Uint8Array || url instanceof ArrayBuffer) {
-      return toBase64DataUrl(url, part.mediaType)
-    }
-    if (typeof Buffer !== "undefined" && Buffer.isBuffer(url)) {
-      return toBase64DataUrl(url, part.mediaType)
-    }
+    // `data` is the AI SDK v5 field; `url` is kept for callers that hand us
+    // already-normalised parts (and for our own older tests).
+    return toDataUrl(part.data ?? part.url, part.mediaType)
   }
 
   return null
