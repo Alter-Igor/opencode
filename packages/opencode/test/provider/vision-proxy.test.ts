@@ -124,4 +124,51 @@ describe("vision proxy", () => {
     expect(calls.length).toBe(0)
     expect(((result[0] as any).content[1] as any).text).toBe("[Image was provided but vision proxy could not describe it.]")
   })
+
+  // Regression: the middleware in session/llm.ts runs AFTER the AI SDK has
+  // converted messages into a LanguageModelV3Prompt, where an attached image
+  // is `{ type: "file", mediaType, data }` — not `{ type: "image", image }`.
+  // The proxy used to read `url`, so pasted images were never described and
+  // the transform replaced them with "this model does not support image input".
+  test("describes AI SDK file parts that carry the image on `data`", async () => {
+    stubFetch({
+      ok: true,
+      json: async () => ({ choices: [{ message: { content: "a login screen" } }] }),
+    } as Partial<Response>)
+
+    const filePartMessage = {
+      role: "user",
+      content: [
+        { type: "text", text: "what is in this image?" },
+        { type: "file", mediaType: "image/png", data: new Uint8Array([1, 2, 3]) },
+      ],
+    } as unknown as ModelMessage
+
+    const result = await proxyUnsupportedImages([filePartMessage], textOnlyModel, proxyConfig, undefined, undefined)
+
+    expect(calls.length).toBe(1)
+    expect(calls[0].body.messages[0].content[1].image_url.url).toStartWith("data:image/png;base64,")
+    expect(((result[0] as any).content[1] as any).text).toContain("a login screen")
+  })
+
+  test("describes file parts whose data is a base64 string or a URL", async () => {
+    stubFetch({
+      ok: true,
+      json: async () => ({ choices: [{ message: { content: "ok" } }] }),
+    } as Partial<Response>)
+
+    const message = {
+      role: "user",
+      content: [
+        { type: "file", mediaType: "image/jpeg", data: "AQID" },
+        { type: "file", mediaType: "image/png", data: new URL("https://example.com/a.png") },
+      ],
+    } as unknown as ModelMessage
+
+    await proxyUnsupportedImages([message], textOnlyModel, proxyConfig, undefined, undefined)
+
+    expect(calls.length).toBe(2)
+    expect(calls[0].body.messages[0].content[1].image_url.url).toBe("data:image/jpeg;base64,AQID")
+    expect(calls[1].body.messages[0].content[1].image_url.url).toBe("https://example.com/a.png")
+  })
 })
