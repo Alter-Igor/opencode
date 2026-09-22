@@ -247,12 +247,13 @@ describe("handoff login flow", () => {
   })
 
   test("exchanges the handoff with the broker key and requests offline access", async () => {
-    let seen: { url: string; auth: string; body: URLSearchParams } | undefined
+    let seen: { url: string; auth: string; body: URLSearchParams; redirect?: string } | undefined
     const mockFetch: any = async (input: any, init: any) => {
       seen = {
         url: String(input),
         auth: String(init?.headers?.Authorization ?? init?.headers?.authorization ?? ""),
         body: new URLSearchParams(String(init?.body)),
+        redirect: init?.redirect,
       }
       return new Response(JSON.stringify({ access_token: "syn-token", refresh_token: "rt-1", expires_in: 3600 }), {
         status: 200,
@@ -270,6 +271,8 @@ describe("handoff login flow", () => {
     expect(seen?.body.get("subject_token")).toBe("handoff-token")
     expect(seen?.body.get("audience")).toBe("synapse")
     expect(seen?.body.get("scope")).toBe("offline_access")
+    // Credential-bearing request must not follow a redirect off-origin.
+    expect(seen?.redirect).toBe("error")
   })
 
   test("throws when the exchange is refused", async () => {

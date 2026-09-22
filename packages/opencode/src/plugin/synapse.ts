@@ -219,6 +219,7 @@ export async function exchangeHandoffForSynapseToken(
   if (input.offline) body.set("scope", "offline_access")
   const response = await fetcher(input.tokenUrl || KEYSTONE_TOKEN, {
     method: "POST",
+    redirect: "error",
     headers: {
       "Content-Type": "application/x-www-form-urlencoded",
       Accept: "application/json",
@@ -264,6 +265,7 @@ export async function exchangeCodeForTokens(
   const targetAudience = input.audience || SYNAPSE_AUDIENCE
   const response = await fetcher(endpoint, {
     method: "POST",
+    redirect: "error",
     headers: {
       "Content-Type": "application/x-www-form-urlencoded",
       Accept: "application/json",
@@ -315,6 +317,7 @@ export async function refreshKeystoneToken(
   const targetAudience = input.audience || SYNAPSE_AUDIENCE
   const response = await fetcher(endpoint, {
     method: "POST",
+    redirect: "error",
     headers: {
       "Content-Type": "application/x-www-form-urlencoded",
       Accept: "application/json",
