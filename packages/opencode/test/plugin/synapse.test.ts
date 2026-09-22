@@ -11,6 +11,9 @@ import {
   SynapseAuthPlugin,
   SYNAPSE_AUDIENCE,
   audienceIsSynapse,
+  buildHandoffLoginUrl,
+  exchangeHandoffForSynapseToken,
+  HANDOFF_APP_ID,
   SYNAPSE_RESOURCE,
 } from "../../src/plugin/synapse"
 
@@ -228,5 +231,55 @@ describe("audienceIsSynapse", () => {
   test("false for non-JWT tokens", () => {
     expect(audienceIsSynapse("sk-static-key")).toBe(false)
     expect(audienceIsSynapse(undefined)).toBe(false)
+  })
+})
+
+describe("handoff login flow", () => {
+  test("builds the Keystone handoff login URL with app, nonce and returnTo", () => {
+    const url = new URL(
+      buildHandoffLoginUrl({ redirectUri: "http://localhost:1459/auth/callback", nonce: "n-1" }),
+    )
+    expect(url.origin + url.pathname).toBe("https://identity.alterspective.com.au/api/auth/login")
+    expect(url.searchParams.get("app")).toBe(HANDOFF_APP_ID)
+    expect(url.searchParams.get("redirect_uri")).toBe("http://localhost:1459/auth/callback")
+    expect(url.searchParams.get("nonce")).toBe("n-1")
+    expect(url.searchParams.get("returnTo")).toBe("/")
+  })
+
+  test("exchanges the handoff with the broker key and requests offline access", async () => {
+    let seen: { url: string; auth: string; body: URLSearchParams; redirect?: string } | undefined
+    const mockFetch: any = async (input: any, init: any) => {
+      seen = {
+        url: String(input),
+        auth: String(init?.headers?.Authorization ?? init?.headers?.authorization ?? ""),
+        body: new URLSearchParams(String(init?.body)),
+        redirect: init?.redirect,
+      }
+      return new Response(JSON.stringify({ access_token: "syn-token", refresh_token: "rt-1", expires_in: 3600 }), {
+        status: 200,
+      })
+    }
+    const tokens = await exchangeHandoffForSynapseToken(
+      { handoff: "handoff-token", brokerKey: "ks_live_broker", offline: true },
+      mockFetch,
+    )
+    expect(tokens.access_token).toBe("syn-token")
+    expect(tokens.refresh_token).toBe("rt-1")
+    expect(seen?.url).toBe("https://identity.alterspective.com.au/api/oidc/token")
+    expect(seen?.auth).toBe("Bearer ks_live_broker")
+    expect(seen?.body.get("grant_type")).toBe("urn:ietf:params:oauth:grant-type:token-exchange")
+    expect(seen?.body.get("subject_token")).toBe("handoff-token")
+    expect(seen?.body.get("audience")).toBe("synapse")
+    expect(seen?.body.get("scope")).toBe("offline_access")
+    // Credential-bearing request must not follow a redirect off-origin.
+    expect(seen?.redirect).toBe("error")
+  })
+
+  test("throws when the exchange is refused", async () => {
+    const mockFetch: any = async () =>
+      new Response(JSON.stringify({ error: "invalid_grant" }), { status: 400 })
+    await expect(
+      exchangeHandoffForSynapseToken({ handoff: "h", brokerKey: "k" }, mockFetch),
+    ).rejects.toThrow(/invalid_grant/)
   })
 })

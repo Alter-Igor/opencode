@@ -20,6 +20,12 @@ export const SYNAPSE_RESOURCE = "https://synapse-mcp.alterspective.com.au/mcp"
 // the fork previously fell back to the MCP bridge (which cannot carry tool schemas).
 export const SYNAPSE_AUDIENCE = "synapse"
 export const OAUTH_SCOPES = "mcp:gpaas"
+/** The registered Keystone downstream app that brokers Synapse access for the fork. */
+export const HANDOFF_APP_ID = "opencode"
+export const KEYSTONE_LOGIN = `${KEYSTONE_ISSUER}/api/auth/login`
+/** The two credentials the delegated flow needs, resolved from the environment. */
+export const BROKER_KEY_ENV = "OPENCODE_KEYSTONE_BROKER_KEY"
+export const CLIENT_SECRET_ENV = "OPENCODE_KEYSTONE_CLIENT_SECRET"
 export const OAUTH_PORT = 1459
 export const OAUTH_REDIRECT_PATH = "/auth/callback"
 export const ACCESS_TOKEN_REFRESH_SKEW_MS = 120_000
@@ -167,6 +173,77 @@ export function buildAuthorizeUrl(
   return `${endpoint}?${params.toString()}`
 }
 
+/**
+ * Keystone first-party handoff login. Unlike the OIDC authorize flow this yields
+ * a short-lived HS256 handoff token that can be exchanged (RFC 8693) for a token
+ * minted for the `synapse` app audience - which the REST inference plane admits.
+ */
+export function buildHandoffLoginUrl(input: {
+  redirectUri: string
+  nonce: string
+  app?: string
+  returnTo?: string
+  loginUrl?: string
+}): string {
+  const params = new URLSearchParams({
+    app: input.app || HANDOFF_APP_ID,
+    redirect_uri: input.redirectUri,
+    nonce: input.nonce,
+    returnTo: input.returnTo || "/",
+  })
+  return `${input.loginUrl || KEYSTONE_LOGIN}?${params.toString()}`
+}
+
+/**
+ * Exchange a Keystone handoff token for a token minted for the target audience
+ * (default `synapse`). The caller authenticates as its registered app with a
+ * service credential holding `credentials:broker`; Keystone stamps the app as
+ * `act.sub`, which is what gives per-app attribution on the gateway.
+ */
+export async function exchangeHandoffForSynapseToken(
+  input: {
+    handoff: string
+    brokerKey: string
+    tokenUrl?: string
+    audience?: string
+    offline?: boolean
+  },
+  fetcher: typeof fetch = fetch,
+): Promise<{ access_token: string; refresh_token?: string; expires_in?: number }> {
+  const body = new URLSearchParams({
+    grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
+    subject_token_type: "urn:ietf:params:oauth:token-type:jwt",
+    subject_token: input.handoff,
+    audience: input.audience || SYNAPSE_AUDIENCE,
+  })
+  if (input.offline) body.set("scope", "offline_access")
+  const response = await fetcher(input.tokenUrl || KEYSTONE_TOKEN, {
+    method: "POST",
+    redirect: "error",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Accept: "application/json",
+      Authorization: `Bearer ${input.brokerKey}`,
+      "User-Agent": `opencode/${InstallationVersion}`,
+    },
+    body,
+  })
+  const json = (await response.json().catch(() => ({}))) as {
+    access_token?: string
+    refresh_token?: string
+    expires_in?: number
+    error?: string
+  }
+  if (!response.ok || !json.access_token) {
+    throw new Error(`Keystone token exchange failed (${response.status}): ${json.error || "unknown"}`)
+  }
+  return {
+    access_token: json.access_token,
+    refresh_token: json.refresh_token,
+    expires_in: json.expires_in ?? 3600,
+  }
+}
+
 export async function exchangeCodeForTokens(
   input: {
     clientId: string
@@ -188,6 +265,7 @@ export async function exchangeCodeForTokens(
   const targetAudience = input.audience || SYNAPSE_AUDIENCE
   const response = await fetcher(endpoint, {
     method: "POST",
+    redirect: "error",
     headers: {
       "Content-Type": "application/x-www-form-urlencoded",
       Accept: "application/json",
@@ -224,6 +302,7 @@ export async function refreshKeystoneToken(
   input: {
     clientId: string
     refreshToken: string
+    clientSecret?: string
     tokenUrl?: string
     audience?: string
     resource?: string
@@ -238,6 +317,7 @@ export async function refreshKeystoneToken(
   const targetAudience = input.audience || SYNAPSE_AUDIENCE
   const response = await fetcher(endpoint, {
     method: "POST",
+    redirect: "error",
     headers: {
       "Content-Type": "application/x-www-form-urlencoded",
       Accept: "application/json",
@@ -248,6 +328,7 @@ export async function refreshKeystoneToken(
       client_id: input.clientId,
       refresh_token: input.refreshToken,
       audience: targetAudience,
+      ...(input.clientSecret ? { client_secret: input.clientSecret } : {}),
     }),
   })
   const body = (await response.json().catch(() => ({}))) as {
@@ -573,6 +654,7 @@ export function extractMcpChatContent(rawText: string): string {
 
 interface SynapsePluginOptions {
   authorizeUrl?: string
+  loginUrl?: string
   tokenUrl?: string
   registerUrl?: string
   inferenceUrl?: string
@@ -629,6 +711,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                 refreshPromise = refreshKeystoneToken({
                   clientId,
                   refreshToken,
+                  clientSecret: meta.clientSecret || process.env[CLIENT_SECRET_ENV] || "",
                   tokenUrl: options?.tokenUrl,
                   audience,
                 })
@@ -1174,78 +1257,50 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
           type: "oauth",
           label: "Sign in with Keystone (Alterspective SSO)",
           async authorize() {
-            const pkce = await generatePKCE()
-            const state = generateState()
+            const nonce = generateState()
             const redirect = redirectUri(OAUTH_PORT)
-
-            let clientId = ""
-            try {
-              const reg = await registerKeystoneClient(redirect, fetch, options?.registerUrl)
-              clientId = reg.clientId
-            } catch {
-              clientId = "ai-office-cli"
-            }
-
-            const url = buildAuthorizeUrl({
-              clientId,
-              redirectUri: redirect,
-              pkce,
-              state,
-              authorizeUrl: options?.authorizeUrl,
-              audience,
-            })
+            const url = buildHandoffLoginUrl({ redirectUri: redirect, nonce, loginUrl: options?.loginUrl })
 
             let server: ReturnType<typeof createServer> | undefined
-            const callbackPromise = new Promise<{ code: string }>((resolve, reject) => {
+            const callbackPromise = new Promise<{ handoff: string }>((resolve, reject) => {
               server = createServer((req, res) => {
                 const reqUrl = new URL(req.url || "/", `http://127.0.0.1:${OAUTH_PORT}`)
-                if (reqUrl.pathname === OAUTH_REDIRECT_PATH) {
-                  const queryCode = reqUrl.searchParams.get("code")
-                  const queryState = reqUrl.searchParams.get("state")
-                  const queryError = reqUrl.searchParams.get("error")
-                  const queryErrorDescription = reqUrl.searchParams.get("error_description")
+                if (reqUrl.pathname !== OAUTH_REDIRECT_PATH) return
 
-                  if (queryError) {
-                    res.writeHead(200, { "Content-Type": "text/html" })
-                    res.end(
-                      OauthCallbackPage.error(queryErrorDescription || queryError, {
-                        provider: "Keystone (Synapse)",
-                      }),
-                    )
-                    reject(new Error(queryErrorDescription || queryError))
-                    return
-                  }
-
-                  if (queryState !== state) {
-                    res.writeHead(400, { "Content-Type": "text/html" })
-                    res.end(
-                      OauthCallbackPage.error("State mismatch. Please try logging in again.", {
-                        provider: "Keystone (Synapse)",
-                      }),
-                    )
-                    reject(new Error("OAuth state mismatch"))
-                    return
-                  }
-
-                  if (!queryCode) {
-                    res.writeHead(400, { "Content-Type": "text/html" })
-                    res.end(
-                      OauthCallbackPage.error("Missing authorization code.", {
-                        provider: "Keystone (Synapse)",
-                      }),
-                    )
-                    reject(new Error("Missing authorization code"))
-                    return
-                  }
-
+                const queryError = reqUrl.searchParams.get("error")
+                const queryErrorDescription = reqUrl.searchParams.get("error_description")
+                if (queryError) {
                   res.writeHead(200, { "Content-Type": "text/html" })
                   res.end(
-                    OauthCallbackPage.success({
-                      provider: "Keystone (Synapse)",
-                    }),
+                    OauthCallbackPage.error(queryErrorDescription || queryError, { provider: "Keystone (Synapse)" }),
                   )
-                  resolve({ code: queryCode })
+                  reject(new Error(queryErrorDescription || queryError))
+                  return
                 }
+
+                const handoff = reqUrl.searchParams.get("handoff")
+                if (!handoff) {
+                  res.writeHead(400, { "Content-Type": "text/html" })
+                  res.end(OauthCallbackPage.error("Missing handoff token.", { provider: "Keystone (Synapse)" }))
+                  reject(new Error("Missing handoff token"))
+                  return
+                }
+
+                // The handoff carries the nonce we generated; a mismatch means a
+                // different login attempt and must not be accepted.
+                const claims = parseJwtPayload(handoff)
+                if (!claims || claims.nonce !== nonce) {
+                  res.writeHead(400, { "Content-Type": "text/html" })
+                  res.end(
+                    OauthCallbackPage.error("Handoff nonce mismatch. Please try again.", { provider: "Keystone (Synapse)" }),
+                  )
+                  reject(new Error("Handoff nonce mismatch"))
+                  return
+                }
+
+                res.writeHead(200, { "Content-Type": "text/html" })
+                res.end(OauthCallbackPage.success({ provider: "Keystone (Synapse)" }))
+                resolve({ handoff })
               })
 
               server.listen(OAUTH_PORT, "127.0.0.1")
@@ -1259,27 +1314,28 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
               method: "auto" as const,
               async callback() {
                 try {
-                  const { code } = await callbackPromise
-                  const tokens = await exchangeCodeForTokens({
-                    clientId,
-                    code,
-                    redirectUri: redirect,
-                    verifier: pkce.verifier,
+                  const brokerKey = process.env[BROKER_KEY_ENV] || ""
+                  if (!brokerKey) throw new Error(`${BROKER_KEY_ENV} is not set`)
+                  const { handoff } = await callbackPromise
+                  const tokens = await exchangeHandoffForSynapseToken({
+                    handoff,
+                    brokerKey,
                     tokenUrl: options?.tokenUrl,
                     audience,
+                    offline: true,
                   })
-
                   return {
                     type: "success" as const,
                     provider: "synapse",
                     key: tokens.access_token,
                     metadata: {
-                      clientId,
+                      clientId: HANDOFF_APP_ID,
+                      clientSecret: process.env[CLIENT_SECRET_ENV] || "",
                       refreshToken: tokens.refresh_token || "",
                       expiresAt: String(Date.now() + (tokens.expires_in ?? 3600) * 1000),
                     },
                   }
-                } catch (err) {
+                } catch {
                   return { type: "failed" as const }
                 } finally {
                   server?.close()
