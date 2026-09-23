@@ -12,6 +12,7 @@ import {
   SYNAPSE_AUDIENCE,
   audienceIsSynapse,
   buildHandoffLoginUrl,
+  redirectUri,
   exchangeHandoffForSynapseToken,
   HANDOFF_APP_ID,
   SYNAPSE_RESOURCE,
@@ -281,5 +282,14 @@ describe("handoff login flow", () => {
     await expect(
       exchangeHandoffForSynapseToken({ handoff: "h", brokerKey: "k" }, mockFetch),
     ).rejects.toThrow(/invalid_grant/)
+  })
+})
+
+describe("callback host", () => {
+  test("redirects to explicit loopback IPv4 so the 127.0.0.1 listener is reachable", () => {
+    // Windows resolves "localhost" to ::1 first; the callback server binds 127.0.0.1,
+    // so a localhost redirect produced ERR_CONNECTION_REFUSED.
+    expect(redirectUri()).toBe("http://127.0.0.1:1459/auth/callback")
+    expect(redirectUri(1459)).not.toContain("localhost")
   })
 })
