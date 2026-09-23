@@ -78,7 +78,11 @@ export function generateState(): string {
 }
 
 export function redirectUri(port = OAUTH_PORT): string {
-  return `http://localhost:${port}${OAUTH_REDIRECT_PATH}`
+  // Explicit loopback IPv4, not "localhost": the callback server binds
+  // 127.0.0.1, but on Windows "localhost" resolves to ::1 (IPv6) first, so the
+  // browser's redirect landed on a closed port (ERR_CONNECTION_REFUSED).
+  // Both loopback hosts are registered on the Keystone app, so either matches.
+  return `http://127.0.0.1:${port}${OAUTH_REDIRECT_PATH}`
 }
 
 export function parseJwtPayload(token: string): Record<string, unknown> | null {
