@@ -1342,7 +1342,12 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                 } catch {
                   return { type: "failed" as const }
                 } finally {
-                  server?.close()
+                  // The browser needs a moment to finish rendering the callback
+                  // page (and fetching its favicon). Closing the listener in the
+                  // same tick made an otherwise successful login end on
+                  // ERR_CONNECTION_REFUSED.
+                  const listener = server
+                  setTimeout(() => listener?.close(), 5000)
                 }
               },
             }
