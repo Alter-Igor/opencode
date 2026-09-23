@@ -277,34 +277,19 @@ class SessionObserverManager {
     } catch {}
   }
 
-  private sessionLearnings: SessionLearning[] = []
-
   public async recordLearning(
     learning: Omit<SessionLearning, "id" | "timestamp">,
     workspaceDir?: string,
   ): Promise<SessionLearning> {
     const normalizedText = learning.lesson.trim().toLowerCase()
-    const existingIndex = this.sessionLearnings.findIndex(
-      (l) => l.lesson.trim().toLowerCase() === normalizedText,
-    )
-    if (existingIndex !== -1) {
-      // Update existing entry timestamp and return without duplicating
-      const existing = this.sessionLearnings[existingIndex]
-      existing.timestamp = new Date().toISOString()
-      return existing
-    }
-
+    const paths = learningStorePaths(workspaceDir)
+    const files = [paths.global, paths.project].filter((file): file is string => Boolean(file))
     const entry: SessionLearning = {
       id: `learn_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
       timestamp: new Date().toISOString(),
       ...learning,
     }
-    this.sessionLearnings.unshift(entry)
-    if (this.sessionLearnings.length > 100) this.sessionLearnings.pop()
-
-    // Persist to the global and project stores, serialised against forgetLearning.
-    const paths = learningStorePaths(workspaceDir)
-    const files = [paths.global, paths.project].filter((file): file is string => Boolean(file))
+    let stored = entry
     await this.mutate(async () => {
       for (const file of files) {
         try {
@@ -314,13 +299,19 @@ class SessionObserverManager {
             const parsed = JSON.parse(await fs.readFile(file, "utf8"))
             if (Array.isArray(parsed)) existing = parsed
           } catch {}
-          if (!existing.some((e) => e.lesson.trim().toLowerCase() === normalizedText)) {
-            await writeJsonAtomic(file, [entry, ...existing].slice(0, 100))
+          const found = existing.find((e) => e.lesson.trim().toLowerCase() === normalizedText)
+          if (found) {
+            // Re-recording refreshes recency but never duplicates.
+            found.timestamp = new Date().toISOString()
+            stored = found
+            await writeJsonAtomic(file, existing.slice(0, 100))
+            continue
           }
+          await writeJsonAtomic(file, [entry, ...existing].slice(0, 100))
         } catch {}
       }
     })
-    return entry
+    return stored
   }
 
   /**
@@ -328,12 +319,9 @@ class SessionObserverManager {
    * builder uses. Shared so the listed `injected` flag cannot drift from reality.
    */
   private async selectInjected(limit: number, workspaceDir?: string): Promise<SessionLearning[]> {
-    if (this.sessionLearnings.length > 0) {
-      return this.sessionLearnings.slice(0, limit)
-    }
-    // Read through the mutation queue: a read that starts while a forget is still
-    // writing must not reload the store it is about to forget from.
-    const loaded = await this.mutate(async () => {
+    // Always read from disk, from the right stores for THIS workspace. One process
+    // can serve several projects, so no cached list may be reused across them.
+    return this.mutate(async () => {
       const read = async (file?: string): Promise<SessionLearning[]> => {
         if (!file) return []
         try {
@@ -354,18 +342,8 @@ class SessionObserverManager {
         seen.add(key)
         merged.push(rule)
       }
-      return merged
+      return merged.slice(0, limit)
     })
-    if (loaded.length > 0) {
-      // Merge, never clobber: a rule recorded while the read was pending must not
-      // be dropped from the cache by the older file contents.
-      const seen = new Set(loaded.map(learningKey))
-      this.sessionLearnings = [
-        ...this.sessionLearnings.filter((l) => !seen.has(learningKey(l))),
-        ...loaded,
-      ]
-    }
-    return this.sessionLearnings.slice(0, limit)
   }
 
   public async getRecentLearnings(limit = 5, workspaceDir?: string): Promise<SessionLearning[]> {
@@ -422,7 +400,6 @@ class SessionObserverManager {
     const needle = lessonText.trim().toLowerCase()
     if (!needle) return 0
     const matches = (l: SessionLearning) => String(l.lesson ?? "").toLowerCase().includes(needle)
-    this.sessionLearnings = this.sessionLearnings.filter((l) => !matches(l))
     const paths = learningStorePaths(workspaceDir)
     const files = [paths.global, paths.project].filter((file): file is string => Boolean(file))
     const removed = new Set<string>()

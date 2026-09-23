@@ -2,7 +2,12 @@ import { describe, expect, test } from "bun:test"
 import { sessionObserver } from "../../src/plugin/observer"
 import * as fs from "fs/promises"
 import * as os from "os"
-import * as path from "path"
+import * as path from "path"
+
+function restoreUserProfile(value: string | undefined) {
+  if (value === undefined) delete process.env.USERPROFILE
+  else process.env.USERPROFILE = value
+}
 
 describe("SessionObserverManager.onToolAfter", () => {
   test("records a tool call with string output", async () => {
@@ -79,8 +84,6 @@ describe("SessionObserverManager.onToolAfter", () => {
 
 
 describe("rule visibility", () => {
-  // Declared before any other learning test so the observer's in-memory cache is
-  // still empty and the real "read from file" injection path actually runs.
   test("injects a rule that exists only in the project store", async () => {
     const global = await fs.mkdtemp(path.join(os.tmpdir(), "oc-g-"))
     const ws = await fs.mkdtemp(path.join(os.tmpdir(), "oc-p-"))
@@ -100,10 +103,8 @@ describe("rule visibility", () => {
       const row = listed.find((r) => r.lesson === "project only rule")!
       expect(row.origin).toBe("project")
       expect(row.injected).toBe(true)
-      // Clear the cache this test populated so later tests read their own files.
-      await sessionObserver.forgetLearning("project only rule", ws)
     } finally {
-      process.env.USERPROFILE = prev
+      restoreUserProfile(prev)
       await fs.rm(global, { recursive: true, force: true })
       await fs.rm(ws, { recursive: true, force: true })
     }
@@ -143,13 +144,13 @@ describe("rule visibility", () => {
       expect(after.map((r) => r.lesson)).not.toContain("rule 1")
       expect(await sessionObserver.forgetLearning("rule 1", ws)).toBe(0)
     } finally {
-      process.env.USERPROFILE = prev
+      restoreUserProfile(prev)
       await fs.rm(central, { recursive: true, force: true })
       await fs.rm(ws, { recursive: true, force: true })
     }
   })
 
-  test("reports a rule injected when memory and the file disagree on its id", async () => {
+  test("dedupes a re-recorded rule by text and still injects it", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "oc-mix-"))
     const prev = process.env.USERPROFILE
     process.env.USERPROFILE = dir
@@ -161,13 +162,13 @@ describe("rule visibility", () => {
         JSON.stringify([{ id: "A", timestamp: "2026-09-23T00:00:00.000Z", lesson: "shared rule", source: "user_feedback" }]),
         "utf8",
       )
-      // The same text already exists on disk, so the file keeps id A while memory
-      // holds a freshly recorded id B. Matching must be by text.
+      // The text already exists on disk under id A, so recording it again must not
+      // duplicate it, and it must still be reported as injected.
       await sessionObserver.recordLearning({ lesson: "shared rule", source: "user_feedback" }, dir)
       const listed = await sessionObserver.listLearnings(dir)
       expect(listed.find((r) => r.lesson === "shared rule")!.injected).toBe(true)
     } finally {
-      process.env.USERPROFILE = prev
+      restoreUserProfile(prev)
       await fs.rm(dir, { recursive: true, force: true })
     }
   })
