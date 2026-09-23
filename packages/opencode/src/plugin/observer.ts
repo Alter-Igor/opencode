@@ -357,6 +357,65 @@ class SessionObserverManager {
     return []
   }
 
+  /**
+   * Every persisted rule, with where it was found and whether it is one of the
+   * most-recent rules actually injected into a session's system prompt. This is
+   * the honest answer to "what rules is the agent using?" - recorded rules that
+   * fall outside the injection window are shown as `stored`, not `injected`.
+   */
+  public async listLearnings(
+    workspaceDir?: string,
+  ): Promise<Array<SessionLearning & { origin: "central" | "workspace"; injected: boolean }>> {
+    const read = async (file: string): Promise<SessionLearning[]> => {
+      try {
+        const parsed = JSON.parse(await fs.readFile(file, "utf8"))
+        return Array.isArray(parsed) ? (parsed as SessionLearning[]) : []
+      } catch {
+        return []
+      }
+    }
+    const homeDir = process.env.USERPROFILE || process.env.HOME || ""
+    const central = homeDir
+      ? await read(path.join(homeDir, ".local", "share", "opencode", "learnings.json"))
+      : []
+    const workspace = workspaceDir
+      ? await read(path.join(workspaceDir, ".system_generated", "logs", "learnings.json"))
+      : []
+    const centralKeys = new Set(central.map((l) => l.lesson.trim().toLowerCase()))
+    const merged = [
+      ...central.map((l) => ({ ...l, origin: "central" as const })),
+      ...workspace
+        .filter((l) => !centralKeys.has(l.lesson.trim().toLowerCase()))
+        .map((l) => ({ ...l, origin: "workspace" as const })),
+    ].sort((a, b) => (a.timestamp < b.timestamp ? 1 : -1))
+    return merged.map((l, index) => ({ ...l, injected: index < INJECTED_LEARNINGS_LIMIT }))
+  }
+
+  /**
+   * Remove rules whose text matches (case-insensitive substring) from memory and
+   * from both persisted stores. Returns how many rows were removed.
+   */
+  public async forgetLearning(lessonText: string, workspaceDir?: string): Promise<number> {
+    const needle = lessonText.trim().toLowerCase()
+    if (!needle) return 0
+    const matches = (l: SessionLearning) => String(l.lesson ?? "").toLowerCase().includes(needle)
+    this.sessionLearnings = this.sessionLearnings.filter((l) => !matches(l))
+    let removed = 0
+    const drop = async (file: string) => {
+      try {
+        const parsed = JSON.parse(await fs.readFile(file, "utf8"))
+        if (!Array.isArray(parsed)) return
+        const kept = parsed.filter((l: SessionLearning) => !matches(l))
+        removed += parsed.length - kept.length
+        await fs.writeFile(file, JSON.stringify(kept.slice(0, 100), null, 2), "utf8")
+      } catch {}
+    }
+    const homeDir = process.env.USERPROFILE || process.env.HOME || ""
+    if (homeDir) await drop(path.join(homeDir, ".local", "share", "opencode", "learnings.json"))
+    if (workspaceDir) await drop(path.join(workspaceDir, ".system_generated", "logs", "learnings.json"))
+    return removed
+  }
+
   public getLatestRetrospectives(): SessionRetrospective[] {
     return this.latestRetrospectives
   }
@@ -365,6 +424,9 @@ class SessionObserverManager {
     return this.diagnosticLogs
   }
 }
+
+/** How many of the most-recent rules are injected into a session system prompt. */
+export const INJECTED_LEARNINGS_LIMIT = 5
 
 export interface SessionLearning {
   id: string
