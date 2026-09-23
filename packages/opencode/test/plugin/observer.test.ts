@@ -81,6 +81,34 @@ describe("SessionObserverManager.onToolAfter", () => {
 describe("rule visibility", () => {
   // Declared before any other learning test so the observer's in-memory cache is
   // still empty and the real "read from file" injection path actually runs.
+  test("injects a rule that exists only in the project store", async () => {
+    const global = await fs.mkdtemp(path.join(os.tmpdir(), "oc-g-"))
+    const ws = await fs.mkdtemp(path.join(os.tmpdir(), "oc-p-"))
+    const prev = process.env.USERPROFILE
+    process.env.USERPROFILE = global
+    try {
+      const wsFile = path.join(ws, ".system_generated", "logs", "learnings.json")
+      await fs.mkdir(path.dirname(wsFile), { recursive: true })
+      await fs.writeFile(
+        wsFile,
+        JSON.stringify([
+          { id: "p1", timestamp: "2026-09-23T00:00:00.000Z", lesson: "project only rule", source: "user_feedback" },
+        ]),
+        "utf8",
+      )
+      const listed = await sessionObserver.listLearnings(ws)
+      const row = listed.find((r) => r.lesson === "project only rule")!
+      expect(row.origin).toBe("project")
+      expect(row.injected).toBe(true)
+      // Clear the cache this test populated so later tests read their own files.
+      await sessionObserver.forgetLearning("project only rule", ws)
+    } finally {
+      process.env.USERPROFILE = prev
+      await fs.rm(global, { recursive: true, force: true })
+      await fs.rm(ws, { recursive: true, force: true })
+    }
+  })
+
   test("reports the real injection window and counts a rule once across both stores", async () => {
     const central = await fs.mkdtemp(path.join(os.tmpdir(), "oc-central-"))
     const ws = await fs.mkdtemp(path.join(os.tmpdir(), "oc-ws-"))
@@ -108,7 +136,7 @@ describe("rule visibility", () => {
       // newest by timestamp, but outside the first-five window the prompt actually uses
       expect(injected["rule 6"]).toBe(false)
       expect(injected["rule 7"]).toBe(false)
-      expect(listed.find((r) => r.lesson === "rule 1")!.origin).toBe("central")
+      expect(listed.find((r) => r.lesson === "rule 1")!.origin).toBe("global")
 
       expect(await sessionObserver.forgetLearning("rule 1", ws)).toBe(1)
       const after = await sessionObserver.listLearnings(ws)

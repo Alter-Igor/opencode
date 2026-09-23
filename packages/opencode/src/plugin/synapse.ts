@@ -6,7 +6,7 @@ import * as fs from "fs/promises"
 import open from "open"
 import { OauthCallbackPage } from "@opencode-ai/core/oauth/page"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
-import { INJECTED_LEARNINGS_LIMIT, sessionObserver, sanitizeJsonSchemaForOpenAI } from "./observer"
+import { INJECTED_LEARNINGS_LIMIT, learningStorePaths, sessionObserver, sanitizeJsonSchemaForOpenAI } from "./observer"
 import { EscalationTracker, declaredTier, classifyFailure, malformedToolCallFromEvent } from "./synapse-escalation"
 
 export const KEYSTONE_ISSUER = "https://identity.alterspective.com.au"
@@ -1434,7 +1434,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
       sessionObserver.onToolAfter(toolInput.sessionID, toolInput.callID, toolInput.tool, output.output)
     },
     "experimental.chat.system.transform": async (_input, output) => {
-      const recentLearnings = await sessionObserver.getRecentLearnings(5)
+      const recentLearnings = await sessionObserver.getRecentLearnings(INJECTED_LEARNINGS_LIMIT, input.directory)
       if (escalations.atCap(_input.sessionID ?? input.directory)) {
         output.system.push(
           "AIESC-03: automatic escalation budget is exhausted for this session. Do NOT retry the same request shape. Present the failure evidence to the user and ask how to proceed.",
@@ -1520,25 +1520,31 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
         args: {},
         async execute() {
           const rules = await sessionObserver.listLearnings(input.directory)
-          if (rules.length === 0) return "No operating rules are recorded."
+          const paths = learningStorePaths(input.directory)
           const injected = rules.filter((r) => r.injected).length
+          const line = (r: (typeof rules)[number]) =>
+            "  " +
+            (r.injected ? "[injected]" : "[stored]  ") +
+            " " +
+            r.lesson +
+            "  (" +
+            r.source +
+            ", recorded " +
+            r.timestamp +
+            ")"
+          const group = (title: string, file: string | undefined, origin: "global" | "project") => {
+            const rows = rules.filter((r) => r.origin === origin)
+            return [title + "  " + (file ?? "(unavailable)"), ...(rows.length > 0 ? rows.map(line) : ["  (none)"])]
+          }
           return [
-            injected + " of " + rules.length + " recorded rule(s) are injected into this session (the most recent " + INJECTED_LEARNINGS_LIMIT + ").",
-            ...rules.map(
-              (r, i) =>
-                (i + 1) +
-                ". " +
-                (r.injected ? "[injected]" : "[stored]  ") +
-                " " +
-                r.lesson +
-                "  (source: " +
-                r.source +
-                ", store: " +
-                r.origin +
-                ", recorded: " +
-                r.timestamp +
-                ")",
-            ),
+            injected +
+              " of " +
+              rules.length +
+              " recorded rule(s) are injected into this session (the most recent " +
+              INJECTED_LEARNINGS_LIMIT +
+              ", project rules first).",
+            ...group("Project - this repo only:", paths.project, "project"),
+            ...group("Global - every project on this machine:", paths.global, "global"),
           ].join("\n")
         },
       }),
