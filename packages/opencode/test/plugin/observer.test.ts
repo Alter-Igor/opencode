@@ -120,4 +120,27 @@ describe("rule visibility", () => {
       await fs.rm(ws, { recursive: true, force: true })
     }
   })
+
+  test("reports a rule injected when memory and the file disagree on its id", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "oc-mix-"))
+    const prev = process.env.USERPROFILE
+    process.env.USERPROFILE = dir
+    try {
+      const file = path.join(dir, ".local", "share", "opencode", "learnings.json")
+      await fs.mkdir(path.dirname(file), { recursive: true })
+      await fs.writeFile(
+        file,
+        JSON.stringify([{ id: "A", timestamp: "2026-09-23T00:00:00.000Z", lesson: "shared rule", source: "user_feedback" }]),
+        "utf8",
+      )
+      // The same text already exists on disk, so the file keeps id A while memory
+      // holds a freshly recorded id B. Matching must be by text.
+      await sessionObserver.recordLearning({ lesson: "shared rule", source: "user_feedback" }, dir)
+      const listed = await sessionObserver.listLearnings(dir)
+      expect(listed.find((r) => r.lesson === "shared rule")!.injected).toBe(true)
+    } finally {
+      process.env.USERPROFILE = prev
+      await fs.rm(dir, { recursive: true, force: true })
+    }
+  })
 })

@@ -334,18 +334,21 @@ class SessionObserverManager {
     if (this.sessionLearnings.length > 0) {
       return this.sessionLearnings.slice(0, limit)
     }
-    try {
-      const homeDir = process.env.USERPROFILE || process.env.HOME || ""
-      if (homeDir) {
+    // Read through the mutation queue: a read that starts while a forget is still
+    // writing must not reload the store it is about to forget from.
+    const loaded = await this.mutate(async () => {
+      try {
+        const homeDir = process.env.USERPROFILE || process.env.HOME || ""
+        if (!homeDir) return [] as SessionLearning[]
         const centralFile = path.join(homeDir, ".local", "share", "opencode", "learnings.json")
         const content = JSON.parse(await fs.readFile(centralFile, "utf8"))
-        if (Array.isArray(content)) {
-          this.sessionLearnings = content
-          return this.sessionLearnings.slice(0, limit)
-        }
+        return Array.isArray(content) ? (content as SessionLearning[]) : []
+      } catch {
+        return [] as SessionLearning[]
       }
-    } catch {}
-    return []
+    })
+    if (loaded.length > 0) this.sessionLearnings = loaded
+    return loaded.slice(0, limit)
   }
 
   public async getRecentLearnings(limit = 5): Promise<SessionLearning[]> {
@@ -458,8 +461,7 @@ class SessionObserverManager {
 /** How many of the most-recent rules are injected into a session system prompt. */
 export const INJECTED_LEARNINGS_LIMIT = 5
 
-const learningKey = (l: SessionLearning) =>
-  l.id ? `id:${l.id}` : `text:${String(l.lesson ?? "").trim().toLowerCase()}`
+const learningKey = (l: SessionLearning) => String(l.lesson ?? "").trim().toLowerCase()
 
 /** Write JSON via a temp file + rename so a reader never sees a half-written file. */
 async function writeJsonAtomic(file: string, rows: SessionLearning[]): Promise<void> {
