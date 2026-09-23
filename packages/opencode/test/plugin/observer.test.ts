@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test"
 import { sessionObserver } from "../../src/plugin/observer"
+import * as fs from "fs/promises"
+import * as os from "os"
+import * as path from "path"
 
 describe("SessionObserverManager.onToolAfter", () => {
   test("records a tool call with string output", async () => {
@@ -74,3 +77,70 @@ describe("SessionObserverManager.onToolAfter", () => {
   })
 })
 
+
+describe("rule visibility", () => {
+  // Declared before any other learning test so the observer's in-memory cache is
+  // still empty and the real "read from file" injection path actually runs.
+  test("reports the real injection window and counts a rule once across both stores", async () => {
+    const central = await fs.mkdtemp(path.join(os.tmpdir(), "oc-central-"))
+    const ws = await fs.mkdtemp(path.join(os.tmpdir(), "oc-ws-"))
+    const prev = process.env.USERPROFILE
+    process.env.USERPROFILE = central
+    const centralFile = path.join(central, ".local", "share", "opencode", "learnings.json")
+    const wsFile = path.join(ws, ".system_generated", "logs", "learnings.json")
+    try {
+      await fs.mkdir(path.dirname(centralFile), { recursive: true })
+      const rows = Array.from({ length: 7 }, (_, i) => ({
+        id: "r" + (i + 1),
+        timestamp: "2026-09-" + String(i + 1).padStart(2, "0") + "T00:00:00.000Z",
+        lesson: "rule " + (i + 1),
+        source: "user_feedback",
+      }))
+      await fs.writeFile(centralFile, JSON.stringify(rows), "utf8")
+      await fs.mkdir(path.dirname(wsFile), { recursive: true })
+      await fs.writeFile(wsFile, JSON.stringify([rows[0]]), "utf8")
+
+      const listed = await sessionObserver.listLearnings(ws)
+      expect(listed.length).toBe(7)
+      const injected = Object.fromEntries(listed.map((r) => [r.lesson, r.injected]))
+      expect(injected["rule 1"]).toBe(true)
+      expect(injected["rule 5"]).toBe(true)
+      // newest by timestamp, but outside the first-five window the prompt actually uses
+      expect(injected["rule 6"]).toBe(false)
+      expect(injected["rule 7"]).toBe(false)
+      expect(listed.find((r) => r.lesson === "rule 1")!.origin).toBe("central")
+
+      expect(await sessionObserver.forgetLearning("rule 1", ws)).toBe(1)
+      const after = await sessionObserver.listLearnings(ws)
+      expect(after.map((r) => r.lesson)).not.toContain("rule 1")
+      expect(await sessionObserver.forgetLearning("rule 1", ws)).toBe(0)
+    } finally {
+      process.env.USERPROFILE = prev
+      await fs.rm(central, { recursive: true, force: true })
+      await fs.rm(ws, { recursive: true, force: true })
+    }
+  })
+
+  test("reports a rule injected when memory and the file disagree on its id", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "oc-mix-"))
+    const prev = process.env.USERPROFILE
+    process.env.USERPROFILE = dir
+    try {
+      const file = path.join(dir, ".local", "share", "opencode", "learnings.json")
+      await fs.mkdir(path.dirname(file), { recursive: true })
+      await fs.writeFile(
+        file,
+        JSON.stringify([{ id: "A", timestamp: "2026-09-23T00:00:00.000Z", lesson: "shared rule", source: "user_feedback" }]),
+        "utf8",
+      )
+      // The same text already exists on disk, so the file keeps id A while memory
+      // holds a freshly recorded id B. Matching must be by text.
+      await sessionObserver.recordLearning({ lesson: "shared rule", source: "user_feedback" }, dir)
+      const listed = await sessionObserver.listLearnings(dir)
+      expect(listed.find((r) => r.lesson === "shared rule")!.injected).toBe(true)
+    } finally {
+      process.env.USERPROFILE = prev
+      await fs.rm(dir, { recursive: true, force: true })
+    }
+  })
+})

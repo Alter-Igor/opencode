@@ -6,7 +6,7 @@ import * as fs from "fs/promises"
 import open from "open"
 import { OauthCallbackPage } from "@opencode-ai/core/oauth/page"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
-import { sessionObserver, sanitizeJsonSchemaForOpenAI } from "./observer"
+import { INJECTED_LEARNINGS_LIMIT, sessionObserver, sanitizeJsonSchemaForOpenAI } from "./observer"
 import { EscalationTracker, declaredTier, classifyFailure, malformedToolCallFromEvent } from "./synapse-escalation"
 
 export const KEYSTONE_ISSUER = "https://identity.alterspective.com.au"
@@ -1514,7 +1514,51 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
           return `✅ Successfully recorded rule: "${args.lesson}". This knowledge is stored and will automatically guide future sessions.`
         },
       }),
-      synapse_buddy_review: tool({
+      synapse_list_rules: tool({
+        description:
+          "List the operating rules (learnings) this agent follows, showing where each is stored and whether it is actually injected into the system prompt. Use when the user asks what rules you are following, or to audit a behaviour such as a language preference.",
+        args: {},
+        async execute() {
+          const rules = await sessionObserver.listLearnings(input.directory)
+          if (rules.length === 0) return "No operating rules are recorded."
+          const injected = rules.filter((r) => r.injected).length
+          return [
+            injected + " of " + rules.length + " recorded rule(s) are injected into this session (the most recent " + INJECTED_LEARNINGS_LIMIT + ").",
+            ...rules.map(
+              (r, i) =>
+                (i + 1) +
+                ". " +
+                (r.injected ? "[injected]" : "[stored]  ") +
+                " " +
+                r.lesson +
+                "  (source: " +
+                r.source +
+                ", store: " +
+                r.origin +
+                ", recorded: " +
+                r.timestamp +
+                ")",
+            ),
+          ].join("\n")
+        },
+      }),
+      synapse_forget_rule: tool({
+        description:
+          "Remove an operating rule (learning) by matching text, so the agent stops applying it. Use when the user asks to stop doing something previously recorded, e.g. 'stop greeting me in French'.",
+        args: {
+          lesson: tool.schema
+            .string()
+            .describe("Text identifying the rule to remove (case-insensitive substring match)."),
+        },
+        async execute(args) {
+          const needle = (args.lesson || "").trim()
+          if (!needle) return "Please provide the rule text to remove."
+          const removed = await sessionObserver.forgetLearning(needle, input.directory)
+          return removed > 0
+            ? 'Removed ' + removed + ' rule(s) matching "' + needle + '". They will not be applied in future sessions.'
+            : 'No rule matched "' + needle + '". Use synapse_list_rules to see the recorded rules.'
+        },
+      }),      synapse_buddy_review: tool({
         description:
           "Run an instant, $0-cost on-premises code review using the Synapse Coder specialist. Checks code snippets or files for syntax errors, SQL injection, broken imports, and security defects.",
         args: {
