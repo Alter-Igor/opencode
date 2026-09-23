@@ -301,10 +301,11 @@ class SessionObserverManager {
           } catch {}
           const found = existing.find((e) => e.lesson.trim().toLowerCase() === normalizedText)
           if (found) {
-            // Re-recording refreshes recency but never duplicates.
+            // Re-recording refreshes recency AND moves the rule to the front, so it
+            // re-enters the injection window; it never duplicates.
             found.timestamp = new Date().toISOString()
             stored = found
-            await writeJsonAtomic(file, existing.slice(0, 100))
+            await writeJsonAtomic(file, [found, ...existing.filter((e) => e !== found)].slice(0, 100))
             continue
           }
           await writeJsonAtomic(file, [entry, ...existing].slice(0, 100))

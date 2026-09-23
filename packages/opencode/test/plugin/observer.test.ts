@@ -1,12 +1,12 @@
 import { describe, expect, test } from "bun:test"
 import { sessionObserver } from "../../src/plugin/observer"
+import { tmpdir } from "../fixture/fixture"
 import * as fs from "fs/promises"
-import * as os from "os"
-import * as path from "path"
-
-function restoreUserProfile(value: string | undefined) {
-  if (value === undefined) delete process.env.USERPROFILE
-  else process.env.USERPROFILE = value
+import * as path from "path"
+
+function restoreUserProfile(value: string | undefined) {
+  if (value === undefined) delete process.env.USERPROFILE
+  else process.env.USERPROFILE = value
 }
 
 describe("SessionObserverManager.onToolAfter", () => {
@@ -81,16 +81,14 @@ describe("SessionObserverManager.onToolAfter", () => {
     expect(retro!.totalToolCalls).toBe(3)
   })
 })
-
-
 describe("rule visibility", () => {
   test("injects a rule that exists only in the project store", async () => {
-    const global = await fs.mkdtemp(path.join(os.tmpdir(), "oc-g-"))
-    const ws = await fs.mkdtemp(path.join(os.tmpdir(), "oc-p-"))
+    await using home = await tmpdir()
+    await using ws = await tmpdir()
     const prev = process.env.USERPROFILE
-    process.env.USERPROFILE = global
+    process.env.USERPROFILE = home.path
     try {
-      const wsFile = path.join(ws, ".system_generated", "logs", "learnings.json")
+      const wsFile = path.join(ws.path, ".system_generated", "logs", "learnings.json")
       await fs.mkdir(path.dirname(wsFile), { recursive: true })
       await fs.writeFile(
         wsFile,
@@ -99,37 +97,34 @@ describe("rule visibility", () => {
         ]),
         "utf8",
       )
-      const listed = await sessionObserver.listLearnings(ws)
-      const row = listed.find((r) => r.lesson === "project only rule")!
+      const row = (await sessionObserver.listLearnings(ws.path)).find((r) => r.lesson === "project only rule")!
       expect(row.origin).toBe("project")
       expect(row.injected).toBe(true)
     } finally {
       restoreUserProfile(prev)
-      await fs.rm(global, { recursive: true, force: true })
-      await fs.rm(ws, { recursive: true, force: true })
     }
   })
 
   test("reports the real injection window and counts a rule once across both stores", async () => {
-    const central = await fs.mkdtemp(path.join(os.tmpdir(), "oc-central-"))
-    const ws = await fs.mkdtemp(path.join(os.tmpdir(), "oc-ws-"))
+    await using home = await tmpdir()
+    await using ws = await tmpdir()
     const prev = process.env.USERPROFILE
-    process.env.USERPROFILE = central
-    const centralFile = path.join(central, ".local", "share", "opencode", "learnings.json")
-    const wsFile = path.join(ws, ".system_generated", "logs", "learnings.json")
+    process.env.USERPROFILE = home.path
     try {
-      await fs.mkdir(path.dirname(centralFile), { recursive: true })
+      const globalFile = path.join(home.path, ".local", "share", "opencode", "learnings.json")
+      await fs.mkdir(path.dirname(globalFile), { recursive: true })
       const rows = Array.from({ length: 7 }, (_, i) => ({
         id: "r" + (i + 1),
         timestamp: "2026-09-" + String(i + 1).padStart(2, "0") + "T00:00:00.000Z",
         lesson: "rule " + (i + 1),
         source: "user_feedback",
       }))
-      await fs.writeFile(centralFile, JSON.stringify(rows), "utf8")
+      await fs.writeFile(globalFile, JSON.stringify(rows), "utf8")
+      const wsFile = path.join(ws.path, ".system_generated", "logs", "learnings.json")
       await fs.mkdir(path.dirname(wsFile), { recursive: true })
       await fs.writeFile(wsFile, JSON.stringify([rows[0]]), "utf8")
 
-      const listed = await sessionObserver.listLearnings(ws)
+      const listed = await sessionObserver.listLearnings(ws.path)
       expect(listed.length).toBe(7)
       const injected = Object.fromEntries(listed.map((r) => [r.lesson, r.injected]))
       expect(injected["rule 1"]).toBe(true)
@@ -139,37 +134,38 @@ describe("rule visibility", () => {
       expect(injected["rule 7"]).toBe(false)
       expect(listed.find((r) => r.lesson === "rule 1")!.origin).toBe("global")
 
-      expect(await sessionObserver.forgetLearning("rule 1", ws)).toBe(1)
-      const after = await sessionObserver.listLearnings(ws)
-      expect(after.map((r) => r.lesson)).not.toContain("rule 1")
-      expect(await sessionObserver.forgetLearning("rule 1", ws)).toBe(0)
+      expect(await sessionObserver.forgetLearning("rule 1", ws.path)).toBe(1)
+      expect((await sessionObserver.listLearnings(ws.path)).map((r) => r.lesson)).not.toContain("rule 1")
+      expect(await sessionObserver.forgetLearning("rule 1", ws.path)).toBe(0)
     } finally {
       restoreUserProfile(prev)
-      await fs.rm(central, { recursive: true, force: true })
-      await fs.rm(ws, { recursive: true, force: true })
     }
   })
 
-  test("dedupes a re-recorded rule by text and still injects it", async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "oc-mix-"))
+  test("re-recording a rule moves it to the front so it re-enters the window", async () => {
+    await using home = await tmpdir()
     const prev = process.env.USERPROFILE
-    process.env.USERPROFILE = dir
+    process.env.USERPROFILE = home.path
     try {
-      const file = path.join(dir, ".local", "share", "opencode", "learnings.json")
+      const file = path.join(home.path, ".local", "share", "opencode", "learnings.json")
       await fs.mkdir(path.dirname(file), { recursive: true })
-      await fs.writeFile(
-        file,
-        JSON.stringify([{ id: "A", timestamp: "2026-09-23T00:00:00.000Z", lesson: "shared rule", source: "user_feedback" }]),
-        "utf8",
-      )
-      // The text already exists on disk under id A, so recording it again must not
-      // duplicate it, and it must still be reported as injected.
-      await sessionObserver.recordLearning({ lesson: "shared rule", source: "user_feedback" }, dir)
-      const listed = await sessionObserver.listLearnings(dir)
-      expect(listed.find((r) => r.lesson === "shared rule")!.injected).toBe(true)
+      const rows = Array.from({ length: 6 }, (_, i) => ({
+        id: "r" + (i + 1),
+        timestamp: "2026-09-0" + (i + 1) + "T00:00:00.000Z",
+        lesson: "rule " + (i + 1),
+        source: "user_feedback",
+      }))
+      await fs.writeFile(file, JSON.stringify(rows), "utf8")
+
+      expect((await sessionObserver.listLearnings()).find((r) => r.lesson === "rule 6")!.injected).toBe(false)
+
+      await sessionObserver.recordLearning({ lesson: "rule 6", source: "user_feedback" })
+
+      const after = await sessionObserver.listLearnings()
+      expect(after.find((r) => r.lesson === "rule 6")!.injected).toBe(true)
+      expect(after.length).toBe(6)
     } finally {
       restoreUserProfile(prev)
-      await fs.rm(dir, { recursive: true, force: true })
     }
   })
 })
