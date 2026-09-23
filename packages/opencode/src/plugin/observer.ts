@@ -347,8 +347,16 @@ class SessionObserverManager {
         return [] as SessionLearning[]
       }
     })
-    if (loaded.length > 0) this.sessionLearnings = loaded
-    return loaded.slice(0, limit)
+    if (loaded.length > 0) {
+      // Merge, never clobber: a rule recorded while the read was pending must not
+      // be dropped from the cache by the older file contents.
+      const seen = new Set(loaded.map(learningKey))
+      this.sessionLearnings = [
+        ...this.sessionLearnings.filter((l) => !seen.has(learningKey(l))),
+        ...loaded,
+      ]
+    }
+    return this.sessionLearnings.slice(0, limit)
   }
 
   public async getRecentLearnings(limit = 5): Promise<SessionLearning[]> {
