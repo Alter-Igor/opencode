@@ -277,37 +277,19 @@ class SessionObserverManager {
     } catch {}
   }
 
-  private sessionLearnings: SessionLearning[] = []
-
   public async recordLearning(
     learning: Omit<SessionLearning, "id" | "timestamp">,
     workspaceDir?: string,
   ): Promise<SessionLearning> {
     const normalizedText = learning.lesson.trim().toLowerCase()
-    const existingIndex = this.sessionLearnings.findIndex(
-      (l) => l.lesson.trim().toLowerCase() === normalizedText,
-    )
-    if (existingIndex !== -1) {
-      // Update existing entry timestamp and return without duplicating
-      const existing = this.sessionLearnings[existingIndex]
-      existing.timestamp = new Date().toISOString()
-      return existing
-    }
-
+    const paths = learningStorePaths(workspaceDir)
+    const files = [paths.global, paths.project].filter((file): file is string => Boolean(file))
     const entry: SessionLearning = {
       id: `learn_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
       timestamp: new Date().toISOString(),
       ...learning,
     }
-    this.sessionLearnings.unshift(entry)
-    if (this.sessionLearnings.length > 100) this.sessionLearnings.pop()
-
-    // Persist to the central and workspace stores, serialised against forgetLearning.
-    const homeDir = process.env.USERPROFILE || process.env.HOME || ""
-    const files = [
-      homeDir ? path.join(homeDir, ".local", "share", "opencode", "learnings.json") : undefined,
-      workspaceDir ? path.join(workspaceDir, ".system_generated", "logs", "learnings.json") : undefined,
-    ].filter((file): file is string => Boolean(file))
+    let stored = entry
     await this.mutate(async () => {
       for (const file of files) {
         try {
@@ -317,50 +299,56 @@ class SessionObserverManager {
             const parsed = JSON.parse(await fs.readFile(file, "utf8"))
             if (Array.isArray(parsed)) existing = parsed
           } catch {}
-          if (!existing.some((e) => e.lesson.trim().toLowerCase() === normalizedText)) {
-            await writeJsonAtomic(file, [entry, ...existing].slice(0, 100))
+          const found = existing.find((e) => e.lesson.trim().toLowerCase() === normalizedText)
+          if (found) {
+            // Re-recording refreshes recency AND moves the rule to the front, so it
+            // re-enters the injection window; it never duplicates.
+            found.timestamp = new Date().toISOString()
+            stored = found
+            await writeJsonAtomic(file, [found, ...existing.filter((e) => e !== found)].slice(0, 100))
+            continue
           }
+          await writeJsonAtomic(file, [entry, ...existing].slice(0, 100))
         } catch {}
       }
     })
-    return entry
+    return stored
   }
 
   /**
    * The rules actually selected for injection, in the same order the prompt
    * builder uses. Shared so the listed `injected` flag cannot drift from reality.
    */
-  private async selectInjected(limit: number): Promise<SessionLearning[]> {
-    if (this.sessionLearnings.length > 0) {
-      return this.sessionLearnings.slice(0, limit)
-    }
-    // Read through the mutation queue: a read that starts while a forget is still
-    // writing must not reload the store it is about to forget from.
-    const loaded = await this.mutate(async () => {
-      try {
-        const homeDir = process.env.USERPROFILE || process.env.HOME || ""
-        if (!homeDir) return [] as SessionLearning[]
-        const centralFile = path.join(homeDir, ".local", "share", "opencode", "learnings.json")
-        const content = JSON.parse(await fs.readFile(centralFile, "utf8"))
-        return Array.isArray(content) ? (content as SessionLearning[]) : []
-      } catch {
-        return [] as SessionLearning[]
+  private async selectInjected(limit: number, workspaceDir?: string): Promise<SessionLearning[]> {
+    // Always read from disk, from the right stores for THIS workspace. One process
+    // can serve several projects, so no cached list may be reused across them.
+    return this.mutate(async () => {
+      const read = async (file?: string): Promise<SessionLearning[]> => {
+        if (!file) return []
+        try {
+          const parsed = JSON.parse(await fs.readFile(file, "utf8"))
+          return Array.isArray(parsed) ? (parsed as SessionLearning[]) : []
+        } catch {
+          return []
+        }
       }
+      const paths = learningStorePaths(workspaceDir)
+      // Project rules first: a committed, reviewed repo rule outranks an ad-hoc
+      // global note (AIMETH-008 - shared repo facts win). One entry per rule text.
+      const seen = new Set<string>()
+      const merged: SessionLearning[] = []
+      for (const rule of [...(await read(paths.project)), ...(await read(paths.global))]) {
+        const key = learningKey(rule)
+        if (seen.has(key)) continue
+        seen.add(key)
+        merged.push(rule)
+      }
+      return merged.slice(0, limit)
     })
-    if (loaded.length > 0) {
-      // Merge, never clobber: a rule recorded while the read was pending must not
-      // be dropped from the cache by the older file contents.
-      const seen = new Set(loaded.map(learningKey))
-      this.sessionLearnings = [
-        ...this.sessionLearnings.filter((l) => !seen.has(learningKey(l))),
-        ...loaded,
-      ]
-    }
-    return this.sessionLearnings.slice(0, limit)
   }
 
-  public async getRecentLearnings(limit = 5): Promise<SessionLearning[]> {
-    return this.selectInjected(limit)
+  public async getRecentLearnings(limit = 5, workspaceDir?: string): Promise<SessionLearning[]> {
+    return this.selectInjected(limit, workspaceDir)
   }
 
   private mutation: Promise<unknown> = Promise.resolve()
@@ -373,15 +361,16 @@ class SessionObserverManager {
   }
 
   /**
-   * Every persisted rule, with where it was found and whether it is one of the
-   * most-recent rules actually injected into a session's system prompt. This is
-   * the honest answer to "what rules is the agent using?" - recorded rules that
-   * fall outside the injection window are shown as `stored`, not `injected`.
+   * Every persisted rule, tagged with which store it lives in (`global` = whole
+   * machine, `project` = this repo) and whether it is actually injected into a
+   * session's system prompt. This is the honest answer to "what rules is the
+   * agent using?" - a rule outside the injection window is shown as stored.
    */
   public async listLearnings(
     workspaceDir?: string,
-  ): Promise<Array<SessionLearning & { origin: "central" | "workspace"; injected: boolean }>> {
-    const read = async (file: string): Promise<SessionLearning[]> => {
+  ): Promise<Array<SessionLearning & { origin: "global" | "project"; injected: boolean }>> {
+    const read = async (file?: string): Promise<SessionLearning[]> => {
+      if (!file) return []
       try {
         const parsed = JSON.parse(await fs.readFile(file, "utf8"))
         return Array.isArray(parsed) ? (parsed as SessionLearning[]) : []
@@ -389,21 +378,17 @@ class SessionObserverManager {
         return []
       }
     }
-    const homeDir = process.env.USERPROFILE || process.env.HOME || ""
-    const central = homeDir
-      ? await read(path.join(homeDir, ".local", "share", "opencode", "learnings.json"))
-      : []
-    const workspace = workspaceDir
-      ? await read(path.join(workspaceDir, ".system_generated", "logs", "learnings.json"))
-      : []
-    const centralKeys = new Set(central.map((l) => l.lesson.trim().toLowerCase()))
+    const paths = learningStorePaths(workspaceDir)
+    const global = await read(paths.global)
+    const project = await read(paths.project)
+    const globalKeys = new Set(global.map(learningKey))
     const merged = [
-      ...central.map((l) => ({ ...l, origin: "central" as const })),
-      ...workspace
-        .filter((l) => !centralKeys.has(l.lesson.trim().toLowerCase()))
-        .map((l) => ({ ...l, origin: "workspace" as const })),
+      ...global.map((l) => ({ ...l, origin: "global" as const })),
+      ...project
+        .filter((l) => !globalKeys.has(learningKey(l)))
+        .map((l) => ({ ...l, origin: "project" as const })),
     ].sort((a, b) => (a.timestamp < b.timestamp ? 1 : -1))
-    const injectedKeys = new Set((await this.selectInjected(INJECTED_LEARNINGS_LIMIT)).map(learningKey))
+    const injectedKeys = new Set((await this.selectInjected(INJECTED_LEARNINGS_LIMIT, workspaceDir)).map(learningKey))
     return merged.map((l) => ({ ...l, injected: injectedKeys.has(learningKey(l)) }))
   }
 
@@ -416,12 +401,8 @@ class SessionObserverManager {
     const needle = lessonText.trim().toLowerCase()
     if (!needle) return 0
     const matches = (l: SessionLearning) => String(l.lesson ?? "").toLowerCase().includes(needle)
-    this.sessionLearnings = this.sessionLearnings.filter((l) => !matches(l))
-    const homeDir = process.env.USERPROFILE || process.env.HOME || ""
-    const files = [
-      homeDir ? path.join(homeDir, ".local", "share", "opencode", "learnings.json") : undefined,
-      workspaceDir ? path.join(workspaceDir, ".system_generated", "logs", "learnings.json") : undefined,
-    ].filter((file): file is string => Boolean(file))
+    const paths = learningStorePaths(workspaceDir)
+    const files = [paths.global, paths.project].filter((file): file is string => Boolean(file))
     const removed = new Set<string>()
     for (const file of files) {
       for (const key of await this.dropRules(file, matches)) removed.add(key)
@@ -468,6 +449,15 @@ class SessionObserverManager {
 
 /** How many of the most-recent rules are injected into a session system prompt. */
 export const INJECTED_LEARNINGS_LIMIT = 5
+
+/** The two on-disk rule stores: global (whole machine) and this project. */
+export function learningStorePaths(workspaceDir?: string): { global?: string; project?: string } {
+  const homeDir = process.env.USERPROFILE || process.env.HOME || ""
+  return {
+    global: homeDir ? path.join(homeDir, ".local", "share", "opencode", "learnings.json") : undefined,
+    project: workspaceDir ? path.join(workspaceDir, ".system_generated", "logs", "learnings.json") : undefined,
+  }
+}
 
 const learningKey = (l: SessionLearning) => String(l.lesson ?? "").trim().toLowerCase()
 
