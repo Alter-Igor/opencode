@@ -290,4 +290,22 @@ describe("rule visibility", () => {
       restoreUserProfile(prev)
     }
   })
+
+  test("forgetting reports nothing when a store is unreadable data", async () => {
+    await using home = await tmpdir()
+    await using ws = await tmpdir()
+    const prev = process.env.USERPROFILE
+    process.env.USERPROFILE = home.path
+    try {
+      await sessionObserver.recordLearning({ lesson: "fragile", source: "user_feedback" })
+      // The project store exists but holds valid JSON that is not the expected array.
+      const wsFile = path.join(ws.path, ".system_generated", "logs", "learnings.json")
+      await fs.mkdir(path.dirname(wsFile), { recursive: true })
+      await fs.writeFile(wsFile, JSON.stringify("not a rules array"), "utf8")
+
+      expect(await sessionObserver.forgetLearning("fragile", ws.path)).toBe(0)
+    } finally {
+      restoreUserProfile(prev)
+    }
+  })
 })

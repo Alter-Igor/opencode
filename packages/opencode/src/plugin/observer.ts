@@ -436,12 +436,15 @@ class SessionObserverManager {
     let raw: string
     try {
       raw = await fs.readFile(file, "utf8")
-    } catch {
-      return { keys, ok: true }
+    } catch (error) {
+      // Only a missing store is a successful absence; any other read error means we
+      // cannot know what the store holds.
+      const code = error && typeof error === "object" && "code" in error ? (error as { code?: unknown }).code : undefined
+      return { keys, ok: code === "ENOENT" }
     }
     try {
       const parsed = JSON.parse(raw)
-      if (!Array.isArray(parsed)) return { keys, ok: true }
+      if (!Array.isArray(parsed)) return { keys, ok: false }
       const rows = parsed as SessionLearning[]
       let changed = false
       for (const row of rows) {
