@@ -233,4 +233,45 @@ describe("rule visibility", () => {
       restoreUserProfile(prev)
     }
   })
+
+  test("a tombstone survives the record cap", async () => {
+    await using home = await tmpdir()
+    const prev = process.env.USERPROFILE
+    process.env.USERPROFILE = home.path
+    try {
+      const file = path.join(home.path, ".local", "share", "opencode", "learnings.json")
+      const rows: Array<{
+        id: string
+        timestamp: string
+        lesson: string
+        source: string
+        deletedAt?: string
+        deletedBy?: string
+      }> = Array.from({ length: 100 }, (_, i) => ({
+        id: "r" + i,
+        timestamp: "2026-09-01T00:00:00.000Z",
+        lesson: "rule " + i,
+        source: "user_feedback",
+      }))
+      rows.push({
+        id: "dead",
+        timestamp: "2026-09-01T00:00:00.000Z",
+        lesson: "tombstoned rule",
+        source: "user_feedback",
+        deletedAt: "2026-09-02T00:00:00.000Z",
+        deletedBy: "test",
+      })
+      await fs.mkdir(path.dirname(file), { recursive: true })
+      await fs.writeFile(file, JSON.stringify(rows), "utf8")
+
+      await sessionObserver.recordLearning({ lesson: "one more", source: "user_feedback" })
+
+      const after = JSON.parse(await fs.readFile(file, "utf8"))
+      const tomb = after.find((r: { lesson: string }) => r.lesson === "tombstoned rule")
+      expect(tomb).toBeDefined()
+      expect(tomb.deletedAt).toBe("2026-09-02T00:00:00.000Z")
+    } finally {
+      restoreUserProfile(prev)
+    }
+  })
 })

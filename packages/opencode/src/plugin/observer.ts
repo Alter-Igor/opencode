@@ -310,10 +310,10 @@ class SessionObserverManager {
             found.deletedAt = undefined
             found.deletedBy = undefined
             stored = found
-            await writeJsonAtomic(file, [found, ...existing.filter((e) => e !== found)].slice(0, 100))
+            await writeJsonAtomic(file, trimRules([found, ...existing.filter((e) => e !== found)]))
             continue
           }
-          await writeJsonAtomic(file, [{ ...entry, scope }, ...existing].slice(0, 100))
+          await writeJsonAtomic(file, trimRules([{ ...entry, scope }, ...existing]))
         } catch {}
       }
     })
@@ -408,40 +408,42 @@ class SessionObserverManager {
     const matches = (l: SessionLearning) => String(l.lesson ?? "").toLowerCase().includes(needle)
     const paths = learningStorePaths(workspaceDir)
     const files = [paths.global, paths.project].filter((file): file is string => Boolean(file))
-    const removed = new Set<string>()
-    for (const file of files) {
-      for (const key of await this.tombstoneRules(file, matches)) removed.add(key)
-    }
-    return removed.size
+    // One mutation for both stores, so a record cannot interleave between them.
+    return this.mutate(async () => {
+      const removed = new Set<string>()
+      for (const file of files) {
+        for (const key of await this.applyTombstones(file, matches)) removed.add(key)
+      }
+      return removed.size
+    })
   }
 
   /**
-   * Mark matching live rules as deleted in one store, atomically. The rows are kept
-   * as tombstones so a later merge or sync cannot resurrect them. A tombstone is only
-   * reported when the write landed; a failed write returns nothing.
+   * Mark matching live rules as deleted in one store. The rows are kept as
+   * tombstones so a later merge or sync cannot resurrect them. Non-queuing: the
+   * caller must already hold the mutation lock. A tombstone is only reported when
+   * the write landed; a failed write returns nothing.
    */
-  private tombstoneRules(file: string, matches: (l: SessionLearning) => boolean): Promise<Set<string>> {
-    return this.mutate(async () => {
-      const found = new Set<string>()
-      try {
-        const parsed = JSON.parse(await fs.readFile(file, "utf8"))
-        if (!Array.isArray(parsed)) return found
-        const rows = parsed as SessionLearning[]
-        let changed = false
-        for (const row of rows) {
-          if (!isLive(row) || !matches(row)) continue
-          row.deletedAt = new Date().toISOString()
-          row.deletedBy = process.env.USERNAME || process.env.USER || "local"
-          found.add(learningKey(row))
-          changed = true
-        }
-        if (!changed) return found
-        await writeJsonAtomic(file, rows.slice(0, 100))
-      } catch {
-        return new Set<string>()
+  private async applyTombstones(file: string, matches: (l: SessionLearning) => boolean): Promise<Set<string>> {
+    const found = new Set<string>()
+    try {
+      const parsed = JSON.parse(await fs.readFile(file, "utf8"))
+      if (!Array.isArray(parsed)) return found
+      const rows = parsed as SessionLearning[]
+      let changed = false
+      for (const row of rows) {
+        if (!isLive(row) || !matches(row)) continue
+        row.deletedAt = new Date().toISOString()
+        row.deletedBy = process.env.USERNAME || process.env.USER || "local"
+        found.add(learningKey(row))
+        changed = true
       }
-      return found
-    })
+      if (!changed) return found
+      await writeJsonAtomic(file, trimRules(rows))
+    } catch {
+      return new Set<string>()
+    }
+    return found
   }
 
   public getLatestRetrospectives(): SessionRetrospective[] {
@@ -469,6 +471,20 @@ const learningKey = (l: SessionLearning) => String(l.lesson ?? "").trim().toLowe
 
 /** A rule is live unless it carries a tombstone. */
 const isLive = (l: SessionLearning) => !l.deletedAt
+
+const MAX_LIVE_RULES = 100
+const MAX_TOMBSTONES = 100
+
+/**
+ * Bound file size without evicting tombstones: a dropped tombstone would let a
+ * later merge resurrect the rule it records as deleted.
+ */
+function trimRules(rows: SessionLearning[]): SessionLearning[] {
+  return [
+    ...rows.filter(isLive).slice(0, MAX_LIVE_RULES),
+    ...rows.filter((r) => !isLive(r)).slice(0, MAX_TOMBSTONES),
+  ]
+}
 
 /** Write JSON via a temp file + rename so a reader never sees a half-written file. */
 async function writeJsonAtomic(file: string, rows: SessionLearning[]): Promise<void> {
