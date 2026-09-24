@@ -168,4 +168,69 @@ describe("rule visibility", () => {
       restoreUserProfile(prev)
     }
   })
+
+  test("forgetting keeps the row as a tombstone instead of deleting it", async () => {
+    await using home = await tmpdir()
+    const prev = process.env.USERPROFILE
+    process.env.USERPROFILE = home.path
+    try {
+      const file = path.join(home.path, ".local", "share", "opencode", "learnings.json")
+      await sessionObserver.recordLearning({ lesson: "tombstone me", source: "user_feedback" })
+      expect(await sessionObserver.forgetLearning("tombstone me")).toBe(1)
+
+      expect((await sessionObserver.listLearnings()).find((r) => r.lesson === "tombstone me")).toBeUndefined()
+
+      const rows = JSON.parse(await fs.readFile(file, "utf8"))
+      const row = rows.find((r: { lesson: string }) => r.lesson === "tombstone me")
+      expect(row).toBeDefined()
+      expect(typeof row.deletedAt).toBe("string")
+      expect(row.scope).toBe("global")
+    } finally {
+      restoreUserProfile(prev)
+    }
+  })
+
+  test("re-recording a forgotten rule revives it without duplicating", async () => {
+    await using home = await tmpdir()
+    const prev = process.env.USERPROFILE
+    process.env.USERPROFILE = home.path
+    try {
+      const file = path.join(home.path, ".local", "share", "opencode", "learnings.json")
+      await sessionObserver.recordLearning({ lesson: "revive me", source: "user_feedback" })
+      expect(await sessionObserver.forgetLearning("revive me")).toBe(1)
+      expect((await sessionObserver.listLearnings()).find((r) => r.lesson === "revive me")).toBeUndefined()
+
+      await sessionObserver.recordLearning({ lesson: "revive me", source: "user_feedback" })
+
+      expect((await sessionObserver.listLearnings()).find((r) => r.lesson === "revive me")!.injected).toBe(true)
+      const rows = JSON.parse(await fs.readFile(file, "utf8"))
+      const rowsForLesson = rows.filter((r: { lesson: string }) => r.lesson === "revive me")
+      expect(rowsForLesson.length).toBe(1)
+      expect(rowsForLesson[0].deletedAt).toBeUndefined()
+    } finally {
+      restoreUserProfile(prev)
+    }
+  })
+
+  test("records the scope of each rule", async () => {
+    await using home = await tmpdir()
+    await using ws = await tmpdir()
+    const prev = process.env.USERPROFILE
+    process.env.USERPROFILE = home.path
+    try {
+      await sessionObserver.recordLearning({ lesson: "global rule", source: "user_feedback" })
+      await sessionObserver.recordLearning({ lesson: "project rule", source: "user_feedback" }, ws.path)
+
+      const global = JSON.parse(
+        await fs.readFile(path.join(home.path, ".local", "share", "opencode", "learnings.json"), "utf8"),
+      )
+      const project = JSON.parse(
+        await fs.readFile(path.join(ws.path, ".system_generated", "logs", "learnings.json"), "utf8"),
+      )
+      expect(global.find((r: { lesson: string }) => r.lesson === "global rule").scope).toBe("global")
+      expect(project.find((r: { lesson: string }) => r.lesson === "project rule").scope).toBe("project")
+    } finally {
+      restoreUserProfile(prev)
+    }
+  })
 })
