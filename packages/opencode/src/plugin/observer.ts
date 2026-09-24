@@ -314,6 +314,7 @@ class SessionObserverManager {
             continue
           }
           await writeJsonAtomic(file, trimRules([{ ...entry, scope }, ...existing]))
+          stored = { ...entry, scope }
         } catch {}
       }
     })
@@ -410,40 +411,51 @@ class SessionObserverManager {
     const files = [paths.global, paths.project].filter((file): file is string => Boolean(file))
     // One mutation for both stores, so a record cannot interleave between them.
     return this.mutate(async () => {
-      const removed = new Set<string>()
-      for (const file of files) {
-        for (const key of await this.applyTombstones(file, matches)) removed.add(key)
-      }
-      return removed.size
+      const results: Array<{ keys: Set<string>; ok: boolean }> = []
+      for (const file of files) results.push(await this.applyTombstones(file, matches))
+      // If a store could not be read or written, we cannot claim its copy is gone, so
+      // report nothing rather than a count that may be wrong.
+      if (results.some((r) => !r.ok)) return 0
+      const forgotten = new Set<string>()
+      for (const result of results) for (const key of result.keys) forgotten.add(key)
+      return forgotten.size
     })
   }
 
   /**
    * Mark matching live rules as deleted in one store. The rows are kept as
    * tombstones so a later merge or sync cannot resurrect them. Non-queuing: the
-   * caller must already hold the mutation lock. A tombstone is only reported when
-   * the write landed; a failed write returns nothing.
+   * caller must already hold the mutation lock. Returns the keys acted on and
+   * whether the read and write both succeeded; an absent store is not a failure.
    */
-  private async applyTombstones(file: string, matches: (l: SessionLearning) => boolean): Promise<Set<string>> {
-    const found = new Set<string>()
+  private async applyTombstones(
+    file: string,
+    matches: (l: SessionLearning) => boolean,
+  ): Promise<{ keys: Set<string>; ok: boolean }> {
+    const keys = new Set<string>()
+    let raw: string
     try {
-      const parsed = JSON.parse(await fs.readFile(file, "utf8"))
-      if (!Array.isArray(parsed)) return found
+      raw = await fs.readFile(file, "utf8")
+    } catch {
+      return { keys, ok: true }
+    }
+    try {
+      const parsed = JSON.parse(raw)
+      if (!Array.isArray(parsed)) return { keys, ok: true }
       const rows = parsed as SessionLearning[]
       let changed = false
       for (const row of rows) {
         if (!isLive(row) || !matches(row)) continue
         row.deletedAt = new Date().toISOString()
         row.deletedBy = process.env.USERNAME || process.env.USER || "local"
-        found.add(learningKey(row))
+        keys.add(learningKey(row))
         changed = true
       }
-      if (!changed) return found
-      await writeJsonAtomic(file, trimRules(rows))
+      if (changed) await writeJsonAtomic(file, trimRules(rows))
+      return { keys, ok: true }
     } catch {
-      return new Set<string>()
+      return { keys, ok: false }
     }
-    return found
   }
 
   public getLatestRetrospectives(): SessionRetrospective[] {

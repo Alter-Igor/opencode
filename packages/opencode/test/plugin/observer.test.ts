@@ -274,4 +274,20 @@ describe("rule visibility", () => {
       restoreUserProfile(prev)
     }
   })
+
+  test("forgetting still counts when the other store does not exist", async () => {
+    await using home = await tmpdir()
+    await using ws = await tmpdir()
+    const prev = process.env.USERPROFILE
+    process.env.USERPROFILE = home.path
+    try {
+      await sessionObserver.recordLearning({ lesson: "only global", source: "user_feedback" }, ws.path)
+      // Remove the project store so only the global copy remains.
+      await fs.rm(path.join(ws.path, ".system_generated", "logs", "learnings.json"), { force: true })
+
+      expect(await sessionObserver.forgetLearning("only global", ws.path)).toBe(1)
+    } finally {
+      restoreUserProfile(prev)
+    }
+  })
 })
