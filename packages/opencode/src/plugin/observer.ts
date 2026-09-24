@@ -292,6 +292,7 @@ class SessionObserverManager {
     let stored = entry
     await this.mutate(async () => {
       for (const file of files) {
+        const scope: "global" | "project" = file === paths.project ? "project" : "global"
         try {
           await fs.mkdir(path.dirname(file), { recursive: true })
           let existing: SessionLearning[] = []
@@ -302,13 +303,18 @@ class SessionObserverManager {
           const found = existing.find((e) => e.lesson.trim().toLowerCase() === normalizedText)
           if (found) {
             // Re-recording refreshes recency AND moves the rule to the front, so it
-            // re-enters the injection window; it never duplicates.
+            // re-enters the injection window; it never duplicates. It also clears any
+            // tombstone, which is how a forgotten rule is restored.
             found.timestamp = new Date().toISOString()
+            found.scope = scope
+            found.deletedAt = undefined
+            found.deletedBy = undefined
             stored = found
-            await writeJsonAtomic(file, [found, ...existing.filter((e) => e !== found)].slice(0, 100))
+            await writeJsonAtomic(file, trimRules([found, ...existing.filter((e) => e !== found)]))
             continue
           }
-          await writeJsonAtomic(file, [entry, ...existing].slice(0, 100))
+          await writeJsonAtomic(file, trimRules([{ ...entry, scope }, ...existing]))
+          stored = { ...entry, scope }
         } catch {}
       }
     })
@@ -337,7 +343,7 @@ class SessionObserverManager {
       // global note (AIMETH-008 - shared repo facts win). One entry per rule text.
       const seen = new Set<string>()
       const merged: SessionLearning[] = []
-      for (const rule of [...(await read(paths.project)), ...(await read(paths.global))]) {
+      for (const rule of [...(await read(paths.project)), ...(await read(paths.global))].filter(isLive)) {
         const key = learningKey(rule)
         if (seen.has(key)) continue
         seen.add(key)
@@ -379,8 +385,8 @@ class SessionObserverManager {
       }
     }
     const paths = learningStorePaths(workspaceDir)
-    const global = await read(paths.global)
-    const project = await read(paths.project)
+    const global = (await read(paths.global)).filter(isLive)
+    const project = (await read(paths.project)).filter(isLive)
     const globalKeys = new Set(global.map(learningKey))
     const merged = [
       ...global.map((l) => ({ ...l, origin: "global" as const })),
@@ -393,9 +399,9 @@ class SessionObserverManager {
   }
 
   /**
-   * Remove rules whose text matches (case-insensitive substring) from memory and
-   * from both persisted stores. Returns the number of distinct rules removed; a
-   * rule present in both stores is counted once.
+   * Forget rules whose text matches (case-insensitive substring): mark them deleted
+   * (tombstone) in both persisted stores. Returns the number of distinct rules newly
+   * forgotten; a rule present in both stores is counted once.
    */
   public async forgetLearning(lessonText: string, workspaceDir?: string): Promise<number> {
     const needle = lessonText.trim().toLowerCase()
@@ -403,39 +409,56 @@ class SessionObserverManager {
     const matches = (l: SessionLearning) => String(l.lesson ?? "").toLowerCase().includes(needle)
     const paths = learningStorePaths(workspaceDir)
     const files = [paths.global, paths.project].filter((file): file is string => Boolean(file))
-    const removed = new Set<string>()
-    for (const file of files) {
-      for (const key of await this.dropRules(file, matches)) removed.add(key)
-    }
-    return removed.size
+    // One mutation for both stores, so a record cannot interleave between them.
+    return this.mutate(async () => {
+      const results: Array<{ keys: Set<string>; ok: boolean }> = []
+      for (const file of files) results.push(await this.applyTombstones(file, matches))
+      // If a store could not be read or written, we cannot claim its copy is gone, so
+      // report nothing rather than a count that may be wrong.
+      if (results.some((r) => !r.ok)) return 0
+      const forgotten = new Set<string>()
+      for (const result of results) for (const key of result.keys) forgotten.add(key)
+      return forgotten.size
+    })
   }
 
   /**
-   * Remove matching rules from one store atomically and count them. A removal is
-   * only reported when the write landed; a failed write returns nothing and the
-   * file is left untouched.
+   * Mark matching live rules as deleted in one store. The rows are kept as
+   * tombstones so a later merge or sync cannot resurrect them. Non-queuing: the
+   * caller must already hold the mutation lock. Returns the keys acted on and
+   * whether the read and write both succeeded; an absent store is not a failure.
    */
-  private dropRules(file: string, matches: (l: SessionLearning) => boolean): Promise<Set<string>> {
-    return this.mutate(async () => {
-      const found = new Set<string>()
-      try {
-        const parsed = JSON.parse(await fs.readFile(file, "utf8"))
-        if (!Array.isArray(parsed)) return found
-        const kept: SessionLearning[] = []
-        for (const row of parsed as SessionLearning[]) {
-          if (matches(row)) {
-            found.add(String(row.lesson ?? "").trim().toLowerCase())
-            continue
-          }
-          kept.push(row)
-        }
-        if (found.size === 0) return found
-        await writeJsonAtomic(file, kept.slice(0, 100))
-      } catch {
-        return new Set<string>()
+  private async applyTombstones(
+    file: string,
+    matches: (l: SessionLearning) => boolean,
+  ): Promise<{ keys: Set<string>; ok: boolean }> {
+    const keys = new Set<string>()
+    let raw: string
+    try {
+      raw = await fs.readFile(file, "utf8")
+    } catch (error) {
+      // Only a missing store is a successful absence; any other read error means we
+      // cannot know what the store holds.
+      const code = error && typeof error === "object" && "code" in error ? (error as { code?: unknown }).code : undefined
+      return { keys, ok: code === "ENOENT" }
+    }
+    try {
+      const parsed = JSON.parse(raw)
+      if (!Array.isArray(parsed)) return { keys, ok: false }
+      const rows = parsed as SessionLearning[]
+      let changed = false
+      for (const row of rows) {
+        if (!isLive(row) || !matches(row)) continue
+        row.deletedAt = new Date().toISOString()
+        row.deletedBy = process.env.USERNAME || process.env.USER || "local"
+        keys.add(learningKey(row))
+        changed = true
       }
-      return found
-    })
+      if (changed) await writeJsonAtomic(file, trimRules(rows))
+      return { keys, ok: true }
+    } catch {
+      return { keys, ok: false }
+    }
   }
 
   public getLatestRetrospectives(): SessionRetrospective[] {
@@ -461,6 +484,23 @@ export function learningStorePaths(workspaceDir?: string): { global?: string; pr
 
 const learningKey = (l: SessionLearning) => String(l.lesson ?? "").trim().toLowerCase()
 
+/** A rule is live unless it carries a tombstone. */
+const isLive = (l: SessionLearning) => !l.deletedAt
+
+const MAX_LIVE_RULES = 100
+const MAX_TOMBSTONES = 100
+
+/**
+ * Bound file size without evicting tombstones: a dropped tombstone would let a
+ * later merge resurrect the rule it records as deleted.
+ */
+function trimRules(rows: SessionLearning[]): SessionLearning[] {
+  return [
+    ...rows.filter(isLive).slice(0, MAX_LIVE_RULES),
+    ...rows.filter((r) => !isLive(r)).slice(0, MAX_TOMBSTONES),
+  ]
+}
+
 /** Write JSON via a temp file + rename so a reader never sees a half-written file. */
 async function writeJsonAtomic(file: string, rows: SessionLearning[]): Promise<void> {
   const tmp = `${file}.${process.pid}.${Math.random().toString(36).slice(2, 7)}.tmp`
@@ -474,6 +514,11 @@ export interface SessionLearning {
   lesson: string
   context?: string
   source: "user_feedback" | "buddy_review" | "auto_correction" | "session_retro"
+  /** Which store this row belongs to. */
+  scope?: "global" | "project"
+  /** Tombstone: set when the rule is forgotten, so a later merge cannot resurrect it. */
+  deletedAt?: string
+  deletedBy?: string
 }
 
 export const sessionObserver = new SessionObserverManager()
