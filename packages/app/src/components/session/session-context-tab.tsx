@@ -337,7 +337,7 @@ export function SessionContextTab() {
                     <div class="text-text-base">{row.label}</div>
                     <div class="text-text-weak">
                       {formatter().number(row.tokens)}
-                      <span class="text-text-weaker"> ┬À {row.percent.toLocaleString(language.intl())}%</span>
+                      <span class="text-text-weaker"> ({row.percent.toLocaleString(language.intl())}%)</span>
                     </div>
                   </div>
                 )}

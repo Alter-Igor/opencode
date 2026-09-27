@@ -54,9 +54,13 @@ function messageRows(messages: ModelMessage[]) {
   const assistant = messages
     .filter((message) => message.role === "assistant")
     .reduce((sum, message) => sum + textOf(message.content).length, 0)
+  const tools = messages
+    .filter((message) => message.role === "tool")
+    .reduce((sum, message) => sum + textOf(message.content).length, 0)
   return [
     { label: "Your messages", tokens: estimate(user) },
     { label: "Earlier replies", tokens: estimate(assistant) },
+    { label: "Tool results", tokens: estimate(tools) },
   ]
 }
 

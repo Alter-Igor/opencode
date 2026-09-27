@@ -17,6 +17,7 @@ import PROMPT_TRINITY from "./prompt/trinity.txt"
 import type { Provider } from "@/provider/provider"
 import type { Agent } from "@/agent/agent"
 import { Permission } from "@/permission"
+import { Skill } from "@/skill"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { Location } from "@opencode-ai/core/location"
 import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
@@ -60,6 +61,7 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/Sy
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
+    const skill = yield* Skill.Service
     const mcp = yield* MCP.Service
     const locations = yield* LocationServiceMap.Service
 
@@ -102,11 +104,21 @@ const layer = Layer.effect(
         ].filter((part): part is string => part !== undefined)
       }),
 
-      skills: Effect.fn("SystemPrompt.skills")(function* (_agent: Agent.Info) {
-        // The local catalogue is not pasted. Company skills are fetched from RAG
-        // by .opencode/plugin/alterspective-rag-standards.ts. The skill tool can
-        // still load one named local skill when the task needs files on this PC.
-        return undefined
+      skills: Effect.fn("SystemPrompt.skills")(function* (agent: Agent.Info) {
+        // Default: do not paste the local catalogue. The fork plugin supplies the RAG lookup.
+        // If that injection is turned off, the old catalogue is the only skill guidance left.
+        const injectionDisabled =
+          process.env.ALTERSPECTIVE_STANDARDS_INJECTION_DISABLED === "true" ||
+          process.env.ALTERSPECTIVE_STANDARDS_INJECTION_ENABLED === "false"
+        if (!injectionDisabled) return undefined
+        if (Permission.disabled(["skill"], agent.permission).has("skill")) return
+        const list = yield* skill.available(agent)
+        if (list.length === 0) return
+        return [
+          "Skills provide specialized instructions and workflows for specific tasks.",
+          "Use the skill tool to load a skill when a task matches its description.",
+          Skill.fmt(list, { verbose: true }),
+        ].join("\n")
       }),
 
       mcp: Effect.fn("SystemPrompt.mcp")(function* (agent: Agent.Info, permission?: PermissionV1.Ruleset) {
@@ -139,7 +151,7 @@ const locationServiceMapNode = LayerNode.make({
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
-  deps: [MCP.node, locationServiceMapNode],
+  deps: [Skill.node, MCP.node, locationServiceMapNode],
 })
 
 export * as SystemPrompt from "./system"

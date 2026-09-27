@@ -54,6 +54,8 @@ async function loadEmbeddedUI() {
     return compiled.default as Record<string, string>
   } catch {
     try {
+      // Present only after `bun run build` in packages/app. Missing in a clean checkout.
+      // @ts-expect-error - generated file, not part of the source tree
       const local = await import("../../../opencode-web-ui.gen.ts")
       return local.default as Record<string, string>
     } catch {

@@ -39,6 +39,19 @@ describe("measureContextUsage", () => {
     expect(map["RAG tools"]).toBeGreaterThan(0)
     expect(map["CAS tools"]).toBeGreaterThan(0)
     expect(map["Earlier replies"]).toBeUndefined()
+    expect(map["Tool results"]).toBeUndefined()
     expect(rows.some((row) => row.label === "invalid")).toBe(false)
+  })
+
+  test("counts a large tool result on its own row", () => {
+    const rows = measureContextUsage({
+      messages: [
+        { role: "user", content: "read the file" },
+        { role: "tool", content: "x".repeat(400) },
+      ],
+      tools: {},
+    })
+    const map = Object.fromEntries(rows.map((row) => [row.label, row.tokens]))
+    expect(map["Tool results"]).toBe(100)
   })
 })
