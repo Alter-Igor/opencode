@@ -21,12 +21,14 @@ import { Permission } from "@/permission"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Wildcard } from "@/util/wildcard"
-import { SessionID } from "@/session/schema"
 import { Auth } from "@/auth"
 import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import * as Option from "effect/Option"
 import * as OtelTracer from "@effect/opentelemetry/Tracer"
+import { Session } from "@/session/session"
+import { MessageID, PartID, SessionID } from "@/session/schema"
+import { measureContextUsage } from "./context-usage"
 import { LLMAISDK } from "./llm/ai-sdk"
 import { LLMNativeRuntime } from "./llm/native-runtime"
 import { LLMRequestPrep } from "./llm/request"
@@ -46,6 +48,7 @@ export type StreamInput = {
   tools: Record<string, Tool>
   retries?: number
   toolChoice?: "auto" | "required" | "none"
+  assistantMessageID?: string
 }
 
 export type StreamRequest = StreamInput & {
@@ -71,6 +74,7 @@ const live: Layer.Layer<
   | EventV2Bridge.Service
   | LLMClientService
   | RuntimeFlags.Service
+  | Session.Service
 > = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -82,6 +86,8 @@ const live: Layer.Layer<
     const events = yield* EventV2Bridge.Service
     const llmClient = yield* LLMClient.Service
     const flags = yield* RuntimeFlags.Service
+    const sessions = yield* Session.Service
+    const contextUsagePart = new Map<string, ReturnType<typeof PartID.ascending>>()
 
     const run = Effect.fn("LLM.run")(function* (input: StreamRequest) {
       yield* Effect.logInfo("stream", {
@@ -112,6 +118,24 @@ const live: Layer.Layer<
         flags,
         isWorkflow,
       })
+
+      if (!input.small && input.assistantMessageID) {
+        const rows = measureContextUsage({
+          messages: prepared.messages,
+          tools: prepared.tools,
+        })
+        const id = contextUsagePart.get(input.assistantMessageID) ?? PartID.ascending()
+        contextUsagePart.set(input.assistantMessageID, id)
+        yield* sessions.updatePart({
+          id,
+          sessionID: SessionID.make(input.sessionID),
+          messageID: MessageID.make(input.assistantMessageID),
+          type: "text",
+          text: "",
+          synthetic: true,
+          metadata: { contextUsage: rows },
+        })
+      }
 
       // Wire up toolExecutor for DWS workflow models so that tool calls
       // from the workflow service are executed via opencode's tool system
@@ -406,6 +430,7 @@ export const node = LayerNode.make({
     EventV2Bridge.node,
     llmClient,
     RuntimeFlags.node,
+    Session.node,
   ],
 })
 

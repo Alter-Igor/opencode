@@ -651,7 +651,10 @@ const layer = Layer.effect(
             ctx.currentText = undefined
             ctx.reasoningMap = {}
             yield* status.set(ctx.sessionID, { type: "busy" })
-            const stream = llm.stream(streamInput)
+            const stream = llm.stream({
+              ...streamInput,
+              assistantMessageID: input.assistantMessage.id,
+            })
 
             yield* stream.pipe(
               Stream.tap((event) => handleEvent(event)),

@@ -105,15 +105,18 @@ const layer = Layer.effect(
       }),
 
       skills: Effect.fn("SystemPrompt.skills")(function* (agent: Agent.Info) {
+        // Default: do not paste the local catalogue. The fork plugin supplies the RAG lookup.
+        // If that injection is turned off, the old catalogue is the only skill guidance left.
+        const injectionDisabled =
+          process.env.ALTERSPECTIVE_STANDARDS_INJECTION_DISABLED === "true" ||
+          process.env.ALTERSPECTIVE_STANDARDS_INJECTION_ENABLED === "false"
+        if (!injectionDisabled) return undefined
         if (Permission.disabled(["skill"], agent.permission).has("skill")) return
-
         const list = yield* skill.available(agent)
-
+        if (list.length === 0) return
         return [
           "Skills provide specialized instructions and workflows for specific tasks.",
           "Use the skill tool to load a skill when a task matches its description.",
-          // the agents seem to ingest the information about skills a bit better if we present a more verbose
-          // version of them here and a less verbose version in tool description, rather than vice versa.
           Skill.fmt(list, { verbose: true }),
         ].join("\n")
       }),

@@ -27,6 +27,7 @@
       "headers": {
         "Authorization": "Bearer {env:SYNAPSE_CODER_STAGING_BEARER_TOKEN}",
       },
+      "enabled": false,
     },
     "alterspective-rag": {
       "type": "remote",
@@ -61,6 +62,7 @@
     "timely": {
       "type": "remote",
       "url": "https://timely-mcp.alterspective.com.au/mcp",
+      "enabled": false,
     },
     "sharedo": {
       // Disabled 2026-09-19: Sharedo tenants are Keystone credential providers
