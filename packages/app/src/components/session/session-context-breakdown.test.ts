@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import type { Message, Part } from "@opencode-ai/sdk/v2/client"
-import { estimateSessionContextBreakdown } from "./session-context-breakdown"
+import { contextUsageFromParts, estimateSessionContextBreakdown, presentContextUsage } from "./session-context-breakdown"
 
 const user = (id: string) => {
   return {
@@ -38,6 +38,30 @@ describe("estimateSessionContextBreakdown", () => {
     expect(map.user).toBe(3)
     expect(map.assistant).toBe(5)
     expect(map.other).toBe(8)
+  })
+
+  test("uses the last saved measurement", () => {
+    const rows = contextUsageFromParts([
+      { type: "text", synthetic: true, metadata: { contextUsage: [{ label: "Instructions", tokens: 1 }] } },
+      { type: "text", text: "answer" },
+      { type: "text", synthetic: true, metadata: { contextUsage: [{ label: "Instructions", tokens: 9 }] } },
+    ])
+    expect(rows).toEqual([{ label: "Instructions", tokens: 9 }])
+  })
+
+  test("adds the provider remainder as left over", () => {
+    const rows = presentContextUsage(
+      [
+        { label: "Instructions", tokens: 17000 },
+        { label: "RAG tools", tokens: 8000 },
+      ],
+      30000,
+    )
+    const map = Object.fromEntries(rows.map((row) => [row.label, row.tokens]))
+    expect(map.Instructions).toBe(17000)
+    expect(map["RAG tools"]).toBe(8000)
+    expect(map["Left over"]).toBe(5000)
+    expect(rows.reduce((sum, row) => sum + row.tokens, 0)).toBe(30000)
   })
 
   test("scales segments when estimates exceed input", () => {

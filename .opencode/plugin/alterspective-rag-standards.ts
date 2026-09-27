@@ -1,5 +1,20 @@
 import type { Plugin } from "@opencode-ai/plugin"
 
+const SKILL_LOOKUP_PROMPT = `
+## Skills
+
+Company skills are in RAG. This prompt does not list them.
+Before a repeatable workflow, call rag_search for a skill. If a result path is under Skills/, call rag_get_articles with that path and follow the markdown.
+Use the local skill tool only for customize-opencode when editing opencode config, or when the task needs scripts that sit next to a SKILL.md file on this PC.
+`.trim()
+
+const LOCAL_SKILL_CATALOGUE = /<available_skills>[\s\S]*?<\/available_skills>/
+
+const LOCAL_SKILL_INTRO = [
+  "Skills provide specialized instructions and workflows for specific tasks.",
+  "Use the skill tool to load a skill when a task matches its description.",
+].join("\n")
+
 const STANDARDS_SYSTEM_PROMPT = `
 ## Alterspective Standards Awareness
 
@@ -9,6 +24,8 @@ Alterspective standards are available via the \`alterspective-rag\` MCP server. 
 - The user asks "how to", "what's the best practice", "what's the standard for"
 - You're making architectural or pattern recommendations
 - You're reviewing code for compliance
+
+If \`rag_search\` or \`rag_ask\` fails, read the matching file under \`C:\\GitHub\\Alterspective-Intelligence\`. Do not invent the rule. Say that RAG was down and the answer is from that local checkout.
 
 Key standards areas and their rule ID prefixes:
 - Coding standards: WEBSTA-001-CODING-*
@@ -41,7 +58,12 @@ const plugin: Plugin = async () => {
   return {
     "experimental.chat.system.transform": async (_input, output) => {
       if (!injectionEnabled()) return
-      output.system.push(STANDARDS_SYSTEM_PROMPT)
+      for (let i = output.system.length - 1; i >= 0; i--) {
+        const next = output.system[i].replace(LOCAL_SKILL_CATALOGUE, "").replace(LOCAL_SKILL_INTRO, "").trim()
+        if (next) output.system[i] = next
+        else output.system.splice(i, 1)
+      }
+      output.system.push(`${SKILL_LOOKUP_PROMPT}\n\n${STANDARDS_SYSTEM_PROMPT}`)
     },
   }
 }

@@ -1,5 +1,49 @@
 import type { Message, Part } from "@opencode-ai/sdk/v2/client"
 
+export type ContextUsageRow = {
+  label: string
+  tokens: number
+}
+
+export type PresentedContextUsage = ContextUsageRow & {
+  percent: number
+}
+
+export function contextUsageFromParts(
+  parts: readonly { type: string; synthetic?: boolean; metadata?: { contextUsage?: unknown } }[],
+): ContextUsageRow[] {
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const part = parts[i]
+    if (!part || part.type !== "text" || !part.synthetic) continue
+    const rows = part.metadata?.contextUsage
+    if (!Array.isArray(rows)) continue
+    return rows.flatMap((row) => {
+      if (!row || typeof row !== "object") return []
+      const label = "label" in row ? row.label : undefined
+      const tokens = "tokens" in row ? row.tokens : undefined
+      if (typeof label !== "string" || typeof tokens !== "number") return []
+      return [{ label, tokens }]
+    })
+  }
+  return []
+}
+
+export function presentContextUsage(rows: ContextUsageRow[], input: number): PresentedContextUsage[] {
+  const clean = rows.filter((row) => row.tokens > 0 && row.label.trim())
+  if (!input || clean.length === 0) return []
+  const estimated = clean.reduce((sum, row) => sum + row.tokens, 0)
+  if (estimated <= input) {
+    const leftover = input - estimated
+    const all = leftover > 0 ? [...clean, { label: "Left over", tokens: leftover }] : clean
+    return all.map((row) => ({ ...row, percent: toPercentLabel(row.tokens, input) }))
+  }
+  const scale = input / estimated
+  const scaled = clean.map((row) => ({ ...row, tokens: Math.floor(row.tokens * scale) }))
+  const used = scaled.reduce((sum, row) => sum + row.tokens, 0)
+  const withGap = input - used > 0 ? [...scaled, { label: "Left over", tokens: input - used }] : scaled
+  return withGap.map((row) => ({ ...row, percent: toPercentLabel(row.tokens, input) }))
+}
+
 export type SessionContextBreakdownKey = "system" | "user" | "assistant" | "tool" | "other"
 
 export type SessionContextBreakdownSegment = {

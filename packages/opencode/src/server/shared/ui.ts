@@ -43,9 +43,23 @@ export function upstreamURL(path: string) {
 
 export function embeddedUI(disableEmbeddedWebUi: boolean) {
   if (disableEmbeddedWebUi) return Promise.resolve(null)
-  return (embeddedUIPromise ??=
+  return (embeddedUIPromise ??= loadEmbeddedUI())
+}
+
+async function loadEmbeddedUI() {
+  try {
+    // Generated into the compiled binary. Missing when running from source.
     // @ts-expect-error - generated file at build time
-    import("opencode-web-ui.gen.ts").then((module) => module.default as Record<string, string>).catch(() => null))
+    const compiled = await import("opencode-web-ui.gen.ts")
+    return compiled.default as Record<string, string>
+  } catch {
+    try {
+      const local = await import("../../../opencode-web-ui.gen.ts")
+      return local.default as Record<string, string>
+    } catch {
+      return null
+    }
+  }
 }
 
 function notFound() {

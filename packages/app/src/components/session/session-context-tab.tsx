@@ -19,7 +19,12 @@ import { useProviders } from "@/hooks/use-providers"
 import { useSDK } from "@/context/sdk"
 import { useSessionLayout } from "@/pages/session/session-layout"
 import { getSessionContext } from "./session-context-metrics"
-import { estimateSessionContextBreakdown, type SessionContextBreakdownKey } from "./session-context-breakdown"
+import {
+  estimateSessionContextBreakdown,
+  contextUsageFromParts,
+  presentContextUsage,
+  type SessionContextBreakdownKey,
+} from "./session-context-breakdown"
 import { createSessionContextFormatter } from "./session-context-format"
 
 const BREAKDOWN_COLOR: Record<SessionContextBreakdownKey, string> = {
@@ -177,6 +182,14 @@ export function SessionContextTab() {
     return c.modelLabel
   })
 
+  const measured = createMemo(() => {
+    const message = ctx()?.message
+    if (!message) return []
+    return contextUsageFromParts(sync().data.part[message.id] ?? [])
+  })
+
+  const measuredRows = createMemo(() => presentContextUsage(measured(), ctx()?.input ?? 0))
+
   const breakdown = createMemo(
     on(
       () => [ctx()?.message.id, ctx()?.input, messages().length, systemPrompt()],
@@ -314,7 +327,30 @@ export function SessionContextTab() {
           </For>
         </div>
 
-        <Show when={breakdown().length > 0}>
+        <Show when={measuredRows().length > 0}>
+          <div class="flex flex-col gap-2">
+            <div class="text-12-regular text-text-weak">What uses the tokens</div>
+            <div class="flex flex-col gap-1">
+              <For each={measuredRows()}>
+                {(row) => (
+                  <div class="flex items-center justify-between gap-3 text-12-regular">
+                    <div class="text-text-base">{row.label}</div>
+                    <div class="text-text-weak">
+                      {formatter().number(row.tokens)}
+                      <span class="text-text-weaker"> ┬À {row.percent.toLocaleString(language.intl())}%</span>
+                    </div>
+                  </div>
+                )}
+              </For>
+            </div>
+            <div class="text-11-regular text-text-weaker">
+              Counts are estimates from the text and tool definitions sent on this turn. Left over is the rest of the
+              provider input count.
+            </div>
+          </div>
+        </Show>
+
+        <Show when={measuredRows().length === 0 && breakdown().length > 0}>
           <div class="flex flex-col gap-2">
             <div class="text-12-regular text-text-weak">{language.t("context.breakdown.title")}</div>
             <div class="h-2 w-full rounded-full bg-surface-base overflow-hidden flex">
