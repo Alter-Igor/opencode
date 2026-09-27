@@ -4,7 +4,7 @@ const SKILL_LOOKUP_PROMPT = `
 ## Skills
 
 Company skills are in RAG. This prompt does not list them.
-Before a repeatable workflow, call rag_search for a skill. If a result path is under Skills/, call rag_get_articles with that path and follow the markdown.
+Before a repeatable workflow, call rag_match_skills with a short description of the task. If it returns a skill, call rag_get_articles with that id and follow the markdown. If it returns no skill, there is no company skill for the task.
 Use the local skill tool only for customize-opencode when editing opencode config, or when the task needs scripts that sit next to a SKILL.md file on this PC.
 `.trim()
 

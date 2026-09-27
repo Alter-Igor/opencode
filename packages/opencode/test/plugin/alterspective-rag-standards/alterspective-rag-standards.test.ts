@@ -83,7 +83,7 @@ describe("alterspective-rag-standards", () => {
     expect(joined).not.toContain("<available_skills>")
     expect(joined).not.toContain("commit-pr")
     expect(joined).toContain("keep this")
-    expect(joined).toContain("call rag_search for a skill")
+    expect(joined).toContain("call rag_match_skills")
     expect(joined).toContain("customize-opencode")
     expect(joined).toContain("Alterspective Standards Awareness")
   })
