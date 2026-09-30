@@ -3,6 +3,7 @@
 // could be a secret must be an {env:NAME} reference whose NAME is on config.boxEnv. Values are
 // never copied into errors or logs — only the key path is named (ERR-MSG-03, ASR-04).
 import { createHash } from "node:crypto"
+import { readFileSync } from "node:fs"
 import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import path from "node:path"
 import type { BridgeConfig } from "../shared/config.ts"
@@ -25,6 +26,8 @@ export type ProfileInput = {
   permission: PermissionRule[]
   /** provider id → env name to use as options.apiKey when the owner's entry has no key (must be on boxEnv). */
   keyEnv?: Record<string, string>
+  /** OpenCode custom tools (file name → source) for opencode/tool/. Default: profileTools(). */
+  tools?: Record<string, string>
 }
 
 export type BuiltProfile = {
@@ -36,6 +39,29 @@ export type BuiltProfile = {
 }
 
 const CONNECTION_ID = /^[A-Za-z0-9_-]+$/
+
+/**
+ * MOD-05 in-box inbox tools (profile-tools/). They are copied into opencode/tool/ so OpenCode
+ * loads them from the read-only profile and the profile hash covers them (review M2).
+ */
+export const PROFILE_TOOL_FILES = ["inbox-lib.ts", "message_supervisor.ts", "message_session.ts", "read_inbox.ts"] as const
+const PROFILE_TOOLS_DIR = path.join(import.meta.dir, "..", "..", "profile-tools")
+let toolSources: Record<string, string> | undefined
+
+/** Sources of the profile tools, read once. A missing file fails closed (profile_invalid). */
+export function profileTools(): Record<string, string> {
+  if (toolSources) return toolSources
+  const out: Record<string, string> = {}
+  for (const name of PROFILE_TOOL_FILES) {
+    try {
+      out[name] = readFileSync(path.join(PROFILE_TOOLS_DIR, name), "utf8")
+    } catch {
+      throw invalid(`The bridge's profile tool ${name} is missing from this checkout.`)
+    }
+  }
+  toolSources = out
+  return out
+}
 
 // ---------- JSONC ----------
 
@@ -198,10 +224,11 @@ export function buildProfile(input: ProfileInput): BuiltProfile {
     mcp: mcpEntries(input.config),
     permission: permissionConfig(input.permission),
   }
-  const files = {
+  const files: Record<string, string> = {
     "opencode/.gitignore": PROFILE_GITIGNORE,
     "opencode/opencode.json": JSON.stringify(config, null, 2) + "\n",
   }
+  for (const [name, source] of Object.entries(input.tools ?? profileTools())) files[`opencode/tool/${name}`] = source
   return { files, hash: hashFiles(files), providers: providers.names, dropped: providers.dropped }
 }
 

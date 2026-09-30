@@ -23,6 +23,8 @@ export const ErrorCode = [
   "not_started",
   "cursor_expired",
   "inbox_unavailable",
+  // The inbox refused a post because a rate or hop limit was reached (HTTP 429 from the sidecar).
+  "inbox_limited",
   "upstream_error",
   "invalid_input",
 ] as const

@@ -23,6 +23,8 @@ volumes:
   sessions: {}
   npm-storage: {}
   pypi-storage: {}
+  # MOD-05 inbox messages (append-only JSONL). Never mounted into the box (review G5).
+  inbox-storage: {}
 
 x-hardened: &hardened
   cap_drop: [ALL]
@@ -68,8 +70,10 @@ services:
       HTTP_PROXY: http://egress:8888
       https_proxy: http://egress:8888
       http_proxy: http://egress:8888
-      NO_PROXY: localhost,127.0.0.1,npm-cache,pypi-cache
-      no_proxy: localhost,127.0.0.1,npm-cache,pypi-cache
+      NO_PROXY: localhost,127.0.0.1,npm-cache,pypi-cache,inbox
+      no_proxy: localhost,127.0.0.1,npm-cache,pypi-cache,inbox
+      # MOD-05: the in-box inbox tools post here. No token: box messages are stored unverified.
+      OCD_INBOX_URL: http://inbox:8080
       npm_config_registry: http://npm-cache:4873/
       BUN_CONFIG_REGISTRY: http://npm-cache:4873/
       npm_config_audit: "false"
@@ -92,7 +96,7 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
-    depends_on: [egress]
+    depends_on: [egress, inbox]
     command: ["opencode", "serve", "--hostname", "0.0.0.0", "--port", "4096"]
 
   # Publishes the box API on the host loopback only (the box itself has no route out).
@@ -163,3 +167,30 @@ services:
     mem_limit: 256m
     memswap_limit: 256m
     cpus: 1
+
+  # MOD-05 agent inbox (technical-design.md §7, review G5; built from ../inbox-sidecar).
+  # The box reaches it as http://inbox:8080 on `sealed` with no token, so box messages are
+  # stored verified:false. Bridges use the admin routes through the 127.0.0.1 published port with
+  # INBOX_ADMIN_TOKEN (by NAME only: from the compose child env, set on THIS service only, never
+  # on the box). `outside` is needed only because Docker publishes no ports from a container that
+  # is on internal networks alone; the sidecar makes no outbound calls.
+  inbox:
+    <<: *hardened
+    build: ../inbox-sidecar
+    image: ${OCD_IMAGE}-inbox
+    container_name: ${OCD_CONTAINER:-opencode-delegate}-inbox
+    labels:
+      com.alterspective.opencode-delegate.image: ${OCD_IMAGE}
+      com.alterspective.opencode-delegate.inbox-port: ${OCD_INBOX_PORT:?OCD_INBOX_PORT is set by the bridge}
+    networks: [sealed, outside]
+    ports: ["127.0.0.1:${OCD_INBOX_PORT}:8080"]
+    tmpfs: ["/tmp:mode=1777,nosuid,nodev,noexec"]
+    volumes: ["inbox-storage:/data"]
+    environment:
+      INBOX_PORT: "8080"
+      INBOX_DATA_DIR: /data
+      INBOX_ADMIN_TOKEN:
+    pids_limit: 64
+    mem_limit: 256m
+    memswap_limit: 256m
+    cpus: 0.5

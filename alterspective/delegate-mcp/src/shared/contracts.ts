@@ -43,3 +43,75 @@ export interface Guard {
   /** Refuse `always` replies (FM-4). */
   checkPermissionReply(reply: string): Verdict
 }
+
+/** MOD-03: session states (technical-design §6). Absent data is a state, never a guess. */
+export type SessionState =
+  | "starting"
+  | "busy"
+  | "retry"
+  | "needs_input"
+  | "idle"
+  | "error"
+  | "aborted"
+  | "not_started"
+  | "unknown"
+  | "not_found"
+  | "server_down"
+
+export type Cursor = { epoch: string; seq: number }
+
+export type HubEventType = "status" | "permission" | "question" | "message" | "error" | "todo" | "resync" | "mcp" | "inbox"
+
+export type HubEvent = {
+  cursor: Cursor
+  at: string
+  type: HubEventType
+  sessionID?: string
+  directory?: string
+  state?: SessionState
+  /** One line for a person or an AI. Session-originated text is never put here (see `untrusted`). */
+  summary: string
+  /** Text that came from a session or the box; always treated as untrusted by consumers. */
+  untrusted?: string
+  /** Request id for permission/question events (answer with oc_answer). */
+  requestID?: string
+}
+
+export type SessionView = { sessionID: string; directory: string; state: SessionState; since: string; detail?: string; pending?: string[] }
+
+export type WaitUntil = "idle" | "needs_input" | "error" | "message"
+
+export interface EventHub {
+  start(): Promise<void>
+  stop(): Promise<void>
+  /** Start tracking a session the bridge created or adopted. */
+  track(sessionID: string, directory: string): void
+  /** Call right after prompt_async: arms the 10 s not_started watchdog. */
+  markSent(sessionID: string): void
+  /** Current state; resolves absent data by reading the server (idle vs not_found). */
+  view(sessionID: string): Promise<SessionView>
+  /** Page of buffered events after `cursor`. A cursor from another epoch → expired:true. */
+  events(cursor: Cursor | undefined, filter?: { sessionID?: string }, limit?: number): { events: HubEvent[]; next: Cursor; expired: boolean }
+  /** Long-poll until a matching event, or timeout (caller caps at 240 s). */
+  wait(input: { sessionIDs: string[]; until: WaitUntil[]; timeoutMs: number; cursor?: Cursor }): Promise<{ events: HubEvent[]; next: Cursor; timedOut: boolean }>
+}
+
+/** MOD-05: agent inbox (technical-design §7). */
+export type InboxMessage = {
+  id: string
+  at: string
+  /** `supervisor:<name>` (verified: only bridges hold the admin token) or `session:<id>` (unverified: any in-box code can claim it). */
+  from: string
+  to: string
+  text: string
+  hops: number
+  verified: boolean
+  correlationId?: string
+}
+
+export interface Inbox {
+  /** Bridge-side post as `supervisor:<name>`. */
+  post(to: string, text: string, opts?: { correlationId?: string }): Promise<InboxMessage>
+  /** Messages addressed to this bridge's supervisor address, after `cursor`. */
+  read(cursor?: string, limit?: number): Promise<{ messages: InboxMessage[]; next: string }>
+}

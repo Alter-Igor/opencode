@@ -26,6 +26,8 @@ const BOX_DIR = "alterspective/delegate-mcp/docker/box"
  * images (named after the box image in compose.yaml) are rebuilt too.
  */
 export const DOCKER_DIR = "alterspective/delegate-mcp/docker"
+/** MOD-05: the inbox sidecar's build context (compose.yaml `build: ../inbox-sidecar`), outside docker/. */
+export const INBOX_SIDECAR_DIR = "alterspective/delegate-mcp/inbox-sidecar"
 
 export function dockerignorePath(repoRoot: string): string {
   return path.join(repoRoot, ...BOX_DIR.split("/"), "Dockerfile.dockerignore")
@@ -87,7 +89,7 @@ export async function buildIdentity(repoRoot: string, imageName: string, exec: E
     throw unavailable("The sandbox build file list could not be read.", `${(error as NodeJS.ErrnoException).code ?? "error"} ${dockerignorePath(repoRoot)}`)
   }
   // The docker/ folder shapes the images too, though it is not copied into the box (N-9).
-  const dirty = await dirtyHash(exec, repoRoot, [...buildContextPathspecs(dockerignore), DOCKER_DIR])
+  const dirty = await dirtyHash(exec, repoRoot, [...buildContextPathspecs(dockerignore), DOCKER_DIR, INBOX_SIDECAR_DIR])
   const image = imageTag(imageName, version, sha, dirty)
   const opencodeVersion = `${version}-alterspective.${sha}${dirty ? `.dirty.${dirty}` : ""}`
   return { version, sha, dirty, image, opencodeVersion }

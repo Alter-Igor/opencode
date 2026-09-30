@@ -149,10 +149,13 @@ async function start(run: Run, built: BuiltProfile): Promise<ApiTarget> {
     await prepareFiles(run, built)
     const password = deps.randomPassword()
     const port = await deps.freePort()
+    // MOD-05: the inbox admin port and token are made per start, like the password (compose-env.ts).
+    const inboxPort = await deps.freePort()
+    const inbox = { port: inboxPort === port ? await deps.freePort() : inboxPort, token: deps.randomPassword() }
     const build = !(await imageExists(deps.exec, deps.image))
-    run.note("info", "starting sandbox", { image: deps.image, build, port, profileHash: built.hash.slice(0, 12) })
-    const result = await deps.exec(dockerArgs.up(run.compose, build), { env: composeEnv(deps, built, port, password), timeoutMs: 20 * 60_000 })
-    if (result.code !== 0) throw upFailure(result, [password, ...Object.values(approvedValues(deps))])
+    run.note("info", "starting sandbox", { image: deps.image, build, port, inboxPort: inbox.port, profileHash: built.hash.slice(0, 12) })
+    const result = await deps.exec(dockerArgs.up(run.compose, build), { env: composeEnv(deps, built, port, password, inbox), timeoutMs: 20 * 60_000 })
+    if (result.code !== 0) throw upFailure(result, [password, inbox.token, ...Object.values(approvedValues(deps))])
     const target = { baseUrl: `http://127.0.0.1:${port}`, password }
     await waitHealthy(deps, target, run.container)
     run.state.startedHere = true

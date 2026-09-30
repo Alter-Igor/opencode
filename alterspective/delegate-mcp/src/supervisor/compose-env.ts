@@ -11,6 +11,15 @@ export const PASSWORD_ENV = "OPENCODE_SERVER_PASSWORD"
 export const MCP_ALLOW_ENV = "OPENCODE_MCP_ALLOW"
 /** Container env the supervisor reads back from `docker inspect`; everything else is discarded unread. */
 export const INSPECT_ENV = [PASSWORD_ENV, MCP_ALLOW_ENV]
+/**
+ * MOD-05 inbox sidecar admin token: generated per box start like the password, given to the
+ * `docker compose up` child and so to the INBOX container only (never the box), and read back by
+ * other bridges with `docker inspect <project>-inbox`. Never written to a file or logged.
+ */
+export const INBOX_ADMIN_TOKEN_ENV = "INBOX_ADMIN_TOKEN"
+/** Label on the inbox container: the 127.0.0.1 host port of its admin routes. */
+export const INBOX_PORT_LABEL = "com.alterspective.opencode-delegate.inbox-port"
+export type InboxStart = { port: number; token: string }
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
 
 export function paths(config: BridgeConfig) {
@@ -33,7 +42,7 @@ export function containerName(config: Pick<BridgeConfig, "project">): string {
  * `${OCD_IMAGE}-<service>` and its container `<project>-<service>` carries the image label, so a
  * running set built from another checkout is caught on reuse.
  */
-export const SIBLING_SERVICES = ["egress", "npm-cache", "pypi-cache"] as const
+export const SIBLING_SERVICES = ["egress", "npm-cache", "pypi-cache", "inbox"] as const
 
 export function siblingContainers(config: Pick<BridgeConfig, "project">): Array<{ service: string; container: string }> {
   return SIBLING_SERVICES.map((service) => ({ service, container: `${containerName(config)}-${service}` }))
@@ -77,15 +86,17 @@ export function composeDownEnv(inputs: ComposeInputs): Record<string, string> {
     OCD_OPENCODE_VERSION: inputs.opencodeVersion,
     OCD_PROFILE_HASH: "down",
     OCD_PORT: "0",
+    OCD_INBOX_PORT: "0",
     OCD_CONTAINER: containerName(inputs.config),
     OCD_PROFILE_DIR: dirs.profile,
     OCD_HANDOFF_DIR: dirs.handoff,
   })
 }
 
-/** Env of the `docker compose up` child: CLI essentials + OCD_* + password + approved keys. */
-export function composeEnv(inputs: ComposeInputs, built: BuiltProfile, port: number, password: string): Record<string, string> {
+/** Env of the `docker compose up` child: CLI essentials + OCD_* + password + approved keys (+ inbox port/token). */
+export function composeEnv(inputs: ComposeInputs, built: BuiltProfile, port: number, password: string, inbox?: InboxStart): Record<string, string> {
   const dirs = paths(inputs.config)
+  const inboxEnv: Record<string, string> = inbox ? { OCD_INBOX_PORT: String(inbox.port), [INBOX_ADMIN_TOKEN_ENV]: inbox.token } : {}
   return childEnv(inputs.hostEnv, {
     ...approvedValues(inputs),
     OCD_IMAGE: inputs.image,
@@ -97,5 +108,6 @@ export function composeEnv(inputs: ComposeInputs, built: BuiltProfile, port: num
     OCD_HANDOFF_DIR: dirs.handoff,
     [MCP_ALLOW_ENV]: mcpAllowPolicy(inputs.config),
     [PASSWORD_ENV]: password,
+    ...inboxEnv,
   })
 }

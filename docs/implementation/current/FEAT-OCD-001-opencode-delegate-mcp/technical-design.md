@@ -118,12 +118,13 @@ Optional Claude channel push as in revision 1 (off by default).
 
 Unchanged from revision 1: `starting`, `busy`, `retry`, `needs_input`, `idle`, `error`, `aborted`, `not_started`, `unknown(stream_gap)`, `not_found`, `server_down`, `policy_unverified`. Idle sessions are absent from `GET /session/status` (`session/status.ts:42-46`) ⇒ resolve via `GET /session/:id`. Reconnect rebuilds from `/session/status`, `/permission`, `/question`; no replay exists. `prompt_async` 204 without `busy` in 10 s ⇒ `not_started` (anomalyco/opencode#26635).
 
-## 7. Agent inbox (MOD-05)
+## 7. Agent inbox (MOD-05) — as built (Wave 2)
 
-- A tiny **inbox sidecar** container (`opencode-delegate-inbox`, Bun HTTP, own volume) on the internal network. The OpenCode box cannot touch its storage (review G5).
-- In-box tools (`message_supervisor`, `message_session`, `read_inbox`) call `http://inbox:<port>` with a per-session token the bridge registers at `oc_start_session`; the sidecar stamps `from` from the token, so senders cannot be forged. Bridges reach it on a `127.0.0.1` published port with an admin token held in bridge memory. **[U]**: file in a bridge-owned dir; `from` not trustworthy.
-- Inside the box the server password is **not** a boundary (the agent can read its own container env); the boundaries are the egress proxy, the fork allowlist patch, and the sidecar's per-session tokens.
-- Messages: `{id, at, from, to, text, hops, correlationId}`; hop limit 3; 10/min per session; enforced by the bridge on write **and** read; always labelled AI-written and untrusted (ETHICS-AGENT-03).
+- **Sidecar** `inbox` (Bun HTTP, image `${OCD_IMAGE}-inbox`, own named volume, hardened like the other siblings). On `sealed` for the box and on `outside` only because Docker will not publish a port from an internal-only container; its admin port is published to host `127.0.0.1` only.
+- **Honest trust model.** Inside the box any code can claim to be any session, so box-side posts (`POST /v1/post`, no token) are stored `verified:false` with the *claimed* `session:<id>` sender; a box-side `supervisor:` sender is refused (403) and the box cannot read supervisor inboxes. Only bridges hold the admin token (generated per box start, kept in bridge memory and in the sidecar's env only — never in the box's env or any file), so admin posts (`POST /v1/admin/post`, Bearer, constant-time compare) are `verified:true` as `supervisor:<name>`. Any in-box code can read any session's inbox: this is one owner's own agents, and it is documented, not hidden.
+- **Limits enforced by the sidecar:** text ≤ 8 KB (413), 10/min per claimed sender and 60/min across the box route (429), hop limit 3 counted per thread (`correlationId`) by the sidecar itself, append-only JSONL (fsync; rotate at 10 MB; keep 5 files); no edit/delete route. Logs never contain message text.
+- **In-box tools** (`message_supervisor`, `message_session`, `read_inbox`, shipped in the read-only profile `tool/` dir and covered by the profile hash): the supervisor address comes from the session's `metadata.supervisor` (set by the bridge on `POST /session`; subagents inherit it); returned text is labelled "AI-written, unverified sender" (ETHICS-AGENT-03). Tools never wake anyone.
+- **Bridge client** (`src/inbox/`): unreachable/timeout/5xx → `inbox_unavailable` (a failed read is never "no messages"); 429 → `inbox_limited`; `wakeText()` frames a message as untrusted input when `oc_post` uses `wake:true` (the bridge is the only thing that wakes a session).
 
 ## 8. Errors, logging, versioning
 
