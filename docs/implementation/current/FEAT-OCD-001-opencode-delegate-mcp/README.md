@@ -1,7 +1,7 @@
 # FEAT-OCD-001: OpenCode delegate MCP bridge
 
 **Feature ID:** FEAT-OCD-001 · **Issue:** [#41 — local OpenCode MCP bridge for delegated sessions](https://github.com/Alter-Igor/opencode/issues/41)
-**Status:** Planning, revision 2 — waiting for owner approval. Nothing is built.
+**Status:** Approved 2026-10-01 (D-A box, Q1 approve, Q2 Keystone + Synapse + npm + PyPI, Q3 patch). Execution: Wave 0.
 **Created:** 2026-09-30 · **Owner:** Igor Jericevich
 **Branch / worktree:** `opencode-mcp-bridge` · `C:\GitHub\opencode---opencode-mcp-bridge`
 
@@ -31,7 +31,7 @@ flowchart LR
 
 **Why a box?** The review found that an agent's shell runs as you. On your own account it could read your ~20 saved API keys and your saved logins. Only a sandbox makes "Keystone only" true, even for an agent that misbehaves. Details: `evidence/adversarial-review.md`.
 
-## Decisions for the owner
+## Owner decisions (answered 2026-10-01: D-A **box**, Q1 **approve**, Q2 **npm + PyPI**, Q3 **allow**)
 
 | # | Decision | Options | My pick |
 |---|---|---|---|

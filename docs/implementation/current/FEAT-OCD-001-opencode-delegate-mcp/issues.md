@@ -10,10 +10,10 @@
 | D-1 | Deviation | Logs to stderr + file, not stdout (`OBS-SNK-01`): stdout carries the MCP protocol. | Proposed |
 | D-2 | Deviation (A-U only) | A-U would store the server password in a lock file (`ASR-04`). A-S keeps it in bridge memory + container env only. | Resolved by A-S |
 | D-3 | Decision | `ERR-COPY-*` / `ERR-PRES-*` apply to CLI text only; tool results go to AI clients and use stable codes + short messages. | Proposed |
-| X-1 | Exclusion needed | `BFA-003`: stdio-only transport. Needs owner approval recorded in `AGENTS.md` (category: local developer tool; condition: no remote access; approver: owner). | Awaiting Q1 |
+| X-1 | Exclusion needed | `BFA-003`: stdio-only transport. Needs owner approval recorded in `AGENTS.md` (category: local developer tool; condition: no remote access; approver: owner). | **Approved by owner 2026-10-01** — recorded in `AGENTS.md` fork notes |
 | U-1 | Upstream bug | anomalyco/opencode#52259: inline `OPENCODE_CONFIG_CONTENT` agents/permissions ignored in v2. Design avoids inline config. | Watch |
 | U-2 | Upstream bug | anomalyco/opencode#26635: `prompt_async` 204 without a run. Design has a 10 s watchdog. | Watch |
-| D-A | Owner decision | Sandbox (A-S) vs same user (A-U). See `README.md`. | Open |
-| Q2 | Owner decision | Egress hosts beyond Keystone + model hosts. | Open |
-| Q3 | Owner decision | Fork patch in `packages/opencode/src/mcp/`. | Open |
+| D-A | Owner decision | Sandbox (A-S) vs same user (A-U). | **Decided 2026-10-01: A-S (Docker box)** |
+| Q2 | Owner decision | Egress hosts beyond Keystone + model hosts. | **Decided: + npm + PyPI.** Model hosts default to Synapse (`synapse2-api.alterspective.com.au`) only; other providers opt-in. |
+| Q3 | Owner decision | Fork patch in `packages/opencode/src/mcp/`. | **Decided: allowed** (≤150 LOC, env-gated, tested) |
 | R-1 | Review | Adversarial round 1 findings C1, C2, H1–H4, M1–M6, L1–L6 dispositioned in `evidence/adversarial-review.md`; round 2 owed. | Open |

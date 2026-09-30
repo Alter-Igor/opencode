@@ -1,0 +1,35 @@
+name: ocd-spike
+networks:
+  sealed: { internal: true }
+  outside: {}
+services:
+  egress:
+    build: ./egress
+    networks: [sealed, outside]
+  gate:
+    image: alpine/socat
+    command: ["TCP-LISTEN:4096,fork,reuseaddr", "TCP:box:4096"]
+    networks: [sealed, outside]
+    ports: ["127.0.0.1:47096:4096"]
+  box:
+    build: ./box
+    networks: [sealed]
+    read_only: true
+    tmpfs: ["/tmp:mode=1777", "/home/agent:uid=10001,gid=10001"]
+    environment:
+      XDG_CONFIG_HOME: /profile
+      XDG_DATA_HOME: /data
+      HTTPS_PROXY: http://egress:8888
+      HTTP_PROXY: http://egress:8888
+      NO_PROXY: localhost,127.0.0.1
+      OPENCODE_DISABLE_MODELS_FETCH: "1"
+      OPENCODE_DISABLE_AUTOUPDATE: "1"
+      OPENCODE_SERVER_PASSWORD: ${OCD_PASSWORD}
+      SYNAPSE_API_KEY: ${SYNAPSE_API_KEY}
+    volumes:
+      - ./profile:/profile:ro
+      - ocd-data:/data
+      - ./work:/work
+    command: ["opencode", "serve", "--hostname", "0.0.0.0", "--port", "4096"]
+volumes:
+  ocd-data: {}

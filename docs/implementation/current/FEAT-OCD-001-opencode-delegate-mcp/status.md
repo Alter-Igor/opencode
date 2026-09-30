@@ -1,6 +1,6 @@
 # FEAT-OCD-001 — Status
 
-**2026-09-30 — Planning, revision 2. Waiting for owner decisions D-A, Q1–Q3.**
+**2026-10-01 — Approved (D-A box, Q1–Q3 as recommended). Execution started: Wave 0 spikes.**
 
 | Item | State |
 |---|---|

@@ -1,0 +1,14 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "synapse/auto",
+  "provider": {
+    "synapse": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": { "baseURL": "https://synapse2-api.alterspective.com.au/v1", "apiKey": "{env:SYNAPSE_API_KEY}" },
+      "models": { "auto": { "name": "auto" } }
+    }
+  },
+  "mcp": {
+    "ks-delegate": { "type": "remote", "url": "https://identity.alterspective.com.au/mcp/dynamic" }
+  }
+}

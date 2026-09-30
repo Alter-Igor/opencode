@@ -55,6 +55,29 @@ Full ledger: in the falsifier's report (session transcript); key rows reproduced
 2. Should delegated agents have outbound internet beyond Keystone + model hosts (npm install, docs)? → **Q2 in `README.md`.**
 3. Is a small fork patch to `packages/opencode/src/mcp/` acceptable (allowlist + single-flight refresh)? → **Q3 in `README.md`.**
 
-## Round 2
+## Round 2 (2026-10-01, after owner decisions)
 
-Not run yet. Required after the owner picks D-A, against the revised `technical-design.md` (each finding → RESOLVED / PARTIAL / NOT-RESOLVED).
+Reviewer: Synapse gateway, `auto` → served `google/gemini-3.1-pro-preview`, artifact-only (revision-2 summary).
+
+| Round-1 item | Verdict | Planner check |
+|---|---|---|
+| (1) bash patterns | RESOLVED | agreed — no claim rests on them |
+| (2) password → `POST /mcp` / self-approve | PARTIAL | agreed: inside the box the agent shares the OpenCode process user; egress + patch are the boundaries |
+| (3) other config layers | RESOLVED | — |
+| (4) user secrets / tokens | RESOLVED | only `SYNAPSE_API_KEY` enters the box (model transport, not MCP) — noted |
+| (5) inbox spoofing | RESOLVED | — |
+| (6) no event / no URLs in `GET /mcp` | PARTIAL (`ks-spoof` name) | resolved by the patch: URL checked at add/connect, not the name |
+| (7) token family race | RESOLVED | pending T0.4 evidence |
+| (8) subagents drop asks | RESOLVED (reviewer) | planner: only partly — asks remain convenience; not a boundary |
+| (9) config/env sources | RESOLVED | — |
+
+**New findings and disposition**
+
+| ID | Sev | Finding | Disposition |
+|---|---|---|---|
+| N1 | High | Agent in the same container can kill/modify OpenCode and drop the patch | Partly valid. Egress still blocks direct hosts, so R7 holds. Harden: image filesystem read-only (`--read-only` + tmpfs), OpenCode code owned by root, server runs as non-root. |
+| N2 | High | **Git hook / config poisoning:** `/work` is rw, so the agent can write `.git/hooks`, `.git/config` (`core.fsmonitor`, `core.hooksPath`), `.husky/*`; the owner's next host `git` run executes it | **Accepted.** Mount only the session's repo (ideally a dedicated worktree), not all of `C:\GitHub`; overlay `.git/hooks` and `.git/config` read-only; `oc_result` flags changes to host-executable paths (`.husky/`, `.githooks/`, `package.json` scripts, `.git*`). Residual: any code the agent writes may later run on the host — the owner reviews diffs before running them. |
+| N3 | High | Exfiltration by publishing to npm/PyPI | **Accepted.** Replace direct registry egress with read-only pull-through caches on the internal network (publish disabled); the box never reaches the public registries directly. Keeps Q2's intent (installs work). |
+| N4 | Medium | 15 s polling window | Resolved by the patch (refused at add time). Poll kept as a second check. |
+
+Round 3 is owed on the final diff before the PR.
