@@ -4,9 +4,16 @@
   "private": true,
   "type": "module",
   "description": "Local stdio MCP bridge that lets AI clients delegate coding work to sandboxed OpenCode sessions (FEAT-OCD-001).",
+  "bin": {
+    "opencode-delegate": "src/cli.ts"
+  },
   "scripts": {
+    "start": "bun src/cli.ts mcp",
+    "doctor": "bun src/cli.ts doctor",
+    "watch": "bun src/cli.ts watch",
     "test": "bun test",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "e2e:w3": "bun spike/e2e-w3.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",
