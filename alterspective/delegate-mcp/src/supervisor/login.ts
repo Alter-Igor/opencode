@@ -3,6 +3,8 @@
 // host, checks `state`, and relays ONLY the code to the box. The code and the URL query are never logged.
 import { spawn } from "node:child_process"
 import http from "node:http"
+import { KS_NAME } from "../guard/entries.ts"
+import { defaultConfig } from "../shared/config.ts"
 import { DelegateError } from "../shared/errors.ts"
 import { silentLogger, type Logger } from "../shared/log.ts"
 import { expectOk, type McpStatus, type OpencodeApi } from "../shared/opencode-api.ts"
@@ -10,7 +12,8 @@ import { expectOk, type McpStatus, type OpencodeApi } from "../shared/opencode-a
 export const LOGIN_PORT = 19876
 export const CALLBACK_PATH = "/mcp/oauth/callback"
 export const LOGIN_TIMEOUT_MS = 5 * 60 * 1000
-const ENTRY = /^ks-[A-Za-z0-9_-]{1,64}$/
+/** Entry names: the guard's KS_NAME (one rule for profile, runtime and sign-in; review A-20). */
+const MAX_ENTRY_LENGTH = 67
 
 export type LoginOptions = {
   /** Opens the authorization URL in the owner's browser. Default: rundll32 url.dll,FileProtocolHandler. */
@@ -20,7 +23,7 @@ export type LoginOptions = {
   timeoutMs?: number
   /** Instance directory for the box API calls. Default `/sessions`. */
   directory?: string
-  /** The only origin whose authorization URL the bridge will open. Default Keystone. */
+  /** The only origin whose authorization URL the bridge will open. Default: config.keystoneOrigin. */
   authOrigin?: string
   logger?: Logger
 }
@@ -73,10 +76,11 @@ async function openListener(port: number, logger: Logger): Promise<Listener> {
     })
     server.listen(port, "127.0.0.1", () => resolve())
   })
+  // Always resolves (an already-closed server reports an error to the callback; that is fine).
   const close = () =>
     new Promise<void>((resolve) => {
-      server.closeAllConnections?.()
       server.close(() => resolve())
+      server.closeAllConnections?.()
     })
   return { expect: (state) => (holder.state = state), received, close }
 }
@@ -115,8 +119,14 @@ async function relay(api: OpencodeApi, entry: string, directory: string, got: Re
   return entryStatus(api, entry, directory)
 }
 
+/**
+ * Keystone sign-in for one ks-* entry. Box calls go through `api`, so they inherit its deadline
+ * (DEFAULT_API_TIMEOUT_MS); the listener is closed on every path, including a throw.
+ */
 export async function login(api: OpencodeApi, entry: string, opts: LoginOptions = {}): Promise<"connected" | "failed"> {
-  if (!ENTRY.test(entry)) throw new DelegateError("invalid_input", "Only ks-* entries can be signed in.", "Pass a ks-* server name (default ks-delegate).")
+  if (!KS_NAME.test(entry) || entry.length > MAX_ENTRY_LENGTH) {
+    throw new DelegateError("invalid_input", "Only ks-* entries can be signed in.", "Pass a ks-* server name (lower-case, for example ks-delegate).")
+  }
   const logger = opts.logger ?? silentLogger
   const directory = opts.directory ?? "/sessions"
   const listener = await openListener(opts.port ?? LOGIN_PORT, logger)
@@ -125,7 +135,7 @@ export async function login(api: OpencodeApi, entry: string, opts: LoginOptions 
     const started = expectOk(await api.call<{ authorizationUrl?: string; oauthState?: string }>({ method: "POST", path: `/mcp/${entry}/auth`, directory, body: {} }), "start the Keystone sign-in")
     if (!started.authorizationUrl) return await entryStatus(api, entry, directory) // already signed in
     if (!started.oauthState) throw new DelegateError("upstream_error", "The delegate box did not return a sign-in state.", "Retry oc_login.")
-    checkAuthUrl(started.authorizationUrl, opts.authOrigin ?? "https://identity.alterspective.com.au")
+    checkAuthUrl(started.authorizationUrl, opts.authOrigin ?? defaultConfig().keystoneOrigin)
     listener.expect(started.oauthState)
     ;(opts.opener ?? defaultOpener)(started.authorizationUrl)
     logger.log("info", "login", "browser opened; waiting for the loopback redirect", { entry })

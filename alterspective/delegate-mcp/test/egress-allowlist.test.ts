@@ -8,25 +8,42 @@ import { defaultConfig } from "../src/shared/config.ts"
 const EGRESS_DIR = path.join(import.meta.dir, "..", "docker", "egress")
 
 // tinyproxy compiles each line as a POSIX ERE with REG_ICASE (FilterCaseSensitive defaults off).
-// For the subset the generator emits (^, $, \.) JS RegExp semantics are identical.
-function allows(list: string, host: string): boolean {
+// For the subset the generator emits (^, $, \., :) JS RegExp semantics are identical.
+// With `FilterURLs On` the string tested is the request URL: `host:443` for CONNECT,
+// `http://host/...` for plain HTTP (observed in the tinyproxy log; proven in egress-live.test.ts).
+function matches(list: string, url: string): boolean {
   return list
     .split("\n")
     .filter((line) => line && !line.startsWith("#"))
-    .some((line) => new RegExp(line, "i").test(host))
+    .some((line) => new RegExp(line, "i").test(url))
 }
+const allows = (list: string, host: string) => matches(list, `${host}:443`)
 
 describe("egressAllowlist", () => {
   const list = egressAllowlist(["identity.alterspective.com.au", "synapse2-api.alterspective.com.au"])
 
-  test("one exact-host anchored line per host, dots escaped", () => {
+  test("one exact host:443 anchored line per host, dots escaped", () => {
     const lines = list.split("\n").filter((l) => l && !l.startsWith("#"))
-    expect(lines).toEqual(["^identity\\.alterspective\\.com\\.au$", "^synapse2-api\\.alterspective\\.com\\.au$"])
+    expect(lines).toEqual(["^identity\\.alterspective\\.com\\.au:443$", "^synapse2-api\\.alterspective\\.com\\.au:443$"])
   })
 
   test("allows the listed hosts", () => {
     expect(allows(list, "identity.alterspective.com.au")).toBe(true)
     expect(allows(list, "synapse2-api.alterspective.com.au")).toBe(true)
+  })
+
+  test("plain-HTTP URLs never match, even for an allowed host (C-5)", () => {
+    for (const url of [
+      "http://identity.alterspective.com.au/",
+      "http://identity.alterspective.com.au:443/",
+      "http://identity.alterspective.com.au:443identity.alterspective.com.au:443",
+      "identity.alterspective.com.au:80",
+      "identity.alterspective.com.au:4430",
+      "identity.alterspective.com.au.:443",
+      "http://example.com/",
+    ]) {
+      expect({ url, allowed: matches(list, url) }).toEqual({ url, allowed: false })
+    }
   })
 
   const refused = [
@@ -56,6 +73,12 @@ describe("egressAllowlist", () => {
     ["npm registry (publish route, N3)", ["registry.npmjs.org"]],
     ["PyPI upload (publish route, N3)", ["upload.pypi.org"]],
     ["PyPI (N3)", ["pypi.org"]],
+    ["IPv4 literal", ["10.0.0.1"]],
+    ["IPv4 with numeric last label", ["example.123"]],
+    ["hex last label", ["example.0x7f"]],
+    ["all-numeric label", ["163.example.com"]],
+    ["IPv6 literal", ["::1"]],
+    ["bracketed IPv6", ["[2001:db8::1]"]],
   ]
   for (const [label, hosts] of invalid) {
     test(`refuses ${label}`, () => expect(() => egressAllowlist(hosts)).toThrow())
@@ -74,12 +97,12 @@ describe("committed egress files", () => {
     expect(committed).toBe(egressAllowlist(defaultConfig({}).egressHosts))
   })
 
-  test("tinyproxy.conf: default deny, CONNECT to 443 only, host (not URL) filter", () => {
+  test("tinyproxy.conf: default deny, CONNECT to 443 only, URL filter (plain HTTP never matches)", () => {
     const conf = readFileSync(path.join(EGRESS_DIR, "tinyproxy.conf"), "utf8")
     const directives = conf.split(/\r?\n/).filter((l) => l.trim() && !l.trim().startsWith("#"))
     expect(directives).toContain("FilterDefaultDeny Yes")
     expect(directives).toContain("FilterType ere")
-    expect(directives).toContain("FilterURLs Off")
+    expect(directives).toContain("FilterURLs On")
     expect(directives.filter((l) => l.startsWith("ConnectPort"))).toEqual(["ConnectPort 443"])
     expect(directives.some((l) => l.startsWith("FilterCaseSensitive"))).toBe(false)
     expect(directives.some((l) => /^Upstream/.test(l))).toBe(false)

@@ -1,114 +1,48 @@
-// Workspaces are tested against real git on scratch repos under %TEMP% (never inside C:\GitHub).
-// The box is simulated: `boxExec` runs git locally with /handoff and /sessions mapped to temp folders and
-// with no global/system git config, standing in for `docker exec <box> ...`.
-import { afterAll, beforeAll, describe, expect, test } from "bun:test"
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
-import os from "node:os"
+// Workspaces, part 1: hooks never run on the host, host-executable changes are reported, open() is
+// atomic. Fixture (real git, simulated box): workspaces-fixture.ts. Part 2: workspaces-collect.test.ts.
+// Pure helpers: workspaces-units.test.ts.
+import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test"
+import { chmodSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import path from "node:path"
-import { defaultConfig } from "../src/shared/config.ts"
-import { DelegateError } from "../src/shared/errors.ts"
-import {
-  canonicalPath,
-  cleanEnv,
-  createWorkspaces,
-  isHostExecutablePath,
-  parseSubst,
-  runCommand,
-  scriptsChanged,
-  type Exec,
-} from "../src/supervisor/workspaces.ts"
+import type { ErrorCode } from "../src/shared/errors.ts"
+import { code, git, posix, T, WorkspaceFixture } from "./workspaces-fixture.ts"
 
-const T = 60_000
-let tmp = ""
-let root = ""
-let hostRepo = ""
-let handoff = ""
-let sessions = ""
-let marker = ""
-let boxEnv: NodeJS.ProcessEnv = {}
-
-const posix = (p: string) => p.replace(/\\/g, "/")
-const identity = ["-c", "user.name=Test", "-c", "user.email=test@example.test", "-c", "commit.gpgsign=false"]
-
-async function git(cwd: string, args: string[], env?: NodeJS.ProcessEnv): Promise<string> {
-  const result = await runCommand(["git", "-C", cwd, ...identity, ...args], env)
-  if (result.code !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`)
-  return result.stdout.trim()
-}
-
-const boxExec: Exec = (argv) =>
-  runCommand(
-    argv.map((a) => a.replace(/^\/handoff(?=\/|$)/, posix(handoff)).replace(/^\/sessions(?=\/|$)/, posix(sessions))),
-    boxEnv,
-  )
-
-function makeWorkspaces(extra: { substMap?: () => Promise<Record<string, string>> } = {}) {
-  const config = { ...defaultConfig({}), home: path.join(tmp, "home"), roots: [root] }
-  return createWorkspaces({ config, container: "unused-in-tests", handoffDir: handoff, stateDir: path.join(tmp, "state"), boxExec, substMap: extra.substMap ?? (async () => ({})) })
-}
-
-const boxClone = (key: string) => path.join(sessions, key)
-
-async function boxCommit(key: string, files: Record<string, string>, message: string) {
-  for (const [file, content] of Object.entries(files)) {
-    mkdirSync(path.dirname(path.join(boxClone(key), file)), { recursive: true })
-    writeFileSync(path.join(boxClone(key), file), content)
-  }
-  await git(boxClone(key), ["add", "-A"], boxEnv)
-  await git(boxClone(key), ["commit", "-q", "-m", message], boxEnv)
-}
-
-beforeAll(async () => {
-  tmp = mkdtempSync(path.join(os.tmpdir(), "ocd-ws-"))
-  root = path.join(tmp, "root")
-  hostRepo = path.join(root, "repo")
-  handoff = path.join(tmp, "handoff")
-  sessions = path.join(tmp, "sessions")
-  marker = path.join(tmp, "HOOK-RAN")
-  mkdirSync(hostRepo, { recursive: true })
-  mkdirSync(sessions, { recursive: true })
-  const emptyGlobal = path.join(tmp, "empty.gitconfig")
-  writeFileSync(emptyGlobal, "")
-  boxEnv = { ...cleanEnv(), GIT_CONFIG_GLOBAL: emptyGlobal, GIT_CONFIG_NOSYSTEM: "1" }
-  await git(hostRepo, ["init", "-q", "-b", "main"])
-  writeFileSync(path.join(hostRepo, "README.md"), "hello\n")
-  writeFileSync(path.join(hostRepo, "package.json"), JSON.stringify({ name: "x", scripts: { test: "bun test" } }, null, 2))
-  mkdirSync(path.join(hostRepo, "sub"))
-  writeFileSync(path.join(hostRepo, "sub", "package.json"), JSON.stringify({ name: "sub", version: "1.0.0", scripts: { a: "b" } }))
-  await git(hostRepo, ["add", "-A"])
-  await git(hostRepo, ["commit", "-q", "-m", "base"])
-}, T)
-
-afterAll(() => {
-  if (tmp) rmSync(tmp, { recursive: true, force: true })
+const fx = new WorkspaceFixture("ocd-ws-")
+beforeAll(() => fx.setup(), T)
+beforeEach(() => {
+  fx.boxOverride = undefined
 })
+afterAll(() => fx.teardown())
 
 describe("workspaces: collect never runs hooks planted in the box clone (red test)", () => {
   test(
     "planted post-checkout / post-merge / reference-transaction hooks stay silent; the branch arrives",
     async () => {
-      const ws = await makeWorkspaces().open(hostRepo, "hook-test")
+      const ws = await fx.workspaces().open(fx.hostRepo, "hook-test")
       expect(ws.branch).toBe("delegate/hook-test")
-      expect(existsSync(path.join(handoff, "hook-test-in.bundle"))).toBe(false)
-      await boxCommit("hook-test", { "src/a.txt": "work\n" }, "agent work")
+      expect(readFileSync(path.join(fx.boxClone("hook-test"), "README.md"), "utf8")).toBe("hello\n")
+      expect(await fx.boxGit("hook-test", ["branch", "--show-current"])).toBe("delegate/hook-test")
+      expect(fx.handoffFiles()).toEqual([])
+      await fx.boxCommit("hook-test", { "src/a.txt": "work\n" }, "agent work")
       for (const hook of ["post-checkout", "post-merge", "reference-transaction"]) {
-        const file = path.join(boxClone("hook-test"), ".git", "hooks", hook)
-        writeFileSync(file, `#!/bin/sh\necho ${hook} >> "${posix(marker)}"\n`)
+        const file = path.join(fx.boxClone("hook-test"), ".git", "hooks", hook)
+        writeFileSync(file, `#!/bin/sh\necho ${hook} >> "${posix(fx.marker)}"\n`)
         chmodSync(file, 0o755)
       }
       // Positive control: the planted hooks are live when git operates inside the clone.
-      await git(boxClone("hook-test"), ["checkout", "-q", "-b", "probe"], boxEnv)
-      await git(boxClone("hook-test"), ["checkout", "-q", "delegate/hook-test"], boxEnv)
-      expect(existsSync(marker)).toBe(true)
-      rmSync(marker)
+      await fx.boxGit("hook-test", ["checkout", "-q", "-b", "probe"])
+      await fx.boxGit("hook-test", ["checkout", "-q", "delegate/hook-test"])
+      expect(existsSync(fx.marker)).toBe(true)
+      rmSync(fx.marker)
 
-      const tip = await git(boxClone("hook-test"), ["rev-parse", "delegate/hook-test"], boxEnv)
-      const result = await makeWorkspaces().collect(ws)
-      expect(existsSync(marker)).toBe(false)
+      const tip = await fx.boxGit("hook-test", ["rev-parse", "delegate/hook-test"])
+      const result = await fx.workspaces().collect(ws)
+      expect(existsSync(fx.marker)).toBe(false)
       expect(result).toEqual({ branch: "delegate/hook-test", commits: 1, hostExecutableChanges: [] })
-      expect(await git(hostRepo, ["rev-parse", "delegate/hook-test"])).toBe(tip)
-      expect(await git(hostRepo, ["branch", "--show-current"])).toBe("main")
-      expect(existsSync(path.join(handoff, "hook-test-out.bundle"))).toBe(false)
+      expect(await git(fx.hostRepo, ["rev-parse", "delegate/hook-test"])).toBe(tip)
+      expect(await git(fx.hostRepo, ["branch", "--show-current"])).toBe("main")
+      expect(fx.handoffFiles()).toEqual([])
+      expect(fx.incoming()).toEqual([])
     },
     T,
   )
@@ -116,11 +50,11 @@ describe("workspaces: collect never runs hooks planted in the box clone (red tes
 
 describe("workspaces: host-executable changes are reported", () => {
   test(
-    "hooks dirs, .git* files, scripts, Makefile and package.json scripts are flagged; plain files are not",
+    "paths, tool configs, agent files, package.json scripts, symlinks, submodules and exec bits are flagged",
     async () => {
-      const workspaces = makeWorkspaces()
-      const ws = await workspaces.open(hostRepo, "exec-test")
-      await boxCommit(
+      const workspaces = fx.workspaces()
+      const ws = await workspaces.open(fx.hostRepo, "exec-test")
+      await fx.boxCommit(
         "exec-test",
         {
           ".husky/pre-commit": "echo hi\n",
@@ -130,82 +64,86 @@ describe("workspaces: host-executable changes are reported", () => {
           "tools/go.sh": "echo\n",
           "tools/go.cmd": "echo\n",
           "Makefile": "all:\n",
+          ".envrc": "export X=1\n",
+          ".mcp.json": "{}\n",
+          "CLAUDE.md": "# rules\n",
+          "pyproject.toml": "[project]\n",
+          ".vscode/tasks.json": "{}\n",
+          ".idea/runConfigurations/app.xml": "<x/>\n",
           "package.json": JSON.stringify({ name: "x", scripts: { test: "bun test", postinstall: "node evil.js" } }),
           "sub/package.json": JSON.stringify({ name: "sub", version: "2.0.0", scripts: { a: "b" } }),
           "README.md": "changed\n",
+          "tools/build": "#!/bin/sh\n",
         },
         "risky",
       )
-      await boxCommit("exec-test", { "notes.txt": "x\n" }, "second")
+      await fx.boxCommit("exec-test", { "notes.txt": "x\n" }, "second")
+      // Modes written straight to the index (works without symlink rights on Windows).
+      writeFileSync(path.join(fx.tmp, "link-target"), "README.md")
+      const blob = await fx.boxGit("exec-test", ["hash-object", "-w", path.join(fx.tmp, "link-target")])
+      const base = await fx.boxGit("exec-test", ["rev-parse", "HEAD~2"])
+      await fx.boxGit("exec-test", ["update-index", "--add", "--cacheinfo", `120000,${blob},docs/link`])
+      await fx.boxGit("exec-test", ["update-index", "--add", "--cacheinfo", `160000,${base},vendor/sub`])
+      await fx.boxGit("exec-test", ["update-index", "--chmod=+x", "tools/build"])
+      await fx.boxGit("exec-test", ["commit", "-q", "-m", "modes"])
       const result = await workspaces.collect(ws)
-      expect(result.commits).toBe(2)
+      expect(result.commits).toBe(3)
       expect([...result.hostExecutableChanges].sort()).toEqual(
-        [".gitattributes", ".githooks/pre-push", ".husky/pre-commit", "Makefile", "package.json", "tools/go.cmd", "tools/go.sh", "tools/run.PS1"].sort(),
+        [
+          ".envrc", ".gitattributes", ".githooks/pre-push", ".husky/pre-commit", ".idea/runConfigurations/app.xml", ".mcp.json", ".vscode/tasks.json",
+          "CLAUDE.md", "Makefile", "docs/link", "package.json", "pyproject.toml", "tools/build", "tools/go.cmd", "tools/go.sh", "tools/run.PS1", "vendor/sub",
+        ].sort(),
       )
     },
     T,
   )
 })
 
-describe("workspaces: folder validation", () => {
-  const code = async (p: Promise<unknown>) => ((await p.catch((e: unknown) => e)) as DelegateError).code
-
+describe("workspaces: open is atomic and never collides", () => {
   test(
-    "refuses folders outside the roots, '..' escapes, and non-repos",
+    "a second open of the same key is directory_busy and leaves the first intact",
     async () => {
-      const outside = path.join(tmp, "outside")
-      mkdirSync(outside, { recursive: true })
-      await git(outside, ["init", "-q"])
-      mkdirSync(path.join(root, "plain"), { recursive: true })
-      const workspaces = makeWorkspaces()
-      expect(await code(workspaces.resolveRepo(outside))).toBe("directory_invalid")
-      expect(await code(workspaces.resolveRepo(`${root}\\repo\\..\\..\\outside`))).toBe("directory_invalid")
-      expect(await code(workspaces.resolveRepo(`${root}/repo/../repo`))).toBe("directory_invalid")
-      expect(await code(workspaces.resolveRepo(path.join(root, "plain")))).toBe("directory_invalid")
-      expect(await code(workspaces.resolveRepo(path.join(root, "missing")))).toBe("directory_invalid")
-      expect(await code(workspaces.open(hostRepo, "Bad_Key"))).toBe("invalid_input")
-      expect(await code(workspaces.open(hostRepo, "abc"))).toBe("invalid_input")
+      const workspaces = fx.workspaces()
+      await workspaces.open(fx.hostRepo, "busy-key")
+      expect(await code(workspaces.open(fx.hostRepo, "busy-key"))).toBe("directory_busy")
+      expect(existsSync(path.join(fx.boxClone("busy-key"), "README.md"))).toBe(true)
+      expect(fx.leftovers("busy-key")).toEqual(["busy-key"])
     },
     T,
   )
 
   test(
-    "normalises case, subdirectories and drive substitutions to the same repo",
+    "works when the owner's checked-out branch is delegate/<key>",
     async () => {
-      const expected = canonicalPath(hostRepo, {})
-      const workspaces = makeWorkspaces({ substMap: async () => ({ "Q:": root }) })
-      expect(await workspaces.resolveRepo(path.join(hostRepo, "sub"))).toBe(expected)
-      if (process.platform === "win32") {
-        expect(await workspaces.resolveRepo(hostRepo.toUpperCase())).toBe(expected)
-        expect(await workspaces.resolveRepo("q:\\repo")).toBe(expected)
+      await git(fx.hostRepo, ["checkout", "-q", "-b", "delegate/head-key"])
+      try {
+        const ws = await fx.workspaces().open(fx.hostRepo, "head-key")
+        expect(await fx.boxGit("head-key", ["rev-parse", ws.branch])).toBe(await git(fx.hostRepo, ["rev-parse", "HEAD"]))
+      } finally {
+        await git(fx.hostRepo, ["checkout", "-q", "main"])
       }
     },
     T,
   )
 
-  test("collect without a host record is not_found", async () => {
-    const ws = { sessionKey: "never-opened", hostRepo, boxPath: "/sessions/never-opened", branch: "delegate/never-opened" }
-    expect(await code(makeWorkspaces().collect(ws))).toBe("not_found")
-  })
-})
-
-describe("workspaces: helpers", () => {
-  test("parseSubst reads `subst` output", () => {
-    expect(parseSubst("T:\\: => X:\\some-dir\r\nW:\\: => C:\\GitHub\\x\r\n")).toEqual({ "T:": "X:\\some-dir", "W:": "C:\\GitHub\\x" })
-  })
-
-  test("isHostExecutablePath", () => {
-    for (const p of [".husky/x", "a/.githooks/y", ".gitmodules", ".github/workflows/ci.yml", "Makefile", "x/GNUmakefile", "a.bat", "b.CMD", "c.ps1", "d.sh"]) {
-      expect(isHostExecutablePath(p)).toBe(true)
-    }
-    for (const p of ["README.md", "src/index.ts", "husky.md", "shell.txt", "package.json"]) expect(isHostExecutablePath(p)).toBe(false)
-  })
-
-  test("scriptsChanged fails closed on unparseable package.json", () => {
-    expect(scriptsChanged('{"scripts":{"a":"b"}}', '{"scripts":{"a":"b"},"version":"2"}')).toBe(false)
-    expect(scriptsChanged('{"scripts":{"a":"b"}}', '{"scripts":{"a":"c"}}')).toBe(true)
-    expect(scriptsChanged(undefined, '{"name":"x"}')).toBe(false)
-    expect(scriptsChanged(undefined, '{"scripts":{}}')).toBe(true)
-    expect(scriptsChanged("{bad", "{bad")).toBe(true)
-  })
+  const failAt = (match: (a: string[]) => boolean, stderr: string) => (argv: string[]) => (match(argv) ? { code: 1, stdout: "", stderr } : undefined)
+  const cases: Array<[string, (a: string[]) => boolean, string, ErrorCode]> = [
+    ["the box is down at clone", (a) => a.includes("clone"), "Error response from daemon: No such container: opencode-delegate", "sandbox_unavailable"],
+    ["checkout fails after the clone", (a) => a.includes("-B"), "fatal: bad object", "upstream_error"],
+    ["the base check fails after the move", (a) => a.includes("rev-parse") && a.at(-1) === "HEAD", "fatal: broken", "upstream_error"],
+  ]
+  for (const [index, [label, match, stderr, expected]] of cases.entries()) {
+    test(
+      `a box failure (${label}) cleans up the temp and final folders, the bundle and the record`,
+      async () => {
+        fx.boxOverride = failAt(match, stderr)
+        const key = `fail-case-${index}`
+        expect(await code(fx.workspaces().open(fx.hostRepo, key))).toBe(expected)
+        expect(fx.leftovers(key)).toEqual([])
+        expect(fx.handoffFiles()).toEqual([])
+        expect(existsSync(path.join(fx.tmp, "state", `${key}.json`))).toBe(false)
+      },
+      T,
+    )
+  }
 })

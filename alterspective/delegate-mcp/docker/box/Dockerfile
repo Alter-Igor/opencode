@@ -30,8 +30,8 @@ RUN apt-get update \
 COPY --from=build --chown=root:root --chmod=0755 /src/packages/opencode/dist/opencode-linux-x64/bin/opencode /usr/local/bin/opencode
 COPY --from=build --chown=root:root --chmod=0755 /usr/local/bin/bun /usr/local/bin/bun
 RUN useradd -m -u 10001 -s /bin/bash agent \
-    && mkdir -p /data /sessions /handoff /profile \
-    && chown agent:agent /data /sessions /handoff \
+    && mkdir -p /data /sessions /handoff/in /handoff/out /profile \
+    && chown agent:agent /data /sessions /handoff/out \
     && git config --system safe.directory '*' \
     && git config --system init.defaultBranch main \
     && opencode --version

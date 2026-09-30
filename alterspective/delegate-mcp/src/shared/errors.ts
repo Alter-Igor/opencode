@@ -4,6 +4,8 @@
 
 export const ErrorCode = [
   "server_down",
+  // HTTP 401 from the box: the bridge and the box disagree on the server password (review A-08).
+  "auth_mismatch",
   "sandbox_unavailable",
   "profile_invalid",
   "profile_changed",
@@ -13,6 +15,10 @@ export const ErrorCode = [
   "port_busy",
   "directory_invalid",
   "directory_busy",
+  // collect: the host's delegate/<key> and the box's are not a fast-forward; nothing was overwritten.
+  "branch_diverged",
+  // collect: the box's out-bundle is over the size cap (WorkspacesOptions.maxBundleBytes).
+  "bundle_too_large",
   "not_found",
   "not_started",
   "cursor_expired",

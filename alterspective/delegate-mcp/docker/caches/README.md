@@ -8,13 +8,14 @@ Why the caches exist: review finding N3. If the box could reach the public regis
 
 | Service name | Port | Build dir | Base image (pinned by version + digest) | Networks | Volume |
 |---|---|---|---|---|---|
-| `egress` | 8888 | `docker/egress` | `alpine:3.22` + tinyproxy 1.11.2 | `sealed`, `outside` | none (`read_only: true` is fine) |
-| `npm-cache` | 4873 | `docker/caches/npm` | `verdaccio/verdaccio:6.10.4` | `sealed`, `outside` | named volume at `/verdaccio/storage` |
-| `pypi-cache` | 5000 | `docker/caches/pypi` | `nginxinc/nginx-unprivileged:1.28.2-alpine` | `sealed`, `outside` | named volume at `/var/cache/nginx/pypi`; `read_only: true` works with tmpfs `/tmp:uid=101,gid=101` |
+| `egress` | 8888 | `docker/egress` | `alpine:3.22` + tinyproxy 1.11.2 | `sealed`, `outside` | none (runs `read_only: true`) |
+| `npm-cache` | 4873 | `docker/caches/npm` | `verdaccio/verdaccio:6.10.4` | `sealed`, `outside` | named volume `npm-storage` at `/verdaccio/storage`; runs `read_only: true` with tmpfs `/tmp` |
+| `pypi-cache` | 5000 | `docker/caches/pypi` | `nginxinc/nginx-unprivileged:1.28.2-alpine` | `sealed`, `outside` | named volume `pypi-storage` at `/var/cache/nginx/pypi`; runs `read_only: true` with tmpfs `/tmp:uid=101,gid=101` |
 
 - `sealed` is `internal: true` (no route out). The box joins **only** `sealed`.
 - None of the three publishes a host port.
 - All three run as non-root: `nobody` (egress), uid 10001 (verdaccio), uid 101 (nginx).
+- `docker/compose.yaml` also gives all three (and the box and gate) `cap_drop: [ALL]`, `no-new-privileges`, and pids/memory/CPU limits.
 - The egress allowlist is `docker/egress/allow.txt`, generated from `config.egressHosts` by `bun src/guard/egress.ts` (the tests fail if the committed file drifts). If the supervisor runs with a non-default host list, it writes `egressAllowlist(config.egressHosts)` to a file and mounts it read-only over `/etc/tinyproxy/allow.txt`.
 
 ## Environment the box needs
@@ -38,7 +39,7 @@ UV_DEFAULT_INDEX=http://pypi-cache:5000/index/
 UV_INSECURE_HOST=pypi-cache
 ```
 
-`NO_PROXY` is required. Without it, npm and pip send cache requests to `egress`, which refuses them (the cache names are not on the allowlist). The `BUN_` and `UV_` lines were not tested live; npm and pip were.
+`NO_PROXY` is required. Without it, npm and pip send cache requests to `egress`, which refuses them (the cache names are not on the allowlist). The box sets every line above (`docker/compose.yaml`). npm, pip and bun were tested live (bun on 2026-10-01: `bun add is-number` resolved through `npm-cache`). The `UV_` lines were not tested: uv is not installed in the box image.
 
 ## How the caches reach the internet — decision
 

@@ -31,7 +31,7 @@ export interface Workspaces {
 /** MOD-02: policy verdicts. Every check fails closed. */
 export type Verdict = { ok: true } | { ok: false; code: "policy_violation" | "policy_unverified"; reason: string }
 
-export type McpEntry = { type?: string; url?: string; headers?: Record<string, string>; oauth?: unknown; enabled?: boolean }
+export type McpEntry = { type?: string; url?: string; headers?: Record<string, string>; oauth?: unknown; enabled?: boolean; timeout?: number }
 
 export interface Guard {
   /** Profile-time validation of MCP entries (names must start ks-). */

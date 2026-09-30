@@ -36,6 +36,9 @@ function readonly(): Rule[] {
     ...standard(),
     { permission: "edit", pattern: "*", action: "deny" },
     { permission: "bash", pattern: "*", action: "ask" },
+    // Keystone tools may change remote state, so a read-only session asks first
+    // (review A-16). Last-match-wins: this overrides the standard `ks-*_*` allow above.
+    { permission: "ks-*_*", pattern: "*", action: "ask" },
   ]
 }
 

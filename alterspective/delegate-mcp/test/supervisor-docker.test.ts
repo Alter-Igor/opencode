@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { DelegateError } from "../src/shared/errors.ts"
-import { childEnv, dockerArgs, freePort, imageTag, inspectBox, parseInspect, requireDocker, type Exec } from "../src/supervisor/docker.ts"
+import { EXIT_NOT_FOUND, EXIT_TIMED_OUT, bunExec, childEnv, dockerArgs, freePort, imageTag, inspectBox, parseInspect, redactAll, requireDocker, type Exec } from "../src/supervisor/docker.ts"
 
 const target = { project: "opencode-delegate", files: ["C:\\repo\\docker\\compose.yaml", "C:\\home\\compose.box-env.yaml"] }
 
@@ -52,9 +52,22 @@ describe("inspect parsing", () => {
   })
 
   test("missing container → undefined", async () => {
-    const exec: Exec = async () => ({ code: 1, stdout: "", stderr: "No such container" })
+    const exec: Exec = async () => ({ code: 1, stdout: "", stderr: "Error: No such container: opencode-delegate" })
     expect(await inspectBox(exec, [])).toBeUndefined()
+    const object: Exec = async () => ({ code: 1, stdout: "", stderr: "Error: No such object: opencode-delegate" })
+    expect(await inspectBox(object, [])).toBeUndefined()
     expect(parseInspect("not json", [])).toBeUndefined()
+  })
+
+  test("any other inspect failure → sandbox_unavailable, never 'not running' (A-10)", async () => {
+    for (const result of [
+      { code: 1, stdout: "", stderr: "error during connect: pipe not found" },
+      { code: 124, stdout: "", stderr: "[timed out]" },
+      { code: 0, stdout: "garbage", stderr: "" },
+    ]) {
+      const error = await inspectBox(async () => result, []).catch((e: unknown) => e)
+      expect((error as DelegateError).code).toBe("sandbox_unavailable")
+    }
   })
 })
 
@@ -73,15 +86,62 @@ describe("docker availability", () => {
 })
 
 describe("image tag + port", () => {
-  test("tag = version-sha and rejects odd input", () => {
+  test("tag = version-sha(-dirty-hash) and rejects odd input with a DelegateError (A-06)", () => {
     expect(imageTag("opencode-delegate-box", "1.18.31", "1483a47")).toBe("opencode-delegate-box:1.18.31-1483a47")
-    expect(() => imageTag("opencode-delegate-box", "1.0 ; x", "1483a47")).toThrow()
-    expect(() => imageTag("opencode-delegate-box", "1.0", "zzz")).toThrow()
+    expect(imageTag("opencode-delegate-box", "1.18.31", "1483a47", "0123456789ab")).toBe("opencode-delegate-box:1.18.31-1483a47-dirty-0123456789ab")
+    for (const [version, sha, dirty] of [["1.0 ; x", "1483a47"], ["1.0", "1483a47"], ["1.0.0", "zzz"], ["1.0.0", ""], ["1.0.0", "1483a47", "NOTHEX!!"]] as const) {
+      const error = (() => {
+        try {
+          return imageTag("opencode-delegate-box", version, sha, dirty)
+        } catch (e) {
+          return e
+        }
+      })()
+      expect((error as DelegateError).code).toBe("sandbox_unavailable")
+    }
+  })
+
+  test("redactAll removes every secret occurrence", () => {
+    expect(redactAll("pw=abc; again abc; key=k1", ["abc", "k1", ""])).toBe("pw=[redacted]; again [redacted]; key=[redacted]")
   })
 
   test("freePort returns a usable port", async () => {
     const port = await freePort()
     expect(port).toBeGreaterThan(0)
     expect(port).toBeLessThan(65536)
+  })
+})
+
+// Real child processes, using this Bun binary as the child (portable, no shell).
+describe("bunExec", () => {
+  const bun = process.execPath
+  const env = { PATH: process.env.PATH ?? "", SystemRoot: process.env.SystemRoot ?? "" }
+
+  test("returns exit code, stdout and stderr", async () => {
+    const result = await bunExec([bun, "-e", "process.stdout.write('out'); process.stderr.write('err'); process.exit(3)"], { env })
+    expect(result).toEqual({ code: 3, stdout: "out", stderr: "err" })
+  })
+
+  test("a missing binary is exit 127, not a throw", async () => {
+    const result = await bunExec(["definitely-not-a-real-binary-ocd"], { env })
+    expect(result.code).toBe(EXIT_NOT_FOUND)
+  })
+
+  test("a timeout kills the child and reports 124", async () => {
+    const started = Date.now()
+    const result = await bunExec([bun, "-e", "setTimeout(() => {}, 60000)"], { env, timeoutMs: 300 })
+    expect(result.code).toBe(EXIT_TIMED_OUT)
+    expect(result.stderr).toContain("timed out")
+    expect(Date.now() - started).toBeLessThan(20_000)
+  })
+
+  test("the child gets only the env it is given", async () => {
+    process.env.OCD_SECRET_PROBE = "leak"
+    try {
+      const result = await bunExec([bun, "-e", "process.stdout.write(String(process.env.OCD_SECRET_PROBE))"], { env })
+      expect(result.stdout).toBe("undefined")
+    } finally {
+      delete process.env.OCD_SECRET_PROBE
+    }
   })
 })

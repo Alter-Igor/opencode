@@ -8,6 +8,11 @@ export type ExecResult = { code: number; stdout: string; stderr: string }
 export type ExecOptions = { env?: Record<string, string>; timeoutMs?: number }
 export type Exec = (argv: string[], options?: ExecOptions) => Promise<ExecResult>
 
+/** Exit codes bunExec reports when it could not run the command at all (as shells do). */
+export const EXIT_NOT_FOUND = 127
+export const EXIT_TIMED_OUT = 124
+
+/** Default project name; the box container is named after the project (compose.yaml). */
 export const BOX_CONTAINER = "opencode-delegate"
 export const LABEL = {
   profileHash: "com.alterspective.opencode-delegate.profile-hash",
@@ -33,20 +38,28 @@ export function childEnv(host: NodeJS.ProcessEnv, extra: Record<string, string> 
   return { ...env, ...extra }
 }
 
+/** Run argv. A missing binary is exit 127; a timeout kills the child and reports exit 124. */
 export const bunExec: Exec = async (argv, options = {}) => {
   let proc: ReturnType<typeof Bun.spawn>
   try {
     proc = Bun.spawn(argv, { env: options.env ?? childEnv(process.env), stdin: "ignore", stdout: "pipe", stderr: "pipe" })
   } catch (error) {
-    return { code: 127, stdout: "", stderr: String(error) }
+    return { code: EXIT_NOT_FOUND, stdout: "", stderr: String(error) }
   }
-  const timer = options.timeoutMs ? setTimeout(() => proc.kill(), options.timeoutMs) : undefined
+  let timedOut = false
+  const timer = options.timeoutMs
+    ? setTimeout(() => {
+        timedOut = true
+        proc.kill()
+      }, options.timeoutMs)
+    : undefined
   const [stdout, stderr, code] = await Promise.all([
     new Response(proc.stdout as ReadableStream).text(),
     new Response(proc.stderr as ReadableStream).text(),
     proc.exited,
   ])
   if (timer) clearTimeout(timer)
+  if (timedOut) return { code: EXIT_TIMED_OUT, stdout, stderr: `${stderr}\n[timed out after ${options.timeoutMs} ms]`.trim() }
   return { code, stdout, stderr }
 }
 
@@ -78,7 +91,7 @@ export async function requireDocker(exec: Exec): Promise<string> {
     "sandbox_unavailable",
     "Docker is not available, so the sandbox cannot start.",
     "Start Docker Desktop and retry. The bridge never runs OpenCode outside the sandbox.",
-    result.stderr.trim().slice(0, 300),
+    `exit ${result.code}: ${result.stderr.trim().slice(0, 300)}`,
   )
 }
 
@@ -91,10 +104,20 @@ export type BoxInspect = {
   env: Record<string, string>
 }
 
+const NOT_FOUND = /No such (container|object)/i
+
+/** undefined only when Docker says the container does not exist; any other failure is sandbox_unavailable. */
 export async function inspectBox(exec: Exec, wanted: string[], name = BOX_CONTAINER): Promise<BoxInspect | undefined> {
   const result = await exec(dockerArgs.inspect(name), { timeoutMs: 20_000 })
-  if (result.code !== 0) return undefined
-  return parseInspect(result.stdout, wanted)
+  if (result.code !== 0 && NOT_FOUND.test(result.stderr)) return undefined
+  const box = result.code === 0 ? parseInspect(result.stdout, wanted) : undefined
+  if (box) return box
+  throw new DelegateError(
+    "sandbox_unavailable",
+    "The bridge could not read the sandbox state from Docker.",
+    "Check Docker Desktop is running, then run oc_doctor.",
+    result.code === 0 ? "docker inspect returned unreadable output" : `docker inspect exit ${result.code}: ${result.stderr.trim().slice(0, 300)}`,
+  )
 }
 
 type RawInspect = { state?: { Running?: boolean; Health?: { Status?: string } }; labels?: Record<string, string> | null; env?: string[] | null; image?: string }
@@ -121,10 +144,26 @@ export async function imageExists(exec: Exec, tag: string): Promise<boolean> {
   return (await exec(dockerArgs.imageExists(tag), { timeoutMs: 20_000 })).code === 0
 }
 
-/** Image tag = OpenCode package version + git short SHA (technical-design.md §4, §8). */
-export function imageTag(image: string, version: string, sha: string): string {
-  if (!/^[0-9A-Za-z._-]+$/.test(version) || !/^[0-9a-f]{7,40}$/.test(sha)) throw new Error("invalid image version or sha")
-  return `${image}:${version}-${sha}`
+const VERSION = /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/
+const SHA = /^[0-9a-f]{7,40}$/
+const DIRTY = /^[0-9a-f]{8,16}$/
+
+/** Image tag = OpenCode version + git short SHA, plus `-dirty-<hash>` for uncommitted builds (§4, VER-DEV-01). */
+export function imageTag(image: string, version: string, sha: string, dirty?: string): string {
+  if (!VERSION.test(version) || !SHA.test(sha) || (dirty !== undefined && !DIRTY.test(dirty)))
+    throw new DelegateError(
+      "sandbox_unavailable",
+      "The OpenCode checkout has an unexpected version or commit, so the sandbox image cannot be named.",
+      "Check packages/opencode/package.json and the git checkout, then retry.",
+      `version=${version.slice(0, 40)} sha=${sha.slice(0, 40)}`,
+    )
+  const tag = `${version}-${sha}${dirty ? `-dirty-${dirty}` : ""}`
+  return `${image}:${tag.slice(0, 128)}`
+}
+
+/** Remove every secret value from text (e.g. compose stderr that echoes the environment). */
+export function redactAll(text: string, secrets: string[]): string {
+  return secrets.filter((secret) => secret.length > 0).reduce((out, secret) => out.split(secret).join("[redacted]"), text)
 }
 
 /** A free 127.0.0.1 TCP port (the OS picks it). */

@@ -59,12 +59,17 @@ describe("permissionBaseline(readonly)", () => {
     ["bash", "git push", "ask"],
     ["external_directory", "/etc", "deny"],
     ["webfetch", "https://example.com", "ask"],
-    ["ks-delegate_search-tools", "*", "allow"],
+    ["ks-delegate_search-tools", "*", "ask"],
+    ["ks-rag_rag-search", "*", "ask"],
   ]
 
   for (const [permission, pattern, action] of cases) {
     test(`${permission} ${pattern} → ${action}`, () => expect(evaluate(rules, permission, pattern)).toBe(action))
   }
+
+  test("ends with the Keystone-tools ask rule so it wins over the standard allow (A-16)", () => {
+    expect(rules[rules.length - 1]).toEqual({ permission: "ks-*_*", pattern: "*", action: "ask" })
+  })
 
   test("keeps every standard rule", () => {
     const standard = permissionBaseline("standard")

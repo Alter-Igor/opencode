@@ -71,6 +71,16 @@ How the refresh fix works: the MCP SDK refreshes in `auth() → refreshAuthoriza
 
 Planner review (round 1, logic): origin compared exactly; `..` and `%2e%2e` normalised before the path test; every connect path (`startup`, `MCP.add`, `MCP.connect`, `finishAuth` → `create`; `startAuth`) checked; non-refresh requests pass through untouched; errors not cached. No defects found. Gap noted: `opencode mcp debug` (`cli/cmd/mcp.ts:768-786`) bypasses both hooks — low risk in the box (profile has only allowlisted entries; egress blocks others).
 
-## T0.2 — Token race
+## T0.2 — Token race (2026-10-01, live, fork image 2210e26) — PASS
 
-Pending the T0.4 patch image (tested once, with the patch, to avoid revoking the new sign-in twice).
+Setup: real supervisor started the box (`spike/start-and-login.ts`); owner signed in through `login.ts` (callback relayed in ~1 s, `ks-delegate: connected`). `spike/t02-race.mjs --yes` then replaced the stored access token with an invalid one marked expired (refresh token untouched) and fired tool listings from 3 new directories at once.
+
+| Observation | Value |
+|---|---|
+| Directories 1–3 | HTTP 200 in 78 / 61 / 86 ms; each `GET /mcp` → `ks-delegate: connected` |
+| Stored token after | new access token, `expiresInSec: 3600`, refresh token rotated (`refreshRotated: true`) |
+| `invalid_grant` in responses or box logs | **0** |
+
+So the single-flight refresh held across 3 directory instances: one rotation, no refresh-token reuse, no family revocation.
+
+**Side finding (open):** the first model call in the fork-built box fails with `System message must be at the beginning.` (Synapse `invalid_request_error`), while upstream `opencode-ai@1.18.33` in the spike box worked. Root-cause investigation in progress; tracked in `issues.md`.

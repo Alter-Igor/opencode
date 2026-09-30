@@ -7,11 +7,12 @@ import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import path from "node:path"
 import type { BridgeConfig } from "../shared/config.ts"
 import type { Guard } from "../shared/contracts.ts"
-import { DelegateError } from "../shared/errors.ts"
+import { DelegateError, isDelegateError } from "../shared/errors.ts"
+import { invalid, scanProvider, type Json, type JsonObject } from "./profile-scan.ts"
+
+export { scanProvider } from "./profile-scan.ts"
 
 export type PermissionRule = ReturnType<Guard["permissionBaseline"]>[number]
-type Json = null | boolean | number | string | Json[] | { [key: string]: Json }
-type JsonObject = { [key: string]: Json }
 
 /** Written because OpenCode crashes writing it into a read-only config dir (config.ts:309-325). */
 export const PROFILE_GITIGNORE = ["node_modules", "package.json", "package-lock.json", "bun.lock", ".gitignore"].join("\n") + "\n"
@@ -34,10 +35,6 @@ export type BuiltProfile = {
   dropped: Array<{ provider: string; reason: string }>
 }
 
-const SECRET_KEY = /api[-_]?key|secret|token$|passw(or)?d|credential|^authorization$|bearer|cookie|private[-_]?key/i
-const SECRET_VALUE = /^(sk|pk|rk|gpapp|ghp|gho|ghs|glpat|xox[abpr])[-_][A-Za-z0-9]|^bearer\s+\S/i
-const ENV_REF = /\{env:([^}]+)\}/g
-const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
 const CONNECTION_ID = /^[A-Za-z0-9_-]+$/
 
 // ---------- JSONC ----------
@@ -100,46 +97,6 @@ export function parseOwnerConfig(text: string, label: string): JsonObject {
   }
   if (!isObject(value)) throw invalid(`The owner OpenCode config (${label}) is not a JSON object.`)
   return value
-}
-
-// ---------- scanning ----------
-
-type Scan = { envNames: Set<string> }
-
-/** Walk a provider entry; refuse {file:} and literal secrets, collect {env:} names. Never reads values into errors. */
-export function scanProvider(value: Json, keyPath: string, scan: Scan = { envNames: new Set() }): Scan {
-  if (typeof value === "string") {
-    checkString(value, keyPath, scan)
-  } else if (Array.isArray(value)) {
-    value.forEach((item, index) => scanProvider(item, `${keyPath}[${index}]`, scan))
-  } else if (isObject(value)) {
-    for (const [key, child] of Object.entries(value)) {
-      const childPath = `${keyPath}.${key}`
-      scanProvider(child, childPath, scan)
-      if (SECRET_KEY.test(key) && typeof child === "string") checkSecretSlot(child, childPath)
-    }
-  }
-  return scan
-}
-
-function checkString(value: string, keyPath: string, scan: Scan) {
-  if (value.includes("{file:"))
-    throw invalid(`The owner config uses a {file:...} reference at ${keyPath}; the box cannot read host files. Use {env:NAME}.`)
-  if (SECRET_VALUE.test(value.replace(ENV_REF, "").trim()))
-    throw invalid(`The owner config has what looks like a literal secret at ${keyPath}. Use {env:NAME}.`)
-  for (const match of value.matchAll(ENV_REF)) {
-    const name = match[1]!
-    if (!ENV_NAME.test(name)) throw invalid(`The owner config has an invalid {env:...} name at ${keyPath}.`)
-    scan.envNames.add(name)
-  }
-}
-
-function checkSecretSlot(value: string, keyPath: string) {
-  if (value === "") return
-  // Allowed: "{env:NAME}" alone, or a scheme word in front of it ("Bearer {env:NAME}").
-  const rest = value.replace(ENV_REF, "").trim()
-  if (rest === value.trim() || !/^((bearer|basic|token)\s*)?$/i.test(rest))
-    throw invalid(`The owner config has a literal secret at ${keyPath}. Replace it with {env:NAME}.`)
 }
 
 // ---------- building ----------
@@ -210,12 +167,22 @@ function modelFields(owner: JsonObject, providers: Providers): JsonObject {
   return out
 }
 
+/** Objects merge key by key (later file wins per leaf); arrays and scalars are replaced, as OpenCode's own merge does (A-21). */
+export function mergeDeep(base: JsonObject, over: JsonObject): JsonObject {
+  const out: JsonObject = { ...base }
+  for (const [key, value] of Object.entries(over)) {
+    const current = out[key]
+    out[key] = isObject(current) && isObject(value) ? mergeDeep(current, value) : value
+  }
+  return out
+}
+
 export function mergeOwnerConfigs(texts: string[]): JsonObject {
   const merged: JsonObject = {}
   texts.forEach((text, index) => {
     const parsed = parseOwnerConfig(text, `file ${index + 1}`)
     for (const key of ["model", "small_model"] as const) if (parsed[key] !== undefined) merged[key] = parsed[key]
-    if (isObject(parsed.provider)) merged.provider = { ...(isObject(merged.provider) ? merged.provider : {}), ...parsed.provider }
+    if (isObject(parsed.provider)) merged.provider = mergeDeep(isObject(merged.provider) ? merged.provider : {}, parsed.provider)
   })
   return merged
 }
@@ -277,25 +244,45 @@ export async function readOwnerConfigs(fs: Pick<ProfileFs, "readText">, dir: str
   return texts
 }
 
+/** Filesystem failure → DelegateError; the path and errno go to `detail` only (A-07). */
+export function fsFailure(what: string, error: unknown, file: string): DelegateError {
+  if (isDelegateError(error)) return error
+  const code = (error as NodeJS.ErrnoException | undefined)?.code ?? "unknown"
+  return new DelegateError("sandbox_unavailable", `The bridge could not ${what}.`, "Check the bridge home folder and ~/.config/opencode are readable and writable, then run oc_doctor.", `${code} ${file}`)
+}
+
+function missing(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException | undefined)?.code === "ENOENT"
+}
+
 export const nodeProfileFs: ProfileFs = {
-  readText: (file) => readFile(file, "utf8").catch(() => undefined),
+  // Only a missing file is "absent"; an unreadable one fails closed instead of being skipped.
+  readText: (file) => readFile(file, "utf8").catch((error: unknown) => {
+    if (missing(error)) return undefined
+    throw fsFailure("read an OpenCode config or profile file", error, file)
+  }),
   async writeText(file, text) {
-    await mkdir(path.dirname(file), { recursive: true })
-    await writeFile(file, text, "utf8")
+    try {
+      await mkdir(path.dirname(file), { recursive: true })
+      await writeFile(file, text, "utf8")
+    } catch (error) {
+      throw fsFailure("write the sandbox profile", error, file)
+    }
   },
   async listFiles(root) {
-    const entries = await readdir(root, { recursive: true, withFileTypes: true }).catch(() => [])
+    const entries = await readdir(root, { recursive: true, withFileTypes: true }).catch((error: unknown) => {
+      if (missing(error)) return []
+      throw fsFailure("list the sandbox profile folder", error, root)
+    })
     return entries
       .filter((entry) => entry.isFile())
       .map((entry) => path.relative(root, path.join(entry.parentPath, entry.name)).split(path.sep).join("/"))
   },
-  remove: (file) => rm(file, { force: true }),
+  remove: (file) => rm(file, { force: true }).catch((error: unknown) => {
+    throw fsFailure("clean the sandbox profile folder", error, file)
+  }),
 }
 
 function isObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value)
-}
-
-function invalid(message: string): DelegateError {
-  return new DelegateError("profile_invalid", message, "Fix the owner's OpenCode config (~/.config/opencode) and retry.")
 }

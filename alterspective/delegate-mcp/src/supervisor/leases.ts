@@ -1,49 +1,89 @@
 // MOD-01 T1.3: bridge leases on the one shared box (technical-design.md §4 "Stop").
 // One file per bridge under <home>/leases. The box stops only when the last live lease goes.
-// Leases whose process is gone (crashed bridge) are pruned so they cannot pin the box forever.
-import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises"
+// A lease records the bridge PID and process start time, and its mtime is a heartbeat the
+// bridge refreshes every minute (review A-18/A-19). A lease is dropped when its PID is dead,
+// or when its heartbeat is old AND the PID now belongs to a different process (PID reuse).
+import { randomBytes } from "node:crypto"
+import { mkdir, readFile, readdir, rename, rm, stat, utimes, writeFile } from "node:fs/promises"
 import path from "node:path"
+import { DelegateError } from "../shared/errors.ts"
+import { recordGone, type ProcessProbe, type ProcessRecord } from "./process.ts"
 
 export type LeaseFs = {
   list(dir: string): Promise<string[]>
   read(file: string): Promise<string | undefined>
-  /** exclusive=true must fail if the file exists (used for the start lock). */
+  /** exclusive=true returns false if the file exists (start lock). Otherwise the write is atomic (tmp + rename). */
   write(file: string, text: string, exclusive?: boolean): Promise<boolean>
   remove(file: string): Promise<void>
   /** Modification time in ms, or undefined when missing. */
   mtime(file: string): Promise<number | undefined>
+  /** Set mtime to now; false when the file is missing. */
+  touch(file: string): Promise<boolean>
+  /** Atomic rename; false when the source is missing. */
+  rename(from: string, to: string): Promise<boolean>
 }
 
 export type Leases = {
-  acquire(bridgeId: string, pid: number): Promise<void>
+  acquire(bridgeId: string, self: ProcessRecord): Promise<void>
+  /** Refresh this bridge's heartbeat; false when the lease file is gone (caller re-acquires). */
+  heartbeat(bridgeId: string): Promise<boolean>
   /** Remove this bridge's lease; returns how many live leases remain. */
   release(bridgeId: string): Promise<number>
   active(): Promise<string[]>
 }
 
+export type LeaseOptions = { probe: ProcessProbe; now: () => number; staleMs?: number }
+
+export const LEASE_HEARTBEAT_MS = 60_000
+const LEASE_STALE_MS = 5 * 60_000
 const BRIDGE_ID = /^[A-Za-z0-9_-]{1,64}$/
 
 export function assertBridgeId(bridgeId: string): void {
-  if (!BRIDGE_ID.test(bridgeId)) throw new Error("invalid bridge id")
+  if (!BRIDGE_ID.test(bridgeId))
+    throw new DelegateError("invalid_input", "The bridge id is not valid.", "Restart the bridge.", "bridge id must match [A-Za-z0-9_-]{1,64}")
 }
 
-export function createLeases(fs: LeaseFs, dir: string, isAlive: (pid: number) => boolean): Leases {
+/** JSON record, or the Wave 1 format "pid\nISO time\n" (still read so a running box is not orphaned). */
+export function parseRecord(text: string | undefined): ProcessRecord | undefined {
+  if (text === undefined) return undefined
+  try {
+    const value = JSON.parse(text) as { pid?: unknown; startedAt?: unknown }
+    if (typeof value.pid === "number") return { pid: value.pid, startedAt: typeof value.startedAt === "number" ? value.startedAt : undefined }
+  } catch {
+    // fall through to the legacy format
+  }
+  const pid = Number(text.split("\n")[0])
+  return Number.isInteger(pid) && pid > 0 ? { pid } : undefined
+}
+
+export function createLeases(fs: LeaseFs, dir: string, options: LeaseOptions): Leases {
   const file = (id: string) => path.join(dir, id)
+  const staleMs = options.staleMs ?? LEASE_STALE_MS
+  async function isLive(id: string): Promise<boolean> {
+    const record = parseRecord(await fs.read(file(id)))
+    if (!record || !options.probe.alive(record.pid)) return false
+    const mtime = await fs.mtime(file(id))
+    if (mtime !== undefined && options.now() - mtime <= staleMs) return true
+    return !(await recordGone(record, options.probe))
+  }
   async function active(): Promise<string[]> {
     const live: string[] = []
     for (const id of await fs.list(dir)) {
       if (!BRIDGE_ID.test(id)) continue
-      const pid = Number((await fs.read(file(id)))?.split("\n")[0])
-      if (Number.isInteger(pid) && pid > 0 && isAlive(pid)) live.push(id)
+      if (await isLive(id)) live.push(id)
       else await fs.remove(file(id))
     }
     return live.sort()
   }
   return {
     active,
-    async acquire(bridgeId, pid) {
+    async acquire(bridgeId, self) {
       assertBridgeId(bridgeId)
-      await fs.write(file(bridgeId), `${pid}\n${new Date().toISOString()}\n`)
+      await fs.write(file(bridgeId), JSON.stringify({ pid: self.pid, startedAt: self.startedAt, bridgeId, at: new Date(options.now()).toISOString() }) + "\n")
+    },
+    async heartbeat(bridgeId) {
+      assertBridgeId(bridgeId)
+      return fs.touch(file(bridgeId))
     },
     async release(bridgeId) {
       assertBridgeId(bridgeId)
@@ -53,34 +93,28 @@ export function createLeases(fs: LeaseFs, dir: string, isAlive: (pid: number) =>
   }
 }
 
-/** Serialise box start-up between bridges on this host. A lock older than staleMs is taken over. */
-export async function withStartLock<T>(
-  fs: LeaseFs,
-  lockFile: string,
-  run: () => Promise<T>,
-  options: { now: () => number; sleep: (ms: number) => Promise<void>; staleMs?: number; waitMs?: number },
-): Promise<T> {
-  const staleMs = options.staleMs ?? 5 * 60_000
-  const deadline = options.now() + (options.waitMs ?? 6 * 60_000)
-  while (!(await fs.write(lockFile, String(options.now()), true))) {
-    const mtime = await fs.mtime(lockFile)
-    if (mtime !== undefined && options.now() - mtime > staleMs) await fs.remove(lockFile)
-    else if (options.now() > deadline) throw new Error("timed out waiting for the start lock")
-    else await options.sleep(500)
-  }
-  try {
-    return await run()
-  } finally {
-    await fs.remove(lockFile)
+async function renameRetry(from: string, to: string): Promise<boolean> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await rename(from, to)
+      return true
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code === "ENOENT") return false
+      // Windows refuses to replace a file another process has open for a moment.
+      if (attempt >= 5 || (code !== "EPERM" && code !== "EBUSY" && code !== "EACCES")) throw error
+      await new Promise((resolve) => setTimeout(resolve, 20 * (attempt + 1)))
+    }
   }
 }
 
-export function processAlive(pid: number): boolean {
+async function atomicWrite(file: string, text: string): Promise<void> {
+  const tmp = `${file}.${randomBytes(6).toString("hex")}.tmp`
   try {
-    process.kill(pid, 0)
-    return true
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM"
+    await writeFile(tmp, text, "utf8")
+    await renameRetry(tmp, file)
+  } finally {
+    await rm(tmp, { force: true })
   }
 }
 
@@ -89,14 +123,17 @@ export const nodeLeaseFs: LeaseFs = {
   read: (file) => readFile(file, "utf8").catch(() => undefined),
   async write(file, text, exclusive = false) {
     await mkdir(path.dirname(file), { recursive: true })
+    if (!exclusive) return atomicWrite(file, text).then(() => true)
     try {
-      await writeFile(file, text, { encoding: "utf8", flag: exclusive ? "wx" : "w" })
+      await writeFile(file, text, { encoding: "utf8", flag: "wx" })
       return true
     } catch (error) {
-      if (exclusive && (error as NodeJS.ErrnoException).code === "EEXIST") return false
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") return false
       throw error
     }
   },
   remove: (file) => rm(file, { force: true }),
   mtime: (file) => stat(file).then((s) => s.mtimeMs, () => undefined),
+  touch: (file) => utimes(file, new Date(), new Date()).then(() => true, () => false),
+  rename: renameRetry,
 }

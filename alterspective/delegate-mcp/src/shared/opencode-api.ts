@@ -1,6 +1,7 @@
 // Thin typed client for the boxed `opencode serve` HTTP API.
 // Owned here (not the generated SDK) so the bridge has no dependency on the monorepo install.
 // Every call carries basic auth, the session directory, and a correlation id (OBS-ID-01/04).
+// Every call has a deadline (review A-14): default 30 s, overridable per client and per call.
 import { DelegateError } from "./errors.ts"
 
 export type ApiTarget = { baseUrl: string; password: string; username?: string }
@@ -14,14 +15,37 @@ export type McpStatus =
 
 export type SessionStatus = { type: "idle" } | { type: "busy" } | { type: "retry"; attempt: number; message: string }
 
-type Call = { method?: "GET" | "POST" | "PATCH" | "DELETE"; path: string; directory?: string; body?: unknown; correlationId?: string }
+export type Call = {
+  method?: "GET" | "POST" | "PATCH" | "DELETE"
+  path: string
+  directory?: string
+  body?: unknown
+  correlationId?: string
+  /** Deadline for this call (request and body). Default: the client's timeout. */
+  timeoutMs?: number
+}
 
 export type OpencodeApi = {
   call<T>(input: Call): Promise<{ status: number; data: T | undefined }>
 }
 
-export function createApi(target: ApiTarget, fetchImpl: typeof fetch = fetch): OpencodeApi {
+export const DEFAULT_API_TIMEOUT_MS = 30_000
+
+export type ApiOptions = { timeoutMs?: number }
+
+function isTimeout(error: unknown): boolean {
+  return error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError")
+}
+
+function unreachable(error: unknown): DelegateError {
+  const detail = isTimeout(error) ? "timeout" : String(error)
+  const message = isTimeout(error) ? "The delegate server did not answer in time." : "The delegate server is not reachable."
+  return new DelegateError("server_down", message, "Run oc_doctor.", detail)
+}
+
+export function createApi(target: ApiTarget, fetchImpl: typeof fetch = fetch, options: ApiOptions = {}): OpencodeApi {
   const auth = "Basic " + Buffer.from(`${target.username ?? "opencode"}:${target.password}`).toString("base64")
+  const clientTimeout = options.timeoutMs ?? DEFAULT_API_TIMEOUT_MS
   return {
     async call<T>(input: Call) {
       const url = new URL(input.path, target.baseUrl)
@@ -29,15 +53,20 @@ export function createApi(target: ApiTarget, fetchImpl: typeof fetch = fetch): O
       const headers: Record<string, string> = { authorization: auth }
       if (input.body !== undefined) headers["content-type"] = "application/json"
       if (input.correlationId) headers["x-correlation-id"] = input.correlationId
-      let res: Response
+      const signal = AbortSignal.timeout(input.timeoutMs ?? clientTimeout)
+      let status: number
+      let text: string
       try {
-        res = await fetchImpl(url, { method: input.method ?? "GET", headers, body: input.body === undefined ? undefined : JSON.stringify(input.body) })
+        const res = await fetchImpl(url, { method: input.method ?? "GET", headers, signal, body: input.body === undefined ? undefined : JSON.stringify(input.body) })
+        status = res.status
+        text = await res.text()
       } catch (error) {
-        throw new DelegateError("server_down", "The delegate server is not reachable.", "Run oc_doctor.", String(error))
+        throw unreachable(error)
       }
-      const text = await res.text()
-      if (res.status === 401) throw new DelegateError("server_down", "The delegate server refused the bridge's credentials.", "Restart the bridge (oc_doctor).")
-      return { status: res.status, data: text ? (safeJson(text) as T | undefined) : undefined }
+      if (status === 401) {
+        throw new DelegateError("auth_mismatch", "The delegate server rejected the bridge's credentials.", "Restart the bridge so it and the box share one password (oc_doctor).", "HTTP 401")
+      }
+      return { status, data: text ? (safeJson(text) as T | undefined) : undefined }
     },
   }
 }

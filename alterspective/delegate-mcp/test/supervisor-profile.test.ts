@@ -89,6 +89,54 @@ describe("profile: secret refusal", () => {
   })
 })
 
+// A-03: the scan fails closed. Each shape below was accepted by the Wave 1 scanner.
+describe("profile: fail-closed secret shapes (A-03)", () => {
+  const shapes: Array<[string, Record<string, unknown>, string]> = [
+    ["custom auth header literal", { headers: { "X-Custom-Auth": "plainvalue123" } }, "headers.X-Custom-Auth"],
+    ["any literal header value", { headers: { "X-Trace": "abc" } }, "headers.X-Trace"],
+    ["APIM subscription key", { headers: { "Ocp-Apim-Subscription-Key": "0123abcd0123abcd" } }, "headers.Ocp-Apim-Subscription-Key"],
+    ["AWS access key id field", { accessKeyId: "ANYVALUE0000" }, "options.accessKeyId"],
+    ["Google API key value", { region: "AIzaSyA-0123456789abcdefghijklmnopqrstu" }, "options.region"],
+    ["AWS key value", { region: "AKIAIOSFODNN7EXAMPLE" }, "options.region"],
+    ["JWT value", { note: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig" }, "options.note"],
+    ["userinfo in baseURL", { baseURL: "https://user:pass@synapse2-api.alterspective.com.au/v1" }, "options.baseURL"],
+    ["numeric apiKey", { apiKey: 1234567890 }, "options.apiKey"],
+    ["numeric header", { headers: { "X-Key": 42 } }, "headers.X-Key"],
+    ["object under a secret key", { auth: { value: "hunter2hunter2" } }, "options.auth.value"],
+    ["key in a query string", { baseURL: "https://x.example/v1?api-key=abc123" }, "options.baseURL"],
+    ["token field", { accessToken: "opaque-value" }, "options.accessToken"],
+  ]
+  for (const [name, extra, where] of shapes) {
+    test(`refuses ${name}`, () => {
+      const text = owner({ synapse: { ...synapse, options: { ...synapse.options, ...extra } } })
+      const error = refusal(() => buildProfile(input([text])))
+      expect(error.code).toBe("profile_invalid")
+      expect(error.message).toContain(where)
+      for (const value of JSON.stringify(extra).match(/"[^"]{6,}"/g) ?? []) {
+        const literal = value.slice(1, -1)
+        if (!where.includes(literal)) expect(error.message).not.toContain(literal)
+      }
+    })
+  }
+
+  test("still accepts env refs in headers, booleans in secret slots and model ids that look like keys", () => {
+    const opts = { ...synapse.options, headers: { "X-Api-Key": "{env:SYNAPSE_API_KEY}" }, useAuth: true }
+    const models = { ...synapse.models, "token-counter": { name: "t", limit: { context: 1, output: 1 } } }
+    const built = buildProfile(input([owner({ synapse: { ...synapse, options: opts, models } })]))
+    expect(built.providers).toEqual(["synapse"])
+  })
+})
+
+describe("profile: merge across owner files (A-21)", () => {
+  test("later files merge into provider entries instead of replacing them", () => {
+    const first = owner({ synapse })
+    const second = JSON.stringify({ provider: { synapse: { options: { timeout: 60000 } } } })
+    const cfg = parsedConfig(buildProfile(input([first, second])).files)
+    expect(cfg.provider.synapse!.options).toEqual({ ...synapse.options, timeout: 60000 })
+    expect((cfg.provider.synapse as unknown as { models: unknown }).models).toEqual(synapse.models)
+  })
+})
+
 describe("profile: selection", () => {
   test("copies only provider/model/small_model and drops providers whose env is not approved", () => {
     const openrouter = { options: { apiKey: "{env:OPENROUTER_API_KEY}" } }

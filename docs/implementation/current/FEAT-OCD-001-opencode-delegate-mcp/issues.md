@@ -17,3 +17,4 @@
 | Q2 | Owner decision | Egress hosts beyond Keystone + model hosts. | **Decided: + npm + PyPI.** Model hosts default to Synapse (`synapse2-api.alterspective.com.au`) only; other providers opt-in. |
 | Q3 | Owner decision | Fork patch in `packages/opencode/src/mcp/`. | **Decided: allowed** (≤150 LOC, env-gated, tested) |
 | R-1 | Review | Adversarial round 1 findings C1, C2, H1–H4, M1–M6, L1–L6 dispositioned in `evidence/adversarial-review.md`; round 2 owed. | Open |
+| B-1 | Bug | Fork-built box: first model call fails `System message must be at the beginning.` Root cause: the Synapse plugin adds a 2nd system block; the fold into one only ran in the auth-fetch wrapper, which is skipped when the key comes from config/env (`provider.ts:1614`). | Fixed in `plugin/synapse.ts` (wire test red→green); live re-check pending box rebuild |
