@@ -23,15 +23,15 @@ Each task is 50–200 LOC, under 2 hours, and ends in something that can be chec
 - [x] **T2.3 Egress allowlist + registry caches** — MOD-02 · Deliverable: proxy config from the approved host list (default deny); npm + PyPI pull-through caches with publish disabled; the box reaches registries only through them · Verification: T0.1 red/green cases automated; `npm publish` from the box refused; `npm install` works · LOC ~120 · Rules: BFA-007
 - [x] **T2.4 Permission baseline + folder rule** — MOD-02 · Deliverable: rulesets in profile and per session; never send `tools`; re-read `session.permission`; `directory_busy` · Verification: unit + integration · LOC ~90 · Rules: ETHICS-AGENT-02
 
-## Wave 2 — MOD-03 + MOD-05
+## Wave 2 — MOD-03 + MOD-05 — **COMPLETE** (`evidence/wave2-e2e.md`; T3.5 moved to Wave 3)
 
-- [ ] **T3.1 SSE client + normaliser** — MOD-03 · LOC ~120 · Verification: fixture replay · Rules: OBS-ID-01
-- [ ] **T3.2 State machine + absent states** — MOD-03 · LOC ~150 · Verification: one test per absent-state row (`technical-design.md` §6) · Rules: TST-VAL-01
-- [ ] **T3.3 Reconnect + rebuild** — MOD-03 · LOC ~100 · Verification: kill stream mid-task; state recovers
-- [ ] **T3.4 Watch CLI** — MOD-03 · LOC ~90 · Verification: run under Claude Code Monitor; lines arrive · Rules: CLI-UX-06, -07, -20
+- [x] **T3.1 SSE client + normaliser** — MOD-03 · LOC ~120 · Verification: fixture replay · Rules: OBS-ID-01
+- [x] **T3.2 State machine + absent states** — MOD-03 · LOC ~150 · Verification: one test per absent-state row (`technical-design.md` §6) · Rules: TST-VAL-01
+- [x] **T3.3 Reconnect + rebuild** — MOD-03 · LOC ~100 · Verification: kill stream mid-task; state recovers
+- [x] **T3.4 Watch CLI** — MOD-03 · LOC ~90 · Verification: run under Claude Code Monitor; lines arrive · Rules: CLI-UX-06, -07, -20
 - [ ] **T3.5 Channel push (optional)** — MOD-03 · LOC ~60 · Verification: manual; else recorded "not verified"
-- [ ] **T5.1 Inbox sidecar** — MOD-05 · Deliverable: Bun HTTP service, own volume, admin token for bridges only (box posts stored `verified:false` with the claimed sender — inside the box a sender cannot be proven), hop/rate/size limits counted by the sidecar · Verification: box cannot forge `verified:true` or read supervisor inboxes; admin needs the token; loop bounded by rate limits (hop limit per thread) · LOC ~150 · Rules: ETHICS-AGENT-03
-- [ ] **T5.2 In-box tools** — MOD-05 · Deliverable: profile `tool/message_supervisor.ts`, `message_session.ts`, `read_inbox.ts` calling the sidecar · Verification: a session calls each; records appear · LOC ~100
+- [x] **T5.1 Inbox sidecar** — MOD-05 · Deliverable: Bun HTTP service, own volume, admin token for bridges only (box posts stored `verified:false` with the claimed sender — inside the box a sender cannot be proven), hop/rate/size limits counted by the sidecar · Verification: box cannot forge `verified:true` or read supervisor inboxes; admin needs the token; loop bounded by rate limits (hop limit per thread) · LOC ~150 · Rules: ETHICS-AGENT-03
+- [x] **T5.2 In-box tools** — MOD-05 · Deliverable: profile `tool/message_supervisor.ts`, `message_session.ts`, `read_inbox.ts` calling the sidecar · Verification: a session calls each; records appear · LOC ~100
 
 ## Wave 3 — MOD-04 + hub
 
