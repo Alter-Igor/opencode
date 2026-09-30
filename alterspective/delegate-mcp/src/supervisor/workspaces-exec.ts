@@ -32,8 +32,11 @@ export function runCommand(argv: readonly string[], env: NodeJS.ProcessEnv = cle
     execFile(file, args, options, (error, stdout, stderr) => {
       const timedOut = Boolean(timeoutMs && error?.killed && String(error.code) !== "ERR_CHILD_PROCESS_STDIO_MAXBUFFER")
       if (timedOut) return resolve({ code: TIMEOUT_CODE, stdout: String(stdout), stderr: `timed out after ${timeoutMs} ms`, timedOut })
-      const code = error ? (typeof error.code === "number" ? error.code : 1) : 0
-      resolve({ code, stdout: String(stdout), stderr: String(stderr || (error && !stderr ? error.message : "")) })
+      const exited = typeof error?.code === "number"
+      const code = error ? (exited ? (error.code as number) : 127) : 0
+      // A plain non-zero exit keeps the real (possibly empty) stderr: callers such as boxExists
+      // read "exit 1, no stderr" as a clean "absent". Only a failure to start gets error.message.
+      resolve({ code, stdout: String(stdout), stderr: String(stderr) || (error && !exited ? error.message : "") })
     })
   })
 }
