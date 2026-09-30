@@ -1,8 +1,8 @@
 // FEAT-OCD-001 MOD-05 T5.2: in-box tool `message_supervisor` (see inbox-lib.ts for the trust model).
-// The supervisor is read from this session's metadata, which the bridge sets when it creates the
-// session; the model never names it, so it cannot address a supervisor by mistake. A per-box env
+// The supervisor is read from session metadata, which the bridge sets when it creates the
+// session (a subagent's is found by walking up its parent sessions); the model never names it, so it cannot address a supervisor by mistake. A per-box env
 // var would be wrong (several bridges share one box) and a `to` argument would be guesswork.
-import { InboxToolError, postMessage, selfAddress, sentText, supervisorOf, textArg, threadArg, type ToolContext } from "./inbox-lib.ts"
+import { InboxToolError, postMessage, rememberSent, selfAddress, sentText, supervisorOf, textArg, threadArg, type ToolContext } from "./inbox-lib.ts"
 
 export default {
   description: [
@@ -24,6 +24,7 @@ export default {
     const to = await supervisorOf(ctx)
     if (to === self) throw new InboxToolError("A session cannot message itself.")
     const message = await postMessage({ from: self, to, text, correlationId: threadArg(args.correlationId, self, to) })
+    rememberSent(self, message)
     return sentText(message)
   },
 }

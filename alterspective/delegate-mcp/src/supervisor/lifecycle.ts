@@ -75,7 +75,11 @@ export function checkReusable(deps: SupervisorDeps, box: BoxInspect, hash: strin
     throw changed("The running sandbox has a different MCP allow policy than this bridge.", `${MCP_ALLOW_ENV} ${box.env[MCP_ALLOW_ENV] === undefined ? "missing" : "differs"}`)
 }
 
-/** egress and the caches must come from the same checkout as the box (review N-9). */
+/**
+ * egress, the caches and the inbox must come from the same checkout as the box (review N-9) and
+ * must be running (W2C-12): reusing a box whose inbox or proxy has stopped would give a sandbox
+ * that half works.
+ */
 export async function checkSiblings(run: Run): Promise<void> {
   const { deps } = run
   for (const { service, container } of siblingContainers(deps.config)) {
@@ -85,6 +89,13 @@ export async function checkSiblings(run: Run): Promise<void> {
       throw changed(
         `The running sandbox's ${service} service was built from a different OpenCode checkout.`,
         `${service} ${sibling ? `image label ${label ?? "missing"}` : "container missing"} != ${deps.image}`,
+      )
+    if (!sibling?.running)
+      throw new DelegateError(
+        "sandbox_unavailable",
+        `The running sandbox's ${service} service is stopped.`,
+        "Restart the sandbox with oc_server_restart, or run oc_doctor.",
+        `${service} container not running`,
       )
   }
 }

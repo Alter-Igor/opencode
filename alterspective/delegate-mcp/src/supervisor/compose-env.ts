@@ -17,7 +17,7 @@ export const INSPECT_ENV = [PASSWORD_ENV, MCP_ALLOW_ENV]
  * other bridges with `docker inspect <project>-inbox`. Never written to a file or logged.
  */
 export const INBOX_ADMIN_TOKEN_ENV = "INBOX_ADMIN_TOKEN"
-/** Label on the inbox container: the 127.0.0.1 host port of its admin routes. */
+/** Label on the inbox container: the 127.0.0.1 host port of its admin routes (published by the gate, W2C-05). */
 export const INBOX_PORT_LABEL = "com.alterspective.opencode-delegate.inbox-port"
 export type InboxStart = { port: number; token: string }
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
@@ -48,11 +48,29 @@ export function siblingContainers(config: Pick<BridgeConfig, "project">): Array<
   return SIBLING_SERVICES.map((service) => ({ service, container: `${containerName(config)}-${service}` }))
 }
 
+/**
+ * Names the box env list may never carry (W2C-14): the override file is merged after
+ * compose.yaml, so a listed name would replace what compose.yaml sets for the box (the inbox URL,
+ * the proxies, the OpenCode lock-down flags, the package indexes) with a host value, or put a
+ * bridge-only secret into the box. Matched without regard to case.
+ */
+const RESERVED_EXACT = new Set(["INBOX_ADMIN_TOKEN", "HOME", "PATH", "BUN_CONFIG_REGISTRY"])
+const RESERVED_PREFIX = ["OCD_", "OPENCODE_", "INBOX_", "XDG_", "NPM_CONFIG_", "PIP_", "UV_"]
+const RESERVED_SUFFIX = ["_PROXY"]
+
+export function isReservedBoxEnv(name: string): boolean {
+  const upper = name.toUpperCase()
+  return RESERVED_EXACT.has(upper) || RESERVED_PREFIX.some((prefix) => upper.startsWith(prefix)) || RESERVED_SUFFIX.some((suffix) => upper.endsWith(suffix))
+}
+
 /** Compose override listing the approved box env vars by NAME only (values come from the child env). */
 export function boxEnvOverride(names: string[]): string {
-  for (const name of names)
+  for (const name of names) {
     if (!ENV_NAME.test(name))
       throw new DelegateError("invalid_input", "The approved box env list has an invalid variable name.", "Fix the bridge configuration (boxEnv).", `name=${name.slice(0, 40)}`)
+    if (isReservedBoxEnv(name))
+      throw new DelegateError("invalid_input", "The approved box env list names a variable the sandbox sets itself.", "Remove it from the bridge configuration (boxEnv).", `name=${name.slice(0, 40)}`)
+  }
   if (names.length === 0) return "services: {}\n"
   return ["services:", "  box:", "    environment:", ...names.map((name) => `      ${name}:`)].join("\n") + "\n"
 }

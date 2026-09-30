@@ -9,12 +9,17 @@
 #
 # Hardening (review C-1, C-2, C-7, C-9): every service drops all capabilities, cannot gain
 # privileges, has a read-only root filesystem and pids/memory/CPU limits. Writable paths are
-# tmpfs or named volumes only.
+# tmpfs or named volumes only. Every service logs through the `local` driver capped at
+# 3 x 10 MB, so a noisy container cannot fill the Docker host's disk (W2C-06).
 name: opencode-delegate
 
 networks:
   # No default route: the box can only reach services on this network.
   sealed:
+    internal: true
+  # MOD-05 (W2C-05): gate <-> inbox admin listener only. The box is NOT on this network, and the
+  # sidecar binds its admin listener to its address here, so the box has no route to it.
+  admin:
     internal: true
   outside: {}
 
@@ -30,6 +35,11 @@ x-hardened: &hardened
   cap_drop: [ALL]
   security_opt: ["no-new-privileges:true"]
   read_only: true
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
 
 services:
   box:
@@ -54,6 +64,10 @@ services:
       # /tmp cannot run programs; /home/agent can (bun/npm/pip keep caches and bins there).
       - /tmp:mode=1777,nosuid,nodev,noexec
       - /home/agent:uid=10001,gid=10001,mode=0700,nosuid,nodev,exec
+      # OpenCode also loads ~/.opencode (tools, plugins, agents) even with
+      # OPENCODE_DISABLE_PROJECT_CONFIG, and /home/agent is writable by in-box code. An empty
+      # root-owned read-only mount there means nothing can be planted for the server to load.
+      - /home/agent/.opencode:uid=0,gid=0,mode=0555,size=4k,nosuid,nodev,noexec
     volumes:
       - data:/data
       - sessions:/sessions
@@ -87,6 +101,14 @@ services:
       UV_INSECURE_HOST: pypi-cache
       OPENCODE_DISABLE_MODELS_FETCH: "1"
       OPENCODE_DISABLE_AUTOUPDATE: "1"
+      # Design §3: only the read-only profile configures OpenCode. A delegated repo's own
+      # .opencode/ (plugins, tools, agents, commands) and opencode.json would otherwise load as
+      # code INSIDE the server process. Side effect: OpenCode also stops reading the repo's
+      # AGENTS.md / CLAUDE.md itself; the bridge passes instructions per session instead.
+      OPENCODE_DISABLE_PROJECT_CONFIG: "1"
+      # No skills from ~/.claude, ~/.agents or the repo, and no Claude Code prompt/skill discovery.
+      OPENCODE_DISABLE_EXTERNAL_SKILLS: "1"
+      OPENCODE_DISABLE_CLAUDE_CODE: "1"
       # By name only: values come from the `docker compose` process env, never a file.
       OPENCODE_MCP_ALLOW:
       OPENCODE_SERVER_PASSWORD:
@@ -99,7 +121,8 @@ services:
     depends_on: [egress, inbox]
     command: ["opencode", "serve", "--hostname", "0.0.0.0", "--port", "4096"]
 
-  # Publishes the box API on the host loopback only (the box itself has no route out).
+  # Publishes the box API and the inbox admin API on the host loopback only (the box itself has
+  # no route out). Two socat listeners; if either exits, the container exits and is restarted.
   gate:
     <<: *hardened
     # Pinned by version and digest (review C-7); resolved 2026-10-01 with
@@ -107,9 +130,15 @@ services:
     image: alpine/socat:1.8.1.3@sha256:5ffbd6ae916cbad86a58fabe0d6d5a6fd5c2b47ddf031e82996baac9300e732f
     container_name: ${OCD_CONTAINER:-opencode-delegate}-gate
     user: "65534:65534"
-    command: ["TCP-LISTEN:4096,fork,reuseaddr", "TCP:box:4096"]
-    networks: [sealed, outside]
-    ports: ["127.0.0.1:${OCD_PORT}:4096"]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        socat TCP-LISTEN:4096,fork,reuseaddr TCP:box:4096 & box=$$!;
+        socat TCP-LISTEN:8081,fork,reuseaddr TCP:inbox-admin:8081 & admin=$$!;
+        while kill -0 $$box && kill -0 $$admin; do sleep 5; done; exit 1
+    networks: [sealed, outside, admin]
+    ports: ["127.0.0.1:${OCD_PORT}:4096", "127.0.0.1:${OCD_INBOX_PORT}:8081"]
+    restart: unless-stopped
     # socat forks one process per connection (event streams stay open).
     pids_limit: 256
     mem_limit: 64m
@@ -130,6 +159,7 @@ services:
     labels:
       com.alterspective.opencode-delegate.image: ${OCD_IMAGE}
     networks: [sealed, outside]
+    restart: unless-stopped
     # tinyproxy runs a thread per client (MaxClients 100); the pids limit counts threads.
     pids_limit: 256
     mem_limit: 128m
@@ -145,6 +175,7 @@ services:
     labels:
       com.alterspective.opencode-delegate.image: ${OCD_IMAGE}
     networks: [sealed, outside]
+    restart: unless-stopped
     tmpfs: ["/tmp:mode=1777,nosuid,nodev,noexec"]
     volumes: ["npm-storage:/verdaccio/storage"]
     pids_limit: 256
@@ -160,6 +191,7 @@ services:
     labels:
       com.alterspective.opencode-delegate.image: ${OCD_IMAGE}
     networks: [sealed, outside]
+    restart: unless-stopped
     tmpfs: ["/tmp:uid=101,gid=101,mode=0700,nosuid,nodev,noexec"]
     volumes: ["pypi-storage:/var/cache/nginx/pypi"]
     # nginx starts one worker per host CPU.
@@ -169,11 +201,13 @@ services:
     cpus: 1
 
   # MOD-05 agent inbox (technical-design.md §7, review G5; built from ../inbox-sidecar).
-  # The box reaches it as http://inbox:8080 on `sealed` with no token, so box messages are
-  # stored verified:false. Bridges use the admin routes through the 127.0.0.1 published port with
-  # INBOX_ADMIN_TOKEN (by NAME only: from the compose child env, set on THIS service only, never
-  # on the box). `outside` is needed only because Docker publishes no ports from a container that
-  # is on internal networks alone; the sidecar makes no outbound calls.
+  # Internal networks only: it has no route to the internet (W2C-05).
+  # - Box listener :8080 on `sealed`: the box reaches it as http://inbox:8080 with no token, so
+  #   box messages are stored verified:false.
+  # - Admin listener :8081, bound to its `admin` address (alias inbox-admin, which exists only on
+  #   that network). The gate publishes it on host 127.0.0.1:${OCD_INBOX_PORT}; bridges call it with
+  #   INBOX_ADMIN_TOKEN (by NAME only: from the compose child env, set on THIS service only, never
+  #   on the box).
   inbox:
     <<: *hardened
     build: ../inbox-sidecar
@@ -182,12 +216,18 @@ services:
     labels:
       com.alterspective.opencode-delegate.image: ${OCD_IMAGE}
       com.alterspective.opencode-delegate.inbox-port: ${OCD_INBOX_PORT:?OCD_INBOX_PORT is set by the bridge}
-    networks: [sealed, outside]
-    ports: ["127.0.0.1:${OCD_INBOX_PORT}:8080"]
+    networks:
+      sealed: {}
+      admin:
+        aliases: [inbox-admin]
+    restart: unless-stopped
     tmpfs: ["/tmp:mode=1777,nosuid,nodev,noexec"]
     volumes: ["inbox-storage:/data"]
     environment:
       INBOX_PORT: "8080"
+      INBOX_ADMIN_PORT: "8081"
+      INBOX_ADMIN_HOST: inbox-admin
+      INBOX_ADMIN_PUBLIC_PORT: ${OCD_INBOX_PORT}
       INBOX_DATA_DIR: /data
       INBOX_ADMIN_TOKEN:
     pids_limit: 64

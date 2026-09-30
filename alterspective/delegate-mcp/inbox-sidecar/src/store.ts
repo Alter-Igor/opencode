@@ -1,55 +1,83 @@
 // FEAT-OCD-001 MOD-05: append-only message store (technical-design.md §7, review G5).
-// Messages are JSON lines in segment files under the data volume. Every append is written and
-// fsync'd before the caller gets an answer. There is no update or delete operation: the only
-// thing that ever removes data is retention, which drops the oldest whole segment once more
-// than `maxSegments` exist. Ids are a monotonic counter and double as read cursors.
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeSync } from "node:fs"
+// Messages are JSON lines in two segment series under the data volume (segments.ts):
+//   inbox-*.jsonl  messages to session inboxes (and any written before the split)
+//   sup-*.jsonl    messages to supervisor inboxes
+// Each series has its own retention budget, so session-to-session traffic can never evict an
+// unread message to a supervisor (W2C-08). There is no update or delete operation: retention is
+// the only thing that ever removes data. Ids are one monotonic counter and double as read cursors.
+// `state.json` holds the store's epoch (random per data volume, so a cursor from a wiped volume
+// is caught) and, per series, the highest id retention has dropped (so a reader learns its cursor
+// fell into a gap).
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeSync } from "node:fs"
+import { randomBytes } from "node:crypto"
 import path from "node:path"
-import type { StoredMessage } from "./rules.ts"
+import { EPOCH, SUPERVISOR_ADDRESS, type StoredMessage } from "./rules.ts"
+import { SegmentLog } from "./segments.ts"
 
 export type StoreOptions = {
   dir: string
   /** Start a new segment once the current one reaches this size. Default 10 MB. */
   segmentBytes?: number
-  /** Oldest segments beyond this count are deleted on rotation. Default 5. */
+  /** Oldest session-inbox segments beyond this count are deleted on rotation. Default 5. */
   maxSegments?: number
+  /** Retention budget of the supervisor-inbox series. Defaults to the values above. */
+  supervisor?: { segmentBytes?: number; maxSegments?: number }
 }
 
-/** `torn`: the file does not end in a newline (a write cut short), so the next append starts one. */
-type Segment = { file: string; firstSeq: number; lastSeq: number; bytes: number; torn: boolean }
-
-const SEGMENT = /^inbox-(\d{12})\.jsonl$/
+type Series = "session" | "supervisor"
+const SERIES: readonly Series[] = ["session", "supervisor"]
+const PREFIX: Record<Series, string> = { session: "inbox", supervisor: "sup" }
 const DEFAULT_SEGMENT_BYTES = 10 * 1024 * 1024
 const DEFAULT_MAX_SEGMENTS = 5
+const STATE_FILE = "state.json"
 
 export type NewMessage = Omit<StoredMessage, "id">
 
-export type Page = { messages: StoredMessage[]; next: string }
+/**
+ * One read. `oldestId`: every id below it in this inbox's series was dropped by retention (or
+ * never existed), so a cursor below `oldestId - 1` may have missed messages. `lastId`: the
+ * highest id ever stored; a cursor above it did not come from this store.
+ */
+export type Page = { messages: StoredMessage[]; next: string; epoch: string; oldestId: string; lastId: string }
+
+/** Per thread: highest hop index, how many verified (supervisor) posts, and where the last one lives. */
+export type ThreadState = { hops: number; verifiedCount: number; lastSeq: number; series: Series }
+
+type State = { epoch: string; evicted: Record<Series, number> }
+
+export function seriesOf(address: string): Series {
+  return SUPERVISOR_ADDRESS.test(address) ? "supervisor" : "session"
+}
 
 export class InboxStore {
   readonly #dir: string
-  readonly #segmentBytes: number
-  readonly #maxSegments: number
-  readonly #segments: Segment[] = []
-  readonly #byAddress = new Map<string, StoredMessage[]>()
-  readonly #threadHops = new Map<string, number>()
+  readonly #logs: Record<Series, SegmentLog>
+  readonly #index: Record<Series, Map<string, StoredMessage[]>> = { session: new Map(), supervisor: new Map() }
+  readonly #threads = new Map<string, ThreadState>()
+  #state: State = { epoch: "", evicted: { session: 0, supervisor: 0 } }
   #seq = 0
-  #fd: number | undefined
   /** Lines that could not be parsed when the store was opened (e.g. a torn last write). */
   skippedLines = 0
+  /** True when state.json was missing or unreadable and a new epoch was made (old cursors expire). */
+  newEpoch = false
 
   private constructor(options: StoreOptions) {
     this.#dir = options.dir
-    this.#segmentBytes = options.segmentBytes ?? DEFAULT_SEGMENT_BYTES
-    this.#maxSegments = options.maxSegments ?? DEFAULT_MAX_SEGMENTS
+    const bytes = options.segmentBytes ?? DEFAULT_SEGMENT_BYTES
+    const max = options.maxSegments ?? DEFAULT_MAX_SEGMENTS
+    const sup = { segmentBytes: options.supervisor?.segmentBytes ?? bytes, maxSegments: options.supervisor?.maxSegments ?? max }
+    this.#logs = {
+      session: new SegmentLog({ dir: options.dir, prefix: PREFIX.session, segmentBytes: bytes, maxSegments: max }, (through) => this.#evict("session", through)),
+      supervisor: new SegmentLog({ dir: options.dir, prefix: PREFIX.supervisor, ...sup }, (through) => this.#evict("supervisor", through)),
+    }
   }
 
   /** Open (or create) the store and load every segment on disk. */
   static open(options: StoreOptions): InboxStore {
     const store = new InboxStore(options)
     mkdirSync(options.dir, { recursive: true })
-    const names = readdirSync(options.dir).filter((name) => SEGMENT.test(name)).sort()
-    for (const name of names) store.#load(name)
+    store.#loadState()
+    for (const series of SERIES) store.#logs[series].load((line) => store.#loadLine(line, series))
     return store
   }
 
@@ -57,97 +85,118 @@ export class InboxStore {
     return this.#seq
   }
 
-  #load(name: string): void {
-    const file = path.join(this.#dir, name)
-    const text = readFileSync(file, "utf8")
-    const firstSeq = Number(SEGMENT.exec(name)![1])
-    const segment: Segment = { file, firstSeq, lastSeq: firstSeq - 1, bytes: statSync(file).size, torn: text.length > 0 && !text.endsWith("\n") }
-    for (const line of text.split("\n")) {
-      if (!line) continue
-      const message = parseLine(line)
-      if (!message) {
-        this.skippedLines++
-        continue
-      }
-      this.#index(message)
-      segment.lastSeq = Math.max(segment.lastSeq, Number(message.id))
-    }
-    this.#segments.push(segment)
+  get epoch(): string {
+    return this.#state.epoch
   }
 
-  #index(message: StoredMessage): void {
+  #loadState(): void {
+    try {
+      const raw = JSON.parse(readFileSync(path.join(this.#dir, STATE_FILE), "utf8")) as Partial<State>
+      const evicted = raw.evicted as Partial<Record<Series, unknown>> | undefined
+      if (typeof raw.epoch === "string" && EPOCH.test(raw.epoch) && typeof evicted?.session === "number" && typeof evicted.supervisor === "number") {
+        this.#state = { epoch: raw.epoch, evicted: { session: evicted.session, supervisor: evicted.supervisor } }
+        return
+      }
+    } catch {
+      // missing or unreadable: start a new epoch below
+    }
+    this.newEpoch = true
+    this.#state = { epoch: randomBytes(8).toString("hex"), evicted: { session: 0, supervisor: 0 } }
+    this.#saveState()
+  }
+
+  /** Write state.json atomically (temp file, fsync, rename). */
+  #saveState(): void {
+    const file = path.join(this.#dir, STATE_FILE)
+    const temp = `${file}.tmp`
+    const fd = openSync(temp, "w")
+    try {
+      writeSync(fd, JSON.stringify(this.#state))
+      fsyncSync(fd)
+    } finally {
+      closeSync(fd)
+    }
+    renameSync(temp, file)
+  }
+
+  #loadLine(line: string, series: Series): number | undefined {
+    const message = parseLine(line)
+    if (!message) {
+      this.skippedLines++
+      return undefined
+    }
+    this.#indexMessage(message, series)
+    return Number(message.id)
+  }
+
+  #indexMessage(message: StoredMessage, series: Series): void {
     const seq = Number(message.id)
     this.#seq = Math.max(this.#seq, seq)
-    const list = this.#byAddress.get(message.to) ?? []
+    const index = this.#index[series]
+    const list = index.get(message.to) ?? []
     list.push(message)
-    this.#byAddress.set(message.to, list)
-    if (message.correlationId) this.#threadHops.set(message.correlationId, Math.max(this.#threadHops.get(message.correlationId) ?? 0, message.hops))
+    index.set(message.to, list)
+    if (!message.correlationId) return
+    const prior = this.#threads.get(message.correlationId)
+    this.#threads.set(message.correlationId, {
+      hops: Math.max(prior?.hops ?? 0, message.hops),
+      verifiedCount: (prior?.verifiedCount ?? 0) + (message.verified ? 1 : 0),
+      lastSeq: Math.max(prior?.lastSeq ?? 0, seq),
+      series: seq >= (prior?.lastSeq ?? 0) ? series : prior!.series,
+    })
   }
 
-  /** Highest hop count stored for a thread, or undefined for a new thread. */
-  threadHops(correlationId: string): number | undefined {
-    return this.#threadHops.get(correlationId)
+  /** What the store knows about a thread, or undefined for a new (or fully expired) thread. */
+  thread(correlationId: string): Readonly<ThreadState> | undefined {
+    return this.#threads.get(correlationId)
+  }
+
+  /** Threads tracked in memory (pruned together with retention, W2C-11). */
+  get threadCount(): number {
+    return this.#threads.size
   }
 
   /** Append one message: assigns the id, writes the line and fsyncs before returning. */
   append(input: NewMessage): StoredMessage {
     const message: StoredMessage = { id: String(this.#seq + 1), ...input }
-    const record = JSON.stringify(message) + "\n"
-    const segment = this.#segmentFor(Buffer.byteLength(record), this.#seq + 1)
-    const line = segment.torn ? "\n" + record : record
-    const fd = this.#fd!
-    writeSync(fd, line)
-    fsyncSync(fd)
-    segment.torn = false
-    segment.bytes += Buffer.byteLength(line)
-    segment.lastSeq = Number(message.id)
-    this.#index(message)
+    const series = seriesOf(message.to)
+    this.#logs[series].append(message)
+    this.#indexMessage(message, series)
     return message
   }
 
-  #segmentFor(lineBytes: number, seq: number): Segment {
-    const current = this.#segments.at(-1)
-    const full = current !== undefined && current.bytes > 0 && current.bytes + lineBytes > this.#segmentBytes
-    if (current && !full) {
-      if (this.#fd === undefined) this.#fd = openSync(current.file, "a")
-      return current
+  /** Forget messages and threads retention dropped from `series` (ids <= through), then persist it. */
+  #evict(series: Series, through: number): void {
+    const index = this.#index[series]
+    for (const [address, list] of index) {
+      const kept = list.filter((message) => Number(message.id) > through)
+      if (kept.length) index.set(address, kept)
+      else index.delete(address)
     }
-    if (this.#fd !== undefined) closeSync(this.#fd)
-    const segment = this.#newSegment(seq)
-    this.#fd = openSync(segment.file, "a")
-    return segment
-  }
-
-  #newSegment(seq: number): Segment {
-    const file = path.join(this.#dir, `inbox-${String(seq).padStart(12, "0")}.jsonl`)
-    const segment: Segment = { file, firstSeq: seq, lastSeq: seq - 1, bytes: 0, torn: false }
-    this.#segments.push(segment)
-    while (this.#segments.length > this.#maxSegments) this.#dropOldest()
-    return segment
-  }
-
-  /** Retention only (never reachable from a route): remove the oldest segment file and its messages. */
-  #dropOldest(): void {
-    const oldest = this.#segments.shift()!
-    rmSync(oldest.file, { force: true })
-    for (const [address, list] of this.#byAddress) {
-      const kept = list.filter((message) => Number(message.id) > oldest.lastSeq)
-      if (kept.length) this.#byAddress.set(address, kept)
-      else this.#byAddress.delete(address)
-    }
+    for (const [id, thread] of this.#threads) if (thread.series === series && thread.lastSeq <= through) this.#threads.delete(id)
+    this.#state.evicted[series] = Math.max(this.#state.evicted[series], through)
+    this.#saveState()
   }
 
   /** Messages to `address` with id > cursor, oldest first. `next` is the cursor for the next page. */
   read(address: string, cursor: number, limit: number): Page {
-    const list = this.#byAddress.get(address) ?? []
+    const series = seriesOf(address)
+    const other = this.#index[series === "session" ? "supervisor" : "session"].get(address)
+    const own = this.#index[series].get(address) ?? []
+    const list = other ? [...other, ...own].sort((a, b) => Number(a.id) - Number(b.id)) : own
     const messages = list.filter((message) => Number(message.id) > cursor).slice(0, limit)
     const last = messages.at(-1)
-    return { messages: messages.map((message) => ({ ...message })), next: last ? last.id : String(cursor) }
+    return {
+      messages: messages.map((message) => ({ ...message })),
+      next: last ? last.id : String(cursor),
+      epoch: this.#state.epoch,
+      oldestId: String(this.#state.evicted[series] + 1),
+      lastId: String(this.#seq),
+    }
   }
 
   close(): void {
-    if (this.#fd !== undefined) closeSync(this.#fd)
-    this.#fd = undefined
+    for (const series of SERIES) this.#logs[series].close()
   }
 }
 

@@ -1,6 +1,6 @@
 // MOD-03: cursor buffer — ring size, epochs, paging, and wait() (manual clock).
 import { describe, expect, test } from "bun:test"
-import { EventBuffer, matchesUntil, type HubEventInput } from "../src/events/buffer.ts"
+import { EventBuffer, matchesUntil, viewMatches, type HubEventInput } from "../src/events/buffer.ts"
 import { DelegateError } from "../src/shared/errors.ts"
 import type { HubEvent } from "../src/shared/contracts.ts"
 import { manualTimers } from "./events-fake.ts"
@@ -97,5 +97,25 @@ describe("until mapping", () => {
     expect(matchesUntil(e({ type: "message" }), "message")).toBe(true)
     expect(matchesUntil(e({ type: "inbox" }), "message")).toBe(true)
     expect(matchesUntil(e({ type: "todo" }), "message")).toBe(false)
+  })
+
+  test("W2A-05: idle means settled; aborted and not_found are failures; only status events carry the settled state", () => {
+    for (const state of ["idle", "error", "aborted", "not_started", "not_found"] as const) expect(matchesUntil(e({ state }), "idle")).toBe(true)
+    for (const state of ["busy", "starting", "needs_input", "unknown", "server_down"] as const) expect(matchesUntil(e({ state }), "idle")).toBe(false)
+    for (const state of ["aborted", "not_found"] as const) expect(matchesUntil(e({ state }), "error")).toBe(true)
+    expect(matchesUntil(e({ type: "error", state: "busy" }), "error")).toBe(false) // a non-fatal error report
+    expect(matchesUntil(e({ type: "link" }), "error")).toBe(false)
+    expect(viewMatches({ sessionID: "s", directory: "/d", state: "aborted", since: "" }, "idle")).toBe(true)
+    expect(viewMatches({ sessionID: "s", directory: "/d", state: "needs_input", since: "" }, "needs_input")).toBe(true)
+    expect(viewMatches({ sessionID: "s", directory: "/d", state: "idle", since: "" }, "message")).toBe(false)
+  })
+
+  test("W2A-03: a subagent's permission wakes a wait on its parent; its idle does not", async () => {
+    const b = new EventBuffer("ep1", manualTimers().timers)
+    const start = b.head()
+    b.append({ type: "status", sessionID: "ses_kid", parentID: "ses_1", state: "idle", summary: "kid idle" })
+    b.append({ type: "permission", sessionID: "ses_kid", parentID: "ses_1", state: "needs_input", requestID: "per_1", summary: "kid asks" })
+    const r = await b.wait({ sessionIDs: ["ses_1"], until: ["idle", "needs_input"], timeoutMs: 1000, cursor: start })
+    expect(r.events.map((x) => x.type)).toEqual(["permission"])
   })
 })

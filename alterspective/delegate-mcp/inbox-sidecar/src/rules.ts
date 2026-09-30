@@ -12,15 +12,30 @@ export const CURSOR = /^\d{1,15}$/
 export const MAX_TEXT_BYTES = 8 * 1024
 /** Request body limit (text plus the JSON around it). */
 export const MAX_BODY_BYTES = 16 * 1024
-/** A message may be relayed at most this many times in one thread (correlationId). */
+/**
+ * Hop limit per thread (correlationId), counted by the sidecar only (a client's claim is ignored).
+ * Box posts are refused once the thread's hop index would pass it. The supervisor's own (verified)
+ * posts are counted separately, so box traffic cannot lock a supervisor out of its thread (W2C-07).
+ * This is a courtesy brake, not the loop bound: any in-box code can start a new thread at will.
+ * The real bound on a loop is the rate limits below.
+ */
 export const HOP_LIMIT = 3
 /** Messages per minute per claimed sender. */
 export const PER_SENDER_PER_MINUTE = 10
 /**
- * Messages per minute over the whole box route. Box senders are only claimed, so a spoofer could
- * rotate made-up session ids to dodge the per-sender limit; this cap bounds that.
+ * Messages per minute over the whole box route to session inboxes. Box senders are only claimed,
+ * so a spoofer could rotate made-up session ids to dodge the per-sender limit; this cap bounds that.
  */
 export const BOX_ROUTE_PER_MINUTE = 60
+/**
+ * Messages per minute over the whole box route to supervisor inboxes: its own budget, so
+ * session-to-session spam cannot starve status messages to a supervisor (W2C-10).
+ */
+export const BOX_TO_SUPERVISOR_PER_MINUTE = 30
+/** Sender keys the per-sender limiter tracks at most; a new key past this is refused (W2C-09). */
+export const MAX_TRACKED_SENDERS = 1000
+/** The store's epoch: random per data volume, so a cursor from a wiped volume is caught (W2C-08). */
+export const EPOCH = /^[0-9a-f]{16}$/
 export const DEFAULT_READ_LIMIT = 50
 export const MAX_READ_LIMIT = 200
 /** Admin tokens shorter than this are refused at start (the bridge sends 32 base64url chars). */

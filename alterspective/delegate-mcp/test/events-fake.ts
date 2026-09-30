@@ -21,7 +21,9 @@ export class FakeBox {
   readonly target: ApiTarget = { baseUrl: "", password: PASSWORD }
   /** directory → sessionID → status (absent = idle, as the real server does). */
   readonly status = new Map<string, Record<string, { type: string; attempt?: number }>>()
-  readonly sessions = new Map<string, { id: string; directory: string }>()
+  readonly sessions = new Map<string, { id: string; directory: string; parentID?: string }>()
+  /** Paths answered with a redirect (W2C-02). */
+  readonly redirects = new Set<string>()
   readonly permissions: Array<{ id: string; sessionID: string; directory: string }> = []
   readonly questions: Array<{ id: string; sessionID: string; directory: string }> = []
   readonly requests: string[] = []
@@ -91,7 +93,10 @@ export class FakeBox {
     const url = new URL(req.url)
     const dir = url.searchParams.get("directory") ?? ""
     this.requests.push(`${req.method} ${url.pathname}${dir ? `?${dir}` : ""}`)
+    if (this.redirects.has(url.pathname)) return new Response(null, { status: 302, headers: { location: "http://127.0.0.1:1/elsewhere" } })
     if (url.pathname === "/global/event") return this.stream()
+    const children = /^\/session\/([^/]+)\/children$/.exec(url.pathname)
+    if (children?.[1]) return json([...this.sessions.values()].filter((s) => s.parentID === decodeURIComponent(children[1] ?? "")))
     if (url.pathname === "/session/status") return json(this.status.get(dir) ?? {})
     if (url.pathname === "/permission") return json(this.permissions.filter((p) => p.directory === dir))
     if (url.pathname === "/question") return json(this.questions.filter((p) => p.directory === dir))
@@ -135,7 +140,60 @@ export function fakeApi(routes: Record<string, Route>): FakeApi {
   }
 }
 
-export type ManualTimers = { timers: Timers; advance(ms: number): void; pending(): number; delays: number[] }
+/**
+ * An SSE fetch for manual-timer hub tests: each call opens a stream the test writes to. The body
+ * holds a real interval while open (an abort-only body spins a core on Bun/Windows).
+ */
+export type FakeStream = { fetch: typeof fetch; send(payload: Payload, directory?: string): void; raw(text: string): void; drop(): void; opens(): number }
+
+export function fakeStream(): FakeStream {
+  const sinks = new Map<Sink, ReturnType<typeof setInterval>>()
+  let opens = 0
+  const open = (): Response => {
+    let sink: Sink | undefined
+    const body = new ReadableStream<Uint8Array>({
+      start(c) {
+        opens++
+        sink = c
+        sinks.set(c, setInterval(() => {}, 1000))
+      },
+      cancel() {
+        if (sink) clearInterval(sinks.get(sink))
+        if (sink) sinks.delete(sink)
+      },
+    })
+    return new Response(body, { headers: { "content-type": "text/event-stream" } })
+  }
+  const write = (text: string) => {
+    for (const c of [...sinks.keys()]) {
+      try {
+        c.enqueue(enc.encode(text))
+      } catch {
+        clearInterval(sinks.get(c))
+        sinks.delete(c)
+      }
+    }
+  }
+  return {
+    fetch: (async () => open()) as unknown as typeof fetch,
+    send: (payload, directory = "/sessions/a") => write(`data: ${JSON.stringify({ directory, payload: { id: "evt_1", ...payload } })}\n\n`),
+    raw: write,
+    drop() {
+      for (const [c, keepAlive] of sinks) {
+        clearInterval(keepAlive)
+        try {
+          c.close()
+        } catch {
+          // already cancelled
+        }
+      }
+      sinks.clear()
+    },
+    opens: () => opens,
+  }
+}
+
+export type ManualTimers ={ timers: Timers; advance(ms: number): void; pending(): number; delays: number[] }
 
 export function manualTimers(start = 1_000_000): ManualTimers {
   let now = start

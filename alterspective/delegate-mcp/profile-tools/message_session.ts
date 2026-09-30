@@ -1,5 +1,5 @@
 // FEAT-OCD-001 MOD-05 T5.2: in-box tool `message_session` (see inbox-lib.ts for the trust model).
-import { InboxToolError, SESSION_ADDRESS, postMessage, selfAddress, sentText, textArg, threadArg, type ToolContext } from "./inbox-lib.ts"
+import { InboxToolError, SESSION_ADDRESS, postMessage, rememberSent, selfAddress, sentText, textArg, threadArg, type ToolContext } from "./inbox-lib.ts"
 
 function peerAddress(value: unknown): string {
   const raw = typeof value === "string" ? value.trim() : ""
@@ -29,6 +29,7 @@ export default {
     if (to === self) throw new InboxToolError("A session cannot message itself.")
     const text = textArg(args.text)
     const message = await postMessage({ from: self, to, text, correlationId: threadArg(args.correlationId, self, to) })
+    rememberSent(self, message)
     return sentText(message)
   },
 }

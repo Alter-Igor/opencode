@@ -1,7 +1,7 @@
 // MOD-03: the cursor buffer. A ring of the last 5,000 hub events; a cursor is {epoch, seq} where
 // the epoch is random per hub start, so a cursor from an earlier bridge run is recognised as
 // expired instead of silently pointing at different events.
-import type { Cursor, HubEvent, WaitUntil } from "../shared/contracts.ts"
+import type { Cursor, HubEvent, SessionState, SessionView, WaitUntil } from "../shared/contracts.ts"
 import { DelegateError } from "../shared/errors.ts"
 import type { Timers } from "./timers.ts"
 
@@ -13,21 +13,42 @@ export type HubEventInput = Omit<HubEvent, "cursor" | "at">
 export type Filter = { sessionID?: string }
 export type Page = { events: HubEvent[]; next: Cursor; expired: boolean }
 export type WaitInput = { sessionIDs: string[]; until: WaitUntil[]; timeoutMs: number; cursor?: Cursor }
-export type WaitResult = { events: HubEvent[]; next: Cursor; timedOut: boolean }
+/** `views`: sessions found already in a matching state by reading state, not by an event (W2A-05/06). */
+export type WaitResult = { events: HubEvent[]; next: Cursor; timedOut: boolean; views?: SessionView[] }
 
-const ERROR_STATES = new Set(["error", "not_started", "server_down"])
+/** `until: idle` means the run is over, however it ended (W2A-05). */
+const SETTLED_STATES = new Set<SessionState>(["idle", "error", "aborted", "not_started", "not_found"])
+const ERROR_STATES = new Set<SessionState>(["error", "aborted", "not_started", "not_found", "server_down"])
 
-/** The `until` mapping (oc_wait): idle → state idle; needs_input → permission/question asked; ... */
-export function matchesUntil(event: HubEvent, until: WaitUntil): boolean {
-  if (until === "idle") return event.state === "idle"
-  if (until === "needs_input") return event.type === "permission" || event.type === "question"
-  if (until === "error") return event.state !== undefined && ERROR_STATES.has(event.state)
-  return event.type === "message" || event.type === "inbox"
+function stateMatches(state: SessionState | undefined, until: WaitUntil): boolean {
+  if (state === undefined) return false
+  if (until === "idle") return SETTLED_STATES.has(state)
+  if (until === "error") return ERROR_STATES.has(state)
+  return false
 }
 
-/** Session filter for wait(): events without a session (inbox to the supervisor) always pass. */
+/** The `until` mapping (oc_wait): idle → settled; needs_input → permission/question asked; error → failure states; message → reply or inbox. */
+export function matchesUntil(event: HubEvent, until: WaitUntil): boolean {
+  if (until === "needs_input") return event.type === "permission" || event.type === "question"
+  if (until === "message") return event.type === "message" || event.type === "inbox"
+  // Only status events carry the session's settled state; an error event's state is the state at the time.
+  return event.type === "status" && stateMatches(event.state, until)
+}
+
+/** The same mapping against a current view (no event): needs_input is the state itself. */
+export function viewMatches(view: SessionView, until: WaitUntil): boolean {
+  if (until === "needs_input") return view.state === "needs_input"
+  return stateMatches(view.state, until)
+}
+
+/**
+ * Session filter for wait(): events without a session (inbox to the supervisor) always pass; a
+ * subagent's permission/question also passes for its parent (W2A-03).
+ */
 function matchesWait(event: HubEvent, input: WaitInput): boolean {
-  const sessionOk = input.sessionIDs.length === 0 || event.sessionID === undefined || input.sessionIDs.includes(event.sessionID)
+  const ids = input.sessionIDs
+  const asks = event.type === "permission" || event.type === "question"
+  const sessionOk = ids.length === 0 || event.sessionID === undefined || ids.includes(event.sessionID) || (asks && event.parentID !== undefined && ids.includes(event.parentID))
   return sessionOk && input.until.some((u) => matchesUntil(event, u))
 }
 

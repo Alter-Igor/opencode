@@ -6,7 +6,7 @@ import {
 
 export type Failure = { failure: true; status: number; code: string; message: string }
 
-export type BoxPost = { from: string; to: string; text: string; hops?: number; correlationId?: string }
+export type BoxPost = { from: string; to: string; text: string; correlationId?: string }
 export type AdminPost = { as: string; to: string; text: string; correlationId?: string }
 export type ReadQuery = { to: string; cursor: number; limit: number }
 
@@ -35,7 +35,10 @@ function checkCommon(body: Record<string, unknown>): Failure | undefined {
   return undefined
 }
 
-/** Box route: the sender is only claimed. A `supervisor:` sender is refused here (403). */
+/**
+ * Box route: the sender is only claimed. A `supervisor:` sender is refused here (403).
+ * `hops` is still accepted for older clients but ignored: only the sidecar counts hops (W2C-07).
+ */
 export function parseBoxPost(input: unknown): BoxPost | Failure {
   const body = asRecord(input, ["from", "to", "text", "hops", "correlationId"])
   if (isFailure(body)) return body
@@ -44,9 +47,7 @@ export function parseBoxPost(input: unknown): BoxPost | Failure {
   if (typeof body.from !== "string" || !SESSION_ADDRESS.test(body.from)) return fail(400, "bad_address", "`from` must be session:ses_<id>.")
   const common = checkCommon(body)
   if (common) return common
-  if (body.hops !== undefined && (typeof body.hops !== "number" || !Number.isInteger(body.hops) || body.hops < 0 || body.hops > 1000))
-    return fail(400, "bad_hops", "`hops` must be a whole number from 0.")
-  return { from: body.from, to: body.to as string, text: body.text as string, hops: body.hops as number | undefined, correlationId: body.correlationId as string | undefined }
+  return { from: body.from, to: body.to as string, text: body.text as string, correlationId: body.correlationId as string | undefined }
 }
 
 /** Admin route: posts as `supervisor:<name>` only; hops are counted by the sidecar per thread. */

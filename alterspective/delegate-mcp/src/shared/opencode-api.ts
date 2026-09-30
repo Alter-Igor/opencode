@@ -37,6 +37,19 @@ function isTimeout(error: unknown): boolean {
   return error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError")
 }
 
+/** fetch with redirect:"error" throws on a 3xx: Bun sets code UnexpectedRedirect, undici says "redirect". */
+export function isRedirectError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false
+  const code = "code" in error ? error.code : undefined
+  const cause = error.cause instanceof Error ? error.cause.message : ""
+  return code === "UnexpectedRedirect" || /redirect/i.test(error.message) || /redirect/i.test(cause)
+}
+
+/** The box answered with a redirect: the bridge never follows one off the box it was given (W2C-02). */
+function redirectRefused(detail: string): DelegateError {
+  return new DelegateError("upstream_error", "The delegate server answered with a redirect, which the bridge refuses.", "Run oc_doctor.", detail)
+}
+
 function unreachable(error: unknown): DelegateError {
   const detail = isTimeout(error) ? "timeout" : String(error)
   const message = isTimeout(error) ? "The delegate server did not answer in time." : "The delegate server is not reachable."
@@ -57,12 +70,13 @@ export function createApi(target: ApiTarget, fetchImpl: typeof fetch = fetch, op
       let status: number
       let text: string
       try {
-        const res = await fetchImpl(url, { method: input.method ?? "GET", headers, signal, body: input.body === undefined ? undefined : JSON.stringify(input.body) })
+        const res = await fetchImpl(url, { method: input.method ?? "GET", headers, signal, redirect: "error", body: input.body === undefined ? undefined : JSON.stringify(input.body) })
         status = res.status
         text = await res.text()
       } catch (error) {
-        throw unreachable(error)
+        throw isRedirectError(error) ? redirectRefused("redirect") : unreachable(error)
       }
+      if (status >= 300 && status < 400) throw redirectRefused(`HTTP ${status}`)
       if (status === 401) {
         throw new DelegateError("auth_mismatch", "The delegate server rejected the bridge's credentials.", "Restart the bridge so it and the box share one password (oc_doctor).", "HTTP 401")
       }

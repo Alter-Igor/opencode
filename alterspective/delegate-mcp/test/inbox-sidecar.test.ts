@@ -1,23 +1,23 @@
-// FEAT-OCD-001 MOD-05 T5.1: the inbox sidecar over real HTTP (Bun.serve on a random port).
+// FEAT-OCD-001 MOD-05 T5.1: the inbox sidecar over real HTTP (two Bun listeners on random ports):
+// sender trust, listener split, request checks, the append-only store. Limits: inbox-sidecar-limits.test.ts.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
+import { appendFile, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { startFromEnv } from "../inbox-sidecar/src/main.ts"
-import { HOP_LIMIT, MAX_TEXT_BYTES, type StoredMessage } from "../inbox-sidecar/src/rules.ts"
-import { createHandler, tokenMatches, type LogLine } from "../inbox-sidecar/src/server.ts"
-import { InboxStore } from "../inbox-sidecar/src/store.ts"
+import { EPOCH, type StoredMessage } from "../inbox-sidecar/src/rules.ts"
+import { tokenMatches, type LogLine } from "../inbox-sidecar/src/server.ts"
+import { InboxStore, type StoreOptions } from "../inbox-sidecar/src/store.ts"
 import type { InboxMessage } from "../src/shared/contracts.ts"
+import { startSidecar, type Sidecar } from "./inbox-harness.ts"
 
 const TOKEN = "t".repeat(20) + "0123456789AB"
 const SES_A = "session:ses_AAAAAAAAAA01"
 const SES_B = "session:ses_BBBBBBBBBB02"
 const SUP = "supervisor:claude-a"
 
-type Server = { url: string; stop: () => void; store: InboxStore; logs: LogLine[]; clock: { now: number } }
-
 let dir: string
-let servers: Server[] = []
+let servers: Sidecar[] = []
 beforeEach(async () => {
   dir = await mkdtemp(path.join(os.tmpdir(), "ocd-inbox-"))
   servers = []
@@ -27,29 +27,28 @@ afterEach(async () => {
   await rm(dir, { recursive: true, force: true })
 })
 
-function serve(over: { segmentBytes?: number; maxSegments?: number } = {}): Server {
-  const store = InboxStore.open({ dir, ...over })
-  const logs: LogLine[] = []
-  const clock = { now: Date.parse("2026-10-01T00:00:00Z") }
-  const http = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: createHandler({ store, adminToken: TOKEN, now: () => clock.now, log: (line) => void logs.push(line) }) })
-  const server = { url: `http://127.0.0.1:${http.port}`, stop: () => (void http.stop(true), store.close()), store, logs, clock }
+function serve(store: Omit<StoreOptions, "dir"> = {}): Sidecar {
+  const server = startSidecar({ dir, token: TOKEN, store, now: () => Date.parse("2026-10-01T00:00:00Z") })
   servers.push(server)
   return server
 }
 
-type Reply = { status: number; body: { message?: StoredMessage; messages?: StoredMessage[]; next?: string; error?: { code: string } } }
+type Body = { message?: StoredMessage; messages?: StoredMessage[]; next?: string; epoch?: string; oldestId?: string; lastId?: string; error?: { code: string } }
+type Reply = { status: number; body: Body }
+type Opts = { token?: string; via?: "box" | "admin"; headers?: Record<string, string> }
 
-async function call(server: Server, method: string, route: string, body?: unknown, token?: string): Promise<Reply> {
-  const headers: Record<string, string> = { "content-type": "application/json" }
-  if (token !== undefined) headers.authorization = `Bearer ${token}`
-  const res = await fetch(server.url + route, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) })
-  return { status: res.status, body: (await res.json()) as Reply["body"] }
+async function call(s: Sidecar, method: string, route: string, body?: unknown, opts: Opts = {}): Promise<Reply> {
+  const headers: Record<string, string> = { "content-type": "application/json", ...opts.headers }
+  if (opts.token !== undefined) headers.authorization = `Bearer ${opts.token}`
+  const via = opts.via ?? (route.startsWith("/v1/admin/") ? "admin" : "box")
+  const res = await fetch((via === "admin" ? s.adminUrl : s.boxUrl) + route, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) })
+  return { status: res.status, body: (await res.json()) as Body }
 }
 
-const boxPost = (s: Server, body: unknown) => call(s, "POST", "/v1/post", body)
-const adminPost = (s: Server, body: unknown, token = TOKEN) => call(s, "POST", "/v1/admin/post", body, token)
-const boxRead = (s: Server, query: string) => call(s, "GET", `/v1/read?${query}`)
-const adminRead = (s: Server, query: string, token = TOKEN) => call(s, "GET", `/v1/admin/read?${query}`, undefined, token)
+const boxPost = (s: Sidecar, body: unknown) => call(s, "POST", "/v1/post", body)
+const adminPost = (s: Sidecar, body: unknown, token = TOKEN) => call(s, "POST", "/v1/admin/post", body, { token })
+const boxRead = (s: Sidecar, query: string) => call(s, "GET", `/v1/read?${query}`)
+const adminRead = (s: Sidecar, query: string, token = TOKEN) => call(s, "GET", `/v1/admin/read?${query}`, undefined, { token })
 
 describe("inbox sidecar: sender trust", () => {
   test("a box post is stored unverified with the claimed session sender and server-stamped id/at", async () => {
@@ -84,7 +83,7 @@ describe("inbox sidecar: sender trust", () => {
     expect((await call(s, "POST", "/v1/admin/post", body)).status).toBe(401)
     expect((await adminPost(s, body, "wrong-token-wrong-token-wrong-token")).status).toBe(401)
     expect((await adminPost(s, body, TOKEN.slice(0, -1))).status).toBe(401)
-    const basic = await fetch(s.url + "/v1/admin/post", { method: "POST", headers: { authorization: `Basic ${TOKEN}` }, body: JSON.stringify(body) })
+    const basic = await call(s, "POST", "/v1/admin/post", body, { headers: { authorization: `Basic ${TOKEN}` } })
     expect(basic.status).toBe(401)
     expect((await adminRead(s, `to=${SUP}`, "nope")).status).toBe(401)
     expect((await boxRead(s, `to=${SES_A}`)).body.messages).toEqual([])
@@ -117,73 +116,36 @@ describe("inbox sidecar: sender trust", () => {
   })
 })
 
-describe("inbox sidecar: limits", () => {
-  test(`hop limit ${HOP_LIMIT}: a thread takes ${HOP_LIMIT + 1} messages, the next is 429 hop_limit`, async () => {
+describe("inbox sidecar: listeners and request checks (W2C-05, W2C-13)", () => {
+  test("admin routes do not exist on the box listener, and box routes do not exist on the admin listener", async () => {
     const s = serve()
-    const thread = { correlationId: "loop-1" }
-    expect((await adminPost(s, { as: SUP, to: SES_A, text: "go", ...thread })).body.message!.hops).toBe(0)
-    expect((await boxPost(s, { from: SES_A, to: SES_B, text: "ping", ...thread })).body.message!.hops).toBe(1)
-    expect((await boxPost(s, { from: SES_B, to: SES_A, text: "pong", ...thread })).body.message!.hops).toBe(2)
-    expect((await boxPost(s, { from: SES_A, to: SES_B, text: "ping", ...thread })).body.message!.hops).toBe(3)
-    const over = await boxPost(s, { from: SES_B, to: SES_A, text: "pong", ...thread })
-    expect(over.status).toBe(429)
-    expect(over.body.error!.code).toBe("hop_limit")
-    // Claiming hops 0 on the same thread does not reset it; the admin route is limited too.
-    expect((await boxPost(s, { from: SES_B, to: SES_A, text: "pong", hops: 0, ...thread })).status).toBe(429)
-    expect((await adminPost(s, { as: SUP, to: SES_A, text: "again", ...thread })).body.error!.code).toBe("hop_limit")
+    expect((await call(s, "POST", "/v1/admin/post", { as: SUP, to: SES_A, text: "x" }, { token: TOKEN, via: "box" })).status).toBe(404)
+    expect((await call(s, "GET", `/v1/admin/read?to=${SUP}`, undefined, { token: TOKEN, via: "box" })).status).toBe(404)
+    expect((await call(s, "POST", "/v1/post", { from: SES_A, to: SES_B, text: "x" }, { token: TOKEN, via: "admin" })).status).toBe(404)
+    expect((await call(s, "GET", `/v1/read?to=${SES_A}`, undefined, { token: TOKEN, via: "admin" })).status).toBe(404)
+    expect(s.store.lastId).toBe(0)
   })
 
-  test("a claimed hop count over the limit is refused on a new thread", async () => {
+  test("a Host the listener does not answer to is 421 on both listeners", async () => {
     const s = serve()
-    const reply = await boxPost(s, { from: SES_A, to: SES_B, text: "x", hops: HOP_LIMIT + 1 })
-    expect(reply.status).toBe(429)
-    expect(reply.body.error!.code).toBe("hop_limit")
+    const evil = { headers: { host: "evil.example:80" } }
+    const box = await call(s, "POST", "/v1/post", { from: SES_A, to: SES_B, text: "x" }, evil)
+    expect(box.status).toBe(421)
+    expect(box.body.error!.code).toBe("bad_host")
+    expect((await call(s, "GET", `/v1/admin/read?to=${SUP}`, undefined, { token: TOKEN, ...evil })).status).toBe(421)
+    expect(s.store.lastId).toBe(0)
   })
 
-  test("10 messages a minute per claimed sender, then 429; the window slides", async () => {
+  test("a POST that is not application/json is 415 and stores nothing; a charset parameter is fine", async () => {
     const s = serve()
-    for (let i = 0; i < 10; i++) expect((await boxPost(s, { from: SES_A, to: SES_B, text: `m${i}` })).status).toBe(201)
-    const limited = await boxPost(s, { from: SES_A, to: SES_B, text: "m10" })
-    expect(limited.status).toBe(429)
-    expect(limited.body.error!.code).toBe("rate_limited")
-    expect((await boxPost(s, { from: SES_B, to: SES_A, text: "other sender" })).status).toBe(201)
-    s.clock.now += 60_000
-    expect((await boxPost(s, { from: SES_A, to: SES_B, text: "later" })).status).toBe(201)
-  })
-
-  test("rotating made-up senders still hits the whole-box-route cap (60/min)", async () => {
-    const s = serve()
-    let refused = 0
-    for (let i = 0; i < 61; i++) {
-      const reply = await boxPost(s, { from: `session:ses_FAKE${String(i).padStart(6, "0")}`, to: SES_B, text: "spam" })
-      if (reply.status === 429) refused++
+    for (const type of ["text/plain", "application/x-www-form-urlencoded", "multipart/form-data; boundary=x", "application/jsonx"]) {
+      const reply = await call(s, "POST", "/v1/post", { from: SES_A, to: SES_B, text: "x" }, { headers: { "content-type": type } })
+      expect(reply.status).toBe(415)
+      expect(reply.body.error!.code).toBe("unsupported_media_type")
     }
-    expect(refused).toBe(1)
-  })
-
-  test("text over 8 KB is 413; exactly 8 KB is accepted; multi-byte text counts bytes", async () => {
-    const s = serve()
-    expect((await boxPost(s, { from: SES_A, to: SES_B, text: "a".repeat(MAX_TEXT_BYTES) })).status).toBe(201)
-    const over = await boxPost(s, { from: SES_A, to: SES_B, text: "a".repeat(MAX_TEXT_BYTES + 1) })
-    expect(over.status).toBe(413)
-    expect(over.body.error!.code).toBe("text_too_large")
-    expect((await boxPost(s, { from: SES_A, to: SES_B, text: "é".repeat(MAX_TEXT_BYTES / 2 + 1) })).status).toBe(413)
-    expect((await boxPost(s, { from: SES_A, to: SES_B, text: "a".repeat(40_000) })).body.error!.code).toBe("body_too_large")
-  })
-
-  test("bad addresses, cursors and limits are 400", async () => {
-    const s = serve()
-    for (const from of ["session:abc", "ses_AAAAAAAAAA01", "session:ses_short", "session:ses_AAAAAAAAAA01 ", ""]) {
-      expect((await boxPost(s, { from, to: SES_B, text: "x" })).body.error!.code).toBe("bad_address")
-    }
-    for (const to of ["supervisor:Claude", "supervisor:", `supervisor:${"a".repeat(41)}`, "user:igor"])
-      expect((await boxPost(s, { from: SES_A, to, text: "x" })).body.error!.code).toBe("bad_address")
-    expect((await boxRead(s, `to=${SES_A}&cursor=-1`)).body.error!.code).toBe("bad_cursor")
-    expect((await boxRead(s, `to=${SES_A}&limit=0`)).body.error!.code).toBe("bad_limit")
-    expect((await boxRead(s, `to=${SES_A}&limit=201`)).body.error!.code).toBe("bad_limit")
-    expect((await boxPost(s, { from: SES_A, to: SES_B, text: "x", correlationId: "has space" })).body.error!.code).toBe("bad_correlation_id")
-    const notJson = await fetch(s.url + "/v1/post", { method: "POST", body: "{nope" })
-    expect(notJson.status).toBe(400)
+    expect((await call(s, "POST", "/v1/admin/post", { as: SUP, to: SES_A, text: "x" }, { token: TOKEN, headers: { "content-type": "text/plain" } })).status).toBe(415)
+    expect(s.store.lastId).toBe(0)
+    expect((await call(s, "POST", "/v1/post", { from: SES_A, to: SES_B, text: "x" }, { headers: { "content-type": "application/json; charset=utf-8" } })).status).toBe(201)
   })
 })
 
@@ -191,58 +153,109 @@ describe("inbox sidecar: append-only store", () => {
   test("no route can change or delete a message: every other method/path is 404", async () => {
     const s = serve()
     await boxPost(s, { from: SES_A, to: SES_B, text: "keep me" })
-    for (const method of ["PUT", "PATCH", "DELETE"])
-      for (const route of ["/v1/post", "/v1/read", "/v1/admin/post", "/v1/admin/read", "/v1/message/1", "/v1/admin/message/1"]) {
-        const res = await fetch(s.url + route, { method, headers: { authorization: `Bearer ${TOKEN}` } })
-        expect(res.status).toBe(404)
-      }
+    for (const via of ["box", "admin"] as const)
+      for (const method of ["PUT", "PATCH", "DELETE"])
+        for (const route of ["/v1/post", "/v1/read", "/v1/admin/post", "/v1/admin/read", "/v1/message/1", "/v1/admin/message/1"])
+          expect((await fetch((via === "box" ? s.boxUrl : s.adminUrl) + route, { method, headers: { authorization: `Bearer ${TOKEN}` } })).status).toBe(404)
     for (const route of ["/", "/v1/health", "/v1/admin/delete", "/v1/admin/reset", "/v1/post/1"])
-      expect((await fetch(s.url + route, { method: "POST", headers: { authorization: `Bearer ${TOKEN}` }, body: "{}" })).status).toBe(404)
+      expect((await fetch(s.adminUrl + route, { method: "POST", headers: { authorization: `Bearer ${TOKEN}` }, body: "{}" })).status).toBe(404)
     expect((await boxRead(s, `to=${SES_B}`)).body.messages!.map((m) => m.text)).toEqual(["keep me"])
   })
 
-  test("cursor paging returns each message once, oldest first", async () => {
+  test("cursor paging returns each message once, oldest first, with epoch/oldestId/lastId", async () => {
     const s = serve()
     for (let i = 1; i <= 5; i++) await adminPost(s, { as: SUP, to: SES_A, text: `m${i}` })
     await adminPost(s, { as: SUP, to: SES_B, text: "not for A" })
     const first = await boxRead(s, `to=${SES_A}&limit=2`)
     expect(first.body.messages!.map((m) => m.text)).toEqual(["m1", "m2"])
+    expect(first.body.epoch).toMatch(EPOCH)
+    expect(first.body).toMatchObject({ oldestId: "1", lastId: "6" })
     const second = await boxRead(s, `to=${SES_A}&limit=2&cursor=${first.body.next}`)
     expect(second.body.messages!.map((m) => m.text)).toEqual(["m3", "m4"])
     const third = await boxRead(s, `to=${SES_A}&cursor=${second.body.next}`)
     expect(third.body.messages!.map((m) => m.text)).toEqual(["m5"])
     const empty = await boxRead(s, `to=${SES_A}&cursor=${third.body.next}`)
-    expect(empty.body).toEqual({ messages: [], next: third.body.next })
+    expect(empty.body).toEqual({ messages: [], next: third.body.next!, epoch: first.body.epoch!, oldestId: "1", lastId: "6" })
   })
 
-  test("messages, ids and thread hops survive a restart; a torn last line is skipped and not glued to the next", async () => {
+  test("messages, ids, thread hops and the epoch survive a restart; a torn last line is skipped and not glued to the next", async () => {
     const s = serve()
-    await boxPost(s, { from: SES_A, to: SUP, text: "one", correlationId: "t" })
-    await boxPost(s, { from: SES_B, to: SUP, text: "two", correlationId: "t" })
+    await boxPost(s, { from: SES_A, to: SES_B, text: "one", correlationId: "t" })
+    await boxPost(s, { from: SES_B, to: SES_A, text: "two", correlationId: "t" })
+    const epoch = s.store.epoch
     s.stop()
     servers = []
-    const [segment] = await readdir(dir)
-    await writeFile(path.join(dir, segment!), (await readFile(path.join(dir, segment!), "utf8")) + '{"id":"3","at":"x","fr')
+    const segment = (await readdir(dir)).find((name) => name.startsWith("inbox-"))!
+    await writeFile(path.join(dir, segment), (await readFile(path.join(dir, segment), "utf8")) + '{"id":"3","at":"x","fr')
     const again = serve()
     expect(again.store.skippedLines).toBe(1)
-    const third = await boxPost(again, { from: SES_A, to: SUP, text: "three", correlationId: "t" })
+    expect(again.store.epoch).toBe(epoch)
+    expect(again.store.newEpoch).toBe(false)
+    const third = await boxPost(again, { from: SES_A, to: SES_B, text: "three", correlationId: "t" })
     expect(third.body.message).toMatchObject({ id: "3", hops: 2 })
     again.stop()
     servers = []
     const reopened = InboxStore.open({ dir })
-    expect(reopened.read(SUP, 0, 50).messages.map((m) => m.text)).toEqual(["one", "two", "three"])
+    expect(reopened.read(SES_B, 0, 50).messages.map((m) => m.text)).toEqual(["one", "three"])
     expect(reopened.skippedLines).toBe(1)
     reopened.close()
   })
 
-  test("segments rotate by size and retention keeps the newest ones", async () => {
+  test("a segment torn after the store opened is detected from its last byte when the file is opened for append (W2C-15)", async () => {
+    const first = InboxStore.open({ dir })
+    first.append({ at: "a", from: SES_A, to: SES_B, text: "one", hops: 0, verified: false })
+    first.close()
+    const store = InboxStore.open({ dir })
+    const segment = (await readdir(dir)).find((name) => name.startsWith("inbox-"))!
+    await appendFile(path.join(dir, segment), '{"id":"2","torn')
+    store.append({ at: "a", from: SES_A, to: SES_B, text: "two", hops: 0, verified: false })
+    store.close()
+    const reopened = InboxStore.open({ dir })
+    expect(reopened.read(SES_B, 0, 50).messages.map((m) => m.text)).toEqual(["one", "two"])
+    expect(reopened.skippedLines).toBe(1)
+    reopened.close()
+  })
+
+  test("a new data folder gets a new epoch; an unreadable state file gets a new one too", async () => {
+    const a = InboxStore.open({ dir: path.join(dir, "a") })
+    const b = InboxStore.open({ dir: path.join(dir, "b") })
+    expect(a.epoch).not.toBe(b.epoch)
+    a.close()
+    b.close()
+    await writeFile(path.join(dir, "a", "state.json"), "{not json")
+    const again = InboxStore.open({ dir: path.join(dir, "a") })
+    expect(again.newEpoch).toBe(true)
+    expect(again.epoch).toMatch(EPOCH)
+    again.close()
+  })
+
+  test("session traffic cannot evict supervisor messages: each series has its own retention (W2C-08)", async () => {
     const s = serve({ segmentBytes: 400, maxSegments: 2 })
-    for (let i = 0; i < 9; i++) await adminPost(s, { as: SUP, to: SES_A, text: `message number ${i} `.padEnd(150, ".") })
-    const files = (await readdir(dir)).sort()
-    expect(files.length).toBe(2)
-    const texts = s.store.read(SES_A, 0, 50).messages.map((m) => m.id)
-    expect(texts.at(-1)).toBe("9")
-    expect(texts.length).toBeLessThan(9)
+    await adminPost(s, { as: SUP, to: SES_A, text: "go" })
+    await boxPost(s, { from: SES_A, to: SUP, text: "status: blocked" })
+    for (let i = 0; i < 9; i++) s.store.append({ at: "a", from: SES_B, to: SES_A, text: `spam ${i} `.padEnd(150, "."), hops: 0, verified: false })
+    expect((await readdir(dir)).filter((name) => name.startsWith("inbox-")).length).toBe(2)
+    const sup = await adminRead(s, `to=${SUP}`)
+    expect(sup.body.messages!.map((m) => m.text)).toEqual(["status: blocked"])
+    expect(sup.body.oldestId).toBe("1")
+    const session = await boxRead(s, `to=${SES_A}`)
+    expect(Number(session.body.oldestId)).toBeGreaterThan(1)
+    expect(session.body.messages!.map((m) => m.text)).not.toContain("go")
+    expect(session.body.messages!.at(-1)!.id).toBe(session.body.lastId!)
+  })
+
+  test("retention also forgets the threads it dropped, and the eviction mark survives a restart (W2C-11)", async () => {
+    const s = serve({ segmentBytes: 400, maxSegments: 2 })
+    for (let i = 0; i < 12; i++) s.store.append({ at: "a", from: SES_B, to: SES_A, text: `m ${i} `.padEnd(150, "."), hops: 0, verified: false, correlationId: `t-${i}` })
+    expect(s.store.thread("t-0")).toBeUndefined()
+    expect(s.store.thread("t-11")).toBeDefined()
+    expect(s.store.threadCount).toBeLessThan(12)
+    const oldest = s.store.read(SES_A, 0, 1).oldestId
+    s.stop()
+    servers = []
+    const reopened = InboxStore.open({ dir, segmentBytes: 400, maxSegments: 2 })
+    expect(reopened.read(SES_A, 0, 1).oldestId).toBe(oldest)
+    reopened.close()
   })
 
   test("logs carry ids, sizes and addresses but never the message text", async () => {
@@ -261,13 +274,19 @@ describe("inbox sidecar: start-up", () => {
     expect(() => startFromEnv({ INBOX_ADMIN_TOKEN: "short", INBOX_DATA_DIR: dir, INBOX_PORT: "0" }, () => {})).toThrow(/INBOX_ADMIN_TOKEN/)
   })
 
-  test("starts from env and serves both routes; the start log has no token", async () => {
+  test("starts both listeners from env, each with only its own routes; the start log has no token", async () => {
     const logs: LogLine[] = []
-    const started = startFromEnv({ INBOX_ADMIN_TOKEN: TOKEN, INBOX_DATA_DIR: dir, INBOX_PORT: "0", INBOX_HOST: "127.0.0.1" }, (line) => void logs.push(line))
+    const env = { INBOX_ADMIN_TOKEN: TOKEN, INBOX_DATA_DIR: dir, INBOX_PORT: "0", INBOX_ADMIN_PORT: "0", INBOX_HOST: "127.0.0.1" }
+    const started = startFromEnv(env, (line) => void logs.push(line))
     try {
-      const url = `http://127.0.0.1:${started.port}`
-      const res = await fetch(`${url}/v1/admin/read?to=${SUP}`, { headers: { authorization: `Bearer ${TOKEN}` } })
-      expect(res.status).toBe(200)
+      const auth = { authorization: `Bearer ${TOKEN}` }
+      const admin = `http://127.0.0.1:${started.adminPort}`
+      expect((await fetch(`${admin}/v1/admin/read?to=${SUP}`, { headers: auth })).status).toBe(200)
+      // The box listener answers to Host inbox:<port> only, so a plain loopback call is refused.
+      const box = `http://127.0.0.1:${started.port}`
+      expect((await fetch(`${box}/v1/read?to=${SES_A}`)).status).toBe(421)
+      expect((await fetch(`${box}/v1/read?to=${SES_A}`, { headers: { host: `inbox:${started.port}` } })).status).toBe(200)
+      expect((await fetch(`${box}/v1/admin/read?to=${SUP}`, { headers: { ...auth, host: `inbox:${started.port}` } })).status).toBe(404)
       expect(JSON.stringify(logs)).not.toContain(TOKEN)
     } finally {
       started.stop()

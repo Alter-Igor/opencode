@@ -1,56 +1,21 @@
 // MOD-03 T3.1: SSE reader for the box's GET /global/event.
 // createApi (shared/opencode-api.ts) is request/response only, so this module streams with fetch
-// and the same basic-auth header. It parses SSE per the WHATWG rules the server uses (chunk
-// boundaries, multi-line data, comments, CR/LF/CRLF), treats 30 s without any bytes as a dropped
-// stream (the server sends a heartbeat every 10 s), and reconnects with backoff 1/2/5/10 s.
-import type { ApiTarget } from "../shared/opencode-api.ts"
+// and the same basic-auth header. Parsing is in sse-parser.ts. 30 s without any bytes is a
+// dropped stream (the server sends a heartbeat every 10 s); reconnects back off 1/2/5/10 s, and
+// the backoff only resets once a connection proved healthy — the hub rebuilt state on it, or it
+// stayed up for HEALTHY_MS (W2A-09) — so a server that accepts and then fails cannot make the
+// loop spin. Redirects are refused (W2C-02): the bridge only ever talks to the box it was given.
+import { isRedirectError, type ApiTarget } from "../shared/opencode-api.ts"
+import { SseParser } from "./sse-parser.ts"
 import { sleep, type Timers } from "./timers.ts"
+
+export { MAX_EVENT_CHARS, SseParser } from "./sse-parser.ts"
 
 export const EVENT_PATH = "/global/event"
 export const BACKOFF_MS: readonly number[] = [1000, 2000, 5000, 10_000]
 export const STALE_MS = 30_000
-/** A line longer than this without a terminator is not SSE; drop it rather than grow forever. */
-const MAX_PENDING = 8 * 1024 * 1024
-
-export class SseParser {
-  private pending = ""
-  private data: string[] = []
-
-  /** Feed decoded text; returns the `data` of every event completed by this chunk. */
-  push(chunk: string): string[] {
-    this.pending += chunk
-    const out: string[] = []
-    let start = 0
-    for (let i = 0; i < this.pending.length; i++) {
-      const c = this.pending[i]
-      if (c !== "\n" && c !== "\r") continue
-      // A CR at the very end may be the first half of a CRLF split across chunks: wait.
-      if (c === "\r" && i === this.pending.length - 1) break
-      const data = this.line(this.pending.slice(start, i))
-      if (data !== undefined) out.push(data)
-      if (c === "\r" && this.pending[i + 1] === "\n") i++
-      start = i + 1
-    }
-    this.pending = this.pending.slice(start)
-    if (this.pending.length > MAX_PENDING) this.pending = ""
-    return out
-  }
-
-  private line(line: string): string | undefined {
-    if (line === "") {
-      const data = this.data.join("\n")
-      this.data = []
-      return data === "" ? undefined : data
-    }
-    if (line.startsWith(":")) return undefined // comment / keep-alive
-    const colon = line.indexOf(":")
-    const field = colon === -1 ? line : line.slice(0, colon)
-    let value = colon === -1 ? "" : line.slice(colon + 1)
-    if (value.startsWith(" ")) value = value.slice(1)
-    if (field === "data") this.data.push(value)
-    return undefined // event, id, retry: not used by this server
-  }
-}
+/** A connection that stayed up this long resets the backoff even without a rebuild. */
+export const HEALTHY_MS = 60_000
 
 /** Why a stream attempt ended. `unreachable` = no HTTP answer at all (server down). */
 export type Drop = { kind: "unreachable" | "http" | "closed" | "stale"; detail: string }
@@ -59,6 +24,8 @@ export type StreamHandlers = {
   onOpen(): void
   onData(data: string): void
   onDrop(drop: Drop): void
+  /** Events were lost inside a live stream (an oversized event was discarded): rebuild state. */
+  onGap?(detail: string): void
 }
 
 export type StreamOptions = {
@@ -66,11 +33,14 @@ export type StreamOptions = {
   fetch?: typeof fetch
   backoffMs?: readonly number[]
   staleMs?: number
+  healthyMs?: number
 }
 
 export type StreamControl = {
   /** Drop the current connection (the loop reconnects after backoff). */
   restart(): void
+  /** The current connection is good (state rebuilt on it): the next drop starts the backoff over. */
+  healthy(): void
   stop(): Promise<void>
 }
 
@@ -111,11 +81,13 @@ function watchdog(timers: Timers, ms: number, abort: AbortController): Dog {
 async function connect(target: ApiTarget, fetchImpl: typeof fetch, signal: AbortSignal): Promise<Response | Drop> {
   try {
     const url = new URL(EVENT_PATH, target.baseUrl)
-    const res = await fetchImpl(url, { headers: { authorization: basicAuth(target), accept: "text/event-stream" }, signal })
+    const res = await fetchImpl(url, { headers: { authorization: basicAuth(target), accept: "text/event-stream" }, signal, redirect: "error" })
     if (res.ok && res.body) return res
     await res.body?.cancel().catch(() => undefined)
-    return { kind: "http", detail: `HTTP ${res.status}` }
+    const redirect = res.status >= 300 && res.status < 400 ? "redirect refused, " : ""
+    return { kind: "http", detail: `${redirect}HTTP ${res.status}` }
   } catch (error) {
+    if (isRedirectError(error)) return { kind: "http", detail: "redirect refused" }
     return { kind: "unreachable", detail: errorName(error) }
   }
 }
@@ -132,6 +104,7 @@ async function pump(body: ReadableStream<Uint8Array>, handlers: StreamHandlers, 
       if (done) break
       dog.kick()
       for (const data of parser.push(decoder.decode(value, { stream: true }))) handlers.onData(data)
+      if (parser.takeOverflow()) handlers.onGap?.("an event over 1 MB was discarded")
     }
   } catch (error) {
     if (!dog.fired) return { kind: "closed", detail: errorName(error) }
@@ -139,16 +112,17 @@ async function pump(body: ReadableStream<Uint8Array>, handlers: StreamHandlers, 
   return dog.fired ? { kind: "stale", detail: `no data for ${staleMs} ms` } : { kind: "closed", detail: "stream ended" }
 }
 
-type Attempt = { drop: Drop; opened: boolean }
+type Attempt = { drop: Drop; openedAt?: number }
 
 async function attempt(target: ApiTarget, o: Required<StreamOptions>, handlers: StreamHandlers, abort: AbortController): Promise<Attempt> {
   const dog = watchdog(o.timers, o.staleMs, abort)
   try {
     const res = await connect(target, o.fetch, abort.signal)
-    if (!(res instanceof Response)) return { drop: dog.fired ? { kind: "unreachable", detail: "timeout" } : res, opened: false }
+    if (!(res instanceof Response)) return { drop: dog.fired ? { kind: "unreachable", detail: "timeout" } : res }
     dog.kick()
+    const openedAt = o.timers.now()
     handlers.onOpen()
-    return { drop: await pump(res.body as ReadableStream<Uint8Array>, handlers, dog, o.staleMs), opened: true }
+    return { drop: await pump(res.body as ReadableStream<Uint8Array>, handlers, dog, o.staleMs), openedAt }
   } finally {
     dog.cancel()
   }
@@ -157,16 +131,19 @@ async function attempt(target: ApiTarget, o: Required<StreamOptions>, handlers: 
 /** Keep one SSE connection alive until stop(). Every end of a connection is reported via onDrop. */
 export function runStream(target: ApiTarget, handlers: StreamHandlers, options: StreamOptions): StreamControl {
   // Field by field: an explicit `undefined` from the caller must not erase a default.
-  const o: Required<StreamOptions> = { timers: options.timers, fetch: options.fetch ?? fetch, backoffMs: options.backoffMs ?? BACKOFF_MS, staleMs: options.staleMs ?? STALE_MS }
+  const o: Required<StreamOptions> = { timers: options.timers, fetch: options.fetch ?? fetch, backoffMs: options.backoffMs ?? BACKOFF_MS, staleMs: options.staleMs ?? STALE_MS, healthyMs: options.healthyMs ?? HEALTHY_MS }
   const stopper = new AbortController()
   let current: AbortController | undefined
+  let healthy = false
   const loop = (async () => {
     let failures = 0
     while (!stopper.signal.aborted) {
       current = new AbortController()
+      healthy = false
       const result = await attempt(target, o, handlers, current)
       if (stopper.signal.aborted) return
-      if (result.opened) failures = 0
+      const lasted = result.openedAt !== undefined && o.timers.now() - result.openedAt >= o.healthyMs
+      if (healthy || lasted) failures = 0
       handlers.onDrop(result.drop)
       const delay = o.backoffMs[Math.min(failures, o.backoffMs.length - 1)] ?? 1000
       failures++
@@ -175,6 +152,7 @@ export function runStream(target: ApiTarget, handlers: StreamHandlers, options: 
   })()
   return {
     restart: () => current?.abort(),
+    healthy: () => void (healthy = true),
     async stop() {
       stopper.abort()
       current?.abort()

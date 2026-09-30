@@ -1,18 +1,19 @@
 // MOD-03: the event hub (contracts.ts EventHub). One SSE connection per bridge; events for
-// tracked sessions go through the state machine into the cursor buffer and to subscribers.
-// On every (re)connect the state is rebuilt from the server before queued stream events are
-// applied, so a gap can never be papered over by a stale snapshot or a lost `idle`.
-import type { Cursor, EventHub, HubEvent, SessionView } from "../shared/contracts.ts"
-import { isDelegateError } from "../shared/errors.ts"
+// tracked sessions (and their subagents) go through the state machine into the cursor buffer and
+// to subscribers. On every (re)connect, in-stream gap or instance dispose the affected state is
+// re-read from the server while stream events queue, and the queue is applied on top, so a gap can
+// never be papered over by a stale snapshot or a lost `idle`.
+import type { Cursor, EventHub, HubEvent, InboxMessage, SessionView } from "../shared/contracts.ts"
 import { safeLog, silentLogger, type Logger } from "../shared/log.ts"
 import { createApi, type ApiTarget, type OpencodeApi } from "../shared/opencode-api.ts"
-import { EventBuffer, type Filter, type HubEventInput, type Page, type WaitInput, type WaitResult } from "./buffer.ts"
-import { MessageMemory, mcpEvent, rawEvent, resyncEvent, statusEvent } from "./describe.ts"
+import { EventBuffer, viewMatches, type Filter, type HubEventInput, type Page, type WaitInput, type WaitResult } from "./buffer.ts"
+import { MessageMemory, errorLabel, inboxEvent, linkEvent, mcpEvent, rawEvent, resyncEvent, statusEvent } from "./describe.ts"
 import { normalise, sessionOf, unwrap, type Raw } from "./normalise.ts"
-import { readRemote, readSnapshot, type Remote } from "./server.ts"
+import { readRemote, readSnapshot } from "./server.ts"
 import { runStream, type Drop, type StreamControl } from "./sse.ts"
-import { NOT_STARTED_MS, SessionTable, type Change, type EntryView, type SnapshotEntry } from "./state.ts"
+import { AUTO_CAP, NOT_STARTED_MS, SessionTable, type Change, type Link } from "./state.ts"
 import { realTimers, type Timers } from "./timers.ts"
+import { TRUSTED, entryView, failedView, remoteView } from "./view.ts"
 
 export type HubOptions = {
   target: ApiTarget
@@ -22,40 +23,38 @@ export type HubOptions = {
   log?: Logger
   /** Track every session seen on the stream (watch CLI). The bridge tracks explicitly. */
   trackAll?: boolean
+  /** Most auto-tracked sessions (trackAll, subagents) kept at once. */
+  autoCap?: number
   capacity?: number
   backoffMs?: readonly number[]
   staleMs?: number
+  healthyMs?: number
   notStartedMs?: number
   epoch?: string
 }
 
 export type Listener = (event: HubEvent) => void
 
-/** EventHub plus two additive members: push subscribers (T3.5 channel, watch CLI) and publish (MOD-05 inbox). */
+/** EventHub plus two additive members: push subscribers (T3.5 channel, watch CLI) and inbox events (MOD-05). */
 export interface DelegateHub extends EventHub {
   subscribe(listener: Listener): () => void
-  publish(event: HubEventInput): HubEvent
+  /** An inbox message for this bridge becomes an `inbox` hub event (no session, no state). */
+  publishInbox(message: InboxMessage): HubEvent
 }
 
-/** Stream events queued while a rebuild is in flight; more than this and the rebuild restarts. */
+/** Stream events queued while a rebuild is in flight; more than this and the stream restarts. */
 const MAX_QUEUED = 10_000
-const TRUSTED = new Set(["starting", "busy", "retry", "needs_input", "idle", "error", "aborted", "not_started", "not_found"])
+const MAX_QUEUED_CHARS = 32 * 1024 * 1024
+/** Session ids the hub adopts on its own (trackAll, subagents). */
+const SESSION_ID_RE = /^ses_[A-Za-z0-9]{1,64}$/
 
-const iso = (ms: number) => new Date(ms).toISOString()
+type Scope = "all" | Set<string>
+type Queue = { items: string[]; chars: number }
 
-function entryView(e: EntryView): SessionView {
-  const view: SessionView = { sessionID: e.sessionID, directory: e.directory, state: e.state === "unresolved" ? "unknown" : e.state, since: iso(e.since) }
-  if (e.detail) view.detail = e.detail
-  if (e.pending.length) view.pending = e.pending
-  return view
-}
-
-function remoteView(sessionID: string, remote: Remote, now: number, detail: string): SessionView {
-  const { entry } = remote
-  const waiting = entry.pending.length > 0 && entry.base !== "not_found"
-  const view: SessionView = { sessionID, directory: remote.directory, state: waiting ? "needs_input" : entry.base, since: iso(now), detail: entry.detail ? `${entry.detail}; ${detail}` : detail }
-  if (waiting) view.pending = entry.pending.map((p) => p.requestID)
-  return view
+function merge(a: Scope | undefined, b: Scope): Scope {
+  if (a === undefined) return b
+  if (a === "all" || b === "all") return "all"
+  return new Set([...a, ...b])
 }
 
 class Hub implements DelegateHub {
@@ -64,20 +63,29 @@ class Hub implements DelegateHub {
   private readonly api: OpencodeApi
   private readonly table: SessionTable
   private readonly buffer: EventBuffer
+  private readonly notStartedMs: number
   private readonly memory = new MessageMemory()
   private readonly listeners = new Set<Listener>()
-  private readonly cancels = new Set<() => void>()
+  /** One not_started watchdog per session (W2A-01). */
+  private readonly startTimers = new Map<string, () => void>()
   private stream: StreamControl | undefined
   private generation = 0
   private opened = false
-  private queue: string[] | undefined
+  private closed = false
+  private resyncPending = false
+  private linkKind: Link["kind"] = "gap"
+  private warnedCap = false
+  private queue: Queue | undefined
+  private scope: Scope | undefined
+  private cause = "rebuild"
   private settle: (() => void) | undefined
 
   constructor(private readonly o: HubOptions) {
     this.timers = o.timers ?? realTimers
     this.log = o.log ?? silentLogger
     this.api = o.api ?? createApi(o.target, o.fetch)
-    this.table = new SessionTable(() => this.timers.now(), o.notStartedMs ?? NOT_STARTED_MS)
+    this.notStartedMs = o.notStartedMs ?? NOT_STARTED_MS
+    this.table = new SessionTable(() => this.timers.now(), this.notStartedMs, o.autoCap ?? AUTO_CAP)
     this.buffer = new EventBuffer(o.epoch ?? crypto.randomUUID(), this.timers, o.capacity)
   }
 
@@ -85,18 +93,20 @@ class Hub implements DelegateHub {
   start(): Promise<void> {
     if (this.stream) return Promise.resolve()
     const first = new Promise<void>((resolve) => (this.settle = resolve))
-    const handlers = { onOpen: () => this.onOpen(), onData: (d: string) => this.onData(d), onDrop: (d: Drop) => this.onDrop(d) }
-    this.stream = runStream(this.o.target, handlers, { timers: this.timers, fetch: this.o.fetch, backoffMs: this.o.backoffMs, staleMs: this.o.staleMs })
+    const handlers = { onOpen: () => this.onOpen(), onData: (d: string) => this.onData(d), onDrop: (d: Drop) => this.onDrop(d), onGap: (d: string) => this.onGap(d) }
+    const o = this.o
+    this.stream = runStream(o.target, handlers, { timers: this.timers, fetch: o.fetch, backoffMs: o.backoffMs, staleMs: o.staleMs, healthyMs: o.healthyMs })
     return first
   }
 
   async stop(): Promise<void> {
+    this.closed = true
     const stream = this.stream
     this.stream = undefined
     this.generation++
     await stream?.stop()
-    for (const cancel of this.cancels) cancel()
-    this.cancels.clear()
+    for (const cancel of this.startTimers.values()) cancel()
+    this.startTimers.clear()
     this.buffer.close()
     this.settled()
   }
@@ -106,13 +116,18 @@ class Hub implements DelegateHub {
   }
 
   markSent(sessionID: string): void {
+    this.cancelStart(sessionID)
     this.emitChanges(this.table.markSent(sessionID))
     if (!this.table.awaitingStart(sessionID)) return
     const cancel = this.timers.setTimeout(() => {
-      this.cancels.delete(cancel)
+      this.startTimers.delete(sessionID)
       this.emitChanges(this.table.startTimeout(sessionID))
-    }, this.o.notStartedMs ?? NOT_STARTED_MS)
-    this.cancels.add(cancel)
+    }, this.notStartedMs)
+    this.startTimers.set(sessionID, cancel)
+  }
+
+  cursor(): Cursor {
+    return this.buffer.head()
   }
 
   async view(sessionID: string): Promise<SessionView> {
@@ -120,11 +135,11 @@ class Hub implements DelegateHub {
     if (known && TRUSTED.has(known.state)) return entryView(known)
     const detail = known ? `read from the server (hub state ${known.state})` : "read from the server"
     try {
-      return remoteView(sessionID, await readRemote(this.api, sessionID, known?.directory), this.timers.now(), detail)
+      return remoteView(sessionID, await readRemote(this.api, sessionID, known?.directory), this.timers.now(), detail, known)
     } catch (error) {
-      const code = isDelegateError(error) ? error.code : "upstream_error"
-      safeLog(this.log, "warn", "events", "view could not read the server", { sessionID, code })
-      return { sessionID, directory: known?.directory ?? "", state: code === "server_down" ? "server_down" : "unknown", since: iso(this.timers.now()), detail: code }
+      const view = failedView(sessionID, known?.directory ?? "", error, this.timers.now())
+      safeLog(this.log, "warn", "events", "view could not read the server", { sessionID, state: view.state, detail: view.detail })
+      return view
     }
   }
 
@@ -132,8 +147,17 @@ class Hub implements DelegateHub {
     return this.buffer.page(cursor, filter, limit)
   }
 
-  wait(input: WaitInput): Promise<WaitResult> {
-    return this.buffer.wait(input)
+  /** Events first; without a cursor, and again before a timeout, the current state (W2A-05/06). */
+  async wait(input: WaitInput): Promise<WaitResult> {
+    const cursor = input.cursor ?? this.buffer.head()
+    if (!input.cursor) {
+      const views = await this.matchingViews(input)
+      if (views.length) return { events: [], next: cursor, timedOut: false, views }
+    }
+    const result = await this.buffer.wait({ ...input, cursor })
+    if (!result.timedOut || this.closed) return result
+    const views = await this.matchingViews(input)
+    return views.length ? { ...result, timedOut: false, views } : result
   }
 
   subscribe(listener: Listener): () => void {
@@ -141,7 +165,17 @@ class Hub implements DelegateHub {
     return () => this.listeners.delete(listener)
   }
 
-  publish(input: HubEventInput): HubEvent {
+  publishInbox(message: InboxMessage): HubEvent {
+    return this.publish(inboxEvent(message))
+  }
+
+  private async matchingViews(input: WaitInput): Promise<SessionView[]> {
+    if (input.sessionIDs.length === 0 || this.closed) return []
+    const views = await Promise.all(input.sessionIDs.map((id) => this.view(id)))
+    return views.filter((v) => input.until.some((u) => viewMatches(v, u)))
+  }
+
+  private publish(input: HubEventInput): HubEvent {
     const event = this.buffer.append(input)
     for (const listener of [...this.listeners]) {
       try {
@@ -163,46 +197,88 @@ class Hub implements DelegateHub {
     for (const change of changes) this.publish(statusEvent(change, cause))
   }
 
-  private onOpen(): void {
-    const gen = ++this.generation
-    this.queue = []
-    safeLog(this.log, "info", "events", "event stream connected; rebuilding state", { sessions: this.table.tracked().length })
-    void this.rebuild(gen)
+  /** A hub-level `link` event whenever the link kind changes (W2A-11). */
+  private linkChanged(): void {
+    const link = this.table.linkState()
+    if (link.kind === this.linkKind) return
+    this.linkKind = link.kind
+    this.publish(linkEvent(link))
   }
 
-  private async rebuild(gen: number): Promise<void> {
-    let snapshot: Map<string, SnapshotEntry>
-    try {
-      snapshot = await readSnapshot(this.api, this.table.tracked())
-    } catch (error) {
-      if (gen !== this.generation) return
-      const code = isDelegateError(error) ? error.code : "upstream_error"
-      safeLog(this.log, "warn", "events", "state rebuild failed; reconnecting", { code, detail: isDelegateError(error) ? error.detail : undefined })
+  private cancelStart(sessionID: string): void {
+    this.startTimers.get(sessionID)?.()
+    this.startTimers.delete(sessionID)
+  }
+
+  /** A busy (or anything that proves the prompt ran) ends that session's watchdog. */
+  private syncStartTimers(sessionID?: string): void {
+    const ids = sessionID === undefined ? [...this.startTimers.keys()] : [sessionID]
+    for (const id of ids) if (this.startTimers.has(id) && !this.table.awaitingStart(id)) this.cancelStart(id)
+  }
+
+  private onOpen(): void {
+    this.resyncPending = this.opened
+    safeLog(this.log, "info", "events", "event stream connected; rebuilding state", { sessions: this.table.size() })
+    this.beginRebuild("all", "rebuild")
+  }
+
+  /** Events were lost inside the live stream: everything is unknown until re-read. */
+  private onGap(detail: string): void {
+    safeLog(this.log, "warn", "events", "events lost inside the stream; rebuilding state", { detail })
+    this.emitChanges(this.table.markGap("all", detail), "a stream gap")
+    this.beginRebuild("all", "a stream gap")
+  }
+
+  /** Re-read `scope` while stream events queue. A second request merges into the one in flight. */
+  private beginRebuild(scope: Scope, cause: string): void {
+    const gen = ++this.generation
+    if (!this.queue) this.cause = cause
+    this.queue ??= { items: [], chars: 0 }
+    this.scope = merge(this.scope, scope)
+    void this.rebuild(gen, this.scope)
+  }
+
+  private async rebuild(gen: number, scope: Scope): Promise<void> {
+    const tracked = this.table.tracked().filter((t) => scope === "all" || scope.has(t.directory))
+    const snap = await readSnapshot(this.api, tracked, (id) => this.table.has(id)).catch(() => undefined)
+    if (gen !== this.generation) return
+    const everything = tracked.length + (snap?.children.length ?? 0)
+    if (!snap || (scope === "all" && everything > 0 && snap.failed.size >= everything)) {
+      safeLog(this.log, "warn", "events", "state rebuild failed; reconnecting", { sessions: tracked.length, reason: snap?.failed.values().next().value })
       this.queue = undefined
+      this.scope = undefined
       this.stream?.restart()
       return
     }
-    if (gen !== this.generation) return
-    const reconnect = this.opened
-    this.opened = true
-    const changes = this.table.rebuild(snapshot)
+    for (const child of snap.children) this.table.autoTrack(child.sessionID, child.directory, child.parentID)
+    this.finishRebuild(scope, this.table.rebuild(snap.entries, snap.failed))
+  }
+
+  private finishRebuild(scope: Scope, changes: Change[]): void {
     // The first connect only learns the starting state (view() shows it); it is not news.
-    if (reconnect) {
-      this.publish(resyncEvent(this.table.tracked().length))
-      this.emitChanges(changes, "rebuild")
-    }
-    const queued = this.queue ?? []
+    const news = this.opened || scope !== "all"
+    if (scope === "all") this.opened = true
+    this.linkChanged()
+    if (this.resyncPending && scope === "all") this.publish(resyncEvent(this.table.size()))
+    if (scope === "all") this.resyncPending = false
+    if (news) this.emitChanges(changes, this.cause)
+    const queued = this.queue?.items ?? []
     this.queue = undefined
+    this.scope = undefined
     for (const data of queued) this.ingest(data)
+    this.syncStartTimers()
+    this.stream?.healthy()
     this.settled()
   }
 
   private onData(data: string): void {
     if (!this.queue) return this.ingest(data)
-    this.queue.push(data)
-    if (this.queue.length > MAX_QUEUED) {
-      safeLog(this.log, "warn", "events", "too many events queued during rebuild; reconnecting")
+    this.queue.items.push(data)
+    this.queue.chars += data.length
+    if (this.queue.items.length > MAX_QUEUED || this.queue.chars > MAX_QUEUED_CHARS) {
+      safeLog(this.log, "warn", "events", "too many events queued during rebuild; reconnecting", { events: this.queue.items.length, chars: this.queue.chars })
       this.queue = undefined
+      this.scope = undefined
       this.stream?.restart()
     }
   }
@@ -210,9 +286,13 @@ class Hub implements DelegateHub {
   private onDrop(drop: Drop): void {
     this.generation++
     this.queue = undefined
+    this.scope = undefined
     const link = drop.kind === "unreachable" ? { kind: "down" as const, detail: `server unreachable (${drop.detail})` } : { kind: "gap" as const, detail: `${drop.kind}: ${drop.detail}` }
-    safeLog(this.log, drop.kind === "unreachable" ? "warn" : "info", "events", "event stream dropped", { kind: drop.kind, detail: drop.detail })
-    this.emitChanges(this.table.setLink(link), `stream ${drop.kind}`)
+    const loud = drop.kind === "unreachable" || drop.kind === "http"
+    safeLog(this.log, loud ? "warn" : "info", "events", "event stream dropped", { kind: drop.kind, detail: drop.detail })
+    const changes = this.table.setLink(link)
+    this.linkChanged()
+    this.emitChanges(changes, `stream ${drop.kind}`)
     this.settled()
   }
 
@@ -224,27 +304,52 @@ class Hub implements DelegateHub {
       if (wrapper.directory && this.table.directories().includes(wrapper.directory)) this.publish(mcpEvent(raw.server, wrapper.directory))
       return
     }
+    if (raw.kind === "disposed") return this.disposed(raw.directory)
+    if (raw.kind === "error" && !raw.sessionID) {
+      safeLog(this.log, "warn", "events", "the server reported an error without a session", { error: errorLabel(raw.name), directory: wrapper.directory })
+      return
+    }
     const sessionID = sessionOf(raw)
     if (!sessionID) return
-    if (!this.table.has(sessionID)) {
-      if (!this.o.trackAll || !wrapper.directory) return
-      this.table.track(sessionID, wrapper.directory)
-    }
+    if (!this.table.has(sessionID) && !this.adopt(raw, sessionID, wrapper.directory)) return
     this.apply(raw, sessionID)
+    this.syncStartTimers(sessionID)
+  }
+
+  /** Track a session the bridge did not: a subagent of a tracked session, or anything under trackAll. */
+  private adopt(raw: Raw, sessionID: string, wrapperDirectory: string | undefined): boolean {
+    const parentID = raw.kind === "info" && raw.parentID && this.table.has(raw.parentID) ? raw.parentID : undefined
+    const directory = (raw.kind === "info" ? raw.directory : undefined) ?? wrapperDirectory
+    if (!directory || !SESSION_ID_RE.test(sessionID) || (!parentID && !this.o.trackAll)) return false
+    if (this.table.autoTrack(sessionID, directory, parentID)) return true
+    if (!this.warnedCap) safeLog(this.log, "warn", "events", "too many sessions to track; new ones are ignored until older ones settle", { cap: this.o.autoCap ?? AUTO_CAP })
+    this.warnedCap = true
+    return false
+  }
+
+  /** The instance for a directory (or every instance) went away: runs there may have ended unseen (W2A-10). */
+  private disposed(directory: string): void {
+    const all = directory === "all"
+    if (!all && !this.table.directories().includes(directory)) return
+    const scope: Scope = all ? "all" : new Set([directory])
+    safeLog(this.log, "info", "events", "server instance disposed; re-reading state", { directory })
+    this.emitChanges(this.table.markGap(scope, all ? "the server disposed every instance" : "the directory's instance was disposed"), "a dispose")
+    this.beginRebuild(scope, "a re-read")
   }
 
   private apply(raw: Raw, id: string): void {
     switch (raw.kind) {
+      case "info":
+        if (raw.parentID) this.emitChanges(this.table.setParent(id, raw.parentID))
+        return
       case "status":
         return this.emitChanges(this.table.status(id, raw.status, raw.attempt))
       case "error":
-        this.table.error(id, raw.name, raw.aborted)
+        this.emitOthers(this.table.error(id, errorLabel(raw.name), raw.aborted), id)
         return this.news(raw, id)
       case "permission.asked":
-        this.table.ask(id, raw.requestID, "permission")
-        return this.news(raw, id)
       case "question.asked":
-        this.table.ask(id, raw.requestID, "question")
+        this.emitOthers(this.table.ask(id, raw.requestID, raw.kind === "permission.asked" ? "permission" : "question"), id)
         return this.news(raw, id)
       case "permission.replied":
       case "question.done":
@@ -261,9 +366,14 @@ class Hub implements DelegateHub {
     }
   }
 
+  /** The session's own change is carried by its specific event; its ancestors' (roll-up) are not. */
+  private emitOthers(changes: Change[], id: string): void {
+    this.emitChanges(changes.filter((c) => c.sessionID !== id))
+  }
+
   private news(raw: Parameters<typeof rawEvent>[0], id: string): void {
     const e = this.table.get(id)
-    if (e) this.publish(rawEvent(raw, { sessionID: id, directory: e.directory, state: e.state }))
+    if (e) this.publish(rawEvent(raw, { sessionID: id, directory: e.directory, state: e.state, parentID: e.parentID }))
   }
 }
 

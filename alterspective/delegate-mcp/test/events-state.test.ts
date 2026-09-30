@@ -10,7 +10,7 @@
 import { describe, expect, test } from "bun:test"
 import { safe, statusEvent } from "../src/events/describe.ts"
 import { createHub } from "../src/events/hub.ts"
-import { SENT_SLACK_MS, SessionTable, type SnapshotEntry } from "../src/events/state.ts"
+import { PRUNE_MS, SENT_SLACK_MS, SessionTable, type SnapshotEntry } from "../src/events/state.ts"
 import { DelegateError } from "../src/shared/errors.ts"
 import { fakeApi, manualTimers } from "./events-fake.ts"
 
@@ -205,3 +205,141 @@ describe("transitions", () => {
     expect(table.has("ses_other")).toBe(false)
   })
 })
+
+describe("wave 2 review fixes (state)", () => {
+  test("W2A-01: the watchdog claims nothing before the window has passed since the latest send", () => {
+    const { table, tick } = upTable()
+    tick(60_000)
+    table.markSent("ses_1")
+    tick(9_999)
+    expect(table.startTimeout("ses_1")).toEqual([])
+    expect(table.get("ses_1")?.state).toBe("starting")
+    tick(1)
+    expect(table.startTimeout("ses_1")[0]?.state).toBe("not_started")
+  })
+
+  test("W2A-02: permission pending → abort → idle is aborted, not stuck in needs_input", () => {
+    const { table } = upTable()
+    table.status("ses_1", "busy")
+    table.ask("ses_1", "per_1", "permission")
+    expect(table.get("ses_1")?.state).toBe("needs_input")
+    table.error("ses_1", "MessageAbortedError", true)
+    expect(table.get("ses_1")?.pending).toEqual([])
+    table.status("ses_1", "idle")
+    expect(table.get("ses_1")?.state).toBe("aborted")
+  })
+
+  test("W2A-02: idle clears requests OpenCode dropped without telling (dispose, abort)", () => {
+    const { table } = upTable()
+    table.status("ses_1", "busy")
+    table.ask("ses_1", "que_1", "question")
+    table.status("ses_1", "idle")
+    expect(table.get("ses_1")).toMatchObject({ state: "idle", pending: [] })
+  })
+
+  test("W2A-04: a non-fatal error changes nothing while the run carries on; it is the state only if idle follows with no busy", () => {
+    const { table } = upTable()
+    table.status("ses_1", "busy")
+    expect(table.error("ses_1", "ContextOverflowError", false)).toEqual([])
+    expect(table.get("ses_1")).toMatchObject({ state: "busy", lastError: "ContextOverflowError" })
+    table.status("ses_1", "busy") // compaction: the loop sets busy again
+    table.status("ses_1", "idle")
+    expect(table.get("ses_1")?.state).toBe("idle")
+    table.status("ses_1", "busy")
+    table.error("ses_1", "APIError", false)
+    table.status("ses_1", "idle")
+    expect(table.get("ses_1")).toMatchObject({ state: "error", detail: "APIError" })
+    table.status("ses_1", "idle") // a second idle (processor + run-state) keeps the error
+    expect(table.get("ses_1")?.state).toBe("error")
+  })
+
+  test("W2A-07: error or aborted is not turned into bare idle by a reconnect", () => {
+    const { table } = upTable()
+    table.status("ses_1", "busy")
+    table.error("ses_1", "MessageAbortedError", true)
+    table.status("ses_1", "idle")
+    table.setLink({ kind: "gap", detail: "closed" })
+    table.rebuild(snap({ ses_1: { base: "idle", pending: [] } }))
+    expect(table.get("ses_1")?.state).toBe("aborted")
+    expect(table.get("ses_1")?.detail).toContain("idle after a stream gap; a later run cannot be ruled out")
+    // An error whose idle was lost in the gap is kept the same way.
+    table.status("ses_1", "busy")
+    table.error("ses_1", "APIError", false)
+    table.setLink({ kind: "gap", detail: "closed" })
+    table.rebuild(snap({ ses_1: { base: "idle", pending: [] } }))
+    expect(table.get("ses_1")?.state).toBe("error")
+  })
+
+  test("W2A-25: only busy/retry count as activity (an error does not swallow the next send)", () => {
+    const { table } = upTable()
+    table.error("ses_1", "APIError", false)
+    table.status("ses_1", "idle")
+    table.markSent("ses_1")
+    expect(table.get("ses_1")?.state).toBe("starting")
+  })
+
+  test("W2A-03: a subagent's pending request rolls up to its parent as needs_input", () => {
+    const { table } = upTable()
+    table.status("ses_1", "busy")
+    table.autoTrack("ses_child", DIR, "ses_1")
+    table.status("ses_child", "busy")
+    const changes = table.ask("ses_child", "per_7", "permission")
+    expect(changes.map((c) => [c.sessionID, c.state, c.parentID])).toEqual([["ses_child", "needs_input", "ses_1"], ["ses_1", "needs_input", undefined]])
+    expect(table.get("ses_1")).toMatchObject({ state: "needs_input", detail: "subagent ses_child asks", pending: ["per_7"] })
+    expect(table.get("ses_child")?.parentID).toBe("ses_1")
+    table.answered("ses_child", "per_7")
+    expect(table.get("ses_1")?.state).toBe("busy")
+  })
+
+  test("W2A-09: sessions whose rebuild read failed stay unknown with the reason until an idle", () => {
+    const { table } = upTable()
+    table.track("ses_2", "/sessions/b")
+    table.setLink({ kind: "gap", detail: "closed" })
+    table.rebuild(snap({ ses_1: { base: "busy", pending: [] } }), new Map([["ses_2", "could not read directory state (upstream_error HTTP 500)"]]))
+    expect(table.get("ses_1")?.state).toBe("busy")
+    expect(table.get("ses_2")).toMatchObject({ state: "unknown", detail: "stream_gap: could not read directory state (upstream_error HTTP 500)" })
+    table.status("ses_2", "busy")
+    expect(table.get("ses_2")?.state).toBe("unknown")
+    table.status("ses_2", "idle")
+    expect(table.get("ses_2")?.state).toBe("idle")
+  })
+
+  test("W2A-10: markGap makes one directory unknown; a snapshot for it clears the gap", () => {
+    const { table } = upTable()
+    table.track("ses_2", "/sessions/b")
+    table.status("ses_1", "busy")
+    table.status("ses_2", "busy")
+    table.markGap(new Set([DIR]), "the directory's instance was disposed")
+    expect(table.get("ses_1")?.state).toBe("unknown")
+    expect(table.get("ses_2")?.state).toBe("busy")
+    table.rebuild(snap({ ses_1: { base: "idle", pending: [] } }))
+    expect(table.get("ses_1")?.state).toBe("idle")
+  })
+
+  test("W2A-08: a snapshot entry from another directory moves the session there", () => {
+    const { table } = upTable()
+    table.rebuild(snap({ ses_1: { base: "busy", pending: [], directory: "/sessions/real" } }))
+    expect(table.get("ses_1")).toMatchObject({ state: "busy", directory: "/sessions/real" })
+  })
+
+  test("W2A-22: not_found entries are pruned after 10 min; auto-tracking is capped and evicts the oldest settled", () => {
+    let now = 1_000_000
+    const table = new SessionTable(() => now, 10_000, 2)
+    table.rebuild(new Map())
+    table.track("ses_gone", DIR)
+    table.deleted("ses_gone")
+    now += PRUNE_MS
+    table.track("ses_new", DIR)
+    expect(table.has("ses_gone")).toBe(false)
+    expect(table.autoTrack("ses_a", DIR)).toBe(true)
+    now += 1
+    expect(table.autoTrack("ses_b", DIR)).toBe(true)
+    table.status("ses_b", "busy")
+    expect(table.autoTrack("ses_c", DIR)).toBe(true) // ses_a (unresolved, oldest) was evicted
+    expect(table.has("ses_a")).toBe(false)
+    table.status("ses_c", "busy")
+    expect(table.autoTrack("ses_d", DIR)).toBe(false) // nothing settled to evict
+    expect(table.has("ses_new")).toBe(true) // explicit tracking is never evicted
+  })
+})
+

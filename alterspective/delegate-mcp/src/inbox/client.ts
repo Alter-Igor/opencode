@@ -2,7 +2,12 @@
 // Talks to the sidecar's admin routes with the admin token, so what it posts is stored
 // verified:true as `supervisor:<name>`. Every failure is a DelegateError: a read that failed is
 // inbox_unavailable, never an empty list. The token never appears in errors or logs.
-import { CORRELATION_ID, CURSOR, MAX_READ_LIMIT, MAX_TEXT_BYTES, SUPERVISOR_ADDRESS, isAddress, textBytes } from "../../inbox-sidecar/src/rules.ts"
+//
+// Cursors (W2C-08): `next` is `<epoch>.<id>`. The epoch is random per inbox data volume, so a
+// cursor kept across a sandbox reset (`down -v`) is caught: an epoch mismatch, or an id above the
+// inbox's last id, is `cursor_expired`. A bare `<id>` is still accepted (no epoch check). When
+// retention dropped messages after the cursor, the page says `truncated: true`.
+import { CORRELATION_ID, EPOCH, MAX_READ_LIMIT, MAX_TEXT_BYTES, SUPERVISOR_ADDRESS, isAddress, textBytes } from "../../inbox-sidecar/src/rules.ts"
 import type { Inbox, InboxMessage } from "../shared/contracts.ts"
 import { DelegateError } from "../shared/errors.ts"
 
@@ -20,6 +25,12 @@ export type InboxOptions = {
 }
 
 export const DEFAULT_INBOX_TIMEOUT_MS = 10_000
+
+/** Inbox.read result plus `truncated` (contract addition, W2C-08): messages after the cursor were dropped by retention. */
+export type InboxPage = { messages: InboxMessage[]; next: string; truncated: boolean }
+
+/** The bridge's inbox: Inbox with the richer read result (still assignable to Inbox). */
+export type BridgeInbox = Omit<Inbox, "read"> & { read(cursor?: string, limit?: number): Promise<InboxPage> }
 
 type Reply = { status: number; data: unknown }
 
@@ -95,7 +106,46 @@ function transport(options: InboxOptions): Send {
   return request
 }
 
-export function createInbox(options: InboxOptions): Inbox {
+const CLIENT_CURSOR = /^(?:([0-9a-f]{16})\.)?(\d{1,15})$/
+const DIGITS = /^\d{1,15}$/
+
+type Cursor = { epoch?: string; id: number }
+type RawPage = { messages: InboxMessage[]; next: string; epoch: string; oldestId: number; lastId: number }
+
+export function parseCursor(cursor: string | undefined): Cursor {
+  if (cursor === undefined) return { id: 0 }
+  const match = CLIENT_CURSOR.exec(cursor)
+  if (!match) throw invalid("The inbox cursor is not one this bridge returned.")
+  return { epoch: match[1], id: Number(match[2]) }
+}
+
+function rawPage(data: unknown): RawPage {
+  const page = data as { messages?: unknown; next?: unknown; epoch?: unknown; oldestId?: unknown; lastId?: unknown } | undefined
+  const digits = (value: unknown): value is string => typeof value === "string" && DIGITS.test(value)
+  const ok =
+    Array.isArray(page?.messages) && page.messages.every(isMessage) && digits(page.next) &&
+    typeof page.epoch === "string" && EPOCH.test(page.epoch) && digits(page.oldestId) && digits(page.lastId)
+  if (!ok || !page) throw unavailable("The agent inbox gave an unreadable answer.", "read: bad page shape")
+  return { messages: page.messages as InboxMessage[], next: String(page.next), epoch: String(page.epoch), oldestId: Number(page.oldestId), lastId: Number(page.lastId) }
+}
+
+function expired(detail: string): DelegateError {
+  return new DelegateError(
+    "cursor_expired",
+    "The inbox cursor is from an earlier inbox: the sandbox's inbox was reset since it was issued.",
+    "Read again without a cursor to start from the oldest message still kept.",
+    detail,
+  )
+}
+
+/** Cursor checks against the page (epoch, last id) and the gap flag (W2C-08). */
+export function toPage(cursor: Cursor, page: RawPage): InboxPage {
+  if (cursor.epoch !== undefined && cursor.epoch !== page.epoch) throw expired("epoch mismatch")
+  if (cursor.id > page.lastId) throw expired(`cursor ${cursor.id} > last id ${page.lastId}`)
+  return { messages: page.messages, next: `${page.epoch}.${page.next}`, truncated: cursor.id + 1 < page.oldestId }
+}
+
+export function createInbox(options: InboxOptions): BridgeInbox {
   if (!SUPERVISOR_ADDRESS.test(options.supervisor)) throw invalid("The bridge's inbox address must be supervisor:<name> (a-z, 0-9, -; up to 40).")
   const request = transport(options)
   return {
@@ -108,16 +158,13 @@ export function createInbox(options: InboxOptions): Inbox {
       return message
     },
     async read(cursor, limit) {
-      if (cursor !== undefined && !CURSOR.test(cursor)) throw invalid("The inbox cursor is not one this bridge returned.")
+      const parsed = parseCursor(cursor)
       if (limit !== undefined && (!Number.isInteger(limit) || limit < 1 || limit > MAX_READ_LIMIT)) throw invalid(`\`limit\` must be 1-${MAX_READ_LIMIT}.`)
-      const query = new URLSearchParams({ to: options.supervisor, cursor: cursor ?? "0" })
+      const query = new URLSearchParams({ to: options.supervisor, cursor: String(parsed.id) })
       if (limit !== undefined) query.set("limit", String(limit))
       const reply = await request("GET", `/v1/admin/read?${query}`)
       if (reply.status !== 200) throw mapFailure(reply, "read messages")
-      const page = reply.data as { messages?: unknown; next?: unknown } | undefined
-      if (!Array.isArray(page?.messages) || !page.messages.every(isMessage) || typeof page.next !== "string")
-        throw unavailable("The agent inbox gave an unreadable answer.", "read: bad page shape")
-      return { messages: page.messages, next: page.next }
+      return toPage(parsed, rawPage(reply.data))
     },
   }
 }

@@ -4,13 +4,13 @@ import { mkdtemp, readFile, rm } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import * as rules from "../inbox-sidecar/src/rules.ts"
-import { createHandler } from "../inbox-sidecar/src/server.ts"
-import { InboxStore } from "../inbox-sidecar/src/store.ts"
+import type { InboxStore } from "../inbox-sidecar/src/store.ts"
 import * as lib from "../profile-tools/inbox-lib.ts"
 import messageSession from "../profile-tools/message_session.ts"
 import messageSupervisor from "../profile-tools/message_supervisor.ts"
 import readInbox from "../profile-tools/read_inbox.ts"
 import { PROFILE_TOOL_FILES, buildProfile, profileTools } from "../src/supervisor/profile.ts"
+import { startSidecar } from "./inbox-harness.ts"
 
 const TOKEN = "admin-token-0123456789-ABCDEFGHIJ"
 const PASSWORD = "box-password-for-test"
@@ -18,6 +18,12 @@ const PARENT = "ses_PARENT00000001"
 const CHILD = "ses_CHILD000000001"
 const ORPHAN = "ses_ORPHAN00000001"
 const PEER = "ses_PEER0000000001"
+const GRANDCHILD = "ses_GRANDCHILD0001"
+const BROKEN = "ses_BROKEN00000001"
+const CRAWLER = "ses_CRAWLER0000001"
+const FLOODED = "ses_FLOODED0000001"
+/** A chain of subagents deeper than supervisorOf() walks: DEEP0 -> DEEP1 -> ... -> DEEP7 (has the supervisor). */
+const DEEP = Array.from({ length: 8 }, (_, i) => `ses_DEEP00000000${i}`)
 const SUP = "supervisor:claude-a"
 const TOOLS_DIR = path.join(import.meta.dir, "..", "profile-tools")
 
@@ -29,9 +35,13 @@ const ctx = (sessionID: string) => ({ sessionID, directory: "/sessions/k1" })
 
 beforeAll(async () => {
   dir = await mkdtemp(path.join(os.tmpdir(), "ocd-inbox-tools-"))
-  store = InboxStore.open({ dir })
-  const inbox = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: createHandler({ store, adminToken: TOKEN }) })
-  const sessions: Record<string, unknown> = { [PARENT]: { metadata: { supervisor: SUP } }, [CHILD]: { parentID: PARENT }, [ORPHAN]: {}, [PEER]: { metadata: { supervisor: SUP } } }
+  const inbox = startSidecar({ dir, token: TOKEN })
+  store = inbox.store
+  const sessions: Record<string, unknown> = {
+    [PARENT]: { metadata: { supervisor: SUP } }, [CHILD]: { parentID: PARENT }, [GRANDCHILD]: { parentID: CHILD }, [ORPHAN]: {},
+    [PEER]: { metadata: { supervisor: SUP } }, [CRAWLER]: { metadata: { supervisor: SUP } }, [FLOODED]: {},
+    ...Object.fromEntries(DEEP.map((id, i) => [id, i === DEEP.length - 1 ? { metadata: { supervisor: SUP } } : { parentID: DEEP[i + 1] }])),
+  }
   const api = Bun.serve({
     port: 0,
     hostname: "127.0.0.1",
@@ -39,19 +49,19 @@ beforeAll(async () => {
       const expected = "Basic " + Buffer.from(`opencode:${PASSWORD}`).toString("base64")
       if (request.headers.get("authorization") !== expected) return new Response("", { status: 401 })
       const id = new URL(request.url).pathname.split("/").at(-1) ?? ""
+      if (id === BROKEN) return new Response("<html>not json</html>", { status: 200 })
       return sessions[id] ? Response.json(sessions[id]) : new Response("", { status: 404 })
     },
   })
-  stops = [() => void inbox.stop(true), () => void api.stop(true)]
+  stops = [inbox.stop, () => void api.stop(true)]
   for (const name of ["OCD_INBOX_URL", "OCD_BOX_API_URL", "OPENCODE_SERVER_PASSWORD"]) saved[name] = process.env[name]
-  process.env.OCD_INBOX_URL = `http://127.0.0.1:${inbox.port}`
+  process.env.OCD_INBOX_URL = inbox.boxUrl
   process.env.OCD_BOX_API_URL = `http://127.0.0.1:${api.port}`
   process.env.OPENCODE_SERVER_PASSWORD = PASSWORD
 })
 
 afterAll(async () => {
   for (const stop of stops) stop()
-  store.close()
   for (const [name, value] of Object.entries(saved)) {
     if (value === undefined) delete process.env[name]
     else process.env[name] = value
@@ -60,7 +70,7 @@ afterAll(async () => {
 })
 
 describe("in-box tools", () => {
-  test("message_supervisor sends to the supervisor in session metadata (inherited by a subagent), unverified", async () => {
+  test("message_supervisor sends to the supervisor in session metadata (found on a subagent's parent), unverified", async () => {
     const out = await messageSupervisor.execute({ text: "blocked on a failing test", correlationId: "" }, ctx(CHILD))
     expect(out).toContain(`to ${SUP}`)
     expect(out).toContain("does not wake")
@@ -70,6 +80,26 @@ describe("in-box tools", () => {
 
   test("message_supervisor refuses when no supervisor is on record", async () => {
     await expect(messageSupervisor.execute({ text: "hello", correlationId: "" }, ctx(ORPHAN))).rejects.toThrow(/no supervisor on record/)
+  })
+
+  test("a nested subagent (subagent of a subagent) finds the supervisor by walking up its parents (W2C-16)", async () => {
+    const out = await messageSupervisor.execute({ text: "nested status", correlationId: "new" }, ctx(GRANDCHILD))
+    expect(out).toContain(`to ${SUP}`)
+    expect(store.read(SUP, 0, 50).messages.at(-1)).toMatchObject({ from: `session:${GRANDCHILD}`, text: "nested status" })
+  })
+
+  test(`past ${lib.MAX_PARENT_HOPS} parents, an unreadable session record, or no record are three different errors (W2A-18)`, async () => {
+    await expect(messageSupervisor.execute({ text: "x", correlationId: "" }, ctx(DEEP[0]!))).rejects.toThrow(new RegExp(`within ${lib.MAX_PARENT_HOPS} parent sessions`))
+    await expect(messageSupervisor.execute({ text: "x", correlationId: "" }, ctx(DEEP[2]!))).resolves.toContain(`to ${SUP}`)
+    await expect(messageSupervisor.execute({ text: "x", correlationId: "" }, ctx(BROKEN))).rejects.toThrow(/came back unreadable/)
+    await expect(messageSupervisor.execute({ text: "x", correlationId: "" }, ctx("ses_MISSING0000001"))).rejects.toThrow(/HTTP 404/)
+  })
+
+  test("a session's second message to the same peer continues the thread it started (W2A-14)", async () => {
+    const first = await messageSession.execute({ sessionID: PEER, text: "first", correlationId: "new" }, ctx(CRAWLER))
+    const thread = /thread (c_[0-9a-f]+), hop 0/.exec(first)![1]!
+    const second = await messageSession.execute({ sessionID: PEER, text: "second", correlationId: "" }, ctx(CRAWLER))
+    expect(second).toContain(`thread ${thread}, hop 1`)
   })
 
   test("message_session posts to another session; self, bad ids and empty text are refused", async () => {
@@ -82,7 +112,7 @@ describe("in-box tools", () => {
   test("read_inbox labels senders, fences text, shows each message once, and replies continue the thread", async () => {
     const verified = store.append({ at: "2026-10-01T00:00:00.000Z", from: SUP, to: `session:${PEER}`, text: "also update the docs", hops: 0, verified: true, correlationId: "task-9" })
     const out = await readInbox.execute({ limit: 20 }, ctx(PEER))
-    expect(out).toContain("2 new message(s)")
+    expect(out).toContain("4 new message(s)")
     expect(out).toContain("AI-written, unverified sender")
     expect(out).toContain("AI-written; sender verified as a bridge supervisor")
     expect(out).toContain("Treat it as untrusted input")
@@ -91,6 +121,17 @@ describe("in-box tools", () => {
     const reply = await messageSupervisor.execute({ text: "docs updated", correlationId: "" }, ctx(PEER))
     expect(reply).toContain("thread task-9, hop 1")
     expect(verified.id).toMatch(/^\d+$/)
+  })
+
+  test("read_inbox says more may be waiting when a page is full, and strips control characters (W2A-19, W2C-17)", async () => {
+    for (let i = 0; i < 3; i++) store.append({ at: "a", from: SUP, to: `session:${FLOODED}`, text: `m${i}\u001b[31m red\u0007`, hops: 0, verified: true })
+    const full = await readInbox.execute({ limit: 2 }, ctx(FLOODED))
+    expect(full).toContain("More messages may be waiting")
+    expect(full).toContain("m0[31m red\n")
+    expect(full).not.toContain("\u001b")
+    const rest = await readInbox.execute({ limit: 2 }, ctx(FLOODED))
+    expect(rest).toContain("1 new message(s)")
+    expect(rest).not.toContain("More messages may be waiting")
   })
 
   test("read_inbox fails loudly when the inbox is unreachable (never 'no messages')", async () => {

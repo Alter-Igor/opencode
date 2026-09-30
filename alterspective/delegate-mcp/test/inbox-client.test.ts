@@ -3,15 +3,14 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test"
 import { mkdtemp, readFile, rm } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
-import { createHandler } from "../inbox-sidecar/src/server.ts"
-import { InboxStore } from "../inbox-sidecar/src/store.ts"
-import { cachedTarget, createInbox, inboxTargetFromDocker, wakeText, type InboxTarget } from "../src/inbox/index.ts"
+import { cachedTarget, createInbox, displayText, inboxTargetFromDocker, wakeText, type InboxTarget } from "../src/inbox/index.ts"
 import { defaultConfig } from "../src/shared/config.ts"
 import type { InboxMessage } from "../src/shared/contracts.ts"
 import { DelegateError } from "../src/shared/errors.ts"
 import { INBOX_ADMIN_TOKEN_ENV, INBOX_PORT_LABEL, SIBLING_SERVICES, composeDownEnv, composeEnv } from "../src/supervisor/compose-env.ts"
 import type { Exec } from "../src/supervisor/docker.ts"
 import { buildProfile } from "../src/supervisor/profile.ts"
+import { startSidecar, type Sidecar } from "./inbox-harness.ts"
 
 const TOKEN = "admin-token-0123456789-ABCDEFGHIJ"
 const SUP = "supervisor:claude-a"
@@ -28,13 +27,21 @@ afterEach(async () => {
   await rm(dir, { recursive: true, force: true })
 })
 
-function sidecar(handler?: (request: Request) => Promise<Response>): { baseUrl: string; store: InboxStore; stop: () => void } {
-  const store = InboxStore.open({ dir })
-  const http = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: handler ?? createHandler({ store, adminToken: TOKEN }) })
-  const stop = () => (void http.stop(true), store.close())
-  stops.push(stop)
-  return { baseUrl: `http://127.0.0.1:${http.port}`, store, stop }
+/** A real sidecar; `baseUrl` is its admin listener (what bridges call). */
+function sidecar(options: { segmentBytes?: number; maxSegments?: number } = {}): Sidecar & { baseUrl: string } {
+  const server = startSidecar({ dir, token: TOKEN, store: { ...options, supervisor: options } })
+  stops.push(server.stop)
+  return { ...server, baseUrl: server.adminUrl }
 }
+
+/** A stand-in admin API that answers with `handler`. */
+function fakeAdmin(handler: (request: Request) => Promise<Response>): { baseUrl: string } {
+  const http = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: handler })
+  stops.push(() => void http.stop(true))
+  return { baseUrl: `http://127.0.0.1:${http.port}` }
+}
+
+const boxPost = (s: Sidecar, body: unknown) => fetch(`${s.boxUrl}/v1/post`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) })
 
 async function failure(promise: Promise<unknown>): Promise<DelegateError> {
   try {
@@ -52,10 +59,36 @@ describe("inbox client: admin API", () => {
     const inbox = createInbox({ supervisor: SUP, target: async () => ({ baseUrl: s.baseUrl, token: TOKEN }) })
     const sent = await inbox.post(SES, "run the tests", { correlationId: "task-1" })
     expect(sent).toMatchObject({ from: SUP, to: SES, verified: true, hops: 0, correlationId: "task-1" })
-    await fetch(`${s.baseUrl}/v1/post`, { method: "POST", body: JSON.stringify({ from: SES, to: SUP, text: "tests pass", correlationId: "task-1" }) })
+    await boxPost(s, { from: SES, to: SUP, text: "tests pass", correlationId: "task-1" })
     const page = await inbox.read()
     expect(page.messages.map((m) => [m.from, m.verified, m.hops])).toEqual([[SES, false, 1]])
-    expect(await inbox.read(page.next)).toEqual({ messages: [], next: page.next })
+    expect(page.next).toBe(`${s.store.epoch}.2`)
+    expect(page.truncated).toBe(false)
+    expect(await inbox.read(page.next)).toEqual({ messages: [], next: page.next, truncated: false })
+    expect((await inbox.read("0")).messages).toHaveLength(1)
+  })
+
+  test("a cursor from another inbox epoch, or past the last id, is cursor_expired (W2C-08)", async () => {
+    const s = sidecar()
+    const inbox = createInbox({ supervisor: SUP, target: async () => ({ baseUrl: s.baseUrl, token: TOKEN }) })
+    await boxPost(s, { from: SES, to: SUP, text: "one" })
+    const other = s.store.epoch === "0123456789abcdef" ? "fedcba9876543210" : "0123456789abcdef"
+    expect((await failure(inbox.read(`${other}.1`))).code).toBe("cursor_expired")
+    const ahead = await failure(inbox.read(`${s.store.epoch}.5`))
+    expect(ahead.code).toBe("cursor_expired")
+    expect(ahead.detail).toBe("cursor 5 > last id 1")
+    expect((await failure(inbox.read("9"))).code).toBe("cursor_expired")
+    expect((await failure(inbox.read("abc.1"))).code).toBe("invalid_input")
+  })
+
+  test("a cursor older than what retention kept is flagged truncated (W2C-08)", async () => {
+    const s = sidecar({ segmentBytes: 400, maxSegments: 2 })
+    const inbox = createInbox({ supervisor: SUP, target: async () => ({ baseUrl: s.baseUrl, token: TOKEN }) })
+    for (let i = 0; i < 8; i++) s.store.append({ at: "a", from: SES, to: SUP, text: `m ${i} `.padEnd(150, "."), hops: 0, verified: false })
+    const page = await inbox.read()
+    expect(page.truncated).toBe(true)
+    expect(page.messages.length).toBeLessThan(8)
+    expect((await inbox.read(page.next)).truncated).toBe(false)
   })
 
   test("a wrong token re-resolves the target once; still wrong → inbox_unavailable", async () => {
@@ -81,7 +114,7 @@ describe("inbox client: admin API", () => {
   })
 
   test("a slow inbox times out as inbox_unavailable", async () => {
-    const s = sidecar(async () => {
+    const s = fakeAdmin(async () => {
       await Bun.sleep(500)
       return new Response("{}")
     })
@@ -92,7 +125,8 @@ describe("inbox client: admin API", () => {
   })
 
   test("an unreadable page or a 5xx is inbox_unavailable, not an empty list", async () => {
-    for (const body of [JSON.stringify({ messages: "nope", next: "0" }), JSON.stringify({ messages: [{ id: 1 }], next: "0" }), "not json"]) {
+    const noEpoch = JSON.stringify({ messages: [], next: "0", oldestId: "1", lastId: "0" })
+    for (const body of [JSON.stringify({ messages: "nope", next: "0" }), JSON.stringify({ messages: [{ id: 1 }], next: "0" }), "not json", noEpoch]) {
       const inbox = createInbox({ supervisor: SUP, target: async () => ({ baseUrl: "http://127.0.0.1:1", token: TOKEN }), fetch: (async () => new Response(body, { status: 200 })) as unknown as typeof fetch })
       expect((await failure(inbox.read())).code).toBe("inbox_unavailable")
     }
@@ -179,6 +213,12 @@ describe("wakeText", () => {
   test("the fence differs per call, so message text cannot close it", () => {
     expect(wakeText(base)).not.toBe(wakeText(base))
   })
+
+  test("control characters are stripped for display; tabs and newlines stay (W2C-17)", () => {
+    const text = "ok\u001b[2J\rline\u0007\u009b31m\tnext\nend\u007f"
+    expect(displayText(text)).toBe("ok[2Jline31m\tnext\nend")
+    expect(wakeText({ ...base, text }, "n")).toContain("<<<inbox-n\nok[2Jline31m\tnext\nend\ninbox-n>>>")
+  })
 })
 
 describe("compose wiring for the inbox", () => {
@@ -197,15 +237,40 @@ describe("compose wiring for the inbox", () => {
   })
 
   test("compose.yaml gives the admin token to the inbox service only, by name, and the box only the URL", async () => {
-    const yaml = await readFile(path.join(import.meta.dir, "..", "docker", "compose.yaml"), "utf8")
+    const yaml = (await readFile(path.join(import.meta.dir, "..", "docker", "compose.yaml"), "utf8")).replace(/\r\n/g, "\n")
     const box = yaml.slice(yaml.indexOf("\n  box:"), yaml.indexOf("\n  gate:"))
+    const gate = yaml.slice(yaml.indexOf("\n  gate:"), yaml.indexOf("\n  egress:"))
     const inbox = yaml.slice(yaml.indexOf("\n  inbox:"))
     expect(box).not.toContain("INBOX_ADMIN_TOKEN")
     expect(box).toContain("OCD_INBOX_URL: http://inbox:8080")
     expect(box).toMatch(/NO_PROXY: [^\n]*\binbox\b/)
+    expect(box).toContain("networks: [sealed]")
     expect(inbox).toMatch(/\n {6}INBOX_ADMIN_TOKEN:\n/)
-    expect(inbox).toContain('ports: ["127.0.0.1:${OCD_INBOX_PORT}:8080"]')
     expect(inbox).toContain("image: ${OCD_IMAGE}-inbox")
     expect(inbox).toContain("<<: *hardened")
+    expect(inbox).toContain("restart: unless-stopped")
+    expect(inbox).toContain("INBOX_ADMIN_HOST: inbox-admin")
+    expect(inbox).not.toContain("ports:")
+    expect(inbox).not.toContain("outside")
+    expect(gate).toContain('"127.0.0.1:${OCD_INBOX_PORT}:8081"')
+    expect(gate).toContain("TCP:inbox-admin:8081")
+    expect(gate).toContain("networks: [sealed, outside, admin]")
+  })
+
+  test("the box never loads a delegated repo's own OpenCode config, plugins or skills", async () => {
+    const yaml = (await readFile(path.join(import.meta.dir, "..", "docker", "compose.yaml"), "utf8")).replace(/\r\n/g, "\n")
+    const box = yaml.slice(yaml.indexOf("\n  box:"), yaml.indexOf("\n  gate:"))
+    for (const flag of ["OPENCODE_DISABLE_PROJECT_CONFIG", "OPENCODE_DISABLE_EXTERNAL_SKILLS", "OPENCODE_DISABLE_CLAUDE_CODE"]) expect(box).toContain(`${flag}: "1"`)
+    // ~/.opencode is loaded regardless of the flag, so it is a read-only, root-owned empty mount.
+    expect(box).toContain("- /home/agent/.opencode:uid=0,gid=0,mode=0555,")
+  })
+
+  test("every service logs through the capped local driver (W2C-06)", async () => {
+    const yaml = (await readFile(path.join(import.meta.dir, "..", "docker", "compose.yaml"), "utf8")).replace(/\r\n/g, "\n")
+    const anchor = yaml.slice(yaml.indexOf("x-hardened:"), yaml.indexOf("\nservices:"))
+    expect(anchor).toMatch(/logging:\n {4}driver: local\n {4}options:\n {6}max-size: "10m"\n {6}max-file: "3"/)
+    const services = yaml.slice(yaml.indexOf("\nservices:")).split(/\n {2}(?=[a-z-]+:\n)/).slice(1)
+    expect(services.length).toBe(6)
+    for (const service of services) expect(service).toContain("<<: *hardened")
   })
 })

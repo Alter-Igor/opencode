@@ -171,6 +171,26 @@ describe("opencode api", () => {
     expect(String((error as DelegateError).detail)).not.toContain("s3cret")
   })
 
+  test("W2C-02: redirects are refused (redirect:error; a real 302 is upstream_error, never followed)", async () => {
+    let mode: RequestRedirect | undefined
+    const fake = (async (_url: URL, init: RequestInit) => {
+      mode = init.redirect
+      return new Response(null, { status: 302, headers: { location: "http://127.0.0.1:1/x" } })
+    }) as unknown as typeof fetch
+    await expect(createApi({ baseUrl: "http://127.0.0.1:1", password: "pw" }, fake).call({ path: "/a" })).rejects.toMatchObject({ code: "upstream_error", detail: "HTTP 302" })
+    expect(mode).toBe("error")
+    let followed = false
+    const server = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: (req) => (new URL(req.url).pathname === "/elsewhere" ? ((followed = true), new Response("{}")) : new Response(null, { status: 302, headers: { location: "/elsewhere" } })) })
+    try {
+      const error = await createApi({ baseUrl: `http://127.0.0.1:${server.port}`, password: "pw" }).call({ path: "/session" }).catch((e: unknown) => e)
+      expect(error).toBeInstanceOf(DelegateError)
+      expect((error as DelegateError).code).toBe("upstream_error")
+      expect(followed).toBe(false)
+    } finally {
+      await server.stop(true)
+    }
+  })
+
   test("expectOk throws upstream_error on non-2xx", () => {
     expect(() => expectOk({ status: 500, data: {} }, "list")).toThrow(DelegateError)
     expect(expectOk({ status: 200, data: { a: 1 } }, "list")).toEqual({ a: 1 })
