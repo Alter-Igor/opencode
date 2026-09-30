@@ -3,11 +3,12 @@
 // before any health wait, so another bridge's release can never stop a box this bridge is
 // about to use (A-02). Every public call is logged with the bridge id and a correlation id.
 // A running set is reused only when the box AND its egress/cache siblings match (N-9).
+// replace() (oc_server_restart) is the way out of profile_changed: down + start under the lock.
 import { chmod, mkdir, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { mcpAllowPolicy, type BridgeConfig } from "../shared/config.ts"
 import type { Supervisor } from "../shared/contracts.ts"
-import { DelegateError } from "../shared/errors.ts"
+import { DelegateError, isDelegateError } from "../shared/errors.ts"
 import type { Logger } from "../shared/log.ts"
 import type { ApiTarget } from "../shared/opencode-api.ts"
 import { INSPECT_ENV, MCP_ALLOW_ENV, approvedValues, boxEnvOverride, composeDownEnv, composeEnv, siblingContainers } from "./compose-env.ts"
@@ -18,18 +19,20 @@ import type { ProcessProbe } from "./process.ts"
 import { buildProfile, fsFailure, readOwnerConfigs, writeProfile, type BuiltProfile, type PermissionRule, type ProfileFs } from "./profile.ts"
 import { createContext, lockOptions, traced, withLease, type Run } from "./run.ts"
 import { withStartLock, type Every } from "./start-lock.ts"
-import { statusOf, targetOf, type DelegateSupervisor } from "./status.ts"
+import { statusOf, targetOf, type DelegateSupervisor, type ReplaceOptions, type ReplaceResult } from "./status.ts"
 
 export { PASSWORD_ENV, boxEnvOverride, composeDownEnv, composeEnv, paths, siblingContainers } from "./compose-env.ts"
 export { defaultSupervisorDeps } from "./deps.ts"
-export { targetOf, type DelegateSupervisor, type SupervisorStatus } from "./status.ts"
+export { targetOf, type DelegateSupervisor, type ReplaceOptions, type ReplaceResult, type SupervisorStatus } from "./status.ts"
 
 export type SupervisorDeps = {
   config: BridgeConfig
   bridgeId: string
   pid: number
-  /** Full image reference, e.g. opencode-delegate-box:1.18.31-1483a47 (or ...-dirty-<hash>). */
+  /** Full image reference, e.g. opencode-delegate-box:1.18.31-<12 hex content hash> (or ...-dirty-<hash>). */
   image: string
+  /** Information only: git short sha of the checkout (doctor shows it; never used for reuse). */
+  buildSha?: string
   /** OpenCode version stamped into the binary when the image has to be built. */
   opencodeVersion: string
   composeFile: string
@@ -61,8 +64,27 @@ async function currentProfile(run: Run): Promise<BuiltProfile> {
   return buildProfile({ ownerConfigs, config: deps.config, permission: deps.permission, keyEnv: deps.keyEnv })
 }
 
+/** What to do about a sandbox that does not fit this bridge: oc_server_restart replaces it (force when others hold it). */
+export function restartAction(others: number): string {
+  if (others <= 0) return "Call oc_server_restart with confirm: true; it replaces the sandbox with one built from this bridge's settings."
+  const who = others === 1 ? "1 other bridge is" : `${others} other bridges are`
+  return `${who} using the sandbox: call oc_server_restart with confirm: true and force: true to replace it anyway (their running sessions are interrupted), or close those bridges first.`
+}
+
 function changed(message: string, detail: string): DelegateError {
-  return new DelegateError("profile_changed", message, "Restart the sandbox with oc_server_restart, or close the other sessions so it restarts with this bridge's settings.", detail)
+  return new DelegateError("profile_changed", message, restartAction(0), detail)
+}
+
+/** Live leases of other bridges (dead ones are pruned). */
+async function otherLeases(run: Run): Promise<number> {
+  return (await run.leases.active()).filter((id) => id !== run.deps.bridgeId).length
+}
+
+/** A profile_changed from the reuse checks says how many other bridges hold the box, so its action names force when needed. */
+async function withHolders(run: Run, error: unknown): Promise<unknown> {
+  if (!isDelegateError(error) || error.code !== "profile_changed") return error
+  const others = await otherLeases(run).catch(() => 0)
+  return new DelegateError(error.code, error.message, restartAction(others), error.detail)
 }
 
 /** A running box is only reused when profile, image and MCP policy all match this bridge (A-04, A-05). */
@@ -101,8 +123,12 @@ export async function checkSiblings(run: Run): Promise<void> {
 }
 
 async function reuse(run: Run, box: BoxInspect, hash: string): Promise<ApiTarget> {
-  checkReusable(run.deps, box, hash)
-  await checkSiblings(run)
+  try {
+    checkReusable(run.deps, box, hash)
+    await checkSiblings(run)
+  } catch (error) {
+    throw await withHolders(run, error)
+  }
   const target = targetOf(box, run.deps.config.project)
   return withLease(run, async () => {
     await waitHealthy(run.deps, target, run.container)
@@ -174,7 +200,8 @@ async function start(run: Run, built: BuiltProfile): Promise<ApiTarget> {
   })
 }
 
-async function ensure(run: Run): Promise<ApiTarget> {
+/** Docker up, this bridge's profile built, the home folder there: the steps before the start lock. */
+async function prepare(run: Run): Promise<BuiltProfile> {
   const { deps } = run
   await requireDocker(deps.exec)
   const built = await currentProfile(run)
@@ -182,10 +209,29 @@ async function ensure(run: Run): Promise<ApiTarget> {
   await mkdir(deps.config.home, { recursive: true }).catch((error: unknown) => {
     throw fsFailure("create the bridge home folder", error, deps.config.home)
   })
-  return withStartLock(deps.leaseFs, run.dirs.startLock, async () => {
-    const box = await inspectBox(deps.exec, INSPECT_ENV, run.container)
+  return built
+}
+
+async function ensure(run: Run): Promise<ApiTarget> {
+  const built = await prepare(run)
+  return withStartLock(run.deps.leaseFs, run.dirs.startLock, async () => {
+    const box = await inspectBox(run.deps.exec, INSPECT_ENV, run.container)
     return box?.running ? reuse(run, box, built.hash) : start(run, built)
   }, await lockOptions(run))
+}
+
+/** `compose down` with the same -f files as `up`, from the bridge home (review N-1). Never -v. Caller holds the start lock. */
+async function composeDown(run: Run): Promise<void> {
+  await writeBoxEnvOverride(run).catch((error: unknown) => {
+    throw fsFailure("prepare the sandbox stop", error, run.dirs.boxEnvOverride)
+  })
+  const result = await run.deps.exec(dockerArgs.down(run.compose), { env: composeDownEnv(run.deps), cwd: run.deps.config.home, timeoutMs: 120_000 })
+  if (result.code !== 0) {
+    const detail = `exit ${result.code}: ${result.stderr.trim().slice(-400)}`
+    run.note("error", "stop failed", { code: result.code, detail })
+    throw new DelegateError("sandbox_unavailable", "The sandbox did not stop.", `Run \`docker compose -p ${run.deps.config.project} down\`, or oc_doctor.`, detail)
+  }
+  run.state.startedHere = false
 }
 
 async function release(run: Run): Promise<void> {
@@ -196,18 +242,32 @@ async function release(run: Run): Promise<void> {
     const remaining = await run.leases.release(run.deps.bridgeId)
     run.state.leased = false
     if (remaining > 0) return run.note("info", "lease released; sandbox kept", { remaining })
-    // Same -f files as `up`, from the bridge home, never the process working folder (review N-1).
-    await writeBoxEnvOverride(run).catch((error: unknown) => {
-      throw fsFailure("prepare the sandbox stop", error, run.dirs.boxEnvOverride)
-    })
-    const result = await run.deps.exec(dockerArgs.down(run.compose), { env: composeDownEnv(run.deps), cwd: run.deps.config.home, timeoutMs: 120_000 })
-    if (result.code !== 0) {
-      const detail = `exit ${result.code}: ${result.stderr.trim().slice(-400)}`
-      run.note("error", "stop failed", { code: result.code, detail })
-      throw new DelegateError("sandbox_unavailable", "The sandbox did not stop.", `Run \`docker compose -p ${run.deps.config.project} down\`, or oc_doctor.`, detail)
-    }
-    run.state.startedHere = false
+    await composeDown(run)
     run.note("info", "last lease released; sandbox stopped")
+  }, await lockOptions(run))
+}
+
+function othersHold(others: number): DelegateError {
+  return new DelegateError("profile_changed", "Other bridges are using the sandbox, so it was not restarted.", restartAction(others), `${others} other live lease(s)`)
+}
+
+/**
+ * oc_server_restart (GAP-1): works even when ensure() fails with profile_changed, because it
+ * needs no lease. Under the start lock, so no other bridge can start or reuse the box meanwhile:
+ * refuse while other bridges hold a running box (unless force), else down + the normal start.
+ * Other bridges' leases stay; their next ensure() reuses the new box or reports profile_changed.
+ */
+async function replace(run: Run, options: ReplaceOptions): Promise<ReplaceResult> {
+  const built = await prepare(run)
+  return withStartLock(run.deps.leaseFs, run.dirs.startLock, async () => {
+    const others = await otherLeases(run)
+    const box = await inspectBox(run.deps.exec, [], run.container)
+    const running = box?.running === true
+    if (running && others > 0 && !options.force) throw othersHold(others)
+    run.note("info", "replacing sandbox", { running, others, force: options.force })
+    await composeDown(run)
+    const target = await start(run, built)
+    return { target, interrupted: running ? others : 0 }
   }, await lockOptions(run))
 }
 
@@ -217,6 +277,7 @@ export function createSupervisor(deps: SupervisorDeps): DelegateSupervisor {
     ensure: () => traced(ctx, "ensure", ensure),
     status: () => traced(ctx, "status", statusOf),
     release: () => traced(ctx, "release", release),
+    replace: (options) => traced(ctx, "replace", (run) => replace(run, options)),
     login: (entry, opener) =>
       traced(ctx, "login", async () => {
         if (!deps.login) throw new DelegateError("upstream_error", "Sign-in is not wired into this bridge.", "Update the bridge.")

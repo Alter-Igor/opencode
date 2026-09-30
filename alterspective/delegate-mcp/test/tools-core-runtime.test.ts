@@ -32,11 +32,14 @@ describe("box manager", () => {
     let ensures = 0
     let releases = 0
     let clock = 0
+    const forced: boolean[] = []
     const sessions = new Map([["ses_0123456789abcdefAB", record()]])
+    const next = () => targets[Math.min(ensures++, targets.length - 1)] as ApiTarget
     const m = createBoxManager({
       supervisor: {
-        ensure: async () => targets[Math.min(ensures++, targets.length - 1)] as ApiTarget,
-        release: async () => void releases++,
+        ensure: async () => next(),
+        // `releases` counts replaces: the old box is let go and a new one started.
+        replace: async (options) => (forced.push(options.force), releases++, { target: next(), interrupted: options.force ? 1 : 0 }),
       },
       sessions,
       log: silentLogger,
@@ -49,7 +52,7 @@ describe("box manager", () => {
       now: () => clock,
       revalidateMs: 1000,
     })
-    return { m, hubs, counts: () => ({ ensures, releases }), tick: (ms: number) => (clock += ms) }
+    return { m, hubs, forced, counts: () => ({ ensures, releases }), tick: (ms: number) => (clock += ms) }
   }
   const A = { baseUrl: "http://127.0.0.1:1", password: "a" }
   const B = { baseUrl: "http://127.0.0.1:2", password: "b" }
@@ -75,7 +78,7 @@ describe("box manager", () => {
     expect(again).toBe(first)
   })
 
-  test("restart releases, and a new target gets a new hub and notifies listeners", async () => {
+  test("restart replaces the box, and a new target gets a new hub and notifies listeners", async () => {
     const t = manager([A, B])
     const seen: string[] = []
     t.m.onBox((box) => seen.push(box.target.baseUrl))
@@ -83,14 +86,29 @@ describe("box manager", () => {
     const next = await t.m.restart()
     expect(t.counts()).toEqual({ ensures: 2, releases: 1 })
     expect(next.target).toBe(B)
+    expect(next.interrupted).toBe(0)
+    expect(t.forced).toEqual([false])
     expect(t.hubs[0]?.stopped).toBe(1)
     expect(seen).toEqual([A.baseUrl, B.baseUrl])
+  })
+
+  test("restart with force passes it on; a box() during the restart shares it instead of ensuring", async () => {
+    const t = manager([A, B])
+    await t.m.box()
+    const restarting = t.m.restart({ force: true })
+    await Promise.resolve()
+    const during = t.m.box()
+    const [restarted, joined] = await Promise.all([restarting, during])
+    expect(restarted.interrupted).toBe(1)
+    expect(t.forced).toEqual([true])
+    expect(joined.target).toBe(B)
+    expect(t.counts().ensures).toBe(2)
   })
 
   test("a failed ensure is not cached", async () => {
     let calls = 0
     const m = createBoxManager({
-      supervisor: { ensure: async () => (calls++ === 0 ? Promise.reject(new Error("down")) : A), release: async () => {} },
+      supervisor: { ensure: async () => (calls++ === 0 ? Promise.reject(new Error("down")) : A), replace: async () => ({ target: A, interrupted: 0 }) },
       sessions: new Map(),
       log: silentLogger,
       api: () => new FakeApi([]),

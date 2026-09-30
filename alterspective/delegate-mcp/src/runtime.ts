@@ -14,11 +14,11 @@ import { createLogger, safeLog, type Logger } from "./shared/log.ts"
 import { createApi, type ApiTarget, type OpencodeApi } from "./shared/opencode-api.ts"
 import { containerName } from "./supervisor/compose-env.ts"
 import { bunExec } from "./supervisor/docker.ts"
-import { createSupervisor, defaultSupervisorDeps, type DelegateSupervisor } from "./supervisor/lifecycle.ts"
+import { createSupervisor, defaultSupervisorDeps, type DelegateSupervisor, type ReplaceOptions } from "./supervisor/lifecycle.ts"
 import { login } from "./supervisor/login.ts"
 import { createWorkspaces } from "./supervisor/workspaces.ts"
 import { cleanEnv, runCommand } from "./supervisor/workspaces-exec.ts"
-import type { Box, CommandRunner, SessionRecord, ToolContext } from "./tools/context.ts"
+import type { Box, CommandRunner, RestartedBox, SessionRecord, ToolContext } from "./tools/context.ts"
 
 export const NAME_RE = /^[a-z0-9-]{1,40}$/
 /** Re-run ensure() at most this often while a box is held (catches another bridge's restart). */
@@ -56,13 +56,14 @@ const hostRunner: CommandRunner = (argv, timeoutMs) => runCommand(argv, cleanEnv
 export type BoxManager = {
   box(): Promise<Box>
   peek(): Box | undefined
-  restart(): Promise<Box>
+  /** oc_server_restart: supervisor.replace(), single-flight with box() so no ensure runs alongside it. */
+  restart(options?: ReplaceOptions): Promise<RestartedBox>
   onBox(listener: (box: Box) => void): () => void
   stop(): Promise<void>
 }
 
 export type BoxManagerDeps = {
-  supervisor: Pick<DelegateSupervisor, "ensure" | "release">
+  supervisor: Pick<DelegateSupervisor, "ensure" | "replace">
   sessions: Map<string, SessionRecord>
   log: Logger
   api?: (target: ApiTarget) => OpencodeApi
@@ -98,11 +99,19 @@ class Manager implements BoxManager {
     return this.current
   }
 
-  async restart(): Promise<Box> {
-    await this.pending?.catch(() => undefined)
-    await this.stop().catch(() => undefined)
-    await this.deps.supervisor.release()
-    return this.ensure()
+  /** Becomes the pending call at once, so a box() made while the old hub stops waits for the new box. */
+  async restart(options: ReplaceOptions = { force: false }): Promise<RestartedBox> {
+    const prior = this.pending
+    let interrupted = 0
+    const target = (async () => {
+      await prior?.catch(() => undefined)
+      await this.stop().catch(() => undefined)
+      const result = await this.deps.supervisor.replace(options)
+      interrupted = result.interrupted
+      return result.target
+    })()
+    const box = await this.track(target)
+    return { ...box, interrupted }
   }
 
   onBox(listener: (box: Box) => void): () => void {
@@ -117,15 +126,22 @@ class Manager implements BoxManager {
   }
 
   private ensure(): Promise<Box> {
-    this.pending ??= this.deps.supervisor
-      .ensure()
+    return this.pending ?? this.track(this.deps.supervisor.ensure())
+  }
+
+  /** Make `work` the one pending box call; concurrent box() calls share it. */
+  private track(work: Promise<ApiTarget>): Promise<Box> {
+    const pending: Promise<Box> = work
       .then(async (target) => {
         const box = await this.swap(target)
         this.checkedAt = this.now()
         return box
       })
-      .finally(() => (this.pending = undefined))
-    return this.pending
+      .finally(() => {
+        if (this.pending === pending) this.pending = undefined
+      })
+    this.pending = pending
+    return pending
   }
 
   private async swap(target: ApiTarget): Promise<Box> {
@@ -165,6 +181,7 @@ function lazySupervisor(make: () => Promise<DelegateSupervisor>): DelegateSuperv
     ensure: async () => (await get()).ensure(),
     status: async () => (await get()).status(),
     release: async () => (made ? (await made).release() : undefined),
+    replace: async (options) => (await get()).replace(options),
     login: async (entry, opener) => (await get()).login(entry, opener),
   }
 }
@@ -219,9 +236,9 @@ export async function createRuntime(options: RuntimeOptions = {}): Promise<Runti
     box: () => manager.box(),
     peekBox: () => manager.peek(),
     apiFor: (target) => createApi(target),
-    restartBox: async () => {
+    restartBox: async (options) => {
       inboxTarget.invalidate()
-      return manager.restart()
+      return manager.restart(options)
     },
     onBox: (listener) => manager.onBox(listener),
     boxExec: (argv, timeoutMs) => runCommand(["docker", "exec", container, ...argv], cleanEnv(), timeoutMs ?? 60_000),

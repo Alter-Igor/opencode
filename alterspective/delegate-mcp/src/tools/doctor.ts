@@ -43,6 +43,9 @@ function boxReport(status: SupervisorStatus): Record<string, unknown> {
     state: "running",
     imageTag: status.imageTag,
     imageMatches: status.imageMatches,
+    // The tag follows the build inputs, so a reused image can be older than the checkout: both shas are shown.
+    imageBuiltFrom: status.imageBuiltFrom ?? "unknown",
+    bridgeAt: status.bridgeAt ?? "unknown",
     policyVerified: status.policyVerified,
     health: status.health,
     startedBy: status.startedBy,
@@ -56,7 +59,8 @@ function guardReport(verdict: Verdict): Record<string, unknown> {
 
 function summaryOf(status: SupervisorStatus, mcp: McpReport | undefined, verdict: Verdict): string {
   if (status.state !== "running") return `Sandbox ${status.state}; nothing else checked. Call oc_doctor with start:true, or any session tool, to start it.`
-  const checks = `image ${status.imageMatches ? "ok" : "MISMATCH"}, policy ${status.policyVerified ? "ok" : "MISMATCH"}`
+  const built = `image built from ${status.imageBuiltFrom ?? "unknown"}, bridge at ${status.bridgeAt ?? "unknown"}`
+  const checks = `image ${status.imageMatches ? "ok" : "MISMATCH"} (${built}), policy ${status.policyVerified ? "ok" : "MISMATCH"}`
   const entries = mcp && "entries" in mcp ? mcp.entries.map((e) => `${e.name} ${e.status}`).join(", ") || "no MCP entries" : "MCP list unavailable"
   return `Sandbox running (${checks}); ${entries}; guard ${verdict.ok ? "ok" : verdict.code}.`
 }

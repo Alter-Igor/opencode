@@ -20,6 +20,8 @@ export const LABEL = {
   profileHash: "com.alterspective.opencode-delegate.profile-hash",
   port: "com.alterspective.opencode-delegate.port",
   image: "com.alterspective.opencode-delegate.image",
+  /** Baked into the image at build time (Dockerfile LABEL): `<version>-alterspective.<git sha>[.dirty.<hash>]`. */
+  ociVersion: "org.opencontainers.image.version",
 } as const
 
 /** Host variables the docker CLI itself needs. Everything else is withheld from the compose child. */
@@ -140,21 +142,33 @@ export async function imageExists(exec: Exec, tag: string): Promise<boolean> {
 }
 
 const VERSION = /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/
-const SHA = /^[0-9a-f]{7,40}$/
+const CONTENT = /^[0-9a-f]{7,40}$/
 const DIRTY = /^[0-9a-f]{8,16}$/
 
-/** Image tag = OpenCode version + git short SHA, plus `-dirty-<hash>` for uncommitted builds (§4, VER-DEV-01). */
-export function imageTag(image: string, version: string, sha: string, dirty?: string): string {
-  if (!VERSION.test(version) || !SHA.test(sha) || (dirty !== undefined && !DIRTY.test(dirty)))
+/**
+ * Image tag = OpenCode version + content hash of the build inputs (identity.ts), plus
+ * `-dirty-<hash>` for uncommitted builds (§4, VER-DEV-01).
+ */
+export function imageTag(image: string, version: string, content: string, dirty?: string): string {
+  if (!VERSION.test(version) || !CONTENT.test(content) || (dirty !== undefined && !DIRTY.test(dirty)))
     throw new DelegateError(
       "sandbox_unavailable",
       "The OpenCode checkout has an unexpected version or commit, so the sandbox image cannot be named.",
       "Check packages/opencode/package.json and the git checkout, then retry.",
-      `version=${version.slice(0, 40)} sha=${sha.slice(0, 40)}`,
+      `version=${version.slice(0, 40)} content=${content.slice(0, 40)}`,
     )
-  const tag = `${version}-${sha}${dirty ? `-dirty-${dirty}` : ""}`
+  const tag = `${version}-${content}${dirty ? `-dirty-${dirty}` : ""}`
   // 128 is Docker's tag limit; room is kept for the sibling suffixes (SIBLING_SERVICES).
   return `${image}:${tag.slice(0, 110)}`
+}
+
+const BUILT_FROM = /alterspective\.([0-9a-f]{7,40})(?:\.dirty\.([0-9a-f]{8,16}))?$/
+
+/** The git sha an image was built from, read from its OCI version label: `<sha>` or `<sha>+dirty.<hash>`. */
+export function builtFrom(labels: Record<string, string>): string | undefined {
+  const match = BUILT_FROM.exec(labels[LABEL.ociVersion] ?? "")
+  if (!match) return undefined
+  return match[2] ? `${match[1]}+dirty.${match[2]}` : match[1]
 }
 
 /** Remove every secret value from text (e.g. compose stderr that echoes the environment). */

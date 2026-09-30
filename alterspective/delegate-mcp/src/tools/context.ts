@@ -6,7 +6,7 @@ import type { Logger } from "../shared/log.ts"
 import type { ApiTarget, OpencodeApi } from "../shared/opencode-api.ts"
 import type { DelegateHub } from "../events/index.ts"
 import type { BridgeInbox } from "../inbox/index.ts"
-import type { DelegateSupervisor } from "../supervisor/lifecycle.ts"
+import type { DelegateSupervisor, ReplaceOptions } from "../supervisor/lifecycle.ts"
 
 /** A session this bridge started: where it lives on the host and in the box. */
 export type SessionRecord = {
@@ -25,6 +25,8 @@ export type SessionRecord = {
 }
 
 export type Box = { target: ApiTarget; api: OpencodeApi; hub: DelegateHub }
+/** A box after oc_server_restart, with how many other bridges held the replaced sandbox. */
+export type RestartedBox = Box & { interrupted: number }
 
 /** Additive (Wave 3): result of one command run on the host or in the box. */
 export type CommandResult = { code: number; stdout: string; stderr: string; timedOut?: boolean }
@@ -48,8 +50,11 @@ export type ToolContext = {
   peekBox(): Box | undefined
   /** Additive (Wave 3): an API client for a target read from status() (oc_doctor never starts the box). */
   apiFor(target: ApiTarget): OpencodeApi
-  /** Additive (Wave 3): release this bridge's lease, then ensure again; a new target gets a new api + hub. */
-  restartBox(): Promise<Box>
+  /**
+   * Additive (Wave 3): replace the sandbox (supervisor.replace; refused while other bridges hold
+   * it unless force). The new target gets a new api + hub; `interrupted` counts the other bridges.
+   */
+  restartBox(options?: ReplaceOptions): Promise<RestartedBox>
   /** Additive (Wave 3): called with every new Box (first start and after a restart). Returns an unsubscribe. */
   onBox(listener: (box: Box) => void): () => void
   /** Additive (Wave 3): run a command inside the box container (`docker exec <box> ...`). Output is untrusted. */

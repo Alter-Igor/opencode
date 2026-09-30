@@ -7,7 +7,7 @@ import type { BoxState, Supervisor } from "../shared/contracts.ts"
 import { DelegateError } from "../shared/errors.ts"
 import type { ApiTarget } from "../shared/opencode-api.ts"
 import { INSPECT_ENV, MCP_ALLOW_ENV, PASSWORD_ENV } from "./compose-env.ts"
-import { LABEL, inspectBox, requireDocker, type BoxInspect } from "./docker.ts"
+import { LABEL, builtFrom, inspectBox, requireDocker, type BoxInspect } from "./docker.ts"
 import { toDelegateError, type Run } from "./run.ts"
 
 type Running = Extract<BoxState, { state: "running" }>
@@ -19,12 +19,25 @@ export type SupervisorStatus =
       health: BoxInspect["health"]
       /** OPENCODE_MCP_ALLOW in the box equals this bridge's mcpAllowPolicy(config). */
       policyVerified: boolean
-      /** The box was built from the same checkout (image label) as this bridge. */
+      /** The box was built from the same build inputs (image label = content-hash tag) as this bridge wants. */
       imageMatches: boolean
+      /** Information only: the git sha baked into the image when it was built (`<sha>[+dirty.<hash>]`). */
+      imageBuiltFrom?: string
+      /** Information only: the git sha of the checkout this bridge runs from. */
+      bridgeAt?: string
     })
+
+export type ReplaceOptions = { force: boolean }
+/** `interrupted`: how many other bridges held the running sandbox that was replaced. */
+export type ReplaceResult = { target: ApiTarget; interrupted: number }
 
 export interface DelegateSupervisor extends Supervisor {
   status(): Promise<SupervisorStatus>
+  /**
+   * Stop the sandbox (compose down, never -v) and start it with this bridge's profile and image,
+   * under the start lock. Refused with profile_changed while other bridges hold it, unless force.
+   */
+  replace(options: ReplaceOptions): Promise<ReplaceResult>
 }
 
 export function targetOf(box: BoxInspect, project: string): ApiTarget {
@@ -55,6 +68,8 @@ export async function statusOf(run: Run): Promise<SupervisorStatus> {
       health: box.health,
       policyVerified: box.env[MCP_ALLOW_ENV] === mcpAllowPolicy(deps.config),
       imageMatches: image === deps.image,
+      imageBuiltFrom: builtFrom(box.labels),
+      bridgeAt: deps.buildSha,
     }
   } catch (error) {
     const failure = toDelegateError(error)

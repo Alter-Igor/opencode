@@ -1,5 +1,5 @@
 // MOD-01: production wiring for the supervisor: real docker CLI, real files, owner config
-// from ~/.config/opencode, and the image named after the checkout (identity.ts).
+// from ~/.config/opencode, and the image named after its build inputs (identity.ts).
 import { randomBytes } from "node:crypto"
 import os from "node:os"
 import path from "node:path"
@@ -27,12 +27,13 @@ export type DefaultDepsOptions = {
 export async function defaultSupervisorDeps(config: BridgeConfig, options: DefaultDepsOptions): Promise<SupervisorDeps> {
   const exec = options.exec ?? bunExec
   const identity = await buildIdentity(options.repoRoot, config.image, exec)
-  options.log?.log("info", "supervisor", "sandbox image identity", { image: identity.image, dirty: identity.dirty !== undefined, bridgeId: options.bridgeId })
+  options.log?.log("info", "supervisor", "sandbox image identity", { image: identity.image, sha: identity.sha, dirty: identity.dirty !== undefined, bridgeId: options.bridgeId })
   return {
     config,
     bridgeId: options.bridgeId,
     pid: process.pid,
     image: identity.image,
+    buildSha: identity.sha,
     opencodeVersion: identity.opencodeVersion,
     composeFile: path.join(options.repoRoot, "alterspective", "delegate-mcp", "docker", "compose.yaml"),
     ownerConfigDir: options.ownerConfigDir ?? path.join(os.homedir(), ".config", "opencode"),

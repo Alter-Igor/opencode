@@ -102,6 +102,8 @@ export type Fake = {
   opened: Array<[string, string]>
   collected: string[]
   started: { count: number; restarts: number }
+  /** oc_server_restart: the force option of each restartBox call, and what the next one reports as interrupted. */
+  restart: { forced: boolean[]; interrupted: number }
   setHost(fn: (argv: string[]) => CommandResult): void
   setBox(fn: (argv: string[]) => CommandResult): void
   status: { value: SupervisorStatus }
@@ -119,6 +121,7 @@ function fakeServices(f: Fake): Pick<ToolContext, "supervisorService" | "workspa
       ensure: async () => TARGET,
       status: async () => f.status.value,
       release: async () => {},
+      replace: async () => ({ target: TARGET, interrupted: f.restart.interrupted }),
       login: async () => "connected",
     },
     workspaces: {
@@ -145,7 +148,7 @@ export function fakeContext(options: { boxHeld?: boolean } = {}): Fake {
   let host = (_argv: string[]) => ({ code: 128, stdout: "", stderr: "fatal: path not in tree" }) as CommandResult
   let inBox = (argv: string[]) => (argv.includes("rev-parse") ? okCmd(`${BASE}\n`) : okCmd(""))
   const f: Fake = {
-    api, hub, order, box, boxCmds: [], hostCmds: [], opened: [], collected: [], started: { count: 0, restarts: 0 },
+    api, hub, order, box, boxCmds: [], hostCmds: [], opened: [], collected: [], started: { count: 0, restarts: 0 }, restart: { forced: [], interrupted: 0 },
     setHost: (fn) => (host = fn),
     setBox: (fn) => (inBox = fn),
     status: { value: { state: "running", target: TARGET, imageTag: "img:1", startedBy: "other", health: "healthy", policyVerified: true, imageMatches: true } },
@@ -167,9 +170,10 @@ export function fakeContext(options: { boxHeld?: boolean } = {}): Fake {
     },
     peekBox: () => (held ? box : undefined),
     apiFor: () => api,
-    restartBox: async () => {
+    restartBox: async (options) => {
       f.started.restarts++
-      return box
+      f.restart.forced.push(options?.force === true)
+      return { ...box, interrupted: f.restart.interrupted }
     },
     onBox: () => () => {},
     boxExec: async (argv) => {

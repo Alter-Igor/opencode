@@ -2,7 +2,7 @@
 // atomic. Fixture (real git, simulated box): workspaces-fixture.ts. Part 2: workspaces-collect.test.ts.
 // Pure helpers: workspaces-units.test.ts.
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test"
-import { chmodSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import path from "node:path"
 import type { ErrorCode } from "../src/shared/errors.ts"
 import { code, git, posix, T, WorkspaceFixture } from "./workspaces-fixture.ts"
@@ -43,6 +43,21 @@ describe("workspaces: collect never runs hooks planted in the box clone (red tes
       expect(await git(fx.hostRepo, ["branch", "--show-current"])).toBe("main")
       expect(fx.handoffFiles()).toEqual([])
       expect(fx.incoming()).toEqual([])
+    },
+    T,
+  )
+})
+
+describe("workspaces: OpenCode's own scratch is ignored in the clone", () => {
+  test(
+    ".system_generated/ is in .git/info/exclude: not untracked, never added",
+    async () => {
+      await fx.workspaces().open(fx.hostRepo, "scratch-test")
+      const exclude = readFileSync(path.join(fx.boxClone("scratch-test"), ".git", "info", "exclude"), "utf8")
+      expect(exclude.split(/\r?\n/)).toContain(".system_generated/")
+      mkdirSync(path.join(fx.boxClone("scratch-test"), ".system_generated", "logs"), { recursive: true })
+      writeFileSync(path.join(fx.boxClone("scratch-test"), ".system_generated", "logs", "diagnostics.log"), "{}\n")
+      expect(await fx.boxGit("scratch-test", ["status", "--porcelain", "--untracked-files=all"])).toBe("")
     },
     T,
   )

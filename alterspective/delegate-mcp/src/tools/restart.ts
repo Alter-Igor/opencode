@@ -1,30 +1,40 @@
-// oc_server_restart: release this bridge's lease and ensure the sandbox again. When this bridge
-// holds the last lease the sandbox stops and starts with this bridge's profile (the fix for
-// profile_changed); running sessions of every bridge are interrupted, so confirm:true is required.
+// oc_server_restart: replace the sandbox with one built from this bridge's profile and image (the
+// fix for profile_changed). It needs no lease, so it works even when ensure() refuses the running
+// box. The supervisor stops (compose down, never -v) and starts it under the start lock. While
+// other bridges use the box it is refused unless force:true, because their running sessions are
+// interrupted; the result says how many were. confirm:true is always required.
 import { z } from "zod"
 import { DelegateError } from "../shared/errors.ts"
 import { defineTool } from "./define.ts"
 import { ok } from "./shape.ts"
 
+function summaryOf(interrupted: number): string {
+  if (interrupted === 0) return "The sandbox was replaced and is running again. Sessions keep their history; check them with oc_status."
+  const who = interrupted === 1 ? "1 other bridge" : `${interrupted} other bridges`
+  return `The sandbox was replaced and is running again. ${who} had running sessions interrupted; sessions keep their history.`
+}
+
 export const restartTool = defineTool({
   name: "oc_server_restart",
   title: "Restart the sandbox",
   description:
-    "Restart the OpenCode sandbox: release this bridge's lease, stop the sandbox when no other bridge holds one, and start it again with this bridge's profile. Interrupts running sessions (of every bridge). Requires confirm: true.",
-  input: { confirm: z.boolean().describe("Must be true: running sessions are interrupted.") },
+    "Replace the OpenCode sandbox: stop it and start it again with this bridge's profile and image (fixes profile_changed). Interrupts running sessions. Refused while other bridges use the sandbox unless force is true. Requires confirm: true.",
+  input: {
+    confirm: z.boolean().describe("Must be true: running sessions are interrupted."),
+    force: z.boolean().optional().describe("Replace the sandbox even while other bridges use it (their running sessions are interrupted). Default false."),
+  },
   annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
   async run(args, ctx) {
     if (args.confirm !== true)
       throw new DelegateError("invalid_input", "The restart was not confirmed; nothing was stopped.", "Call oc_server_restart with confirm: true once running sessions may be interrupted.")
-    const prior = await ctx.supervisorService.status()
-    const before = prior.state === "running" ? prior.target.baseUrl : undefined
-    const box = await ctx.restartBox()
+    const box = await ctx.restartBox({ force: args.force === true })
     const status = await ctx.supervisorService.status()
-    // Each start publishes a new random port, so an unchanged URL means the running box was kept.
-    const restarted = before !== box.target.baseUrl
-    const summary = restarted
-      ? "The sandbox is running again. Sessions keep their history; check them with oc_status."
-      : "Other bridges still hold the sandbox, so it was kept running (nothing restarted). Close their sessions, then retry."
-    return ok(summary, { restarted, state: status.state, imageTag: status.state === "running" ? status.imageTag : undefined, baseUrl: box.target.baseUrl })
+    return ok(summaryOf(box.interrupted), {
+      restarted: true,
+      interrupted: box.interrupted,
+      state: status.state,
+      imageTag: status.state === "running" ? status.imageTag : undefined,
+      baseUrl: box.target.baseUrl,
+    })
   },
 })

@@ -162,6 +162,25 @@ describe("oc_doctor, oc_login, oc_list_models, oc_server_restart", () => {
     const confirmed = await invoke(restartTool, { confirm: true }, f.ctx)
     expect(confirmed.isError).toBeUndefined()
     expect(f.started.restarts).toBe(1)
-    expect(data(confirmed)).toMatchObject({ restarted: false })
+    expect(f.restart.forced).toEqual([false])
+    expect(data(confirmed)).toMatchObject({ restarted: true, interrupted: 0 })
+  })
+
+  test("oc_server_restart force:true is passed on and reports the interrupted bridges", async () => {
+    const f = fakeContext()
+    f.restart.interrupted = 1
+    const result = await invoke(restartTool, { confirm: true, force: true }, f.ctx)
+    expect(f.restart.forced).toEqual([true])
+    expect(data(result)).toMatchObject({ restarted: true, interrupted: 1, state: "running" })
+    expect(text(result)).toContain("1 other bridge had running sessions interrupted")
+  })
+
+  test("oc_doctor shows the sha the image was built from and the bridge's sha", async () => {
+    const f = fakeContext({ boxHeld: false })
+    f.status.value = { state: "running", target: TARGET, imageTag: "img:1", startedBy: "other", health: "healthy", policyVerified: true, imageMatches: true, imageBuiltFrom: "1111111", bridgeAt: "2222222" }
+    f.api.on("GET /mcp", { status: 200, data: {} })
+    const result = await invoke(doctorTool, {}, f.ctx)
+    expect(data(result).box).toMatchObject({ imageMatches: true, imageBuiltFrom: "1111111", bridgeAt: "2222222" })
+    expect(text(result)).toContain("image built from 1111111, bridge at 2222222")
   })
 })

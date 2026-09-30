@@ -168,9 +168,19 @@ async function hostHead(ctx: Ctx, repo: string): Promise<string> {
   return base
 }
 
+/**
+ * Scratch OpenCode itself writes into the workspace (the fork's observer plugin,
+ * packages/opencode/src/plugin/observer.ts: .system_generated/logs, retrospectives). Listed in the
+ * clone's .git/info/exclude so it is never seen as untracked work nor committed by `git add -A`.
+ */
+export const WORKSPACE_EXCLUDES = [".system_generated/"]
+
 /** Clone the bundle into a private temp folder and put delegate/<key> at `base`. */
 async function cloneAt(ctx: Ctx, bundle: string, tmp: string, key: string, base: string): Promise<void> {
   await boxRun(ctx, ["git", "clone", "--quiet", "--no-checkout", bundle, tmp], "clone the session workspace", "long")
+  // Arguments, never interpolated into the script: the file is $1, the patterns follow.
+  const append = 'f="$1"; shift; mkdir -p "$(dirname "$f")" && printf "%s\\n" "$@" >> "$f"'
+  await boxRun(ctx, ["sh", "-c", append, "sh", `${tmp}/.git/info/exclude`, ...WORKSPACE_EXCLUDES], "hide OpenCode scratch files from git")
   // -B, not -b: the clone already has delegate/<key> when that is the owner's checked-out branch.
   await boxRun(ctx, ["git", "-C", tmp, "checkout", "--quiet", "-B", `delegate/${key}`, base], "create the session branch", "long")
 }
