@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test"
-import { createLogger, redact, scrub } from "../src/shared/log.ts"
+import { rmSync, writeFileSync } from "node:fs"
+import os from "node:os"
+import path from "node:path"
+import { createLogger, redact, safeLog, scrub } from "../src/shared/log.ts"
 import { createApi, DEFAULT_API_TIMEOUT_MS, expectOk } from "../src/shared/opencode-api.ts"
 import { DelegateError, ErrorCode } from "../src/shared/errors.ts"
 import { defaultConfig, mcpAllowPolicy } from "../src/shared/config.ts"
@@ -52,6 +55,50 @@ describe("log", () => {
     const entry = JSON.parse(lines[0]!)
     expect(entry).toMatchObject({ level: "info", service: "opencode-delegate", component: "test", msg: "got Bearer [redacted]", correlationId: "c1", token: "[redacted]" })
     expect(typeof entry.ts).toBe("string")
+  })
+
+  test("secret field names are matched whole or as a suffix, not as any substring (N-5)", () => {
+    const secret = ["password", "passwd", "secret", "token", "accessToken", "refresh_token", "Authorization", "apiKey", "api_key", "x-api-key", "SYNAPSE_API_KEY", "OPENCODE_SERVER_PASSWORD", "cookie", "clientSecret"]
+    const plain = ["passed", "tokens", "bypass", "tokenCount", "promptTokens", "secretary", "passage", "keystoneOrigin", "monkey", "sessionID"]
+    const out = redact(Object.fromEntries([...secret, ...plain].map((k) => [k, "v"])))
+    for (const k of secret) expect({ k, v: out[k] }).toEqual({ k, v: "[redacted]" })
+    for (const k of plain) expect({ k, v: out[k] }).toEqual({ k, v: "v" })
+  })
+
+  const commit = "0123456789abcdef0123456789abcdef01234567"
+  const sha256 = "a".repeat(64)
+  test("commit ids and image digests survive in the id fields only (N-5)", () => {
+    const kept = redact({ commit, base: commit, sha: commit, head: commit, containerId: sha256, image: `opencode-delegate-box:1.2.3@sha256:${sha256}`, digest: `sha256:${sha256}` })
+    expect(kept).toEqual({ commit, base: commit, sha: commit, head: commit, containerId: sha256, image: `opencode-delegate-box:1.2.3@sha256:${sha256}`, digest: `sha256:${sha256}` })
+    // Anywhere else, and in msg, the same values are still redacted (fail closed).
+    const other = redact({ detail: `head ${commit}`, note: `sha256:${sha256}`, owner: commit })
+    for (const value of Object.values(other)) expect(String(value)).toContain("[redacted]")
+    expect(scrub(`fetched ${commit}`)).toBe("fetched [redacted]")
+  })
+
+  test("id fields still scrub other secrets, and odd-length or upper-case hex (N-5)", () => {
+    const out = redact({ commit: "Bearer abc123DEF456ghi789", sha: "0123456789abcdef0123456789abcdef", head: commit.toUpperCase() })
+    expect(out).toEqual({ commit: "Bearer [redacted]", sha: "[redacted]", head: "[redacted]" })
+  })
+
+  test("logging never throws: a throwing writer, an unusable log folder (A-11)", () => {
+    const throwing = createLogger({ write: () => { throw new Error("stderr closed") } })
+    expect(() => throwing.log("error", "t", "boom", { detail: "x" })).not.toThrow()
+    // A log "folder" that is really a file: mkdir and append both fail.
+    const file = path.join(os.tmpdir(), `ocd-log-file-${process.pid}-${Date.now()}`)
+    writeFileSync(file, "x")
+    try {
+      const lines: string[] = []
+      const logger = createLogger({ dir: path.join(file, "sub"), write: (l) => lines.push(l) })
+      expect(() => logger.log("info", "t", "still logged")).not.toThrow()
+      expect(lines).toHaveLength(1)
+    } finally {
+      rmSync(file, { force: true })
+    }
+  })
+
+  test("safeLog swallows a throwing logger", () => {
+    expect(() => safeLog({ log: () => { throw new Error("x") } }, "info", "t", "m")).not.toThrow()
   })
 
   test("drops lines below the minimum level", () => {

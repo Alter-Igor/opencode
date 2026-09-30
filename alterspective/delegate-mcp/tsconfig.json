@@ -11,5 +11,6 @@
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true
   },
-  "include": ["src/**/*.ts", "test/**/*.ts"]
+  "include": ["src/**/*.ts", "test/**/*.ts", "spike/**/*.ts"],
+  "exclude": ["spike/t01/work"]
 }

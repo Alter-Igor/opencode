@@ -158,6 +158,117 @@ describe("start lock on the real filesystem", () => {
     expect(JSON.parse(await readFile(lockFile(), "utf8")).token).toBe("someone-else")
   })
 
+  test("an unreadable lock is waited on with sleeps and times out, never a busy spin (N-2)", async () => {
+    let reads = 0
+    let sleeps = 0
+    let clock = 0
+    const fs: LeaseFs = {
+      ...nodeLeaseFs,
+      write: async () => false, // the lock exists...
+      read: async () => {
+        if (++reads > 10_000) throw new Error("busy spin: read the lock 10000 times without sleeping")
+        return undefined // ...but cannot be read (EACCES, or mid-replace)
+      },
+      mtime: async () => clock,
+    }
+    const sleep = async () => {
+      sleeps++
+      clock += 60_000
+    }
+    const error = await withStartLock(fs, lockFile(), async () => {}, options({ now: () => clock, sleep, waitMs: 10 * 60_000 })).catch((e: unknown) => e)
+    expect((error as DelegateError).code).toBe("sandbox_unavailable")
+    expect((error as DelegateError).detail).toContain("unreadable")
+    expect(sleeps).toBeGreaterThanOrEqual(10)
+    expect(reads).toBe(sleeps + 1)
+  })
+
+  test("a take-over never removes a lock another bridge took meanwhile: one holder at a time (N-3)", async () => {
+    // A hung holder's lock is old. Just before our take-over, another bridge takes it over first
+    // and now holds a fresh lock. We must leave that lock alone and wait for it.
+    await writeFile(lockFile(), JSON.stringify({ token: "hung", pid: 43, startedAt: 4_300 }))
+    const old = new Date(Date.now() - 10 * 60_000)
+    await utimes(lockFile(), old, old)
+    const other = JSON.stringify({ token: "other-bridge", pid: 43, startedAt: 4_300 })
+    let otherHolds = false
+    let injected = false
+    const violations: string[] = []
+    const fs: LeaseFs = {
+      ...nodeLeaseFs,
+      async write(file, text, exclusive) {
+        const ok = await nodeLeaseFs.write(file, text, exclusive)
+        if (ok && file.endsWith(".guard") && !injected) {
+          // The other bridge finished its own take-over between our judgement and our guard.
+          injected = true
+          await rm(lockFile())
+          await nodeLeaseFs.write(lockFile(), other, true)
+          otherHolds = true
+        }
+        return ok
+      },
+      async remove(file) {
+        if (file === lockFile() && otherHolds && (await nodeLeaseFs.read(file)) === other) violations.push("removed the other bridge's lock")
+        return nodeLeaseFs.remove(file)
+      },
+    }
+    let sleeps = 0
+    const sleep = async () => {
+      if (++sleeps === 3) {
+        await nodeLeaseFs.remove(lockFile()) // the other bridge releases
+        otherHolds = false
+      }
+    }
+    let ranWhileOtherHeld = false
+    await withStartLock(fs, lockFile(), async () => void (ranWhileOtherHeld = otherHolds), options({ sleep }))
+    expect(violations).toEqual([])
+    expect(ranWhileOtherHeld).toBe(false)
+    expect(sleeps).toBe(3)
+    expect(await readdir(dir)).toEqual([])
+  })
+
+  test("many waiters on one stale lock: exactly one runs at a time (N-3)", async () => {
+    await writeFile(lockFile(), JSON.stringify({ token: "gone", pid: 999, startedAt: 1 }))
+    let inside = 0
+    let most = 0
+    const contenders = Array.from({ length: 8 }, (_, i) =>
+      withStartLock(nodeLeaseFs, lockFile(), async () => {
+        most = Math.max(most, ++inside)
+        await new Promise((r) => setTimeout(r, 5))
+        inside--
+      }, options({ self: { pid: 100 + i, startedAt: 1 }, probe: { alive: (pid) => pid !== 999, startTime: async () => 1 } })),
+    )
+    await Promise.all(contenders)
+    expect(most).toBe(1)
+    expect(await readdir(dir)).toEqual([])
+  })
+
+  test("a waiter reads the holder's start time once, and only when its heartbeat is late (N-6)", async () => {
+    await writeFile(lockFile(), JSON.stringify({ token: "other", pid: 43, startedAt: 4_300 }))
+    let probes = 0
+    const probe: ProcessProbe = { alive: () => true, startTime: async () => (probes++, 4_300) }
+    let clock = Date.now()
+    let sleeps = 0
+    // Fresh heartbeat: no start-time probe at all, however long we wait.
+    const fresh = async () => {
+      clock += 20_000
+      await utimes(lockFile(), new Date(clock), new Date(clock))
+      if (++sleeps === 10) await rm(lockFile())
+    }
+    await withStartLock(nodeLeaseFs, lockFile(), async () => {}, options({ now: () => clock, sleep: fresh, probe }))
+    expect(sleeps).toBe(10)
+    expect(probes).toBe(0)
+    // Late heartbeat (2-5 min old): probed once, then remembered for every later wait.
+    await writeFile(lockFile(), JSON.stringify({ token: "other", pid: 43, startedAt: 4_300 }))
+    const late = new Date(clock - 3 * 60_000)
+    await utimes(lockFile(), late, late)
+    sleeps = 0
+    const idle = async () => {
+      if (++sleeps === 10) await rm(lockFile())
+    }
+    await withStartLock(nodeLeaseFs, lockFile(), async () => {}, options({ now: () => clock, sleep: idle, probe }))
+    expect(sleeps).toBe(10)
+    expect(probes).toBe(1)
+  })
+
   test("the holder refreshes its heartbeat while it works", async () => {
     const beats: Array<() => void> = []
     const touched: string[] = []

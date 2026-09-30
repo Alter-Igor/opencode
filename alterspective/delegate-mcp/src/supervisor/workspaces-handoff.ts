@@ -9,10 +9,12 @@
 //   with lstat semantics (never followed), then the name is reserved with an exclusive create.
 // - out-bundle: moved (rename, not copy) into a host-only quarantine folder first, so the box can no
 //   longer swap it, then refused unless it is a regular file within the size cap. Only then fetched.
+// Every file-system failure is a DelegateError; host paths and errno go to `detail` only (A-07).
 import { randomBytes } from "node:crypto"
-import { closeSync, lstatSync, mkdirSync, openSync, renameSync, rmdirSync, type Stats, unlinkSync } from "node:fs"
+import { closeSync, lstatSync, mkdirSync, openSync, rmdirSync, type Stats, unlinkSync } from "node:fs"
 import path from "node:path"
 import { DelegateError } from "../shared/errors.ts"
+import { renameRetry, type RawRename } from "./leases.ts"
 
 export const HANDOFF_IN = "in"
 export const HANDOFF_OUT = "out"
@@ -21,14 +23,26 @@ export const DEFAULT_MAX_BUNDLE_BYTES = 500 * 1024 * 1024
 const refused = (message: string, detail?: string) =>
   new DelegateError("policy_violation", message, "Run oc_doctor; if it repeats, stop the box and clear the hand-off folder.", detail)
 
+const errno = (error: unknown) => (error as NodeJS.ErrnoException | undefined)?.code ?? "unknown"
+
+/** A file-system failure in the bridge's hand-off folder (A-07): path and errno in detail only. */
+export function handoffFailure(what: string, error: unknown, p: string): DelegateError {
+  return new DelegateError(
+    "upstream_error",
+    `The bridge could not ${what} in its hand-off folder.`,
+    "Check the bridge home folder (OPENCODE_DELEGATE_HOME) is on a local drive and writable, then retry. Run oc_doctor if it repeats.",
+    `${errno(error)} ${p}`,
+  )
+}
+
 export const randomNonce = () => randomBytes(8).toString("hex")
 
 function lstatOrUndefined(p: string): Stats | undefined {
   try {
     return lstatSync(p)
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined
-    throw error
+    if (errno(error) === "ENOENT") return undefined
+    throw handoffFailure("check an entry", error, p)
   }
 }
 
@@ -36,7 +50,11 @@ function lstatOrUndefined(p: string): Stats | undefined {
 export function ensureRealDir(dir: string): void {
   const stat = lstatOrUndefined(dir)
   if (!stat) {
-    mkdirSync(dir, { recursive: true })
+    try {
+      mkdirSync(dir, { recursive: true })
+    } catch (error) {
+      throw handoffFailure("create a folder", error, dir)
+    }
     return ensureRealDir(dir)
   }
   if (stat.isSymbolicLink() || !stat.isDirectory()) throw refused("A hand-off folder was replaced by a link or a file; nothing was written.", dir)
@@ -49,8 +67,12 @@ export function removeEntry(p: string): void {
   if (stat.isDirectory() && !stat.isSymbolicLink()) throw refused("The hand-off folder holds an unexpected directory; nothing was written.", p)
   try {
     unlinkSync(p)
-  } catch {
-    rmdirSync(p) // a directory symlink or junction on Windows
+  } catch (unlinkError) {
+    try {
+      rmdirSync(p) // a directory symlink or junction on Windows
+    } catch (error) {
+      throw refused("A planted hand-off entry could not be removed.", `${errno(unlinkError)}/${errno(error)} ${p}`)
+    }
   }
   if (lstatOrUndefined(p)) throw refused("A planted hand-off entry could not be removed.", p)
 }
@@ -78,7 +100,7 @@ export function reserveInBundle(handoffDir: string, boxHandoff: string, key: str
   try {
     closeSync(openSync(hostPath, "wx"))
   } catch (error) {
-    throw refused("The hand-off bundle name was taken while it was being reserved.", `${hostPath}: ${(error as NodeJS.ErrnoException).code}`)
+    throw refused("The hand-off bundle name was taken while it was being reserved.", `${hostPath}: ${errno(error)}`)
   }
   return { hostPath, boxPath: `${boxHandoff}/${HANDOFF_IN}/${name}` }
 }
@@ -104,17 +126,32 @@ export function planOutBundle(handoffDir: string, boxHandoff: string, quarantine
   return { hostPath, boxPath: `${boxHandoff}/${HANDOFF_OUT}/${name}`, quarantinePath: path.join(quarantineDir, name) }
 }
 
-/** Move the box's bundle out of its reach, then check type and size. Returns the host-only path. */
-export function takeOutBundle(bundle: OutBundle, maxBytes: number): string {
+/** Why a move off the hand-off folder failed, in words the owner can act on (review N-11). */
+export function moveFailure(error: unknown, from: string, to: string): DelegateError {
+  const code = errno(error)
+  const detail = `${code} ${from} -> ${to}`
+  if (code === "EXDEV")
+    return new DelegateError("upstream_error", "The session bundle could not be moved: the hand-off folder and the bridge's state folder are on different drives.", "Keep the bridge home on one drive (OPENCODE_DELEGATE_HOME), then collect again.", detail)
+  if (code === "EBUSY" || code === "EPERM" || code === "EACCES")
+    return new DelegateError("upstream_error", "The session bundle is in use by another program (for example a virus scanner), so it could not be moved.", "Retry the collect in a moment. If it repeats, run oc_doctor.", detail)
+  return new DelegateError("upstream_error", "The session bundle could not be moved off the hand-off folder.", "Retry the collect; if it repeats, run oc_doctor.", detail)
+}
+
+/**
+ * Move the box's bundle out of its reach, then check type and size. Returns the host-only path.
+ * The rename retries a file that Windows holds open for a moment (leases.ts renameRetry).
+ */
+export async function takeOutBundle(bundle: OutBundle, maxBytes: number, raw?: RawRename): Promise<string> {
   assertRegularFile(bundle.hostPath, "session bundle") // clear message when the box wrote nothing
   ensureRealDir(path.dirname(bundle.quarantinePath))
   removeEntry(bundle.quarantinePath)
+  let moved: boolean
   try {
-    renameSync(bundle.hostPath, bundle.quarantinePath) // moves the entry itself, never a link target
+    moved = await renameRetry(bundle.hostPath, bundle.quarantinePath, raw) // moves the entry itself, never a link target
   } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code
-    throw new DelegateError("upstream_error", "The session bundle could not be moved off the hand-off folder.", "Keep the bridge home on one drive (OPENCODE_DELEGATE_HOME).", String(code))
+    throw moveFailure(error, bundle.hostPath, bundle.quarantinePath)
   }
+  if (!moved) throw new DelegateError("upstream_error", "The session bundle disappeared from the hand-off folder before it could be moved.", "Collect again.", bundle.hostPath)
   const stat = assertRegularFile(bundle.quarantinePath, "session bundle")
   if (stat.size > maxBytes) {
     removeQuietly(bundle.quarantinePath)

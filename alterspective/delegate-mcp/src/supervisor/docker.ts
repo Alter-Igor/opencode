@@ -1,11 +1,13 @@
-// MOD-01 T1.3: thin wrapper over the docker CLI. Every call is an argument array run with
-// Bun.spawn (never a shell string). stdout of `docker inspect` can carry the server password,
+// MOD-01 T1.3: thin wrapper over the docker CLI. Every call is an argument array run through
+// spawn.ts (never a shell string). stdout of `docker inspect` can carry the server password,
 // so callers must never log exec results; this module only returns parsed fields.
 import net from "node:net"
 import { DelegateError } from "../shared/errors.ts"
+import { runProcess } from "./spawn.ts"
 
 export type ExecResult = { code: number; stdout: string; stderr: string }
-export type ExecOptions = { env?: Record<string, string>; timeoutMs?: number }
+/** `cwd` matters for compose: without -f it would search the working folder and its parents. */
+export type ExecOptions = { env?: Record<string, string>; timeoutMs?: number; cwd?: string }
 export type Exec = (argv: string[], options?: ExecOptions) => Promise<ExecResult>
 
 /** Exit codes bunExec reports when it could not run the command at all (as shells do). */
@@ -38,29 +40,19 @@ export function childEnv(host: NodeJS.ProcessEnv, extra: Record<string, string> 
   return { ...env, ...extra }
 }
 
-/** Run argv. A missing binary is exit 127; a timeout kills the child and reports exit 124. */
+/** Exit code reported for a child killed by a signal it did not ask for. */
+export const EXIT_SIGNALLED = 128
+
+/**
+ * Run argv. A missing binary is exit 127; a timeout kills the whole process tree (review N-4,
+ * spawn.ts) and reports exit 124, returning within timeout + KILL_GRACE_MS even when a
+ * grandchild keeps the output pipes open.
+ */
 export const bunExec: Exec = async (argv, options = {}) => {
-  let proc: ReturnType<typeof Bun.spawn>
-  try {
-    proc = Bun.spawn(argv, { env: options.env ?? childEnv(process.env), stdin: "ignore", stdout: "pipe", stderr: "pipe" })
-  } catch (error) {
-    return { code: EXIT_NOT_FOUND, stdout: "", stderr: String(error) }
-  }
-  let timedOut = false
-  const timer = options.timeoutMs
-    ? setTimeout(() => {
-        timedOut = true
-        proc.kill()
-      }, options.timeoutMs)
-    : undefined
-  const [stdout, stderr, code] = await Promise.all([
-    new Response(proc.stdout as ReadableStream).text(),
-    new Response(proc.stderr as ReadableStream).text(),
-    proc.exited,
-  ])
-  if (timer) clearTimeout(timer)
-  if (timedOut) return { code: EXIT_TIMED_OUT, stdout, stderr: `${stderr}\n[timed out after ${options.timeoutMs} ms]`.trim() }
-  return { code, stdout, stderr }
+  const result = await runProcess(argv, { env: options.env ?? childEnv(process.env), cwd: options.cwd, timeoutMs: options.timeoutMs })
+  if (result.startError !== undefined) return { code: EXIT_NOT_FOUND, stdout: "", stderr: result.startError }
+  if (result.timedOut) return { code: EXIT_TIMED_OUT, stdout: result.stdout, stderr: `${result.stderr}\n[timed out after ${options.timeoutMs} ms]`.trim() }
+  return { code: result.code ?? EXIT_SIGNALLED, stdout: result.stdout, stderr: result.stderr }
 }
 
 export type ComposeFiles = { project: string; files: string[] }
@@ -78,8 +70,11 @@ export const dockerArgs = {
     name,
   ],
   up: (target: ComposeFiles, build: boolean) => compose(target, "up", "-d", "--remove-orphans", ...(build ? ["--build"] : [])),
-  // `down` without -f: Compose finds the project by label, so no interpolation vars are needed. Never -v.
-  down: (project: string) => ["docker", "compose", "-p", project, "down"],
+  // `down` gets the same -f files as `up` (review N-1): without them Compose would look for a
+  // compose file in the working folder and its parents and could load a stranger's. The caller
+  // also runs it with cwd = config.home. --remove-orphans takes every container of the project,
+  // even one a later compose.yaml no longer lists. Never -v: volumes hold the sign-in and sessions.
+  down: (target: ComposeFiles) => compose(target, "down", "--remove-orphans"),
 }
 
 /** Docker CLI missing or daemon not running → sandbox_unavailable. There is no fallback (edge case 11). */
@@ -158,7 +153,8 @@ export function imageTag(image: string, version: string, sha: string, dirty?: st
       `version=${version.slice(0, 40)} sha=${sha.slice(0, 40)}`,
     )
   const tag = `${version}-${sha}${dirty ? `-dirty-${dirty}` : ""}`
-  return `${image}:${tag.slice(0, 128)}`
+  // 128 is Docker's tag limit; room is kept for the sibling suffixes (SIBLING_SERVICES).
+  return `${image}:${tag.slice(0, 110)}`
 }
 
 /** Remove every secret value from text (e.g. compose stderr that echoes the environment). */

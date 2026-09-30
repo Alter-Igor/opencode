@@ -93,10 +93,17 @@ export function createLeases(fs: LeaseFs, dir: string, options: LeaseOptions): L
   }
 }
 
-async function renameRetry(from: string, to: string): Promise<boolean> {
+/** A raw rename (fs.promises.rename by default; tests pass a fake). */
+export type RawRename = (from: string, to: string) => Promise<void>
+
+/**
+ * Rename, retrying EPERM/EBUSY/EACCES a few times (Windows holds a just-written file open for a
+ * moment: indexer, antivirus). false when the source is missing; any other error is thrown.
+ */
+export async function renameRetry(from: string, to: string, raw: RawRename = rename): Promise<boolean> {
   for (let attempt = 0; ; attempt++) {
     try {
-      await rename(from, to)
+      await raw(from, to)
       return true
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code
@@ -128,12 +135,16 @@ export const nodeLeaseFs: LeaseFs = {
       await writeFile(file, text, { encoding: "utf8", flag: "wx" })
       return true
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EEXIST") return false
+      const code = (error as NodeJS.ErrnoException).code
+      if (code === "EEXIST") return false
+      // Windows: creating a name whose previous file is still being deleted fails with EPERM
+      // (delete pending) for a moment. That is "taken right now": the caller waits and retries.
+      if (process.platform === "win32" && (code === "EPERM" || code === "EACCES")) return false
       throw error
     }
   },
   remove: (file) => rm(file, { force: true }),
   mtime: (file) => stat(file).then((s) => s.mtimeMs, () => undefined),
   touch: (file) => utimes(file, new Date(), new Date()).then(() => true, () => false),
-  rename: renameRetry,
+  rename: (from, to) => renameRetry(from, to),
 }

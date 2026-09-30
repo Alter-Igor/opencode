@@ -59,6 +59,27 @@ describe("defaultSupervisorDeps: image identity (A-06)", () => {
     expect((await defaultSupervisorDeps(config, options())).opencodeVersion).toContain(".dirty.")
   })
 
+  test("a change anywhere under docker/ (egress, caches, compose.yaml) → a new dirty tag (N-9)", async () => {
+    const docker = path.join(repo, "alterspective", "delegate-mcp", "docker")
+    await mkdir(path.join(docker, "egress"), { recursive: true })
+    await writeFile(path.join(docker, "egress", "Dockerfile"), "FROM alpine\n")
+    await writeFile(path.join(docker, "compose.yaml"), "services: {}\n")
+    const sha = await seed()
+    expect((await defaultSupervisorDeps(config, options())).image).toBe(`opencode-delegate-box:1.2.3-${sha}`)
+    await writeFile(path.join(docker, "egress", "Dockerfile"), "FROM alpine:3.22\n")
+    const egress = (await defaultSupervisorDeps(config, options())).image
+    expect(egress).toMatch(/-dirty-[0-9a-f]{12}$/)
+    await git("checkout", "--", ".")
+    await writeFile(path.join(docker, "compose.yaml"), "services: { x: {} }\n")
+    const compose = (await defaultSupervisorDeps(config, options())).image
+    expect(compose).toMatch(/-dirty-[0-9a-f]{12}$/)
+    expect(compose).not.toBe(egress)
+    await git("checkout", "--", ".")
+    await mkdir(path.join(docker, "caches", "npm"), { recursive: true })
+    await writeFile(path.join(docker, "caches", "npm", "config.yaml"), "new: file\n")
+    expect((await defaultSupervisorDeps(config, options())).image).toMatch(/-dirty-[0-9a-f]{12}$/)
+  })
+
   test("a change outside the build context keeps the clean tag", async () => {
     const sha = await seed()
     await writeFile(path.join(repo, "README.md"), "changed docs\n")

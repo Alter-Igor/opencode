@@ -20,6 +20,12 @@ function unavailable(message: string, detail: string): DelegateError {
 
 /** Repo-relative folder of the box Dockerfile (forward slashes: it is also a git pathspec). */
 const BOX_DIR = "alterspective/delegate-mcp/docker/box"
+/**
+ * Everything the running set is built from (review N-9): the box, egress and cache Dockerfiles
+ * and configs, and compose.yaml. A change anywhere here gives a new tag, so the egress and cache
+ * images (named after the box image in compose.yaml) are rebuilt too.
+ */
+export const DOCKER_DIR = "alterspective/delegate-mcp/docker"
 
 export function dockerignorePath(repoRoot: string): string {
   return path.join(repoRoot, ...BOX_DIR.split("/"), "Dockerfile.dockerignore")
@@ -80,8 +86,8 @@ export async function buildIdentity(repoRoot: string, imageName: string, exec: E
   } catch (error) {
     throw unavailable("The sandbox build file list could not be read.", `${(error as NodeJS.ErrnoException).code ?? "error"} ${dockerignorePath(repoRoot)}`)
   }
-  // The Dockerfile and its ignore file shape the image too, though they are not copied into it.
-  const dirty = await dirtyHash(exec, repoRoot, [...buildContextPathspecs(dockerignore), BOX_DIR])
+  // The docker/ folder shapes the images too, though it is not copied into the box (N-9).
+  const dirty = await dirtyHash(exec, repoRoot, [...buildContextPathspecs(dockerignore), DOCKER_DIR])
   const image = imageTag(imageName, version, sha, dirty)
   const opencodeVersion = `${version}-alterspective.${sha}${dirty ? `.dirty.${dirty}` : ""}`
   return { version, sha, dirty, image, opencodeVersion }

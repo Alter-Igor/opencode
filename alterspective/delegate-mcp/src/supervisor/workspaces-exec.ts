@@ -1,9 +1,9 @@
 // MOD-01 workspaces: process execution and host path canonicalisation (split from workspaces.ts).
 // Every command is an argument array (no shell strings) and has a deadline (review A-14).
-import { execFile } from "node:child_process"
 import { realpathSync } from "node:fs"
 import path from "node:path"
 import { DelegateError } from "../shared/errors.ts"
+import { runProcess } from "./spawn.ts"
 
 export type ExecResult = { code: number; stdout: string; stderr: string; timedOut?: boolean }
 export type ExecOptions = { timeoutMs?: number }
@@ -19,26 +19,24 @@ export function cleanEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEn
   return out
 }
 
+const MAX_OUTPUT_BYTES = 64 * 1024 * 1024
+
 /**
- * Run one command. `timeoutMs` kills it at the deadline and reports TIMEOUT_CODE / timedOut.
- * On Windows the kill reaches the direct child only (for `docker exec` that is the CLI, not the
- * process inside the box).
+ * Run one command. `timeoutMs` kills the whole process tree at the deadline (review N-4,
+ * spawn.ts) and reports TIMEOUT_CODE / timedOut; the call returns within timeout + KILL_GRACE_MS
+ * even when a grandchild keeps the output pipes open. For `docker exec` the tree is the CLI on
+ * the host; the process inside the box is ended by Docker when the exec session closes.
  */
-export function runCommand(argv: readonly string[], env: NodeJS.ProcessEnv = cleanEnv(), timeoutMs?: number): Promise<ExecResult> {
-  const [file, ...args] = argv
-  if (!file) return Promise.resolve({ code: 127, stdout: "", stderr: "empty command" })
-  return new Promise((resolve) => {
-    const options = { env, windowsHide: true, maxBuffer: 64 * 1024 * 1024, timeout: timeoutMs ?? 0, killSignal: "SIGKILL" as const }
-    execFile(file, args, options, (error, stdout, stderr) => {
-      const timedOut = Boolean(timeoutMs && error?.killed && String(error.code) !== "ERR_CHILD_PROCESS_STDIO_MAXBUFFER")
-      if (timedOut) return resolve({ code: TIMEOUT_CODE, stdout: String(stdout), stderr: `timed out after ${timeoutMs} ms`, timedOut })
-      const exited = typeof error?.code === "number"
-      const code = error ? (exited ? (error.code as number) : 127) : 0
-      // A plain non-zero exit keeps the real (possibly empty) stderr: callers such as boxExists
-      // read "exit 1, no stderr" as a clean "absent". Only a failure to start gets error.message.
-      resolve({ code, stdout: String(stdout), stderr: String(stderr) || (error && !exited ? error.message : "") })
-    })
-  })
+export async function runCommand(argv: readonly string[], env: NodeJS.ProcessEnv = cleanEnv(), timeoutMs?: number): Promise<ExecResult> {
+  const result = await runProcess(argv, { env, timeoutMs, maxBuffer: MAX_OUTPUT_BYTES })
+  if (result.timedOut) return { code: TIMEOUT_CODE, stdout: result.stdout, stderr: `timed out after ${timeoutMs} ms`, timedOut: true }
+  // Could not start, or output over the cap: 127 with the reason (as before, via execFile).
+  if (result.startError !== undefined) return { code: 127, stdout: "", stderr: result.startError }
+  if (result.overflow) return { code: 127, stdout: result.stdout, stderr: `output over ${MAX_OUTPUT_BYTES} bytes; the command was stopped` }
+  // A plain non-zero exit keeps the real (possibly empty) stderr: callers such as boxExists
+  // read "exit 1, no stderr" as a clean "absent".
+  if (result.code !== undefined) return { code: result.code, stdout: result.stdout, stderr: result.stderr }
+  return { code: 128, stdout: result.stdout, stderr: result.stderr || `killed by ${result.signal ?? "a signal"}` }
 }
 
 /** Parse `subst` output lines such as `T:\: => X:\some\dir`. */

@@ -9,3 +9,5 @@
 | Adversarial review | Round 1 done (Synapse artifact reviewer + grounded falsifier). Round 2 owed after D-A |
 | Code | None written |
 | Worktree | `C:\GitHub\opencode---opencode-mcp-bridge`, branch `opencode-mcp-bridge` from `origin/dev` @ `b83572c4cc` |
+
+**2026-10-01 — Wave 1 built.** Supervisor, workspaces, sign-in, guard, egress, caches. Two reviews → all findings fixed (`ea3443e696`). Suite 285 pass / 6 skip / 0 fail, tsc clean, 96% lines. Live: T0.2 PASS, Wave 1 e2e PASS. Pushed `deff903515`. Next: verification review, then Wave 2.

@@ -7,11 +7,13 @@
 //            host-only folder, checks it, then `git fetch <bundle>`
 // No host-side git command ever runs inside the box clone, so hooks planted there cannot run on the host.
 // Hand-off hardening: workspaces-handoff.ts. Host-executable detection: workspaces-detect.ts.
+import { randomUUID } from "node:crypto"
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import path from "node:path"
 import type { BridgeConfig } from "../shared/config.ts"
 import type { Workspace, Workspaces } from "../shared/contracts.ts"
-import { DelegateError } from "../shared/errors.ts"
+import { DelegateError, isDelegateError } from "../shared/errors.ts"
+import { safeLog, silentLogger, type Logger } from "../shared/log.ts"
 import { flagChanges, parseRawDiff } from "./workspaces-detect.ts"
 import { canonicalPath, invalidFolder, isUnder, runCommand, samePath, systemSubst, type Exec } from "./workspaces-exec.ts"
 import { assertRegularFile, DEFAULT_MAX_BUNDLE_BYTES, planOutBundle, randomNonce, removeQuietly, reserveInBundle, takeOutBundle } from "./workspaces-handoff.ts"
@@ -47,6 +49,8 @@ export type WorkspacesOptions = {
   timeouts?: { longMs?: number; shortMs?: number }
   /** Unique part of hand-off and temp names. Default: 16 random hex characters. */
   nonce?: () => string
+  /** Every public call and error is logged here with a correlation id (A-17). Default: silent. */
+  logger?: Logger
 }
 
 type SessionState = { hostRepo: string; base: string }
@@ -120,10 +124,18 @@ function checkKey(key: string) {
 
 const statePath = (ctx: Ctx, key: string) => path.join(ctx.stateDir, `${key}.json`)
 
+const errno = (error: unknown) => (error as NodeJS.ErrnoException | undefined)?.code ?? "unknown"
+
 function writeState(ctx: Ctx, key: string, state: SessionState): void {
   if (!COMMIT_ID.test(state.base)) throw new DelegateError("upstream_error", "The base commit read from git is not a full commit id.", "Retry oc_start_session.", "invalid base")
-  mkdirSync(ctx.stateDir, { recursive: true })
-  writeFileSync(statePath(ctx, key), JSON.stringify(state satisfies SessionState))
+  const file = statePath(ctx, key)
+  try {
+    mkdirSync(ctx.stateDir, { recursive: true })
+    writeFileSync(file, JSON.stringify(state satisfies SessionState))
+  } catch (error) {
+    // A-07: the host path and errno go to detail only.
+    throw new DelegateError("upstream_error", "The bridge could not save this session's workspace record on the host.", "Check the bridge home folder (OPENCODE_DELEGATE_HOME) is writable, then start the session again.", `${errno(error)} ${file}`)
+  }
 }
 
 function readState(ctx: Ctx, key: string): SessionState {
@@ -131,8 +143,9 @@ function readState(ctx: Ctx, key: string): SessionState {
   let raw: string
   try {
     raw = readFileSync(file, "utf8")
-  } catch {
-    throw new DelegateError("not_found", "This session has no workspace record on the host.", "Start a new session with oc_start_session.", "missing")
+  } catch (error) {
+    if (errno(error) === "ENOENT") throw new DelegateError("not_found", "This session has no workspace record on the host.", "Start a new session with oc_start_session.", `missing: ${file}`)
+    throw new DelegateError("upstream_error", "The bridge could not read this session's workspace record on the host.", "Check the bridge home folder (OPENCODE_DELEGATE_HOME) is readable, then collect again.", `${errno(error)} ${file}`)
   }
   try {
     const parsed = JSON.parse(raw) as Partial<SessionState>
@@ -140,7 +153,12 @@ function readState(ctx: Ctx, key: string): SessionState {
   } catch {
     // reported below
   }
-  throw new DelegateError("not_found", "This session's workspace record on the host is damaged.", `Delete ${file} and start a new session with oc_start_session.`, "corrupt")
+  throw new DelegateError(
+    "not_found",
+    "This session's workspace record on the host is damaged.",
+    `Delete ${key}.json from the bridge's workspaces folder (the bridge log has the full path), then start a new session with oc_start_session.`,
+    `corrupt: ${file}`,
+  )
 }
 
 /** The host HEAD commit the session starts from (review A-22). */
@@ -232,7 +250,7 @@ async function collect(ctx: Ctx, ws: Workspace) {
   const bundle = planOutBundle(ctx.handoffDir, ctx.boxHandoff, path.join(ctx.stateDir, "incoming"), ws.sessionKey, ctx.nonce())
   try {
     await boxRun(ctx, ["git", "-C", `${ctx.boxSessions}/${ws.sessionKey}`, "bundle", "create", "--quiet", bundle.boxPath, branch], "bundle the session branch", "long")
-    const local = takeOutBundle(bundle, ctx.maxBundleBytes)
+    const local = await takeOutBundle(bundle, ctx.maxBundleBytes)
     await fetchBranch(ctx, state.hostRepo, local, branch)
   } finally {
     removeQuietly(bundle.hostPath)
@@ -243,7 +261,39 @@ async function collect(ctx: Ctx, ws: Workspace) {
   return { branch, commits: Number(count.trim()), hostExecutableChanges }
 }
 
-export function createWorkspaces(options: WorkspacesOptions): Workspaces & { resolveRepo(hostRepo: string): Promise<string> } {
+/** Per-call options: the caller's correlation id ties these log lines to its own (A-17). */
+export type CallOptions = { correlationId?: string }
+
+export type DelegateWorkspaces = Workspaces & {
+  open(hostRepo: string, sessionKey: string, call?: CallOptions): Promise<Workspace>
+  collect(workspace: Workspace, call?: CallOptions): ReturnType<Workspaces["collect"]>
+  resolveRepo(hostRepo: string, call?: CallOptions): Promise<string>
+}
+
+/** Anything that is not a DelegateError yet becomes one; its text goes to detail only. */
+function asDelegateError(error: unknown): DelegateError {
+  if (isDelegateError(error)) return error
+  const message = error instanceof Error ? error.message : String(error)
+  return new DelegateError("upstream_error", "The workspace step hit an unexpected error.", "Retry; if it repeats, run oc_doctor (the bridge log has the details).", `${errno(error)}: ${message.slice(0, 300)}`)
+}
+
+/** Log a public call, its outcome and any error with one correlation id (A-17). Logging never throws. */
+async function traced<T>(logger: Logger, op: string, call: CallOptions | undefined, fields: Record<string, string>, fn: () => Promise<T>, done?: (result: T) => Record<string, string | number | boolean>): Promise<T> {
+  const correlationId = call?.correlationId ?? randomUUID()
+  const began = Date.now()
+  safeLog(logger, "info", "workspaces", `${op} called`, { correlationId, ...fields })
+  try {
+    const result = await fn()
+    safeLog(logger, "info", "workspaces", `${op} done`, { correlationId, ms: Date.now() - began, ...fields, ...done?.(result) })
+    return result
+  } catch (error) {
+    const failure = asDelegateError(error)
+    safeLog(logger, "error", "workspaces", `${op} failed`, { correlationId, code: failure.code, detail: failure.detail, ms: Date.now() - began, ...fields })
+    throw failure
+  }
+}
+
+export function createWorkspaces(options: WorkspacesOptions): DelegateWorkspaces {
   const ctx: Ctx = {
     roots: options.config.roots,
     host: options.hostExec ?? ((argv, o) => runCommand(argv, undefined, o?.timeoutMs)),
@@ -257,9 +307,13 @@ export function createWorkspaces(options: WorkspacesOptions): Workspaces & { res
     timeouts: { long: options.timeouts?.longMs ?? LONG_TIMEOUT_MS, short: options.timeouts?.shortMs ?? SHORT_TIMEOUT_MS },
     nonce: options.nonce ?? randomNonce,
   }
+  const logger = options.logger ?? silentLogger
+  // Session keys are logged (they are the owner's own labels); repo paths go only to failure detail.
   return {
-    open: (hostRepo, sessionKey) => open(ctx, hostRepo, sessionKey),
-    collect: (ws) => collect(ctx, ws),
-    resolveRepo: (hostRepo) => resolveRepo(ctx, hostRepo),
+    open: (hostRepo: string, sessionKey: string, call?: CallOptions) =>
+      traced(logger, "open", call, { sessionKey }, () => open(ctx, hostRepo, sessionKey), (ws) => ({ branch: ws.branch })),
+    collect: (ws: Workspace, call?: CallOptions) =>
+      traced(logger, "collect", call, { sessionKey: ws.sessionKey }, () => collect(ctx, ws), (r) => ({ branch: r.branch, commits: r.commits, hostExecutableChanges: r.hostExecutableChanges.length })),
+    resolveRepo: (hostRepo: string, call?: CallOptions) => traced(logger, "resolveRepo", call, {}, () => resolveRepo(ctx, hostRepo)),
   }
 }

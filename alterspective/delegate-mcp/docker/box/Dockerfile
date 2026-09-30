@@ -5,7 +5,9 @@
 
 # ---- stage 1: compile a linux-x64 single binary from the fork source ----
 # Bun version must match root package.json "packageManager" (packages/script checks ^version).
-FROM oven/bun:1.3.14 AS build
+# Base images are pinned by version and digest (review C-9); resolved 2026-10-01 with
+# `docker buildx imagetools inspect <image>:<tag>` (multi-arch index digests).
+FROM oven/bun:1.3.14@sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4 AS build
 WORKDIR /src
 COPY . .
 # --ignore-scripts: skips husky (needs .git) and electron downloads; the compiled
@@ -22,7 +24,7 @@ RUN bun run --cwd packages/opencode script/build.ts --single --skip-embed-web-ui
     && test -x packages/opencode/dist/opencode-linux-x64/bin/opencode
 
 # ---- stage 2: the runtime box ----
-FROM node:22-slim
+FROM node:22-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d3a30b772c
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git curl ca-certificates python3 python3-pip python3-venv \
     && rm -rf /var/lib/apt/lists/*

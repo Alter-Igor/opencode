@@ -14,9 +14,14 @@ describe("docker args are argument arrays, never shell strings", () => {
     expect(dockerArgs.up(target, false)).not.toContain("--build")
   })
 
-  test("down never removes volumes", () => {
-    expect(dockerArgs.down("opencode-delegate")).toEqual(["docker", "compose", "-p", "opencode-delegate", "down"])
-    expect(dockerArgs.down("opencode-delegate")).not.toContain("-v")
+  test("down uses the same -f files as up, removes orphans, and never removes volumes (N-1)", () => {
+    expect(dockerArgs.down(target)).toEqual([
+      "docker", "compose", "-p", "opencode-delegate",
+      "-f", "C:\\repo\\docker\\compose.yaml", "-f", "C:\\home\\compose.box-env.yaml",
+      "down", "--remove-orphans",
+    ])
+    expect(dockerArgs.down(target)).not.toContain("-v")
+    expect(dockerArgs.down(target)).not.toContain("--volumes")
   })
 
   test("a path with spaces or shell metacharacters stays one argument", () => {

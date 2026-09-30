@@ -2,11 +2,11 @@
 // The box starts the OAuth flow; the bridge opens the owner's browser, catches the loopback redirect on the
 // host, checks `state`, and relays ONLY the code to the box. The code and the URL query are never logged.
 import { spawn } from "node:child_process"
+import { randomUUID } from "node:crypto"
 import http from "node:http"
 import { KS_NAME } from "../guard/entries.ts"
-import { defaultConfig } from "../shared/config.ts"
-import { DelegateError } from "../shared/errors.ts"
-import { silentLogger, type Logger } from "../shared/log.ts"
+import { DelegateError, isDelegateError } from "../shared/errors.ts"
+import { safeLog, silentLogger, type Logger } from "../shared/log.ts"
 import { expectOk, type McpStatus, type OpencodeApi } from "../shared/opencode-api.ts"
 
 export const LOGIN_PORT = 19876
@@ -23,9 +23,16 @@ export type LoginOptions = {
   timeoutMs?: number
   /** Instance directory for the box API calls. Default `/sessions`. */
   directory?: string
-  /** The only origin whose authorization URL the bridge will open. Default: config.keystoneOrigin. */
-  authOrigin?: string
+  /**
+   * The only origin whose authorization URL the bridge will open: pass the bridge's own
+   * `config.keystoneOrigin` (review A-20). Required, so a caller cannot silently fall back to the
+   * default config when it runs with another one.
+   */
+  authOrigin: string
+  /** Every call and error is logged here with `correlationId` (A-17). Default: silent. */
   logger?: Logger
+  /** Ties these log lines to the caller's. Default: a new UUID. */
+  correlationId?: string
 }
 
 type Received = { code: string | undefined; reply(status: number, text: string): Promise<void> }
@@ -121,13 +128,37 @@ async function relay(api: OpencodeApi, entry: string, directory: string, got: Re
 
 /**
  * Keystone sign-in for one ks-* entry. Box calls go through `api`, so they inherit its deadline
- * (DEFAULT_API_TIMEOUT_MS); the listener is closed on every path, including a throw.
+ * (DEFAULT_API_TIMEOUT_MS); the listener is closed on every path, including a throw. The call,
+ * its result and any error are logged with one correlation id (A-17).
  */
-export async function login(api: OpencodeApi, entry: string, opts: LoginOptions = {}): Promise<"connected" | "failed"> {
+export async function login(api: OpencodeApi, entry: string, opts: LoginOptions): Promise<"connected" | "failed"> {
+  const correlationId = opts.correlationId ?? randomUUID()
+  const logger = withCorrelation(opts.logger ?? silentLogger, correlationId)
+  const began = Date.now()
+  // The entry name is logged only once it passed KS_NAME (it may be anything before that).
+  logger.log("info", "login", "login called")
+  try {
+    const result = await signIn(api, entry, opts, logger)
+    logger.log("info", "login", "login done", { entry, result, ms: Date.now() - began })
+    return result
+  } catch (error) {
+    const failure = isDelegateError(error)
+      ? error
+      : new DelegateError("upstream_error", "The Keystone sign-in hit an unexpected error.", "Retry oc_login; if it repeats, run oc_doctor.", error instanceof Error ? `${error.name}: ${error.message.slice(0, 300)}` : String(error).slice(0, 300))
+    logger.log("error", "login", "login failed", { code: failure.code, detail: failure.detail, ms: Date.now() - began })
+    throw failure
+  }
+}
+
+/** A logger that adds the correlation id to every line and never throws (A-11, A-17). */
+function withCorrelation(logger: Logger, correlationId: string): Logger {
+  return { log: (level, component, msg, fields = {}) => safeLog(logger, level, component, msg, { correlationId, ...fields }) }
+}
+
+async function signIn(api: OpencodeApi, entry: string, opts: LoginOptions, logger: Logger): Promise<"connected" | "failed"> {
   if (!KS_NAME.test(entry) || entry.length > MAX_ENTRY_LENGTH) {
     throw new DelegateError("invalid_input", "Only ks-* entries can be signed in.", "Pass a ks-* server name (lower-case, for example ks-delegate).")
   }
-  const logger = opts.logger ?? silentLogger
   const directory = opts.directory ?? "/sessions"
   const listener = await openListener(opts.port ?? LOGIN_PORT, logger)
   let timer: ReturnType<typeof setTimeout> | undefined
@@ -135,7 +166,7 @@ export async function login(api: OpencodeApi, entry: string, opts: LoginOptions 
     const started = expectOk(await api.call<{ authorizationUrl?: string; oauthState?: string }>({ method: "POST", path: `/mcp/${entry}/auth`, directory, body: {} }), "start the Keystone sign-in")
     if (!started.authorizationUrl) return await entryStatus(api, entry, directory) // already signed in
     if (!started.oauthState) throw new DelegateError("upstream_error", "The delegate box did not return a sign-in state.", "Retry oc_login.")
-    checkAuthUrl(started.authorizationUrl, opts.authOrigin ?? defaultConfig().keystoneOrigin)
+    checkAuthUrl(started.authorizationUrl, opts.authOrigin)
     listener.expect(started.oauthState)
     ;(opts.opener ?? defaultOpener)(started.authorizationUrl)
     logger.log("info", "login", "browser opened; waiting for the loopback redirect", { entry })

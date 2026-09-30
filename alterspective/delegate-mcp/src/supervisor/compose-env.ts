@@ -28,6 +28,17 @@ export function containerName(config: Pick<BridgeConfig, "project">): string {
   return config.project
 }
 
+/**
+ * The services next to the box that are built from docker/ (review N-9). Each one's image is
+ * `${OCD_IMAGE}-<service>` and its container `<project>-<service>` carries the image label, so a
+ * running set built from another checkout is caught on reuse.
+ */
+export const SIBLING_SERVICES = ["egress", "npm-cache", "pypi-cache"] as const
+
+export function siblingContainers(config: Pick<BridgeConfig, "project">): Array<{ service: string; container: string }> {
+  return SIBLING_SERVICES.map((service) => ({ service, container: `${containerName(config)}-${service}` }))
+}
+
 /** Compose override listing the approved box env vars by NAME only (values come from the child env). */
 export function boxEnvOverride(names: string[]): string {
   for (const name of names)
@@ -52,6 +63,24 @@ export function approvedValues(inputs: Pick<ComposeInputs, "config" | "hostEnv">
     if (value !== undefined) approved[name] = value
   }
   return approved
+}
+
+/**
+ * Env of the `docker compose down` child (review N-1). `down` loads the same -f files as `up`,
+ * so the required interpolation variables must be set; none of them is a secret, and neither the
+ * password nor any approved key is passed. Placeholders stand in for values only `up` needs.
+ */
+export function composeDownEnv(inputs: ComposeInputs): Record<string, string> {
+  const dirs = paths(inputs.config)
+  return childEnv(inputs.hostEnv, {
+    OCD_IMAGE: inputs.image,
+    OCD_OPENCODE_VERSION: inputs.opencodeVersion,
+    OCD_PROFILE_HASH: "down",
+    OCD_PORT: "0",
+    OCD_CONTAINER: containerName(inputs.config),
+    OCD_PROFILE_DIR: dirs.profile,
+    OCD_HANDOFF_DIR: dirs.handoff,
+  })
 }
 
 /** Env of the `docker compose up` child: CLI essentials + OCD_* + password + approved keys. */

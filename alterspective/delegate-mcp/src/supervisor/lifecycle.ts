@@ -2,14 +2,15 @@
 // Start, reuse and stop all run under the host start lock, and this bridge's lease is taken
 // before any health wait, so another bridge's release can never stop a box this bridge is
 // about to use (A-02). Every public call is logged with the bridge id and a correlation id.
-import { mkdir, writeFile } from "node:fs/promises"
+// A running set is reused only when the box AND its egress/cache siblings match (N-9).
+import { chmod, mkdir, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { mcpAllowPolicy, type BridgeConfig } from "../shared/config.ts"
 import type { Supervisor } from "../shared/contracts.ts"
 import { DelegateError } from "../shared/errors.ts"
 import type { Logger } from "../shared/log.ts"
 import type { ApiTarget } from "../shared/opencode-api.ts"
-import { INSPECT_ENV, MCP_ALLOW_ENV, approvedValues, boxEnvOverride, composeEnv } from "./compose-env.ts"
+import { INSPECT_ENV, MCP_ALLOW_ENV, approvedValues, boxEnvOverride, composeDownEnv, composeEnv, siblingContainers } from "./compose-env.ts"
 import { LABEL, dockerArgs, imageExists, inspectBox, redactAll, requireDocker, type BoxInspect, type Exec, type ExecResult } from "./docker.ts"
 import { waitHealthy } from "./health.ts"
 import type { LeaseFs } from "./leases.ts"
@@ -19,7 +20,7 @@ import { createContext, lockOptions, traced, withLease, type Run } from "./run.t
 import { withStartLock, type Every } from "./start-lock.ts"
 import { statusOf, targetOf, type DelegateSupervisor } from "./status.ts"
 
-export { PASSWORD_ENV, boxEnvOverride, composeEnv, paths } from "./compose-env.ts"
+export { PASSWORD_ENV, boxEnvOverride, composeDownEnv, composeEnv, paths, siblingContainers } from "./compose-env.ts"
 export { defaultSupervisorDeps } from "./deps.ts"
 export { targetOf, type DelegateSupervisor, type SupervisorStatus } from "./status.ts"
 
@@ -74,8 +75,23 @@ export function checkReusable(deps: SupervisorDeps, box: BoxInspect, hash: strin
     throw changed("The running sandbox has a different MCP allow policy than this bridge.", `${MCP_ALLOW_ENV} ${box.env[MCP_ALLOW_ENV] === undefined ? "missing" : "differs"}`)
 }
 
+/** egress and the caches must come from the same checkout as the box (review N-9). */
+export async function checkSiblings(run: Run): Promise<void> {
+  const { deps } = run
+  for (const { service, container } of siblingContainers(deps.config)) {
+    const sibling = await inspectBox(deps.exec, [], container)
+    const label = sibling?.labels[LABEL.image]
+    if (label !== deps.image)
+      throw changed(
+        `The running sandbox's ${service} service was built from a different OpenCode checkout.`,
+        `${service} ${sibling ? `image label ${label ?? "missing"}` : "container missing"} != ${deps.image}`,
+      )
+  }
+}
+
 async function reuse(run: Run, box: BoxInspect, hash: string): Promise<ApiTarget> {
   checkReusable(run.deps, box, hash)
+  await checkSiblings(run)
   const target = targetOf(box, run.deps.config.project)
   return withLease(run, async () => {
     await waitHealthy(run.deps, target, run.container)
@@ -92,11 +108,30 @@ async function prepareFiles(run: Run, built: BuiltProfile): Promise<void> {
   try {
     // Both bind sources must exist before `up`, or Docker creates them root-owned (review C-4).
     await mkdir(path.join(dirs.handoff, "in"), { recursive: true })
-    await mkdir(path.join(dirs.handoff, "out"), { recursive: true })
-    await writeFile(dirs.boxEnvOverride, boxEnvOverride(deps.config.boxEnv), "utf8")
+    const out = path.join(dirs.handoff, "out")
+    await mkdir(out, { recursive: true })
+    const mode = handoffOutMode(process.platform)
+    if (mode !== undefined) await chmod(out, mode)
+    await writeBoxEnvOverride(run)
   } catch (error) {
     throw fsFailure("prepare the sandbox folders", error, deps.config.home)
   }
+}
+
+/**
+ * Mode for <home>/handoff/out on the host (review N-12, docker/box/README.md). On a Linux Docker
+ * host the bind mount keeps host ownership, and the box user (uid 10001) must write its bundle
+ * there, so the folder is opened to all (0777). Safe because the host never runs anything from
+ * it and takes each bundle by rename into a host-only folder, then checks type and size
+ * (workspaces-handoff.ts). On Windows, Docker Desktop maps permissions itself and POSIX modes
+ * mean nothing to NTFS, so the folder is left alone.
+ */
+export function handoffOutMode(platform: NodeJS.Platform): number | undefined {
+  return platform === "win32" ? undefined : 0o777
+}
+
+async function writeBoxEnvOverride(run: Run): Promise<void> {
+  await writeFile(run.dirs.boxEnvOverride, boxEnvOverride(run.deps.config.boxEnv), "utf8")
 }
 
 const PORT_BUSY = /port is already allocated|address already in use|Only one usage of each socket address/i
@@ -142,11 +177,16 @@ async function ensure(run: Run): Promise<ApiTarget> {
 async function release(run: Run): Promise<void> {
   if (!run.state.leased) return run.note("info", "release: this bridge holds no lease; nothing to stop")
   await withStartLock(run.deps.leaseFs, run.dirs.startLock, async () => {
-    run.stopHeartbeat()
+    // Waits for a heartbeat already in flight, so it cannot re-create the lease (review N-10).
+    await run.stopHeartbeat()
     const remaining = await run.leases.release(run.deps.bridgeId)
     run.state.leased = false
     if (remaining > 0) return run.note("info", "lease released; sandbox kept", { remaining })
-    const result = await run.deps.exec(dockerArgs.down(run.deps.config.project), { timeoutMs: 120_000 })
+    // Same -f files as `up`, from the bridge home, never the process working folder (review N-1).
+    await writeBoxEnvOverride(run).catch((error: unknown) => {
+      throw fsFailure("prepare the sandbox stop", error, run.dirs.boxEnvOverride)
+    })
+    const result = await run.deps.exec(dockerArgs.down(run.compose), { env: composeDownEnv(run.deps), cwd: run.deps.config.home, timeoutMs: 120_000 })
     if (result.code !== 0) {
       const detail = `exit ${result.code}: ${result.stderr.trim().slice(-400)}`
       run.note("error", "stop failed", { code: result.code, detail })

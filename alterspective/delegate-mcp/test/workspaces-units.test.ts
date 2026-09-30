@@ -1,6 +1,6 @@
 // Pure workspace helpers: host-executable detection (A-15, C-3), hand-off helpers (C-4), exec deadline (A-14).
 import { afterAll, beforeAll, describe, expect, test } from "bun:test"
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import {
@@ -13,7 +13,8 @@ import {
   TIMEOUT_CODE,
   type RawEntry,
 } from "../src/supervisor/workspaces.ts"
-import { ensureRealDir, removeEntry } from "../src/supervisor/workspaces-handoff.ts"
+import { flagChanges, packageJsonRisky } from "../src/supervisor/workspaces-detect.ts"
+import { ensureRealDir, removeEntry, takeOutBundle } from "../src/supervisor/workspaces-handoff.ts"
 import { DelegateError } from "../src/shared/errors.ts"
 
 let tmp = ""
@@ -81,6 +82,118 @@ describe("modes and raw diff", () => {
     expect(scriptsChanged(undefined, '{"name":"x"}')).toBe(false)
     expect(scriptsChanged(undefined, '{"scripts":{}}')).toBe(true)
     expect(scriptsChanged("{bad", "{bad")).toBe(true)
+  })
+})
+
+describe("round-2 detection (N-7, N-8)", () => {
+  test("flags agent/tool configs, test and build hooks, MSBuild and script files", () => {
+    const flagged = [
+      "opencode.json", "sub/opencode.jsonc", ".opencode/agent.md", ".cursor/rules.mdc", ".codex/config.toml", ".gemini/settings.json",
+      "tests/conftest.py", "Directory.Build.props", "src/Directory.Build.targets", "App/App.csproj", "Legacy.vbproj", "crate/build.rs",
+      "tools/Module.psm1", "setup.vbs",
+    ]
+    for (const p of flagged) expect({ p, flagged: isHostExecutablePath(p) }).toEqual({ p, flagged: true })
+    for (const p of ["opencode.md", "cursor.txt", "src/build.rsx", "conftest.txt", "app.cs", "docs/codex.md"]) expect({ p, flagged: isHostExecutablePath(p) }).toEqual({ p, flagged: false })
+  })
+
+  const pkg = (extra: Record<string, unknown>) => JSON.stringify({ name: "x", version: "1.0.0", ...extra })
+  test("package.json: bin changes and non-registry dependencies are risky; registry bumps are not", () => {
+    expect(packageJsonRisky(pkg({}), pkg({ bin: { x: "cli.js" } }))).toBe(true)
+    expect(packageJsonRisky(pkg({ bin: "a.js" }), pkg({ bin: "b.js" }))).toBe(true)
+    for (const spec of ["file:../evil", "link:../evil", "git+https://example.test/e.git", "git://example.test/e.git", "github:owner/evil", "http://example.test/e.tgz", "https://example.test/e.tgz"]) {
+      for (const field of ["dependencies", "devDependencies", "optionalDependencies"]) {
+        expect({ spec, field, risky: packageJsonRisky(pkg({}), pkg({ [field]: { evil: spec } })) }).toEqual({ spec, field, risky: true })
+      }
+    }
+    // Changing where a non-registry dependency points is risky too; removing one is reported.
+    expect(packageJsonRisky(pkg({ dependencies: { a: "file:./a" } }), pkg({ dependencies: { a: "file:./b" } }))).toBe(true)
+    expect(packageJsonRisky(pkg({ dependencies: { a: "file:./a" } }), pkg({}))).toBe(true)
+    // Registry versions and unrelated fields are not.
+    expect(packageJsonRisky(pkg({ dependencies: { a: "^1.0.0" } }), pkg({ dependencies: { a: "^2.0.0", b: "npm:left-pad@1" }, version: "2.0.0" }))).toBe(false)
+    expect(packageJsonRisky(pkg({ scripts: { t: "x" } }), pkg({ scripts: { t: "x" }, description: "d" }))).toBe(false)
+    expect(packageJsonRisky(undefined, pkg({}))).toBe(false)
+    expect(packageJsonRisky(pkg({}), "{bad")).toBe(true)
+    expect(packageJsonRisky(pkg({}), "[]")).toBe(true)
+  })
+
+  const entry = (srcMode: string, dstMode: string, p = "package.json"): RawEntry => ({ srcMode, dstMode, status: "M", path: p })
+  test("a package.json whose blob cannot be read is flagged, not treated as absent (N-8)", async () => {
+    const benign = pkg({ scripts: { t: "x" } })
+    const asked: string[] = []
+    const reader = (fail: string) => async (rev: string, file: string) => {
+      asked.push(`${rev}:${file}`)
+      return rev === fail ? undefined : benign
+    }
+    expect(await flagChanges([entry("100644", "100644")], "base", "branch", reader("none"))).toEqual([])
+    expect(await flagChanges([entry("100644", "100644")], "base", "branch", reader("branch"))).toEqual(["package.json"])
+    expect(await flagChanges([entry("100644", "100644")], "base", "branch", reader("base"))).toEqual(["package.json"])
+    // An added file (000000 on the base side) is never read at the base.
+    asked.length = 0
+    const plainReader = async (rev: string, file: string) => (asked.push(`${rev}:${file}`), pkg({}))
+    expect(await flagChanges([entry("000000", "100644", "sub/package.json")], "base", "branch", plainReader)).toEqual([])
+    expect(asked).toEqual(["branch:sub/package.json"])
+    expect(await flagChanges([entry("000000", "100644", "sub/package.json")], "base", "branch", reader("none"))).toEqual(["sub/package.json"]) // added with scripts
+    // A deleted one is flagged when it had scripts, not when it had none, and always when its read fails.
+    expect(await flagChanges([entry("100644", "000000")], "base", "branch", reader("none"))).toEqual(["package.json"])
+    expect(await flagChanges([entry("100644", "000000")], "base", "branch", async () => pkg({}))).toEqual([])
+    expect(await flagChanges([entry("100644", "000000")], "base", "branch", reader("base"))).toEqual(["package.json"])
+  })
+})
+
+describe("hand-off failures are DelegateErrors with the path in detail only (A-07, N-11)", () => {
+  test("a folder that cannot be created or checked", () => {
+    const file = path.join(tmp, "not-a-folder")
+    writeFileSync(file, "x")
+    const error = (() => {
+      try {
+        ensureRealDir(path.join(file, "in"))
+      } catch (e) {
+        return e as DelegateError
+      }
+    })()
+    expect(error).toBeInstanceOf(DelegateError)
+    expect(error!.code).toBe("upstream_error")
+    expect(error!.message).not.toContain(tmp)
+    expect(error!.action).not.toContain(tmp)
+    expect(error!.detail).toContain(file)
+  })
+
+  const bundle = (name: string) => {
+    const out = path.join(tmp, "take", "out")
+    mkdirSync(out, { recursive: true })
+    const hostPath = path.join(out, name)
+    writeFileSync(hostPath, "bundle")
+    return { hostPath, boxPath: `/handoff/out/${name}`, quarantinePath: path.join(tmp, "take", "quarantine", name) }
+  }
+  const failWith = (code: string, times = Infinity) => {
+    let calls = 0
+    return async (from: string, to: string) => {
+      if (calls++ < times) throw Object.assign(new Error(`${code}: rename '${from}'`), { code })
+      renameSync(from, to)
+    }
+  }
+
+  test("a briefly busy bundle (EBUSY/EPERM) is retried and then moved", async () => {
+    const b = bundle("busy.bundle")
+    expect(await takeOutBundle(b, 1_000, failWith("EBUSY", 2))).toBe(b.quarantinePath)
+    expect(existsSync(b.quarantinePath)).toBe(true)
+    const c = bundle("perm.bundle")
+    expect(await takeOutBundle(c, 1_000, failWith("EPERM", 3))).toBe(c.quarantinePath)
+  })
+
+  test("errors say what to do: busy → retry, cross-device → one drive; no path in message or action", async () => {
+    const busy = (await takeOutBundle(bundle("stuck.bundle"), 1_000, failWith("EBUSY")).catch((e: unknown) => e)) as DelegateError
+    expect(busy.code).toBe("upstream_error")
+    expect(busy.message).toContain("in use")
+    expect(busy.action).toContain("Retry")
+    const exdev = (await takeOutBundle(bundle("far.bundle"), 1_000, failWith("EXDEV")).catch((e: unknown) => e)) as DelegateError
+    expect(exdev.message).toContain("different drives")
+    expect(exdev.action).toContain("one drive")
+    for (const e of [busy, exdev]) {
+      expect(e.message).not.toContain(tmp)
+      expect(e.action).not.toContain(tmp)
+      expect(e.detail).toContain(tmp)
+    }
   })
 })
 

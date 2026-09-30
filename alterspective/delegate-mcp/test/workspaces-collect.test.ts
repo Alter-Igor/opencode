@@ -131,10 +131,60 @@ describe("workspaces: collect errors are specific", () => {
     const corrupt = await failure(fx.workspaces().collect(ws("corrupt-key")))
     const badBase = await failure(fx.workspaces().collect(ws("badbase-key")))
     expect([missing.code, corrupt.code, badBase.code]).toEqual(["not_found", "not_found", "not_found"])
-    expect([missing.detail, corrupt.detail, badBase.detail]).toEqual(["missing", "corrupt", "corrupt"])
+    expect([missing.detail, corrupt.detail, badBase.detail].map((d) => d?.split(":")[0])).toEqual(["missing", "corrupt", "corrupt"])
     expect(corrupt.message).not.toBe(missing.message)
+    // A-07: the file name is named, the host path only in detail.
     expect(corrupt.action).toContain("corrupt-key.json")
+    for (const e of [missing, corrupt, badBase]) {
+      expect(e.message).not.toContain(fx.tmp)
+      expect(e.action).not.toContain(fx.tmp)
+    }
+    expect(corrupt.detail).toContain(path.join(fx.tmp, "state", "corrupt-key.json"))
   })
+
+  test(
+    "a workspace record that cannot be written is upstream_error with the path in detail only; the open is undone (A-07)",
+    async () => {
+      const blocked = path.join(fx.tmp, "state-is-a-file")
+      writeFileSync(blocked, "x")
+      const error = await failure(fx.workspaces({ stateDir: blocked }).open(fx.hostRepo, "nostate-key"))
+      expect(error.code).toBe("upstream_error")
+      expect(error.message).not.toContain(fx.tmp)
+      expect(error.action).not.toContain(fx.tmp)
+      expect(error.detail).toContain(blocked)
+      expect(fx.leftovers("nostate-key")).toEqual([])
+      expect(fx.handoffFiles()).toEqual([])
+    },
+    T,
+  )
+})
+
+describe("workspaces: every public call is logged with a correlation id (A-17)", () => {
+  test(
+    "open and collect log called/done, errors log code + detail, all with the caller's correlation id",
+    async () => {
+      const lines: Array<{ level: string; msg: string; fields: Record<string, unknown> }> = []
+      const logger = { log: (level: string, _c: string, msg: string, fields: Record<string, unknown> = {}) => void lines.push({ level, msg, fields }) }
+      const workspaces = fx.workspaces({ logger })
+      const ws = await workspaces.open(fx.hostRepo, "log-key", { correlationId: "cid-open" })
+      await fx.boxCommit("log-key", { "a.txt": "1\n" }, "one")
+      await workspaces.collect(ws, { correlationId: "cid-collect" })
+      await workspaces.open(fx.hostRepo, "log-key", { correlationId: "cid-busy" }).catch(() => undefined)
+      const byCid = (cid: string) => lines.filter((l) => l.fields.correlationId === cid).map((l) => l.msg)
+      expect(byCid("cid-open")).toEqual(["open called", "open done"])
+      expect(byCid("cid-collect")).toEqual(["collect called", "collect done"])
+      expect(byCid("cid-busy")).toEqual(["open called", "open failed"])
+      expect(lines.find((l) => l.msg === "collect done")?.fields).toMatchObject({ branch: "delegate/log-key", commits: 1, hostExecutableChanges: 0 })
+      expect(lines.find((l) => l.msg === "open failed")?.fields).toMatchObject({ code: "directory_busy", sessionKey: "log-key" })
+      // Without a caller id each call still gets its own.
+      await workspaces.resolveRepo(fx.hostRepo)
+      expect(typeof lines.at(-1)?.fields.correlationId).toBe("string")
+      // A throwing logger changes nothing (A-11).
+      const loud = fx.workspaces({ logger: { log: () => { throw new Error("sink down") } } })
+      expect(await loud.resolveRepo(fx.hostRepo)).toBe(await workspaces.resolveRepo(fx.hostRepo))
+    },
+    T,
+  )
 })
 
 describe("workspaces: deadlines and folder validation", () => {

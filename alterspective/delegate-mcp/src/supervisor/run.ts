@@ -2,9 +2,10 @@
 // Every public call gets a correlation id; every log line carries it and the bridge id.
 // Any error that is not already a DelegateError is wrapped, so callers only ever see stable
 // codes; paths, errno and stderr go to `detail`, which is logged but never shown (ERR-SPLIT-01).
+// Logging never throws (A-11): a broken logger cannot turn status() or a failure into a crash.
 import { randomUUID } from "node:crypto"
 import { DelegateError, isDelegateError, type ErrorCode } from "../shared/errors.ts"
-import { silentLogger, type Level, type Logger } from "../shared/log.ts"
+import { safeLog, silentLogger, type Level, type Logger } from "../shared/log.ts"
 import { containerName, paths } from "./compose-env.ts"
 import type { ComposeFiles } from "./docker.ts"
 import { LEASE_HEARTBEAT_MS, createLeases, type Leases } from "./leases.ts"
@@ -14,7 +15,10 @@ import { LOCK_WAIT_MS, intervalEvery, type LockOptions } from "./start-lock.ts"
 
 type Fields = Record<string, string | number | boolean | undefined>
 
-type State = { startedHere: boolean; leased: boolean; stopLeaseHeartbeat?: () => void; self?: ProcessRecord }
+/** The lease heartbeat (review N-10): once stopped, a beat still in flight cannot re-acquire. */
+type Heartbeat = { stopped: boolean; inFlight?: Promise<void>; stopTimer: () => void }
+
+type State = { startedHere: boolean; leased: boolean; heartbeat?: Heartbeat; self?: ProcessRecord }
 
 export type Ctx = {
   deps: SupervisorDeps
@@ -29,7 +33,8 @@ export type Ctx = {
 export type Run = Ctx & {
   cid: string
   note(level: Level, msg: string, fields?: Fields): void
-  stopHeartbeat(): void
+  /** Stop the lease heartbeat and wait for a beat already running to finish. */
+  stopHeartbeat(): Promise<void>
 }
 
 export function createContext(deps: SupervisorDeps): Ctx {
@@ -53,16 +58,22 @@ export function toDelegateError(error: unknown, fallback: ErrorCode = "sandbox_u
   return new DelegateError(fallback, "The sandbox supervisor hit an unexpected error.", "Run oc_doctor; the bridge log has the details.", `${name}${errno ? ` ${errno}` : ""}: ${message.slice(0, 300)}`)
 }
 
+export async function stopHeartbeat(state: State): Promise<void> {
+  const beat = state.heartbeat
+  state.heartbeat = undefined
+  if (!beat) return
+  beat.stopped = true
+  beat.stopTimer()
+  await beat.inFlight
+}
+
 function runOf(ctx: Ctx): Run {
   const cid = randomUUID()
   return {
     ...ctx,
     cid,
-    note: (level, msg, fields = {}) => ctx.log.log(level, "supervisor", msg, { bridgeId: ctx.deps.bridgeId, correlationId: cid, ...fields }),
-    stopHeartbeat() {
-      ctx.state.stopLeaseHeartbeat?.()
-      ctx.state.stopLeaseHeartbeat = undefined
-    },
+    note: (level, msg, fields = {}) => safeLog(ctx.log, level, "supervisor", msg, { bridgeId: ctx.deps.bridgeId, correlationId: cid, ...fields }),
+    stopHeartbeat: () => stopHeartbeat(ctx.state),
   }
 }
 
@@ -93,14 +104,25 @@ export async function lockOptions(run: Run): Promise<LockOptions> {
 }
 
 function startLeaseHeartbeat(run: Run, self: ProcessRecord): void {
-  if (run.state.stopLeaseHeartbeat) return
-  const beat = async () => {
-    // A lease pruned by mistake (e.g. after sleep) comes back on the next beat.
-    if (!(await run.leases.heartbeat(run.deps.bridgeId))) await run.leases.acquire(run.deps.bridgeId, self)
+  if (run.state.heartbeat) return
+  const beat: Heartbeat = { stopped: false, stopTimer: () => {} }
+  const once = async () => {
+    if (beat.stopped) return
+    // A lease pruned by mistake (e.g. after sleep) comes back on the next beat, unless the
+    // heartbeat was stopped meanwhile: then the lease is being released and must stay gone.
+    if (await run.leases.heartbeat(run.deps.bridgeId)) return
+    if (beat.stopped) return
+    await run.leases.acquire(run.deps.bridgeId, self)
   }
-  run.state.stopLeaseHeartbeat = (run.deps.every ?? intervalEvery)(() => {
-    beat().catch((error: unknown) => run.note("warn", "lease heartbeat failed", { detail: toDelegateError(error).detail }))
+  beat.stopTimer = (run.deps.every ?? intervalEvery)(() => {
+    if (beat.stopped || beat.inFlight) return
+    beat.inFlight = once()
+      .catch((error: unknown) => run.note("warn", "lease heartbeat failed", { detail: toDelegateError(error).detail }))
+      .finally(() => {
+        beat.inFlight = undefined
+      })
   }, LEASE_HEARTBEAT_MS)
+  run.state.heartbeat = beat
 }
 
 /** Take this bridge's lease before fn (health waits included); drop it again if fn fails and we had none before. */
@@ -114,7 +136,7 @@ export async function withLease<T>(run: Run, fn: () => Promise<T>): Promise<T> {
     return await fn()
   } catch (error) {
     if (!had) {
-      run.stopHeartbeat()
+      await run.stopHeartbeat()
       run.state.leased = false
       await run.leases.release(run.deps.bridgeId).catch(() => undefined)
     }

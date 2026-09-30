@@ -71,3 +71,24 @@ export async function recordGone(record: ProcessRecord, probe: ProcessProbe): Pr
 }
 
 export const nodeProcessProbe: ProcessProbe = { alive: processAlive, startTime: (pid) => osStartTime(pid) }
+
+/**
+ * `probe` with start times remembered per PID (review N-6). A live process's start time cannot
+ * change, and reading it costs a PowerShell or ps run, so a waiter asks once per PID. Use one
+ * cache per wait: if the PID dies and is reused during that wait, the cached value can hide the
+ * reuse, and the heartbeat's staleness rule (LOCK_STALE_MS) still ends the wait.
+ */
+export function cachedProbe(probe: ProcessProbe): ProcessProbe {
+  const starts = new Map<number, Promise<number | undefined>>()
+  return {
+    alive: (pid) => probe.alive(pid),
+    startTime(pid) {
+      let start = starts.get(pid)
+      if (!start) {
+        start = probe.startTime(pid).catch(() => undefined)
+        starts.set(pid, start)
+      }
+      return start
+    },
+  }
+}

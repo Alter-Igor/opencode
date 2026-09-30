@@ -173,22 +173,48 @@ describe("login relay", () => {
     await portIsFree(port)
   })
 
-  test("the default auth origin is config.keystoneOrigin", async () => {
+  test("the auth origin is the one from the config passed in, not the default config (A-20)", async () => {
     const port = await freePort()
-    // With no authOrigin option, a URL on the test origin is refused...
-    const { api } = fakeApi()
-    const error = await login(api, "ks-delegate", { port, opener: () => {} }).catch((e: unknown) => e)
+    const custom = { ...defaultConfig({}), keystoneOrigin: AUTH_ORIGIN }
+    // A URL on the default Keystone origin is refused when the bridge runs with another config...
+    const onDefault = fakeApi({ authUrl: `${defaultConfig({}).keystoneOrigin}/api/oauth/authorize?state=s1` })
+    const error = await login(onDefault.api, "ks-delegate", { port, authOrigin: custom.keystoneOrigin, opener: () => {} }).catch((e: unknown) => e)
     expect((error as DelegateError).code).toBe("policy_violation")
-    // ...and one on config.keystoneOrigin is opened.
-    const ok = fakeApi({ authUrl: `${defaultConfig({}).keystoneOrigin}/api/oauth/authorize?state=s1` })
-    const result = await login(ok.api, "ks-delegate", { port, opener: () => void hit(port, "code=abc&state=s1") })
+    // ...and one on that config's origin is opened.
+    const onCustom = fakeApi()
+    const result = await login(onCustom.api, "ks-delegate", { port, authOrigin: custom.keystoneOrigin, opener: () => void hit(port, "code=abc&state=s1") })
+    expect(result).toBe("connected")
+  })
+
+  test("every call and error is logged with one correlation id (A-17)", async () => {
+    const port = await freePort()
+    const lines: Array<{ level: string; msg: string; fields: Record<string, unknown> }> = []
+    const logger = { log: (level: string, _c: string, msg: string, fields: Record<string, unknown> = {}) => void lines.push({ level, msg, fields }) }
+    const { api } = fakeApi()
+    await login(api, "ks-delegate", { port, authOrigin: AUTH_ORIGIN, logger, correlationId: "cid-1", opener: () => void hit(port, "code=abc&state=s1") })
+    expect(lines.map((l) => l.msg)).toContain("login called")
+    expect(lines.find((l) => l.msg === "login done")?.fields).toMatchObject({ result: "connected", entry: "ks-delegate" })
+    expect(lines.every((l) => l.fields.correlationId === "cid-1")).toBe(true)
+    lines.length = 0
+    await login(api, "evil", { authOrigin: AUTH_ORIGIN, logger }).catch(() => undefined)
+    const failed = lines.find((l) => l.msg === "login failed")!
+    expect(failed.level).toBe("error")
+    expect(failed.fields.code).toBe("invalid_input")
+    expect(typeof failed.fields.correlationId).toBe("string")
+    expect(new Set(lines.map((l) => l.fields.correlationId)).size).toBe(1)
+  })
+
+  test("a throwing logger never breaks the sign-in (A-11)", async () => {
+    const port = await freePort()
+    const logger = { log: () => { throw new Error("log sink down") } }
+    const result = await login(fakeApi().api, "ks-delegate", { port, authOrigin: AUTH_ORIGIN, logger, opener: () => void hit(port, "code=abc&state=s1") })
     expect(result).toBe("connected")
   })
 
   test("entry names follow the guard's KS_NAME rule", async () => {
     const { api, calls } = fakeApi()
     for (const name of ["evil-rag", "ks-", "ks-Delegate", "ks-a_b", "ks-a/b", `ks-${"a".repeat(80)}`]) {
-      const error = await login(api, name, { opener: () => {} }).catch((e: unknown) => e)
+      const error = await login(api, name, { authOrigin: AUTH_ORIGIN, opener: () => {} }).catch((e: unknown) => e)
       expect({ name, code: (error as DelegateError).code }).toEqual({ name, code: "invalid_input" })
     }
     expect(calls).toHaveLength(0)

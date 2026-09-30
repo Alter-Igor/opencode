@@ -25,7 +25,7 @@ const api = createApi(target)
 const before = await api.call<Record<string, { status: string }>>({ path: "/mcp", directory: "/sessions" })
 console.error("before:", JSON.stringify(before.data))
 if (before.data?.["ks-delegate"]?.status !== "connected" && !process.argv.includes("--no-login")) {
-  const result = await login(api, "ks-delegate", { logger: log })
+  const result = await login(api, "ks-delegate", { authOrigin: config.keystoneOrigin, logger: log })
   console.error("login:", result)
 }
 const after = await api.call<Record<string, { status: string }>>({ path: "/mcp", directory: "/sessions" })
