@@ -43,7 +43,7 @@ describe("estimateSessionContextBreakdown", () => {
   test("uses the last saved measurement", () => {
     const rows = contextUsageFromParts([
       { type: "text", synthetic: true, metadata: { contextUsage: [{ label: "Instructions", tokens: 1 }] } },
-      { type: "text", text: "answer" },
+      { type: "text" },
       { type: "text", synthetic: true, metadata: { contextUsage: [{ label: "Instructions", tokens: 9 }] } },
     ])
     expect(rows).toEqual([{ label: "Instructions", tokens: 9 }])
