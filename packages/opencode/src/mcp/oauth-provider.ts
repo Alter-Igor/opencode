@@ -5,6 +5,8 @@ import type {
   OAuthClientInformation,
   OAuthClientInformationFull,
 } from "@modelcontextprotocol/sdk/shared/auth.js"
+import type { FetchLike } from "@modelcontextprotocol/sdk/shared/transport.js"
+import { createHash } from "node:crypto"
 import { Effect } from "effect"
 import { McpAuth } from "./auth"
 
@@ -235,6 +237,37 @@ export class McpOAuthPendingProvider extends McpOAuthProvider {
       ),
     )
   }
+}
+
+// Alterspective fork (FEAT-OCD-001 §3.4): single-flight refresh-token grants.
+// The SDK refreshes inside auth() -> refreshAuthorization(), using the transport's fetch.
+// Keystone revokes the whole token family when a refresh token is presented twice, so
+// every in-process grant for the same (token endpoint, refresh token) shares one network
+// call, and the result is kept briefly for callers that read the token before it rotated.
+const REFRESH_REUSE_MS = 60_000
+type SharedResponse = { status: number; statusText: string; headers: [string, string][]; body: string }
+const refreshes = new Map<string, Promise<SharedResponse>>()
+
+export const refreshSingleFlightFetch: FetchLike = (url, init) => {
+  const params = init?.method === "POST" && init.body instanceof URLSearchParams ? init.body : undefined
+  const token = params?.get("grant_type") === "refresh_token" ? params.get("refresh_token") : null
+  if (!token) return fetch(url, init)
+  const key = `${String(url)} ${createHash("sha256").update(token).digest("hex")}`
+  let shared = refreshes.get(key)
+  if (!shared) {
+    shared = fetch(url, init).then(async (res) => ({
+      status: res.status,
+      statusText: res.statusText,
+      headers: [...res.headers],
+      body: await res.text(),
+    }))
+    refreshes.set(key, shared)
+    shared.then(
+      () => setTimeout(() => refreshes.delete(key), REFRESH_REUSE_MS).unref(),
+      () => refreshes.delete(key),
+    )
+  }
+  return shared.then((r) => new Response(r.body, { status: r.status, statusText: r.statusText, headers: r.headers }))
 }
 
 export { OAUTH_CALLBACK_PORT, OAUTH_CALLBACK_PATH }

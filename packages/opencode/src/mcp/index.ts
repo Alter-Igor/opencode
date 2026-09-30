@@ -22,6 +22,8 @@ import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { withTimeout } from "@/util/timeout"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { McpOAuthPendingProvider, McpOAuthProvider, OAUTH_CALLBACK_PATH } from "./oauth-provider"
+import { refreshSingleFlightFetch } from "./oauth-provider"
+import { McpAllow } from "./allowlist"
 import { McpOAuthCallback } from "./oauth-callback"
 import { McpAuth } from "./auth"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -271,6 +273,7 @@ const layer = Layer.effect(
           name: "StreamableHTTP",
           transport: new StreamableHTTPClientTransport(url, {
             authProvider,
+            fetch: refreshSingleFlightFetch,
             requestInit: mcp.headers ? { headers: mcp.headers } : undefined,
           }),
         },
@@ -278,6 +281,7 @@ const layer = Layer.effect(
           name: "SSE",
           transport: new SSEClientTransport(url, {
             authProvider,
+            fetch: refreshSingleFlightFetch,
             requestInit: mcp.headers ? { headers: mcp.headers } : undefined,
           }),
         },
@@ -374,6 +378,9 @@ const layer = Layer.effect(
         if (mcp.enabled === false) {
           return DISABLED_RESULT
         }
+        const allowed = McpAllow.check(key, mcp)
+        if (!allowed.ok)
+          return { status: { status: "failed", error: McpAllow.blockedMessage(allowed.reason) } } satisfies CreateResult
 
         const { client: mcpClient, status } =
           mcp.type === "remote"
@@ -805,6 +812,8 @@ const layer = Layer.effect(
 
     const startAuth = Effect.fn("MCP.startAuth")(function* (mcpName: string) {
       const mcpConfig = yield* requireMcpConfig(mcpName)
+      const allowed = McpAllow.check(mcpName, mcpConfig)
+      if (!allowed.ok) throw new Error(McpAllow.blockedMessage(allowed.reason))
       if (mcpConfig.type !== "remote") throw new Error(`MCP server ${mcpName} is not a remote server`)
       if (mcpConfig.oauth === false) throw new Error(`MCP server ${mcpName} has OAuth explicitly disabled`)
       const url = remoteURL(mcpConfig.url)

@@ -52,6 +52,25 @@ Method: `t03-login.mjs` calls `POST /mcp/ks-delegate/auth` in the box, opens the
 
 So: per-user OAuth (R8) works from inside the sandbox, tokens live only in the box volume, and a Keystone tool call succeeds as the owner. **Not yet checked:** the call in Keystone's audit log (F6).
 
+## T0.4 — Fork MCP patch (2026-10-01) — PASS
+
+Files: `packages/opencode/src/mcp/allowlist.ts` (new, 74 lines); `mcp/index.ts` +9 lines (check in `create` and `startAuth`, `fetch: refreshSingleFlightFetch` on both remote transports); `mcp/oauth-provider.ts` +33 lines (`refreshSingleFlightFetch`). Tests: `test/mcp/allowlist.test.ts`, `allowlist-lifecycle.test.ts`, `refresh-single-flight.test.ts`.
+
+| Check | Result |
+|---|---|
+| `bun test test/mcp` before | 61 pass, 0 fail (10 files) |
+| after | 87 pass, 0 fail (13 files) |
+| Mutation: origin check → `startsWith` | look-alike-host test fails (18/1); restored |
+| Mutation: bypass single-flight | both single-flight tests fail 3/3; restored |
+| Single-flight SDK test repeated | 0 failures in 25 runs |
+| Refused local entry | never spawns (marker file absent) |
+| Refused remote entry | mock server receives 0 requests |
+| `bun typecheck` (worktree) | 1 error in `test/session/context-usage.test.ts:50` — file untouched by this patch (from fork commit #40). A clean-tree baseline could not be taken: `tsgo` panics (`failed to evaluate symlinks`) in the main checkout. **Not re-verified.** |
+
+How the refresh fix works: the MCP SDK refreshes in `auth() → refreshAuthorization() → executeTokenRequest()` through the transport's `fetch`; the patch shares one in-flight grant per (token endpoint, sha256 of refresh token) and keeps the result 60 s, so a caller holding the old refresh token gets the new tokens instead of re-presenting the old one. In-process only; two separate OpenCode processes could still race (the design runs one box).
+
+Planner review (round 1, logic): origin compared exactly; `..` and `%2e%2e` normalised before the path test; every connect path (`startup`, `MCP.add`, `MCP.connect`, `finishAuth` → `create`; `startAuth`) checked; non-refresh requests pass through untouched; errors not cached. No defects found. Gap noted: `opencode mcp debug` (`cli/cmd/mcp.ts:768-786`) bypasses both hooks — low risk in the box (profile has only allowlisted entries; egress blocks others).
+
 ## T0.2 — Token race
 
 Pending the T0.4 patch image (tested once, with the patch, to avoid revoking the new sign-in twice).
