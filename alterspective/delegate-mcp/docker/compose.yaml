@@ -1,0 +1,91 @@
+# FEAT-OCD-001 T1.2: the delegate sandbox (technical-design.md §1, §4).
+# Started by src/supervisor/lifecycle.ts as:
+#   docker compose -p opencode-delegate -f docker/compose.yaml -f <home>/compose.box-env.yaml up -d
+# Secrets never live in this file or any other file: OPENCODE_SERVER_PASSWORD, OPENCODE_MCP_ALLOW
+# and the approved model keys are listed by NAME only, so Compose copies them from the
+# environment of the `docker compose` child process. The override file adds the config.boxEnv names.
+name: opencode-delegate
+
+networks:
+  # No default route: the box can only reach services on this network.
+  sealed:
+    internal: true
+  outside: {}
+
+volumes:
+  data: {}
+  sessions: {}
+
+services:
+  box:
+    image: ${OCD_IMAGE:?OCD_IMAGE is set by the bridge}
+    build:
+      context: ../../..
+      dockerfile: alterspective/delegate-mcp/docker/box/Dockerfile
+      args:
+        OPENCODE_VERSION: ${OCD_OPENCODE_VERSION:-0.0.0-alterspective-local}
+    container_name: opencode-delegate
+    labels:
+      com.alterspective.opencode-delegate.profile-hash: ${OCD_PROFILE_HASH:?OCD_PROFILE_HASH is set by the bridge}
+      com.alterspective.opencode-delegate.port: ${OCD_PORT:?OCD_PORT is set by the bridge}
+      com.alterspective.opencode-delegate.image: ${OCD_IMAGE}
+    networks: [sealed]
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777
+      - /home/agent:uid=10001,gid=10001,mode=0700
+    volumes:
+      - data:/data
+      - sessions:/sessions
+      - ${OCD_HANDOFF_DIR:?OCD_HANDOFF_DIR is set by the bridge}:/handoff
+      - ${OCD_PROFILE_DIR:?OCD_PROFILE_DIR is set by the bridge}:/profile:ro
+    environment:
+      XDG_CONFIG_HOME: /profile
+      XDG_DATA_HOME: /data
+      HOME: /home/agent
+      HTTPS_PROXY: http://egress:8888
+      HTTP_PROXY: http://egress:8888
+      https_proxy: http://egress:8888
+      http_proxy: http://egress:8888
+      NO_PROXY: localhost,127.0.0.1,npm-cache,pypi-cache
+      no_proxy: localhost,127.0.0.1,npm-cache,pypi-cache
+      npm_config_registry: http://npm-cache:4873/
+      PIP_INDEX_URL: http://pypi-cache:5000/index/
+      # pip ignores a plain-http index unless the host is trusted (internal network only).
+      PIP_TRUSTED_HOST: pypi-cache
+      OPENCODE_DISABLE_MODELS_FETCH: "1"
+      OPENCODE_DISABLE_AUTOUPDATE: "1"
+      # By name only: values come from the `docker compose` process env, never a file.
+      OPENCODE_MCP_ALLOW:
+      OPENCODE_SERVER_PASSWORD:
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -o /dev/null -u \"opencode:$$OPENCODE_SERVER_PASSWORD\" 'http://127.0.0.1:4096/path?directory=/sessions'"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    depends_on: [egress]
+    command: ["opencode", "serve", "--hostname", "0.0.0.0", "--port", "4096"]
+
+  # Publishes the box API on the host loopback only (the box itself has no route out).
+  gate:
+    image: alpine/socat
+    container_name: opencode-delegate-gate
+    command: ["TCP-LISTEN:4096,fork,reuseaddr", "TCP:box:4096"]
+    networks: [sealed, outside]
+    ports: ["127.0.0.1:${OCD_PORT}:4096"]
+    depends_on: [box]
+
+  # Default-deny HTTPS proxy: the box's only way out (owned by MOD-02, docker/egress).
+  egress:
+    build: ./egress
+    networks: [sealed, outside]
+
+  # Read-only pull-through package caches (owned by MOD-02, docker/caches).
+  npm-cache:
+    build: ./caches/npm
+    networks: [sealed, outside]
+
+  pypi-cache:
+    build: ./caches/pypi
+    networks: [sealed, outside]
