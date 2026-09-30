@@ -11,7 +11,7 @@ Each task is 50–200 LOC, under 2 hours, and ends in something that can be chec
 
 **Kill-criteria check after W0** (`plan.md` §5). Stop and report to the owner if any is hit.
 
-## Wave 1 — MOD-01 + MOD-02 (built + reviewed + fixed; live e2e PASS `evidence/wave1-e2e.md`; verification review running)
+## Wave 1 — MOD-01 + MOD-02 (built + reviewed + fixed; live e2e PASS `evidence/wave1-e2e.md`; verification review done; fixes `0d7407fb4f`; e2e re-run PASS) — **WAVE 1 COMPLETE**
 
 - [x] **T1.1 Profile builder** — MOD-01 · Deliverable: profile dir from owner `provider`/`model`/`small_model` (`{env:}` refs only), allowlisted MCP, permission baseline; approved env-var list · Verification: unit tests incl. literal-key refusal (red first) · LOC ~150 · Rules: ASR-04, SECURITY :517
 - [x] **T1.2 Image + compose** — MOD-01 · Deliverable: `Dockerfile` (fork + patch, pre-installed plugin deps, toolchains), compose for box / egress / inbox, image tag with SHA · Verification: `docker compose config` valid; image runs `opencode --version` · LOC ~150 · Rules: VER-BUILD-02, ARCH-ASSESS-01

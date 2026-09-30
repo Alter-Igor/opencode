@@ -16,3 +16,9 @@ Script: `alterspective/delegate-mcp/spike/e2e-w1.ts` (real supervisor, workspace
 **Bug found by this run and fixed:** `runCommand` put Node's generic "Command failed" text into `stderr` for a plain non-zero exit, so `boxExists` read "folder absent" (`test -e` exit 1) as a box failure and `open()` always failed live. Unit tests used a fake box and missed it. Fix in `src/supervisor/workspaces-exec.ts`; new real-process test `test/workspaces-exec.test.ts` (2 red on the old code, green after).
 
 Suite after the fix: workspace tests 38 pass / 0 fail.
+
+## Re-run after the verification-review fixes (commit 0d7407fb4f)
+
+Box restarted on the new image (`compose down` without `-v`); `ks-delegate` stayed `connected`. Same script: workspace `/sessions/e2e-muom60t4`, guard ok, `write` + `bash` completed, reply `DONE`, collect `{"commits":1,"hostExecutableChanges":[]}`, host file `hi from the box.`, host HEAD `main`. Suite: 317 pass / 6 skip / 0 fail, tsc clean, live egress 4/4.
+
+**Wave 1 exit:** 2 review agents (logic/quality, security/integration) + 1 verification review; all findings resolved; static checks green; runtime verified twice.
