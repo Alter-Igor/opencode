@@ -4,8 +4,9 @@
 //            only, review W3C-11) -> box `git clone --no-checkout` into /sessions/.<key>.<nonce>.tmp,
 //            checks out delegate/<key> at the host HEAD, then `mv -T` to /sessions/<key> (refused
 //            with directory_busy when it already exists). The host record is workspaces-state.ts.
-//   collect: box `git bundle create /handoff/out/<fresh>.bundle delegate/<key>` -> host moves it to a
-//            host-only folder, checks it, then `git fetch <bundle>`
+//   collect: box `git bundle create /handoff/out/<fresh>.bundle delegate/<key>` (a box-only volume) ->
+//            `docker cp` streams it into a host-only folder, checked (workspaces-copyout.ts), then
+//            `git fetch <bundle>`. The box has no writable host folder (issue G-7).
 // No host-side git command ever runs inside the box clone, so hooks planted there cannot run on the host.
 // Hand-off hardening: workspaces-handoff.ts. Host-executable detection: workspaces-detect.ts.
 import { randomUUID } from "node:crypto"
@@ -15,13 +16,15 @@ import type { Workspace, Workspaces } from "../shared/contracts.ts"
 import { DelegateError, isDelegateError } from "../shared/errors.ts"
 import { safeLog, silentLogger, type Logger } from "../shared/log.ts"
 import { flagChanges, parseRawDiff } from "./workspaces-detect.ts"
-import { canonicalPath, invalidFolder, isUnder, runCommand, samePath, systemSubst, type Exec } from "./workspaces-exec.ts"
-import { assertRegularFile, DEFAULT_MAX_BUNDLE_BYTES, planOutBundle, randomNonce, removeQuietly, reserveInBundle, takeOutBundle } from "./workspaces-handoff.ts"
+import { boxFailure, canonicalPath, invalidFolder, isUnder, runCommand, samePath, systemSubst, type Exec } from "./workspaces-exec.ts"
+import { copyOutBundle, dockerTarSource, type TarSource } from "./workspaces-copyout.ts"
+import { assertRegularFile, DEFAULT_MAX_BUNDLE_BYTES, planOutBundle, randomNonce, removeQuietly, reserveInBundle } from "./workspaces-handoff.ts"
 import { bindHostState, COMMIT_ID, listHostStates, readHostState, removeHostState, SESSION_KEY, writeHostState, type HostSessionState, type SessionBinding } from "./workspaces-state.ts"
 
 export { canonicalPath, cleanEnv, isUnder, parseSubst, runCommand, TIMEOUT_CODE, type Exec, type ExecOptions, type ExecResult } from "./workspaces-exec.ts"
 export { isHostExecutableMode, isHostExecutablePath, parseRawDiff, scriptsChanged, type RawEntry } from "./workspaces-detect.ts"
 export { DEFAULT_MAX_BUNDLE_BYTES, HANDOFF_IN, HANDOFF_OUT } from "./workspaces-handoff.ts"
+export { TAR_SLACK_BYTES, type TarSource, type TarStream } from "./workspaces-copyout.ts"
 
 export { AGENT_RE, COMMIT_ID, MODEL_RE, SESSION_ID_RE, SESSION_KEY, SUPERVISOR_RE, type HostSessionState, type SessionBinding, type SessionProfile } from "./workspaces-state.ts"
 /** bundle, clone and fetch: whole repositories. */
@@ -33,7 +36,7 @@ export type WorkspacesOptions = {
   config: BridgeConfig
   /** Box container name; used by the default box exec (`docker exec <container> ...`). */
   container: string
-  /** Host hand-off folder: `in/` is mounted read-only at `<boxHandoff>/in`, `out/` read-write at `<boxHandoff>/out`. Default `<home>/handoff`. */
+  /** Host hand-off folder: `<handoffDir>/in` is mounted read-only at `<boxHandoff>/in`. `<boxHandoff>/out` is box-only. Default `<home>/handoff`. */
   handoffDir?: string
   /** Host-only state (base commit per session, quarantined bundles). Never mounted. Default `<home>/workspaces`. */
   stateDir?: string
@@ -41,6 +44,8 @@ export type WorkspacesOptions = {
   boxSessions?: string
   hostExec?: Exec
   boxExec?: Exec
+  /** Streams a box file out as tar (G-7). Default `docker cp <container>:<path> -`. */
+  boxTar?: TarSource
   /** Drive-letter substitutions (e.g. from `subst`). Default: parsed `subst` output on Windows. */
   substMap?: () => Promise<Record<string, string>>
   /** Refuse out-bundles larger than this before fetching. Default 500 MB. */
@@ -58,6 +63,7 @@ type Ctx = {
   roots: string[]
   host: Exec
   box: Exec
+  tar: TarSource
   handoffDir: string
   stateDir: string
   boxHandoff: string
@@ -73,13 +79,6 @@ async function hostGit(ctx: Ctx, args: string[], what: string, length: Length = 
   if (result.code === 0) return result.stdout
   if (result.timedOut) throw new DelegateError("upstream_error", `git took too long to ${what} on the host.`, "Retry; for a very large repository raise the workspace timeout.", "timeout")
   throw new DelegateError("upstream_error", `git failed to ${what} on the host.`, "Check the repository state and retry.", result.stderr.trim())
-}
-
-function boxFailure(what: string, stderr: string, timedOut: boolean | undefined): DelegateError {
-  if (timedOut) return new DelegateError("upstream_error", `The delegate box took too long to ${what}.`, "Retry; if it repeats, run oc_doctor.", "timeout")
-  const down = /no such container|cannot connect|error during connect|is not running/i.test(stderr)
-  const action = down ? "Run oc_doctor to start the box." : "Retry; if it repeats, run oc_doctor."
-  return new DelegateError(down ? "sandbox_unavailable" : "upstream_error", `The delegate box failed to ${what}.`, action, stderr.trim())
 }
 
 async function boxRun(ctx: Ctx, args: string[], what: string, length: Length = "short"): Promise<string> {
@@ -254,13 +253,13 @@ async function collect(ctx: Ctx, ws: Workspace) {
   const state = readState(ctx, ws.sessionKey)
   if (!samePath(state.hostRepo, ws.hostRepo)) throw invalidFolder(ctx.roots, "The workspace does not match its host record.", ws.hostRepo)
   const branch = `delegate/${ws.sessionKey}`
-  const bundle = planOutBundle(ctx.handoffDir, ctx.boxHandoff, path.join(ctx.stateDir, "incoming"), ws.sessionKey, ctx.nonce())
+  const bundle = planOutBundle(ctx.boxHandoff, path.join(ctx.stateDir, "incoming"), ws.sessionKey, ctx.nonce())
   try {
     await boxRun(ctx, ["git", "-C", `${ctx.boxSessions}/${ws.sessionKey}`, "bundle", "create", "--quiet", bundle.boxPath, branch], "bundle the session branch", "long")
-    const local = await takeOutBundle(bundle, ctx.maxBundleBytes)
+    const local = await copyOutBundle(ctx.box, ctx.tar, bundle, ctx.maxBundleBytes, ctx.timeouts.long)
     await fetchBranch(ctx, state.hostRepo, local, branch)
   } finally {
-    removeQuietly(bundle.hostPath)
+    await cleanupBox(ctx, [bundle.boxPath])
     removeQuietly(bundle.quarantinePath)
   }
   const count = await hostGit(ctx, ["-C", state.hostRepo, "rev-list", "--count", `${state.base}..${branch}`], "count commits")
@@ -314,6 +313,7 @@ export function createWorkspaces(options: WorkspacesOptions): DelegateWorkspaces
     roots: options.config.roots,
     host: options.hostExec ?? ((argv, o) => runCommand(argv, undefined, o?.timeoutMs)),
     box: options.boxExec ?? ((argv, o) => runCommand(["docker", "exec", options.container, ...argv], undefined, o?.timeoutMs)),
+    tar: options.boxTar ?? dockerTarSource(options.container),
     handoffDir: options.handoffDir ?? path.join(options.config.home, "handoff"),
     stateDir: options.stateDir ?? path.join(options.config.home, "workspaces"),
     boxHandoff: options.boxHandoff ?? "/handoff",

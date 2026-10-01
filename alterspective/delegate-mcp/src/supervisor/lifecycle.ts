@@ -5,8 +5,9 @@
 // A running set is reused only when the box AND its front/cache siblings match (N-9).
 // replace() (oc_server_restart) is the way out of profile_changed: down + start under the lock.
 // It can also change the box-wide Keystone set (review R4-01), saved in the bridge home.
-import { chmod, mkdir, writeFile } from "node:fs/promises"
+import { mkdir, writeFile } from "node:fs/promises"
 import path from "node:path"
+import { removeLegacyOut, sweepOutBundles } from "./handoff-hygiene.ts"
 import { mcpAllowPolicy, type BridgeConfig } from "../shared/config.ts"
 import { saveKeystoneSet } from "../shared/keystone.ts"
 import type { Supervisor } from "../shared/contracts.ts"
@@ -146,6 +147,7 @@ async function reuse(run: Run, box: BoxInspect, plan: Plan): Promise<ApiTarget> 
     await waitHealthy(run.deps, target, run.container)
     // R5-01: sign-ins of entries that left the set must not stay in the box, even on reuse.
     await pruneSignIns(run, plan)
+    await sweepOutBundles(run)
     run.note("info", "reusing running sandbox", { health: box.health })
     return target
   })
@@ -158,12 +160,10 @@ async function prepareFiles(run: Run, plan: Plan): Promise<void> {
   if (onDisk !== built.hash)
     throw new DelegateError("profile_invalid", "The profile on disk does not match what was built.", "Retry; check that nothing else writes the profile folder.", `on disk ${onDisk.slice(0, 12)} != built ${built.hash.slice(0, 12)}`)
   try {
-    // Both bind sources must exist before `up`, or Docker creates them root-owned (review C-4).
+    // The bind source must exist before `up`, or Docker creates it root-owned (review C-4).
+    // There is no host out/ folder: the box's out/ is a box-only volume (G-7).
     await mkdir(path.join(dirs.handoff, "in"), { recursive: true })
-    const out = path.join(dirs.handoff, "out")
-    await mkdir(out, { recursive: true })
-    const mode = handoffOutMode(process.platform)
-    if (mode !== undefined) await chmod(out, mode)
+    await removeLegacyOut(run)
     await writeBoxEnvOverride(run)
     // front's servers for this Keystone set (R4-01); compose mounts the folder read-only into front.
     await mkdir(dirs.front, { recursive: true })
@@ -171,18 +171,6 @@ async function prepareFiles(run: Run, plan: Plan): Promise<void> {
   } catch (error) {
     throw fsFailure("prepare the sandbox folders", error, deps.config.home)
   }
-}
-
-/**
- * Mode for <home>/handoff/out on the host (review N-12, docker/box/README.md). On a Linux Docker
- * host the bind mount keeps host ownership, and the box user (uid 10001) must write its bundle
- * there, so the folder is opened to all (0777). Safe because the host never runs anything from
- * it and takes each bundle by rename into a host-only folder, then checks type and size
- * (workspaces-handoff.ts). On Windows, Docker Desktop maps permissions itself and POSIX modes
- * mean nothing to NTFS, so the folder is left alone.
- */
-export function handoffOutMode(platform: NodeJS.Platform): number | undefined {
-  return platform === "win32" ? undefined : 0o777
 }
 
 async function writeBoxEnvOverride(run: Run): Promise<void> {
@@ -217,6 +205,7 @@ async function start(run: Run, plan: Plan): Promise<ApiTarget> {
     run.state.startedHere = true
     // R5-01: the data volume outlives the box, so every start (and every set change) cleans it.
     await pruneSignIns(run, plan)
+    await sweepOutBundles(run)
     return target
   })
 }

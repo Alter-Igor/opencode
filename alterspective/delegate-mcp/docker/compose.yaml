@@ -9,7 +9,8 @@
 #
 # Hardening (review C-1, C-2, C-7, C-9): every service drops all capabilities, cannot gain
 # privileges, has a read-only root filesystem and pids/memory/CPU limits. Writable paths are
-# tmpfs or named volumes only. Every service logs through the `local` driver capped at
+# tmpfs or named volumes only: no service has a writable host folder (issue G-7, review R3-08;
+# test/handoff-compose.test.ts, and oc_doctor checks the live mounts). Every service logs through the `local` driver capped at
 # 3 x 10 MB, so a noisy container cannot fill the Docker host's disk (W2C-06).
 name: opencode-delegate
 
@@ -28,6 +29,9 @@ networks:
 volumes:
   data: {}
   sessions: {}
+  # G-7: the box writes its session bundle here. Box-only: the bridge copies the bundle out with
+  # `docker cp` (src/supervisor/workspaces-copyout.ts), so in-box code cannot write a host folder.
+  handoff-out: {}
   npm-storage: {}
   pypi-storage: {}
   # MOD-05 inbox messages (append-only JSONL). Never mounted into the box (review G5).
@@ -77,9 +81,10 @@ services:
     volumes:
       - data:/data
       - sessions:/sessions
-      # Hand-off (review C-4): the host writes in/ (box reads only); the box writes out/.
+      # Hand-off (review C-4, G-7): the host writes in/ (box reads only). out/ is a box-only volume;
+      # the bridge takes the bundle with `docker cp`, never through a host folder.
       - ${OCD_HANDOFF_DIR:?OCD_HANDOFF_DIR is set by the bridge}/in:/handoff/in:ro
-      - ${OCD_HANDOFF_DIR:?OCD_HANDOFF_DIR is set by the bridge}/out:/handoff/out
+      - handoff-out:/handoff/out
       - ${OCD_PROFILE_DIR:?OCD_PROFILE_DIR is set by the bridge}:/profile:ro
       # front's CA certificate only (the key never leaves front).
       - front-ca-public:/etc/ocd-front-ca:ro
