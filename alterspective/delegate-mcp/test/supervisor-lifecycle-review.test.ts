@@ -9,7 +9,6 @@ import type { Exec, ExecOptions, ExecResult } from "../src/supervisor/docker.ts"
 import { nodeLeaseFs, type LeaseFs } from "../src/supervisor/leases.ts"
 import { boxEnvOverride, composeEnv, createSupervisor, type DelegateSupervisor, type SupervisorDeps } from "../src/supervisor/lifecycle.ts"
 import type { ProcessProbe } from "../src/supervisor/process.ts"
-import { SWEEP_SCRIPT } from "../src/supervisor/handoff-hygiene.ts"
 import { frontFilesFor } from "../src/supervisor/plan.ts"
 import { buildProfile, nodeProfileFs } from "../src/supervisor/profile.ts"
 import { IMAGE, L, deps, fail, fakeDocker, home, leaseDir, made, owner, probe, recorder, supervisor, writeOwner, type Box, type Call, type Line, useSupervisorFixture } from "./supervisor-lifecycle-fixture.ts"
@@ -139,19 +138,19 @@ describe("supervisor: round-2 review fixes", () => {
     expect(log.lines.find((l) => l.msg === "left the legacy handoff/out folder in place")?.fields.code).toBe("ENOTEMPTY")
   })
 
-  test("L5: every start and every reuse sweeps leftover bundles in the box with the fixed glob only", async () => {
-    const isSweep = (c: Call) => c.argv[1] === "exec" && c.argv.at(-1) === SWEEP_SCRIPT
+  test("L5/N1: every start and every reuse sweeps only old leftover bundles, with no shell", async () => {
+    const isSweep = (c: Call) => c.argv[1] === "exec" && c.argv[3] === "find"
     const started: Call[] = []
     const box = { running: false, labels: {}, env: [] as string[] }
     await supervisor(deps(fakeDocker(box, started))).ensure()
-    expect(started.filter(isSweep).map((c) => c.argv)).toEqual([["docker", "exec", "opencode-delegate", "sh", "-c", "rm -f -- /handoff/out/*-out.bundle"]])
+    expect(started.filter(isSweep).map((c) => c.argv)).toEqual([["docker", "exec", "opencode-delegate", "find", "/handoff/out", "-maxdepth", "1", "-type", "f", "-name", "*-out.bundle", "-mmin", "+30", "-delete"]])
     const reused: Call[] = []
     await supervisor(deps(fakeDocker(box, reused))).ensure()
     expect(reused.some((c) => c.argv.includes("up"))).toBe(false)
     expect(reused.filter(isSweep)).toHaveLength(1)
     // A failed sweep is logged, never fatal.
     const log = recorder()
-    const failing = fakeDocker(box, [], { exec: (argv) => (argv.at(-1) === SWEEP_SCRIPT ? { code: 1, stdout: "", stderr: "boom" } : { code: 0, stdout: JSON.stringify({ names: [], removed: [] }), stderr: "" }) })
+    const failing = fakeDocker(box, [], { exec: (argv) => (argv[3] === "find" ? { code: 1, stdout: "", stderr: "boom" } : { code: 0, stdout: JSON.stringify({ names: [], removed: [] }), stderr: "" }) })
     expect((await supervisor(deps(failing, { log })).ensure()).baseUrl).toContain("127.0.0.1")
     expect(log.lines.some((l) => l.msg === "could not sweep leftover session bundles from the box")).toBe(true)
   })

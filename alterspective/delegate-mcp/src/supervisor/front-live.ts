@@ -101,17 +101,16 @@ async function mountsOf(exec: Exec, container: string): Promise<Mount[] | undefi
 
 /** Options of each writable volume the box mounts (read-only `docker volume inspect`). */
 async function volumeOptionsOf(exec: Exec, mounts: Mount[] | undefined): Promise<VolumeOptions> {
-  const out: VolumeOptions = {}
-  for (const mount of mounts ?? []) {
-    if (mount.Type !== "volume" || mount.RW === false || typeof mount.Name !== "string") continue
-    const result = await exec(["docker", "volume", "inspect", "--format", "{{json .Options}}", mount.Name], { timeoutMs: 20_000 })
+  const names = (mounts ?? []).flatMap((m) => (m.Type === "volume" && m.RW !== false && typeof m.Name === "string" ? [m.Name] : []))
+  const inspect = async (name: string): Promise<[string, Record<string, string> | null | undefined]> => {
+    const result = await exec(["docker", "volume", "inspect", "--format", "{{json .Options}}", name], { timeoutMs: 20_000 })
     try {
-      out[mount.Name] = result.code === 0 ? (JSON.parse(result.stdout.trim()) as Record<string, string> | null) : undefined
+      return [name, result.code === 0 ? (JSON.parse(result.stdout.trim()) as Record<string, string> | null) : undefined]
     } catch {
-      out[mount.Name] = undefined
+      return [name, undefined]
     }
   }
-  return out
+  return Object.fromEntries(await Promise.all(names.map(inspect)))
 }
 
 /** Read front's loaded config and both containers' mounts, and compare with `expected` (the generated servers file). */
