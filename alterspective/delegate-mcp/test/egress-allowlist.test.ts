@@ -156,7 +156,7 @@ describe("committed front files", () => {
 describe("checkEgress (oc_doctor)", () => {
   test("the committed files pass for the default config", () => {
     expect(checkEgress(defaultConfig({}).egressHosts)).toEqual({
-      ok: true, control: "tls-front", source: "configuration", frontConfigMatches: true, aliasesMatch: true, connectProxy: false, problems: [],
+      ok: true, control: "tls-front", source: "configuration", frontConfigMatches: true, aliasesMatch: true, connectProxy: false, upstreamTlsVerified: true, boxSealed: true, problems: [],
     })
   })
 

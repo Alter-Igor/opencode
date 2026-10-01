@@ -207,14 +207,28 @@ async function discard(ctx: Ctx, key: string): Promise<void> {
 
 /** The box made this pack: every object is checked before it reaches the owner's object store (R3-07). */
 const FSCK_FETCH = ["-c", "transfer.fsckObjects=true", "-c", "fetch.fsckObjects=true"]
+/** git's object check refused an object (`error: object <id>: badTimezone: ...`, then `fatal: fsck error ...`). */
+const FSCK_FAILED = /fsck error|^error: object [0-9a-f]+:/im
+/**
+ * The bundle itself is unreadable (R4-07): cut off, bytes damaged, a bad header, or not a bundle.
+ * git 2.51 says `early EOF` / `pack has bad object` / `index-pack died`, others `index-pack failed`;
+ * a header that lost the branch reads as a missing remote ref. Checked after FSCK_FAILED, because
+ * an object-check failure also ends with `index-pack died`.
+ */
+const BUNDLE_DAMAGED =
+  /index-pack (failed|died)|unpack-objects (failed|died)|early EOF|pack has bad object|bad pack header|inflate|invalid gitfile format|not a bundle|bundle file|could not read from remote repository|couldn't find remote ref/i
 
 /** Fetch delegate/<key> from a bundle file; git runs no hook from the bundle. Non-fast-forward is refused. */
 async function fetchBranch(ctx: Ctx, repo: string, bundle: string, branch: string): Promise<void> {
   // No --quiet: git then prints nothing for a rejected (non-fast-forward) ref, and the cause is lost.
   const result = await ctx.host(["git", ...FSCK_FETCH, "-C", repo, "fetch", "--no-tags", bundle, `${branch}:${branch}`], { timeoutMs: ctx.timeouts.long })
   if (result.code === 0) return
-  if (/fsck error|index-pack failed|unpack-objects failed/i.test(result.stderr)) {
+  if (FSCK_FAILED.test(result.stderr)) {
     throw new DelegateError("policy_violation", `${branch} from the box failed git's object check, so nothing was fetched.`, "Treat the session's commits as suspect: check them with oc_result before collecting again.", result.stderr.trim())
+  }
+  // Still policy_violation (fail safe): the bridge made this bundle a moment ago, so damage is unexplained.
+  if (BUNDLE_DAMAGED.test(result.stderr)) {
+    throw new DelegateError("policy_violation", `The bundle of ${branch} from the box is damaged or incomplete, so nothing was fetched.`, "Collect again; if it repeats, treat the session as suspect and check it with oc_result.", result.stderr.trim())
   }
   if (/non-fast-forward|\[rejected\]/i.test(result.stderr)) {
     throw new DelegateError("branch_diverged", `${branch} changed on the host and in the box (not a fast-forward); nothing was overwritten.`, `Rename or delete the host branch ${branch} (or merge it by hand), then collect again.`, result.stderr.trim())

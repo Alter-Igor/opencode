@@ -160,3 +160,27 @@ describe("untrusted text: invisible fillers and selectors are stripped (R3-05)",
     expect(untrusted("❤\uFE0F 🙂")?.text).toBe("❤ 🙂")
   })
 })
+
+// R4-02: the rest of Unicode's Default_Ignorable_Code_Point set: Mongolian free variation
+// selectors, the combining grapheme joiner, the Khmer inherent vowels, and the reserved ranges.
+const IGNORABLE = ["\u180B", "\u180C", "\u180D", "\u180F", "\u034F", "\u17B4", "\u17B5", "\u061C", "\u2065", "\uFFF0", "\uFFF8", "\u{1BCA0}", "\u{1D173}", "\u{E0080}", "\u{E0FFF}"]
+
+describe("untrusted text: every default-ignorable code point is stripped (R4-02)", () => {
+  test("each one goes, in tool results, hub events and instruction text", () => {
+    for (const ch of IGNORABLE) {
+      const cp = ch.codePointAt(0)!.toString(16)
+      expect({ cp, out: untrusted(`a${ch}b`)?.text }).toEqual({ cp, out: "ab" })
+      expect({ cp, out: hubUntrusted(`a${ch}b`) }).toEqual({ cp, out: "ab" })
+      expect({ cp, out: cleanInstructionText(`a${ch}b`) }).toEqual({ cp, out: "ab" })
+    }
+  })
+
+  test("visible neighbours survive: CJK, accents (precomposed and combining), Korean, Mongolian, Khmer, Braille dots", () => {
+    // U+0301 combining acute, U+1820/1821 Mongolian letters, U+1780 Khmer KA + U+17B6 its first
+    // visible vowel, U+2801..28FF Braille dots (only the blank U+2800 goes).
+    const text = "中文 日本語 caf\u00E9 cafe\u0301 \uD55C\uAD6D\uC5B4 \u1820\u1821 \u1780\u17B6 \u2801\u2803\u28FF\n\tend"
+    expect(untrusted(text)?.text).toBe(text)
+    expect(hubUntrusted(text)).toBe(text)
+    expect(cleanInstructionText(text)).toBe(text)
+  })
+})

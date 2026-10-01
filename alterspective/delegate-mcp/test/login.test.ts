@@ -221,6 +221,25 @@ describe("login relay", () => {
     expect(urls).toEqual([authUrl(port)])
   })
 
+  test("R4-03: the URL that was checked is the one opened, not the box's raw text", async () => {
+    const port = await freePort()
+    // The WHATWG parser drops leading C0/space and inner tab/CR/LF, and reads `\` as `/` in an
+    // https URL; a browser or rundll32 given the raw text may read it differently.
+    const good = authUrl(port)
+    const raws = [
+      ` \u0001${good}`,
+      good.replace("/api/oauth/authorize", "\\api\\oauth\\authorize"),
+      good.replace("/api/oauth/authorize", "/api/oauth/auth\torize").replace("identity.", "iden\ntity."),
+    ]
+    for (const raw of raws) {
+      expect(raw).not.toBe(good)
+      const urls: string[] = []
+      const result = await login(fakeApi({ authUrl: raw }).api, "ks-delegate", { port, authOrigin: AUTH_ORIGIN, opener: (url) => void (urls.push(url), hit(port, "code=abc&state=s1")) })
+      expect({ raw, result, urls }).toEqual({ raw, result: "connected", urls: [good] })
+      expect(new URL(urls[0]!).href).toBe(urls[0]!)
+    }
+  })
+
   test("the auth origin is the one from the config passed in, not the default config (A-20)", async () => {
     const port = await freePort()
     const custom = { ...defaultConfig({}), keystoneOrigin: AUTH_ORIGIN }

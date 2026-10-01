@@ -2,7 +2,7 @@
 # OCD_LIVE_EGRESS=1) as an OVERLAY on the real docker/compose.yaml, under a throwaway project name,
 # starting only `front` and these probes; then `down -v`. It never touches `opencode-delegate`.
 # Paths are relative to docker/ (the first -f file's folder).
-# Both probes join ONLY `sealed` (internal), like the box, and mount front's public CA like it.
+# Every probe joins ONLY `sealed` (internal), like the box, and mounts front's public CA like it.
 services:
   probe:
     # Same pin as the box's runtime stage (docker/box/Dockerfile).
@@ -24,6 +24,28 @@ services:
     environment:
       NODE_EXTRA_CA_CERTS: /etc/ocd-front-ca/ca.pem
     volumes:
+      - ./front/live/bun-fetch.mjs:/check/bun-fetch.mjs:ro
+      - front-ca-public:/etc/ocd-front-ca:ro
+    depends_on:
+      front: { condition: service_healthy }
+
+  # R4-04: the same probes from the REAL box image (the image the bridge builds; the test sets
+  # OCD_LIVE_BOX_IMAGE), hardened and placed like the box: `sealed` only, its own user, no capabilities.
+  probe-box:
+    image: ${OCD_LIVE_BOX_IMAGE:?OCD_LIVE_BOX_IMAGE is set by test/egress-live.test.ts}
+    entrypoint: ["sleep", "600"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,nosuid,nodev,noexec
+    pids_limit: 128
+    mem_limit: 1g
+    networks: [sealed]
+    environment:
+      NODE_EXTRA_CA_CERTS: /etc/ocd-front-ca/ca.pem
+    volumes:
+      - ./front/live/client.mjs:/check/client.mjs:ro
       - ./front/live/bun-fetch.mjs:/check/bun-fetch.mjs:ro
       - front-ca-public:/etc/ocd-front-ca:ro
     depends_on:

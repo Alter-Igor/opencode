@@ -1,6 +1,8 @@
 // MOD-02: oc_doctor's egress check (review R3-01). It reads the files the sandbox is started from
 // (this checkout's docker/ folder) and says whether the egress control they describe is the
-// fixed-upstream TLS front generated from config.egressHosts, with no CONNECT proxy left.
+// fixed-upstream TLS front generated from config.egressHosts, with no CONNECT proxy left, that
+// front verifies its upstreams (upstream.conf), and that the box sits on the internal `sealed`
+// network only (R4-05).
 // It checks CONFIGURATION, not traffic: the live red/green proof is test/egress-live.test.ts
 // (OCD_LIVE_EGRESS=1). Never throws: an unreadable file is a failed check with a reason.
 import { readFileSync } from "node:fs"
@@ -19,11 +21,20 @@ export type EgressCheck = {
   aliasesMatch: boolean
   /** A CONNECT proxy (the old tinyproxy `egress`) or a proxy variable in the box env is present. */
   connectProxy: boolean
+  /** docker/front/upstream.conf verifies the upstream certificate and forces SNI (R4-05). */
+  upstreamTlsVerified: boolean
+  /** `sealed` is an internal network and the box is on it and nothing else (R4-05). */
+  boxSealed: boolean
   problems: string[]
 }
 
 type Service = { networks?: unknown; environment?: unknown; image?: unknown; build?: unknown }
-type Compose = { services?: Record<string, Service> }
+type Compose = { services?: Record<string, Service>; networks?: Record<string, { internal?: unknown } | null> }
+
+/** Shared upstream settings; included by every generated server in servers.conf. */
+export const FRONT_UPSTREAM_FILE = "front/upstream.conf"
+/** Without these, front would accept any certificate, or send no SNI, to its fixed upstream. */
+const UPSTREAM_TLS = ["proxy_ssl_verify", "proxy_ssl_server_name"] as const
 
 const lf = (text: string) => text.replaceAll("\r\n", "\n")
 
@@ -101,14 +112,57 @@ function parseCompose(dir: string, problems: string[]): Compose | undefined {
   }
 }
 
+/** Every `name value;` directive in an nginx file, comments removed (values lower-cased). */
+function directives(text: string): Map<string, string[]> {
+  const found = new Map<string, string[]>()
+  const statements = text.replace(/#.*$/gm, "").split(/[;{}]/)
+  for (const statement of statements) {
+    const [name, ...args] = statement.trim().split(/\s+/)
+    if (!name) continue
+    found.set(name, [...(found.get(name) ?? []), args.join(" ").toLowerCase()])
+  }
+  return found
+}
+
+/** Each UPSTREAM_TLS directive is present, and every occurrence of it is `on` (a later `off` wins in nginx). */
+function upstreamTlsVerified(dir: string, problems: string[]): boolean {
+  const text = readText(dir, FRONT_UPSTREAM_FILE, problems)
+  if (text === undefined) return false
+  const found = directives(text)
+  const wrong = UPSTREAM_TLS.filter((name) => {
+    const values = found.get(name) ?? []
+    return values.length === 0 || values.some((value) => value !== "on")
+  })
+  if (wrong.length) problems.push(`${FRONT_UPSTREAM_FILE} does not set ${wrong.map((name) => `\`${name} on\``).join(" and ")} (and nothing else)`)
+  return wrong.length === 0
+}
+
+function networksOf(service: Service | undefined): string[] {
+  const networks = service?.networks
+  if (Array.isArray(networks)) return networks.map(String)
+  return networks && typeof networks === "object" ? Object.keys(networks) : []
+}
+
+/** The box is on `sealed` only, and `sealed` has no default route (`internal: true`). */
+function boxSealed(compose: Compose, problems: string[]): boolean {
+  const internal = compose.networks?.sealed?.internal === true
+  if (!internal) problems.push("compose.yaml network `sealed` is not `internal: true`")
+  const boxNetworks = networksOf(compose.services?.box)
+  const only = boxNetworks.length === 1 && boxNetworks[0] === "sealed"
+  if (!only) problems.push(`the box is on [${boxNetworks.join(", ")}], not on \`sealed\` only`)
+  return internal && only
+}
+
 /** The egress control the sandbox's files describe, for `hosts` (config.egressHosts). */
 export function checkEgress(hosts: readonly string[], dir: string = DOCKER_DIR): EgressCheck {
   const problems: string[] = []
   const frontConfigMatches = frontMatches(dir, hosts, problems)
+  const upstreamTls = upstreamTlsVerified(dir, problems)
   const compose = parseCompose(dir, problems)
   const aliases = compose ? aliasesMatch(compose, hosts, problems) : false
   if (compose && !compose.services?.front) problems.push("compose.yaml has no `front` service")
   const connectProxy = compose ? hasConnectProxy(compose, problems) : true
-  const ok = frontConfigMatches && aliases && !connectProxy && compose?.services?.front !== undefined
-  return { ok, control: "tls-front", source: "configuration", frontConfigMatches, aliasesMatch: aliases, connectProxy, problems }
+  const sealed = compose ? boxSealed(compose, problems) : false
+  const ok = frontConfigMatches && upstreamTls && aliases && !connectProxy && sealed && compose?.services?.front !== undefined
+  return { ok, control: "tls-front", source: "configuration", frontConfigMatches, aliasesMatch: aliases, connectProxy, upstreamTlsVerified: upstreamTls, boxSealed: sealed, problems }
 }

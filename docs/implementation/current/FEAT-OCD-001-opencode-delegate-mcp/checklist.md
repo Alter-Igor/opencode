@@ -48,6 +48,6 @@ Each task is 50–200 LOC, under 2 hours, and ends in something that can be chec
 
 ## Before PR
 
-- [ ] Fork test baseline (`bun test` in `packages/core`, `packages/opencode`) vs the `dev` baseline (`AGENTS.md:165`)
-- [ ] Adversarial round 2 (design) done; round 3 on the final diff (QUA-001-53)
-- [ ] F6 Keystone audit evidence, or "not verified" stated
+- [x] Fork test baseline (`bun test` in `packages/core`, `packages/opencode`) vs the `dev` baseline (`AGENTS.md:165`) — `packages/opencode`: same 21 pre-existing Windows failures on `dev` and branch, none new; `packages/core` not run (this branch does not change it)
+- [x] Adversarial round 2 (design) done; round 3 on the final diff (QUA-001-53) — round 3 found R3-01 (fixed); round 4 checks the fix round
+- [x] F6 Keystone audit evidence, or "not verified" stated — **not verified**: `list-audit-log` returned 500

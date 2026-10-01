@@ -1,9 +1,11 @@
-// Runs INSIDE the sealed probe container (docker/front/live/probe.yaml). Prints one JSON object.
-// Every request is a public, read-only GET. No credentials are ever sent.
+// Runs INSIDE a sealed probe container (docker/front/live/probe.yaml): node:22-slim and the real
+// box image (R4-04). Prints one JSON object. Argument: the `sealed` network's gateway address.
+// Every request is a public, read-only GET or a bare TCP connect. No credentials are ever sent.
 import dns from "node:dns/promises"
 import { readFileSync } from "node:fs"
 import https from "node:https"
 import net from "node:net"
+import os from "node:os"
 import tls from "node:tls"
 import { randomBytes } from "node:crypto"
 
@@ -11,6 +13,11 @@ const CA = readFileSync("/etc/ocd-front-ca/ca.pem")
 const IDENTITY = "identity.alterspective.com.au"
 const SYNAPSE = "synapse2-api.alterspective.com.au"
 const T = 20_000
+const GATEWAY = process.argv[2] ?? ""
+/** Cloudflare's public DNS over IPv6: a public v6 address that answers on 443 when reachable. */
+const PUBLIC_V6 = "2606:4700:4700::1111"
+/** The Docker host side of `sealed` (R4-04): SSH, DNS, HTTP(S) and the Docker API ports. */
+const GATEWAY_PORTS = [22, 53, 80, 443, 2375, 2376]
 
 /** GET over front. `connectTo` is the name the socket goes to; `sni` and `host` can be swapped. */
 // trust: "front" (front's CA only), "public" (Node's bundled roots only), "none" (no verification; red probes).
@@ -73,6 +80,27 @@ async function resolves(name) {
   }
 }
 
+/** IPv6 answers only: getaddrinfo for AF_INET6, and a raw AAAA query to Docker's DNS. */
+async function v6(name) {
+  const lookup = await dns.lookup(name, { all: true, family: 6 }).then((all) => all.map((a) => a.address), () => [])
+  const aaaa = await dns.resolve6(name).catch(() => [])
+  return { lookup, aaaa }
+}
+
+/** Global IPv6 addresses on this container's interfaces (loopback and link-local left out). */
+const globalV6 = () =>
+  Object.values(os.networkInterfaces())
+    .flat()
+    .filter((a) => a && a.family === "IPv6" && !a.internal && !a.address.toLowerCase().startsWith("fe80"))
+    .map((a) => a.address)
+
+async function gatewayPorts() {
+  if (!GATEWAY) return { none: "no gateway address given" }
+  const out = {}
+  for (const port of GATEWAY_PORTS) out[port] = await rawTcp(GATEWAY, port)
+  return out
+}
+
 const frontIp = (await resolves(IDENTITY))[0] ?? "none"
 const result = {
   frontIp,
@@ -112,6 +140,14 @@ const result = {
     3128: await rawTcp(frontIp, 3128),
     8080: await rawTcp(frontIp, 8080),
     80: await rawTcp(frontIp, 80),
+  },
+  // (f) the Docker host side of `sealed`: nothing listens for the box there.
+  gateway: { ip: GATEWAY, ports: await gatewayPorts() },
+  // (g) IPv6: no address, no route, and no AAAA answer that could go round front.
+  ipv6: {
+    addresses: globalV6(),
+    direct: await rawTcp(PUBLIC_V6, 443),
+    names: { identity: await v6(IDENTITY), synapse: await v6(SYNAPSE), cloudflare: await v6("www.cloudflare.com") },
   },
 }
 process.stdout.write(JSON.stringify(result) + "\n")

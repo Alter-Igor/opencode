@@ -117,8 +117,12 @@ function single(q: URLSearchParams, key: string): string | undefined {
  * The URL comes from the box, and the bridge opens it in the owner's signed-in browser. So only an
  * authorization-code request with PKCE (S256) to Keystone's authorize endpoint, redirecting back to
  * this listener, is opened (R3-06); any other Keystone page or redirect target is refused.
+ * Returns the checked URL's serialisation, and only that is opened (R4-03): the WHATWG parser drops
+ * leading C0/space and inner tab/CR/LF and reads `\` as `/`, so the box's raw text could be read
+ * differently by rundll32 or the browser than by these checks. An `href` that would not re-parse to
+ * itself is refused, so what is opened is exactly what was checked.
  */
-function checkAuthUrl(raw: string, authOrigin: string, port: number): void {
+function checkAuthUrl(raw: string, authOrigin: string, port: number): string {
   const url = parseUrl(raw)
   if (url?.origin !== authOrigin || url.username || url.password) throw new DelegateError("policy_violation", "The sign-in URL from the box is not a Keystone URL; it was not opened.", "Run oc_doctor.")
   const q = url.searchParams
@@ -126,6 +130,8 @@ function checkAuthUrl(raw: string, authOrigin: string, port: number): void {
   if (url.pathname !== AUTHORIZE_PATH || single(q, "response_type") !== "code" || !pkce || single(q, "redirect_uri") !== loopbackRedirect(port)) {
     throw new DelegateError("policy_violation", "The sign-in URL from the box is not a Keystone authorization request back to this bridge; it was not opened.", "Run oc_doctor.")
   }
+  if (parseUrl(url.href)?.href !== url.href) throw new DelegateError("policy_violation", "The sign-in URL from the box does not have one stable form; it was not opened.", "Run oc_doctor.")
+  return url.href
 }
 
 async function entryStatus(api: OpencodeApi, entry: string, directory: string): Promise<"connected" | "failed"> {
@@ -193,9 +199,9 @@ async function signIn(api: OpencodeApi, entry: string, opts: LoginOptions, logge
     const started = expectOk(await api.call<{ authorizationUrl?: string; oauthState?: string }>({ method: "POST", path: `/mcp/${entry}/auth`, directory, body: {} }), "start the Keystone sign-in")
     if (!started.authorizationUrl) return await entryStatus(api, entry, directory) // already signed in
     if (!started.oauthState) throw new DelegateError("upstream_error", "The delegate box did not return a sign-in state.", "Retry oc_login.")
-    checkAuthUrl(started.authorizationUrl, opts.authOrigin, port)
+    const checked = checkAuthUrl(started.authorizationUrl, opts.authOrigin, port)
     listener.expect(started.oauthState)
-    ;(opts.opener ?? defaultOpener)(started.authorizationUrl)
+    ;(opts.opener ?? defaultOpener)(checked)
     logger.log("info", "login", "browser opened; waiting for the loopback redirect", { entry })
     const timeout = new Promise<undefined>((resolve) => (timer = setTimeout(() => resolve(undefined), opts.timeoutMs ?? LOGIN_TIMEOUT_MS)))
     const got = await Promise.race([listener.received, timeout])

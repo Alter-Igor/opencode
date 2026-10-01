@@ -188,3 +188,83 @@ Not a finding: in-box code can read and write every session's clone (one shared 
 | R3-10 | **Fixed** with the above: README security rows and compose comments rewritten; technical design revision 4. | — |
 
 Suite after the round: 660 pass / 8 skip / 0 fail (the 8 skips are the gated live egress tests); tsc clean. A round-4 review of the fix round was not run.
+
+## Round 4 (2026-10-01, fix round 6bf4046d75..78dc875a49)
+
+Reviewed: `git diff 6bf4046d75 78dc875a49` (58 files) plus the docs-only commits after it. Focus: R3-01 (`front`), R3-02 (gate split), and spot checks of R3-03..R3-09.
+
+**The live box was not running.** `docker ps -a` showed no `opencode-delegate*` container and no `sealed` / `admin` network, only the named volumes. So no `docker exec` probe, no `nginx -T` and no `docker network inspect` was possible. Nothing was started, stopped or reconfigured. The one container this round ran was a throwaway `docker run --rm --network none --read-only --cap-drop ALL` of the existing `front` image, with both CA volumes mounted read-only, to read the CA certificate and list file modes (the key itself was not read).
+
+### Reviewers
+
+| Role | Model / agent | Could see | Output |
+|---|---|---|---|
+| Grounded falsifier | Claude (Opus 5.5), file tools | The fix diff, `docker/compose.yaml`, `docker/front/*`, `docker/caches/*`, the inbox sidecar, the Synapse gateway source (`C:\GitHub\Alterspective-Synapse`, head `2c0667f6`), Keystone discovery metadata, the owner's Keystone tool catalogue (`search-tools`, read-only) | Probes table + R4-01..R4-07 |
+| Hosted reviewer | Synapse gateway `mcp__synapse__chat`, model `auto` → served `ornith-1.0-35b` (on-prem) | A ~1,300-word summary of the fix (no client names, no secret values) | Verdicts on 5 questions; see "Hosted reviewer's view" |
+
+### Probes
+
+| What was tried | How | Result |
+|---|---|---|
+| Live box probes (`docker exec opencode-delegate …`, `nginx -T`, `docker network inspect`) | `docker ps -a --filter name=opencode-delegate` | **Not possible.** No container or network exists; only the volumes `opencode-delegate_*` remain. |
+| CA certificate on the live volume | Throwaway `front` image, `--network none`, volumes read-only: `openssl x509 -ext basicConstraints,keyUsage,nameConstraints` | **Holds.** `CA:TRUE, pathlen:0`; `Certificate Sign, CRL Sign`; critical name constraints permit only `DNS:identity.alterspective.com.au` and `DNS:synapse2-api.alterspective.com.au`, exclude all IPv4 and IPv6. Valid to 2029-01-03. |
+| CA key location and modes | Same run, `ls -ln` | **Holds.** `/ca/private/ca.key` 0600 uid 101. `/ca/public` holds only `ca.pem` (0644), identical to the private copy. Only `front` mounts `front-ca-private` (`compose.yaml:213`; `egress-compose.test.ts:86-92`). The box mount is `:ro` (`compose.yaml:85`). |
+| SNI or `Host` choosing the upstream | Read `docker/front/servers.conf:4-44`, `upstream.conf` | **Holds.** Upstream, `proxy_ssl_name` and `Host` are literals per server. `$front_upstream` is `set` from a literal, never from the request. Unknown SNI → `ssl_reject_handshake`. `$host` (lower-cased, port and trailing dot stripped; taken from an absolute-form request line first) must equal the literal, else 421. Upper-case SNI fails the `$ssl_server_name` test: fails closed. |
+| Absolute-form URI, HTTP/2, CONNECT, Upgrade, smuggling | Read config; live test cases `hostSwapAbsoluteUri`, `connectOverTls`, `connectPlain` (`docker/front/live/client.mjs:98-109`) | **Holds by reading.** No `http2` on `listen`. nginx drops `Upgrade` unless set. Body framing is re-made by nginx (chunked or exact `Content-Length`) and there is no upstream `keepalive`, so a smuggled second request would reach nginx again, not the upstream. Not run live this round. |
+| Header routing at the front doors (`X-Forwarded-Host`, `Forwarded`) | Reasoning only | **Not checked.** nginx passes these headers unchanged. Cloudflare and Azure Container Apps route on SNI/`:authority`, so no route change is expected. Not probed. |
+| Cloudflare helper paths on the identity host as a fetcher | Host `curl` GETs: `/cdn-cgi/image/width=10/https://example.com/favicon.ico`, `/cdn-cgi/zaraz/i.js`, `/cdn-cgi/rum` | **Closed.** All 404. `/cdn-cgi/trace` 200 with `h=identity.alterspective.com.au`. |
+| Keystone as a server-side fetcher (CIMD, `jwks_uri`) | Host GET of `/.well-known/oauth-authorization-server` | **Closed.** No `client_id_metadata_document_supported`. Token auth methods are `client_secret_basic`, `client_secret_post`, `none` (no `private_key_jwt`, so no `jwks_uri` fetch). |
+| Keystone `/mcp/dynamic` as a relay | `profile.ts:160` (`ks-delegate` → `/mcp/dynamic`); owner's catalogue via `keystone-dynamic search-tools` | **Open (R4-01).** `m365 send-mail` (any recipient, attachments), `monday execute_code` and others are reachable. |
+| Synapse as a fetcher (remote image URLs, provider web tools) | Read Synapse source: `packages/gateway/src/protocol/unsupported-content.ts`, `packages/contracts/src/wire/openai.ts:110-155` | **Closed by source.** Inbound `image_url` and Anthropic URL images are refused at ingress. Unknown top-level fields (`plugins`, `web_search_options`) are stripped by zod. Live gateway version not verified. |
+| npm cache as a relay | Read `docker/caches/npm/config.yaml` | **Closed.** One uplink (`registry.npmjs.org`). Tarballs come from npm's own metadata. Publish/login impossible. A package name only reaches npm's logs. |
+| PyPI cache as a relay | Read `docker/caches/pypi/nginx.conf` | **Closed.** Two literal upstreams, GET only, path appended under fixed prefixes. |
+| DNS | Live test `(d)` (`test/egress-live.test.ts:111-117`); `front` resolver from host env only | **Holds (planner's live run, not re-run).** `www.cloudflare.com`, vault-mcp and a random name do not resolve in a sealed probe, so Docker is not forwarding external queries. The box cannot set `OCD_FRONT_RESOLVER`. Spoofed upstream answers fail `proxy_ssl_verify` against `proxy_ssl_name`. |
+| IPv6 | Read compose (no `enable_ipv6`); `resolver … ipv6=off` | **Holds by reading.** Not probed live (R4-04). |
+| Sealed bridge gateway / Docker VM listeners | — | **Not checked** (R4-04). |
+| R3-02: listener on a box network that forwards to `inbox-admin` | `compose.yaml:141-174,270-295`; `inbox-sidecar/src/main.ts:56-57`; `egress-compose.test.ts:28-59` | **Holds by reading.** `gate-admin` is on `admin` + `outside` only. The admin listener binds the `inbox-admin` address (admin network only). The box is on `sealed` only and cannot add routes (no `NET_ADMIN`). Not probed live. |
+| R3-03 directory regex | Work-queue script: `BOX_DIRECTORY_RE` on `/sessions/abc\n`, `/sessions/..`, `/sessions/ABC` | **Holds.** All rejected; `/sessions/abc` accepted. Events drop a bad `directory` (`events/hub.ts:177-180`); views report the tracked path (`events/view.ts:24-31`). |
+| R3-05 `stripUnsafe` coverage | Work-queue script on `a<cp>b` | **Gap (R4-02).** U+180B–180D, U+180F, U+034F, U+17B4, U+17B5 survive. U+FE0F, U+E0101, U+200B, U+3164 are removed. |
+| R3-06 sign-in URL | Read `supervisor/login.ts:99-129,198` | **Holds for the checks.** Origin, no userinfo, exact path, single `response_type`/`code_challenge`/`code_challenge_method`/`redirect_uri`. Gap: the raw string, not the parsed URL, is opened (R4-03). |
+| R3-07 fsck | Read `workspaces.ts:208-225`; `workspaces-collect.test.ts` R3-07 case uses real git; host git `2.51.0.windows.1` | **Holds.** Note: `index-pack failed` also matches non-fsck failures (a corrupt or truncated bundle), which are then reported as "failed git's object check". Fails closed; wording only. |
+| R3-09 runtime swap | Read `runtime.ts:93-170` | **Holds.** `current` is cleared before the old hub stops, and set only after `start()` succeeds. `pending` serialises `box()` and `restart()`. |
+
+### Findings
+
+| ID | Sev | Finding | Where | Status | Suggested fix |
+|---|---|---|---|---|---|
+| R4-01 | **High** (residual, not a regression) | **The allowed hosts are a relay to attacker-chosen places, so the R3-01 impact (code and tokens leave to an attacker) is still reachable.** The network wall now holds. But `ks-delegate` is Keystone `/mcp/dynamic`, which relays to every connection the owner has. That includes `m365 send-mail` (any recipient, with attachments) and `monday execute_code` (arbitrary code in a remote sandbox). The default profile is `standard`, so Keystone tools run without asking. In-box code can also skip OpenCode and call Keystone directly with the tokens in `/data/mcp-auth.json` (accepted in round 2). Scenario: a prompt-injected agent zips `/sessions/*` and mails it to an outside address as the owner. Keystone logs the call, but nothing stops it. This is inside R7 ("only Keystone MCP services"), which is why it is a residual. But the README's "What the box stops" list and §1 ("the control that makes R7 hold") read as if exfiltration is stopped. | `src/supervisor/profile.ts:160`; `src/tools/sessions.ts:24,41` (`standard` default); `README.md` "What the box stops" + "Call every MCP service Keystone gives you" | CONFIRMED by composition: profile entry read; tools observed in the owner's Keystone catalogue (read-only `search-tools`); front passes Keystone POSTs (`wave3-e2e.md` Run 4). **Not executed** (it would send an external email). | Owner decision. (a) Give the box a Keystone connection policy, or pinned `/mcp/c/<id>` entries only, with no outbound-communication or remote-code tools by default. (b) Or make `readonly` the default profile and say plainly in the README: "the box does not stop data leaving through your Keystone connections (for example email); limit them". At minimum, (b). |
+| R4-02 | Low | `stripUnsafe` still leaves invisible characters. These include more variation selectors: Mongolian free variation selectors U+180B–180D and U+180F. Also the combining grapheme joiner U+034F and the Khmer inherent vowels U+17B4/17B5. The README now says variation selectors are removed. | `src/shared/text.ts:12`; README "Untrusted text" row | CONFIRMED (work-queue script: all seven survive; the R3-05 set is removed) | Add `\u180B-\u180D\u180F\u034F\u17B4\u17B5`. Consider `\p{Default_Ignorable_Code_Point}` (`\p{DI}`) instead of a hand list. Add cases to `tools-shape.test.ts`. |
+| R4-03 | Low | `oc_login` checks the WHATWG-parsed URL but opens the raw string from the box (`opener(started.authorizationUrl)`). The parser drops leading C0/space and inner tab/CR/LF, and reads `\` as `/`. `rundll32 url.dll,FileProtocolHandler` and the browser get the unparsed text. No working differential was found. | `src/supervisor/login.ts:124,198` | PLAUSIBLE (needs control of the server's reply, as R3-06) | Open `url.href` from the checked parse. Or refuse any raw string that differs from `url.href`. |
+| R4-04 | Low | The live red tests miss three paths. (1) The `sealed` bridge gateway address and the Docker VM's listeners (published gate ports). (2) IPv6. (3) The real box image: the probes are `node:22-slim` and `oven/bun`, not the box. The fix's claim "the box's only way out is front" is proven for IPv4 to public IPs only. | `docker/front/live/client.mjs:103-115`; `test/egress-live.test.ts:111-123` | Gap (CONFIRMED by reading); exploit PLAUSIBLE only | Add probes: TCP to the `sealed` subnet's `.1` on `OCD_PORT`, `OCD_INBOX_PORT`, 2375/2376, 53, 80, 443. An IPv6 connect to a public v6 address. One run of `client.mjs` inside the real box image. |
+| R4-05 | Low | `oc_doctor`'s `egress.ok` checks only the generated `servers.conf` / `hosts.txt`, front's aliases and the absence of a proxy. It does not check `upstream.conf` (`proxy_ssl_verify on`), `nginx.conf`, `entrypoint.sh`, `sealed.internal`, or that the box is on `sealed` only. It reads the checkout, not the running containers. A drift there still reports `ok: true` (it is labelled `source: configuration`). | `src/guard/egress-check.ts:104-114` | CONFIRMED by reading | Hash the static `front` files into the check. Assert `networks.sealed.internal === true` and `box.networks == ["sealed"]` there too (the test has them; the doctor does not). Later, compare against the running `front` with `nginx -T`. |
+| R4-06 | Low | Technical design §1 still draws `R[/work = C:\GitHub bind mount/]` inside the box. Compose mounts no repo folder: the box gets a bundle copy (README "Your repos"). | `technical-design.md` §1 mermaid | CONFIRMED (`compose.yaml:77-85` has no `/work`) | Replace with `/sessions` (volume, bundle copies) and `/handoff`. |
+| R4-07 | Info | R3-07 error mapping: `index-pack failed` also fires for a corrupt or cut-off bundle, which is then reported as "failed git's object check". It fails closed. | `src/supervisor/workspaces.ts:216` | CONFIRMED by reading | Match `fsck error` / `error: object .*:` for the policy message. Report other `index-pack` failures as `upstream_error`. |
+
+Not findings (checked): the CA design and key handling; the npm and PyPI caches; Cloudflare helper paths; Keystone server-side fetches; Synapse remote-URL content; DNS; R3-02; R3-03; R3-04 (one line, `packages/opencode/src/mcp/index.ts:857`); R3-09.
+
+### Hosted reviewer's view and check
+
+| Hosted claim | Hosted rating | Check |
+|---|---|---|
+| `front` with `ip_forward=1` routes the box's packets to `outside` | Critical | **Refuted.** The box is on an internal network with no default route. It has no `NET_ADMIN` or `NET_RAW` (`cap_drop: ALL`), so it cannot add a route via front's address or send raw packets. The live probe to `1.1.1.1:443` was unreachable. |
+| K/S used as relays (semantic egress) | Critical | **Agreed in substance, rated High** as R4-01. It is a residual inside R7, not a hole in `front`. The Synapse half is closed by source (inbound URL content refused). |
+| HTTP request smuggling | High | **Not confirmed.** nginx re-frames the body and opens a fresh upstream connection per request (no `keepalive`). `Host` is forced. No concrete desync was shown. |
+| `rundll32` decodes the URL differently | High | **Partly agreed, Low** as R4-03. No working differential was found. |
+| Docker DNS might forward | Unclear | **Refuted** by the live test `(d)`: public names do not resolve. |
+| IPv6 direct path | Low | **Not checked live**; folded into R4-04. |
+| Caches as relays | Medium | **Refuted** by the configs (fixed uplinks). |
+| Unicode normalisation (homoglyphs) | Medium | **Out of scope.** Stripping is for invisible text; homoglyphs are visible. The real gap is R4-02, which the hosted reviewer did not name. |
+| fsck stderr matching misses errors | Unclear | **Refuted** for safety: any non-zero exit fails the collect. Wording only (R4-07). |
+| CA design | HOLDS | **Agreed** (live certificate read). |
+
+The served model was the small on-prem one. Its answer was generic and often wrong (four of its ten items are refuted above). It is recorded for completeness and not relied on.
+
+### Not checked
+
+- Anything live inside a box. The box, `front`, the networks and the gates were not running. So these were not run against the real box: SNI/Host swaps, `nginx -T`, `docker network inspect`, gateway and IPv6 probes, and the R3-02 reachability check.
+- The bridge test suite and `OCD_LIVE_EGRESS=1` were not run this round. The planner's figures (660 pass / 8 skip; 6 live pass) are not re-verified.
+- Whether Keystone access tokens are audience-bound per connection, and whether token exchange (`urn:ietf:params:oauth:grant-type:token-exchange` is advertised) lets in-box code mint tokens for other audiences. The §1 claim "RFC 8707 audience binding" was not verified.
+- Whether the deployed Synapse gateway matches the source read here (`2c0667f6`).
+- `X-Forwarded-Host` / `Forwarded` handling at Cloudflare and Azure Container Apps.
+
+**Verdict:** R3-01 is fixed as a network control. The box can no longer choose where its TLS goes. The CA is sound, and the caches are not relays. R3-02..R3-09 hold, with small gaps (R4-02, R4-03, R4-07). Before the PR, the owner should decide R4-01. Either narrow what `/mcp/dynamic` gives the box, or state in the README that data can still leave through the owner's Keystone connections. R4-04 should land as extra live probes the next time the box runs.

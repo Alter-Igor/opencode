@@ -118,7 +118,35 @@ describe("workspaces: collect errors are specific", () => {
       const error = await failure(fx.workspaces().collect(ws))
       expect(error.code).toBe("policy_violation")
       expect(error.message).toContain("object check")
+      expect(error.message).not.toContain("damaged")
       expect(await fx.hostHas("delegate/fsck-key")).toBe(false)
+      expect(fx.incoming()).toEqual([])
+    },
+    T,
+  )
+
+  test(
+    "R4-07: a damaged or cut-off bundle is policy_violation, reported as damaged, not as a failed object check",
+    async () => {
+      const ws = await fx.workspaces().open(fx.hostRepo, "cut-key")
+      await fx.boxCommit("cut-key", { "big.txt": randomBytes(20_000).toString("base64") }, "work")
+      const whole = path.join(fx.tmp, "cut-whole.bundle")
+      await fx.boxGit("cut-key", ["bundle", "create", "--quiet", whole, "delegate/cut-key"])
+      const bytes = readFileSync(whole)
+      const flipped = Buffer.from(bytes)
+      flipped.fill(0xff, bytes.length >> 1, (bytes.length >> 1) + 8)
+      const damaged: Record<string, Buffer> = {
+        "cut in half": bytes.subarray(0, bytes.length >> 1),
+        "bytes flipped in the pack": flipped,
+        "header only": bytes.subarray(0, bytes.indexOf("\n\n") + 2),
+        "not a bundle": Buffer.from("garbage\n"),
+      }
+      for (const [why, content] of Object.entries(damaged)) {
+        fx.boxOverride = (argv) => (argv.includes("bundle") ? (writeFileSync(argv.at(-2) ?? "", content), OK) : undefined)
+        const error = await failure(fx.workspaces().collect(ws))
+        expect({ why, code: error.code, damaged: error.message.includes("damaged or incomplete"), fsck: error.message.includes("object check") }).toEqual({ why, code: "policy_violation", damaged: true, fsck: false })
+      }
+      expect(await fx.hostHas("delegate/cut-key")).toBe(false)
       expect(fx.incoming()).toEqual([])
     },
     T,
