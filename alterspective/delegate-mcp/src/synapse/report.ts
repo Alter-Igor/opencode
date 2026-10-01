@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises"
 import type { Exec } from "../supervisor/docker.ts"
 import { AUTH_FILE_NAME, SYNAPSE_HOST, authConfHasToken, authConfPath, isAuthConf } from "./auth-conf.ts"
 import { expectedSynapseLocations, locationLines } from "./front-routes.ts"
-import { readState, refreshAt, type Reload, type SynapseDeps, type TokenState } from "./token-manager.ts"
+import { readState, refreshAt, type Reload, type SynapseDeps } from "./token-manager.ts"
 
 export type LiveAuth =
   | {
@@ -41,8 +41,9 @@ export type SynapseReport = {
   /** Review M3: the last reload of front (front-reload's result) and when. */
   lastReload?: { result: Reload; at: string }
   /**
-   * Review M3: front has loaded the include written last: a reload that worked after the write, or
-   * front (re)started after it. `nginx -T` alone cannot tell: it reads the files on disk.
+   * Review M3/N2: front has loaded the include written last: the sha256 front recorded when it
+   * checked and loaded an include (start, or a reload that worked) equals this home's file.
+   * `nginx -T` alone cannot tell: it reads the files on disk.
    */
   loadedSinceWrite: boolean
   live: LiveAuth
@@ -59,7 +60,7 @@ export async function synapseReport(deps: SynapseDeps, exec: Exec): Promise<Syna
   const kind = needsSignIn ? "needs_sign_in" : deps.now() >= state.expiresAt ? "expired" : !hostFile.hasToken ? "include_empty" : "signed_in"
   const live = await liveAuth(exec, deps.frontContainer, conf)
   const liveOk = !("unavailable" in live) && live.shapeOk && live.hasToken && live.matchesHost && live.routesOk
-  const loadedSinceWrite = loadedAfterWrite(state, await frontStartedAt(exec, deps.frontContainer))
+  const loadedSinceWrite = conf !== "" && (await frontLoadedSha(exec, deps.frontContainer)) === sha(conf)
   return {
     state: kind,
     ...(state?.user ? { user: state.user } : {}),
@@ -79,23 +80,16 @@ export async function synapseReport(deps: SynapseDeps, exec: Exec): Promise<Syna
 }
 
 /**
- * The include written last is loaded when a reload worked after that write, or front started after
- * it. A state from before review M3 has no `includeAt`; its adopt time stands in (the write it made).
+ * Review N2: front-reload records here (front's tmpfs) the sha256 of the include it checked, at start
+ * and after each reload that worked. No clocks: equal to the host file's sha256 means front loaded it.
  */
-export function loadedAfterWrite(state: TokenState | undefined, startedAt: number | undefined): boolean {
-  const writtenAt = state?.includeAt ?? state?.obtainedAt
-  if (state === undefined || writtenAt === undefined) return false
-  const reloaded = state.lastReload?.result === "reloaded" && state.lastReload.at >= writtenAt
-  return reloaded || (startedAt !== undefined && startedAt >= writtenAt)
-}
+export const LOADED_AUTH_SHA = "/tmp/front/loaded-auth.sha"
 
-/** When front's container last started (Docker's clock), or undefined when it cannot be read. */
-export async function frontStartedAt(exec: Exec, container: string): Promise<number | undefined> {
-  const run = await exec(["docker", "inspect", "--type", "container", "--format", "{{.State.StartedAt}}", container], { timeoutMs: 20_000 })
-  if (run.code !== 0) return undefined
-  // Docker prints nanoseconds; Date.parse wants at most milliseconds.
-  const at = Date.parse(run.stdout.trim().replace(/(\.\d{3})\d+/, "$1"))
-  return Number.isFinite(at) && at > 0 ? at : undefined
+/** The sha256 front recorded for the include it loaded, or undefined (not running, none recorded, garbled). */
+export async function frontLoadedSha(exec: Exec, container: string): Promise<string | undefined> {
+  const run = await exec(["docker", "exec", container, "cat", LOADED_AUTH_SHA], { timeoutMs: 20_000 })
+  const value = run.stdout.trim()
+  return run.code === 0 && /^[0-9a-f]{64}$/.test(value) ? value : undefined
 }
 
 const sha = (text: string) => createHash("sha256").update(text).digest("hex")

@@ -16,6 +16,7 @@ import type { Logger } from "../shared/log.ts"
 import type { ApiTarget } from "../shared/opencode-api.ts"
 import { FRONT_SERVERS_NAME } from "../guard/egress.ts"
 import { ensureAuthConf } from "../synapse/auth-conf.ts"
+import { SYNAPSE_LOCK_WAIT_MS } from "../synapse/lock.ts"
 import { INSPECT_ENV, MCP_ALLOW_ENV, approvedValues, boxEnvOverride, composeDownEnv, composeEnv, siblingContainers } from "./compose-env.ts"
 import { LABEL, dockerArgs, imageExists, inspectBox, redactAll, requireDocker, type BoxInspect, type Exec, type ExecResult } from "./docker.ts"
 import { waitHealthy } from "./health.ts"
@@ -168,14 +169,24 @@ async function prepareFiles(run: Run, plan: Plan): Promise<void> {
     await mkdir(path.join(dirs.handoff, "in"), { recursive: true })
     await removeLegacyOut(run)
     await writeBoxEnvOverride(run)
-    // front's servers for this Keystone set (R4-01); compose mounts the folder read-only into front.
     await mkdir(dirs.front, { recursive: true })
-    await writeFile(path.join(dirs.front, FRONT_SERVERS_NAME), plan.front.servers, "utf8")
-    // WS2 (#48): servers.conf includes the Synapse auth file, so it must exist (empty = no credential).
-    await ensureAuthConf(dirs.front)
+    await mkdir(path.dirname(dirs.synapseLock), { recursive: true })
   } catch (error) {
     throw fsFailure("prepare the sandbox folders", error, deps.config.home)
   }
+  // Review N1: front's generated files are written under the Synapse refresh lock (src/synapse/lock.ts),
+  // so a token refresh never reloads front between its check and a file written here. The caller
+  // holds the start lock: start lock first, then this one (the Synapse code never takes the start lock).
+  await withStartLock(deps.leaseFs, dirs.synapseLock, async () => {
+    try {
+      // front's servers for this Keystone set (R4-01); compose mounts the folder read-only into front.
+      await writeFile(path.join(dirs.front, FRONT_SERVERS_NAME), plan.front.servers, "utf8")
+      // WS2 (#48): servers.conf includes the Synapse auth file, so it must exist (empty = no credential).
+      await ensureAuthConf(dirs.front)
+    } catch (error) {
+      throw fsFailure("write front's generated files", error, deps.config.home)
+    }
+  }, { ...(await lockOptions(run)), waitMs: SYNAPSE_LOCK_WAIT_MS, staleMs: SYNAPSE_LOCK_WAIT_MS })
 }
 
 async function writeBoxEnvOverride(run: Run): Promise<void> {

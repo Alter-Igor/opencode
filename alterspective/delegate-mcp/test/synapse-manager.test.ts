@@ -13,7 +13,8 @@ import { withStartLock } from "../src/supervisor/start-lock.ts"
 import { authConf, authConfHasToken, authConfPath, ensureAuthConf, isAuthConf, writeAuthConf } from "../src/synapse/auth-conf.ts"
 import { refreshFraction } from "../src/synapse/index.ts"
 import { RETRY_BASE_MS, backoffMs, refreshIfDue } from "../src/synapse/refresh.ts"
-import { synapseReport } from "../src/synapse/report.ts"
+import { LOADED_AUTH_SHA, synapseReport } from "../src/synapse/report.ts"
+import { createHash } from "node:crypto"
 import { synapseLine } from "../src/tools/doctor.ts"
 import { dpapiStore, memoryStore, type PowerShell, type SecretStore } from "../src/synapse/secret-store.ts"
 import { FRONT_RELOAD, adopt, isDue, readState, refreshAt, type SynapseDeps } from "../src/synapse/token-manager.ts"
@@ -29,13 +30,17 @@ function harness(over: Partial<SynapseDeps> = {}) {
   let clock = 1_000_000
   let reply: () => Response = () => ok()
   // front: `front-reload` exits with `docker.reload` (0 reloaded, 3 files changed, 4 nginx -t refused);
-  // `docker inspect` says whether it runs and when it started (ISO, nanoseconds like Docker).
-  const docker = { reload: 0, running: "true", startedAt: "0001-01-01T00:00:00Z" }
+  // `docker inspect` says whether it runs. Like the real script, a reload that works records the
+  // include's sha256 (review N2), which `cat /tmp/front/loaded-auth.sha` then returns.
+  const docker: { reload: number; running: string; loadedSha?: string } = { reload: 0, running: "true" }
   const exec: Exec = async (argv) => {
     calls.exec.push(argv)
-    if (argv.includes(FRONT_RELOAD)) return { code: docker.reload, stdout: "", stderr: docker.reload ? "front-reload: refused\n" : "" }
+    if (argv.includes(FRONT_RELOAD)) {
+      if (docker.reload === 0) docker.loadedSha = createHash("sha256").update(readFileSync(authConfPath(path.join(home, "front")), "utf8")).digest("hex")
+      return { code: docker.reload, stdout: "", stderr: docker.reload ? "front-reload: refused\n" : "" }
+    }
     if (argv.includes("{{.State.Running}}")) return { code: 0, stdout: `${docker.running}\n`, stderr: "" }
-    if (argv.includes("{{.State.StartedAt}}")) return { code: 0, stdout: `${docker.startedAt}\n`, stderr: "" }
+    if (argv.includes(LOADED_AUTH_SHA)) return docker.loadedSha ? { code: 0, stdout: `${docker.loadedSha}\n`, stderr: "" } : { code: 1, stdout: "", stderr: "no such file" }
     return { code: argv.includes("-T") ? 1 : 0, stdout: "", stderr: "" }
   }
   const fetcher: Fetch = async () => {
@@ -308,6 +313,9 @@ describe("review M1 / M3: the reload goes through front-reload, and its result i
     await h.signedIn()
     expect((await synapseReport(h.deps, h.deps.exec)).loadedSinceWrite).toBe(true)
     h.docker.reload = 3
+    // A new access token, so the include changes (front still holds the old one: N2's sha differs).
+    const next = jwt({ sub: "oid-1", email: "owner@example.test", act: { sub: "service:opencode" }, iat: 2 })
+    h.setReply(() => new Response(JSON.stringify({ access_token: next, refresh_token: "rt-2", expires_in: 1000 }), { status: 200 }))
     h.advance(800_000)
     expect(await refreshIfDue(h.deps)).toEqual({ outcome: "refreshed", reload: "config_changed" })
     const state = await readState(h.home)
@@ -327,14 +335,21 @@ describe("review M1 / M3: the reload goes through front-reload, and its result i
     expect((await readState(h.home))?.lastReload?.result).toBe("front_not_running")
   })
 
-  test("front (re)started after the last include write has loaded it, even if the last reload failed", async () => {
+  test("review N2: loaded means front's recorded sha256 equals the host include's; no clock is involved", async () => {
     const h = harness()
     h.docker.reload = 1
     h.docker.running = "false"
     await h.signedIn()
+    // No record (front not running, never reloaded): not loaded, whatever the clocks say.
     expect((await synapseReport(h.deps, h.deps.exec)).loadedSinceWrite).toBe(false)
-    h.docker.startedAt = new Date(h.clock() + 5_000).toISOString().replace("Z", "123456Z")
+    // front (re)started and its entrypoint recorded THIS include: loaded.
+    h.docker.loadedSha = createHash("sha256").update(h.conf()).digest("hex")
     expect((await synapseReport(h.deps, h.deps.exec)).loadedSinceWrite).toBe(true)
+    // It recorded another include (an older token): not loaded. A garbled record counts as none.
+    h.docker.loadedSha = "0".repeat(64)
+    expect((await synapseReport(h.deps, h.deps.exec)).loadedSinceWrite).toBe(false)
+    h.docker.loadedSha = "not-a-sha"
+    expect((await synapseReport(h.deps, h.deps.exec)).loadedSinceWrite).toBe(false)
   })
 
   test("a failure kept retrying keeps the reload record (retryLater rebuilds the state)", async () => {

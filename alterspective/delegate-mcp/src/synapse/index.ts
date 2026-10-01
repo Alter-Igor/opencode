@@ -1,6 +1,5 @@
 // WS2 (#48): wiring for the host-held Synapse token (token-manager.ts) and its oc_doctor report.
 import { randomUUID } from "node:crypto"
-import path from "node:path"
 import { frontDir, type BridgeConfig } from "../shared/config.ts"
 import type { Logger } from "../shared/log.ts"
 import { bunExec, type Exec } from "../supervisor/docker.ts"
@@ -8,6 +7,7 @@ import { nodeLeaseFs } from "../supervisor/leases.ts"
 import { defaultOpener } from "../supervisor/login.ts"
 import { nodeProcessProbe, ownStartTime } from "../supervisor/process.ts"
 import { withStartLock } from "../supervisor/start-lock.ts"
+import { SYNAPSE_LOCK_WAIT_MS, synapseLockFile } from "./lock.ts"
 import { refreshIfDue, startRefreshLoop } from "./refresh.ts"
 import { loadAppSecrets, type AppSecrets } from "./secrets.ts"
 import { dpapiStore, refreshStoreFile } from "./secret-store.ts"
@@ -17,7 +17,6 @@ import { DEFAULT_REFRESH_FRACTION, signIn, type SynapseDeps } from "./token-mana
 export { liveAuth, synapseReport, type SynapseReport } from "./report.ts"
 
 export const REFRESH_FRACTION_ENV = "OPENCODE_DELEGATE_SYNAPSE_REFRESH_FRACTION"
-const LOCK_WAIT_MS = 2 * 60_000
 
 /** 0.01-0.95; anything else is the default 0.8 (the env exists so a live test can force a refresh). */
 export function refreshFraction(env: NodeJS.ProcessEnv): number {
@@ -39,7 +38,7 @@ export function createSynapseAuth(config: Pick<BridgeConfig, "home" | "keystoneO
     secrets = undefined
     throw error
   }))
-  const lockFile = path.join(config.home, "synapse", "refresh.lock")
+  const lockFile = synapseLockFile(config.home)
   let startedAt: Promise<number> | undefined
   const deps: SynapseDeps = {
     home: config.home,
@@ -52,7 +51,7 @@ export function createSynapseAuth(config: Pick<BridgeConfig, "home" | "keystoneO
     fetch: (input, init) => fetch(input, init),
     exec: bunExec,
     // The tick takes the lock every time (review N2), so this process's start time is read once, not per call.
-    lock: async (fn) => withStartLock(nodeLeaseFs, lockFile, fn, { now: Date.now, sleep: (ms) => new Promise((r) => setTimeout(r, ms)), probe: nodeProcessProbe, self: { pid: process.pid, startedAt: await (startedAt ??= ownStartTime(nodeProcessProbe)) }, waitMs: LOCK_WAIT_MS, staleMs: LOCK_WAIT_MS }),
+    lock: async (fn) => withStartLock(nodeLeaseFs, lockFile, fn, { now: Date.now, sleep: (ms) => new Promise((r) => setTimeout(r, ms)), probe: nodeProcessProbe, self: { pid: process.pid, startedAt: await (startedAt ??= ownStartTime(nodeProcessProbe)) }, waitMs: SYNAPSE_LOCK_WAIT_MS, staleMs: SYNAPSE_LOCK_WAIT_MS }),
     now: Date.now,
     refreshFraction: refreshFraction(env),
     opener: defaultOpener,

@@ -21,7 +21,7 @@ describe("front-reload is baked into front and is the only reload path", () => {
     expect(dockerfile).toContain("COPY --chmod=0755 front-reload.sh /usr/local/bin/front-reload")
     expect(dockerfile).toMatch(/sed -i 's\/\\r\$\/\/' [^\n]*\/usr\/local\/bin\/front-reload/)
     const entry = read("entrypoint.sh")
-    const check = entry.indexOf("/usr/local/bin/front-reload --check")
+    const check = entry.indexOf("/usr/local/bin/front-reload --start")
     expect(check).toBeGreaterThan(-1)
     expect(check).toBeLessThan(entry.indexOf("exec nginx"))
   })
@@ -38,6 +38,7 @@ describe("front-reload is baked into front and is the only reload path", () => {
 })
 
 const sh = Bun.which("sh")
+const sha = (text: string) => createHash("sha256").update(text).digest("hex")
 
 describe.skipIf(!sh)("front-reload run with sh (fake nginx)", () => {
   const SERVERS = "server { listen 443; }\n"
@@ -57,25 +58,30 @@ describe.skipIf(!sh)("front-reload run with sh (fake nginx)", () => {
       writeFileSync(fake, `#!/bin/sh\necho "$*" >> '${calls.replaceAll("\\", "/")}'\n[ "$1" = "-t" ] && exit ${opts.nginxTest ?? 0}\nexit 0\n`)
       chmodSync(fake, 0o755)
       const result = Bun.spawnSync([sh!, SCRIPT, ...(opts.args ?? [])], {
-        env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}`, OCD_FRONT_GEN: gen.replaceAll("\\", "/"), OCD_FRONT_HASH: opts.hash ?? HASH },
+        env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}`, OCD_FRONT_GEN: gen.replaceAll("\\", "/"), OCD_FRONT_RUN: path.join(dir, "run").replaceAll("\\", "/"), OCD_FRONT_HASH: opts.hash ?? HASH },
       })
-      return { code: result.exitCode, stderr: result.stderr.toString(), nginx: existsSync(calls) ? readFileSync(calls, "utf8").trim().split("\n") : [] }
+      const recordedFile = path.join(dir, "run", "loaded-auth.sha")
+      // Review N2: the sha256 front records for the include it checked and loaded.
+      const recorded = existsSync(recordedFile) ? readFileSync(recordedFile, "utf8") : undefined
+      return { code: result.exitCode, stderr: result.stderr.toString(), nginx: existsSync(calls) ? readFileSync(calls, "utf8").trim().split("\n") : [], recorded }
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
   }
 
   test("the files front started with: nginx -t, then reload (exit 0); with a token too, up to the longest", () => {
-    expect(run({ auth: authConf(undefined) })).toMatchObject({ code: 0, nginx: ["-t -q", "-s reload"] })
-    expect(run({ auth: authConf(TOKEN) })).toMatchObject({ code: 0, nginx: ["-t -q", "-s reload"] })
+    expect(run({ auth: authConf(undefined) })).toMatchObject({ code: 0, nginx: ["-t -q", "-s reload"], recorded: `${sha(authConf(undefined))}\n` })
+    expect(run({ auth: authConf(TOKEN) })).toMatchObject({ code: 0, nginx: ["-t -q", "-s reload"], recorded: `${sha(authConf(TOKEN))}\n` })
     const longest = `${"a".repeat(100)}.${"b".repeat(MAX_TOKEN_LENGTH - 202)}.${"c".repeat(100)}`
     expect(isAuthConf(authConf(longest))).toBe(true)
     expect(run({ auth: authConf(longest) })).toMatchObject({ code: 0, nginx: ["-t -q", "-s reload"] })
   })
 
-  test("--check only checks (never reloads)", () => {
-    expect(run({ auth: authConf(TOKEN), args: ["--check"] })).toMatchObject({ code: 0, nginx: [] })
+  test("--check only checks (never reloads, records nothing); --start checks and records (review N2)", () => {
+    expect(run({ auth: authConf(TOKEN), args: ["--check"] })).toMatchObject({ code: 0, nginx: [], recorded: undefined })
     expect(run({ auth: authConf(TOKEN), args: ["--check"], hash: "0".repeat(64) })).toMatchObject({ code: 3, nginx: [] })
+    expect(run({ auth: authConf(TOKEN), args: ["--start"] })).toMatchObject({ code: 0, nginx: [], recorded: `${sha(authConf(TOKEN))}\n` })
+    expect(run({ auth: `${authConf(TOKEN)}x`, args: ["--start"] })).toMatchObject({ code: 3, nginx: [], recorded: undefined })
   })
 
   test("servers.conf is not the file front started with: exit 3, nginx never runs", () => {
@@ -104,12 +110,12 @@ describe.skipIf(!sh)("front-reload run with sh (fake nginx)", () => {
     for (const [name, auth] of Object.entries(bad)) {
       if (auth !== undefined) expect({ name, ts: isAuthConf(auth) }).toEqual({ name, ts: false })
       const result = auth === undefined ? run({}) : run({ auth })
-      expect({ name, code: result.code, nginx: result.nginx }).toEqual({ name, code: 3, nginx: [] })
+      expect({ name, code: result.code, nginx: result.nginx, recorded: result.recorded }).toEqual({ name, code: 3, nginx: [], recorded: undefined })
       expect(result.stderr).not.toContain(TOKEN)
     }
   })
 
   test("nginx -t refuses: exit 4 and no reload (front keeps the last good config)", () => {
-    expect(run({ auth: authConf(undefined), nginxTest: 1 })).toMatchObject({ code: 4, nginx: ["-t -q"] })
+    expect(run({ auth: authConf(undefined), nginxTest: 1 })).toMatchObject({ code: 4, nginx: ["-t -q"], recorded: undefined })
   })
 })
