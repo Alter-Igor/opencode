@@ -171,3 +171,20 @@ Not a finding: in-box code can read and write every session's clone (one shared 
 - The full bridge test suite was not run this round.
 
 **Verdict:** not ready for the PR as a "Keystone-only, sealed box". Fix R3-01 first, or lower the claims to match it. R3-02 and R3-03 are small and should land with it.
+
+### Disposition (planner, after the fix round at `78dc875a49`)
+
+| ID | Disposition | Evidence |
+|---|---|---|
+| R3-01 | **Fixed.** tinyproxy replaced by `front`: TLS ends inside it (private CA, name-constrained, key never leaves its volume); one fixed, verified upstream per allowed host; unknown SNI refused at the handshake; wrong `Host` → 421; no CONNECT proxy. | Planner re-probe before the fix confirmed both swaps (`h=www.cloudflare.com`; vault-mcp `/health` 200). Live red/green in a throwaway project, `OCD_LIVE_EGRESS=1`: 6 pass. On the real box: `e2e-w3` PASS, and a session called Keystone `get-my-identity` through `front` (`evidence/wave3-e2e.md` Runs 3–4). |
+| R3-02 | **Fixed.** `gate` split into `gate-box` (`sealed`) and `gate-admin` (`admin`); the box has no network with a listener that forwards to `inbox-admin`. | `test/egress-compose.test.ts` |
+| R3-03 | **Fixed.** Views report the tracked path; a different box answer only sets `directoryMismatch` (+ `reportedDirectory` when it matches `^/sessions/[a-z0-9-]{1,64}$`). | `test/review-r3-directory.test.ts`: 4 cases, red first |
+| R3-04 | **Fixed** (fork, one line). | `allowlist-lifecycle.test.ts` case, red first |
+| R3-05 | **Fixed.** | 3 cases in `test/tools-shape.test.ts`, red first |
+| R3-06 | **Fixed.** Path, `response_type`, S256 challenge and loopback `redirect_uri` required. Path matches Keystone's live discovery (`/api/oauth/authorize`, `S256`). | `test/login.test.ts`, red first |
+| R3-07 | **Fixed** (`fetch.fsckObjects`). | `test/workspaces-collect.test.ts`, red first |
+| R3-08 | **Open**, issue G-7. | — |
+| R3-09 | **Fixed.** | `test/tools-core-runtime.test.ts`, red first |
+| R3-10 | **Fixed** with the above: README security rows and compose comments rewritten; technical design revision 4. | — |
+
+Suite after the round: 660 pass / 8 skip / 0 fail (the 8 skips are the gated live egress tests); tsc clean. A round-4 review of the fix round was not run.

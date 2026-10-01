@@ -37,9 +37,21 @@ Scratch script (not in the repo) with a real MCP client over the interaction too
 | `oc_post` wake to a session not ours | Refused `not_found` |
 | Clean-up | Session deleted, `/sessions/iy-56742724` removed |
 
+## Run 3 — full flow through the front proxy (`spike/e2e-w3.ts`, commit `78dc875a49`)
+
+Box replaced with `oc_server_restart {confirm: true, force: true}` over MCP; image `opencode-delegate-box:1.18.31-3c5f47265441`, built from `78dc875`. `oc_doctor` after warm-up: `verified: true`, health `healthy`, `egress.ok: true` (`control: tls-front`, `connectProxy: false`).
+
+Same checks as Run 1, all PASS, exit 0: `directory_busy` on a second session; `hello.txt` collected; `PINEAPPLE`; forged session refused (`not_found`); two repos in parallel (16 s); host `HEAD` unchanged.
+
+## Run 4 — a session calls a Keystone MCP tool through `front`
+
+Scratch script over MCP stdio: a session was asked to call `ks-delegate`'s `get-my-identity` and reply with the email domain only. Reply (untrusted): `TOOL_OK alterspective.com.au`. So the agent reached Keystone MCP as the signed-in user, through `front`.
+
+`front` log for Runs 3–4 (method and status per host; paths are not logged): `identity` POST 200 / 202 / 404, `synapse2-api` POST 200. No other SNI or `Host` appeared. The `identity` POST 404s (5–6 per run) did not break any call; they look like MCP session re-initialisation after the restart, but that is **not verified**.
+
 ## Secret scan (T4.6)
 
-The live values of the box server password (32 chars) and `SYNAPSE_API_KEY` (49 chars) were read from `docker inspect opencode-delegate` into shell variables, never printed, and searched for with `grep -F` in: the bridge logs (`~/.local/share/opencode-delegate/logs/`), the Run 1 bridge stderr log, and the Run 1 + Run 2 outputs. **0 hits.** A pattern scan (JWTs, `gpaas_`/`gpapp_`/`sk-` keys, `Bearer` values, token/password JSON fields) over the same files also found 0.
+The live values of the box server password (32 chars) and `SYNAPSE_API_KEY` (49 chars) were read from `docker inspect opencode-delegate` into shell variables, never printed, and searched for with `grep -F` in: the bridge logs (`~/.local/share/opencode-delegate/logs/`), the Run 1 bridge stderr log, and the Run 1 + Run 2 outputs. **0 hits** (repeated after Run 3 over the bridge logs, the Run 3 stderr log and output, and the `front` container log: 0 hits). A pattern scan (JWTs, `gpaas_`/`gpapp_`/`sk-` keys, `Bearer` values, token/password JSON fields) over the same files also found 0.
 
 Inside the box, the env holds only the secrets the design puts there: `OPENCODE_SERVER_PASSWORD` and `SYNAPSE_API_KEY` (shared key, follow-up #48). Keystone OAuth tokens live in the box data volume by design.
 
