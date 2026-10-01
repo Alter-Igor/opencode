@@ -316,10 +316,11 @@ describe("wave 2 review fixes (state)", () => {
     expect(table.get("ses_1")?.state).toBe("idle")
   })
 
-  test("W2A-08: a snapshot entry from another directory moves the session there", () => {
+  test("W2A-08: a snapshot entry from another directory moves the reads there; R3-03: the tracked path is still reported", () => {
     const { table } = upTable()
     table.rebuild(snap({ ses_1: { base: "busy", pending: [], directory: "/sessions/real" } }))
-    expect(table.get("ses_1")).toMatchObject({ state: "busy", directory: "/sessions/real" })
+    expect(table.get("ses_1")).toMatchObject({ state: "busy", directory: DIR, reportedDirectory: "/sessions/real" })
+    expect(table.tracked()).toContainEqual({ sessionID: "ses_1", directory: "/sessions/real" })
   })
 
   test("W2A-22: not_found entries are pruned after 10 min; auto-tracking is capped and evicts the oldest settled", () => {

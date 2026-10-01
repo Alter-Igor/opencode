@@ -4,6 +4,8 @@ import type { ApiTarget, OpencodeApi } from "./opencode-api.ts"
 
 /** OpenCode session ids (id/id.ts). The one session-id shape the bridge accepts (W3A-19). */
 export const SESSION_ID_RE = /^ses_[A-Za-z0-9]{8,64}$/
+/** A box folder the bridge makes (`/sessions/<key>`). Any other directory the box reports is box text (R3-03). */
+export const BOX_DIRECTORY_RE = /^\/sessions\/[a-z0-9-]{1,64}$/
 
 /** MOD-01: one Docker box per user. */
 export type BoxState =
@@ -92,10 +94,15 @@ export type HubEvent = {
  * read from the server at that moment instead: the state began at or before `since` (= observedAt).
  * `pending` of a parent includes the request ids of its subagents. `lastError` (additive) is the
  * last error the session reported, as a known error name or "unrecognised error".
+ * `directory` is the path the bridge tracked, never the box's answer (R3-03). `directoryMismatch`
+ * (additive) says the box reports the session elsewhere; `reportedDirectory` is that answer, shown
+ * only when it is a well-formed box path.
  */
 export type SessionView = {
   sessionID: string
   directory: string
+  directoryMismatch?: true
+  reportedDirectory?: string
   state: SessionState
   since: string
   detail?: string

@@ -146,12 +146,21 @@ class Manager implements BoxManager {
 
   private async swap(target: ApiTarget): Promise<Box> {
     if (this.current && sameTarget(this.current.target, target)) return this.current
-    await this.current?.hub.stop().catch(() => undefined)
+    // R3-09: let go of the old box before stopping it, so a new hub that fails to start never
+    // leaves the stopped one handed out by box() or peek().
+    const old = this.current
+    this.current = undefined
+    await old?.hub.stop().catch(() => undefined)
     const { deps } = this
     const api = (deps.api ?? ((t: ApiTarget) => createApi(t)))(target)
     const hub = (deps.hub ?? ((t: ApiTarget, a: OpencodeApi) => createHub({ target: t, api: a, log: deps.log })))(target, api)
     for (const s of deps.sessions.values()) hub.track(s.sessionID, s.boxPath)
-    await hub.start()
+    try {
+      await hub.start()
+    } catch (error) {
+      await hub.stop().catch(() => undefined)
+      throw error
+    }
     const box: Box = { target, api, hub }
     this.current = box
     safeLog(deps.log, "info", "runtime", "box ready", { baseUrl: target.baseUrl, sessions: deps.sessions.size })

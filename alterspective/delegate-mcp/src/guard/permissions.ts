@@ -7,7 +7,7 @@
 //   file, `sh -c`, or a different spelling — review G1);
 // - subagents drop `ask` rules (packages/opencode/src/agent/subagent-permissions.ts:20-23);
 // - the agent has a shell inside the box either way.
-// The boundaries are the egress proxy, the fork MCP allowlist patch, and the bridge guard.
+// The boundaries are the egress front (docker/front), the fork MCP allowlist patch, and the bridge guard.
 // No R7 (Keystone-only) claim rests on anything in this file.
 //
 // OpenCode evaluates rules last-match-wins (permission/index.ts `evaluate` uses findLast), so

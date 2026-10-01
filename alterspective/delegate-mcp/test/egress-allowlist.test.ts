@@ -1,66 +1,76 @@
-// T2.3 — egress allowlist generated from config.egressHosts (technical-design §1, review N3).
+// R3-01 — the egress front config generated from config.egressHosts (technical-design §1).
+// The live red/green proof is test/egress-live.test.ts (OCD_LIVE_EGRESS=1).
 import { describe, expect, test } from "bun:test"
-import { readFileSync } from "node:fs"
+import { mkdtemp, cp, readFile, rm, writeFile } from "node:fs/promises"
+import os from "node:os"
 import path from "node:path"
-import { egressAllowlist } from "../src/guard/egress.ts"
+import { checkEgress } from "../src/guard/egress-check.ts"
+import { egressHostList, frontHosts, frontServers } from "../src/guard/egress.ts"
 import { defaultConfig } from "../src/shared/config.ts"
 
-const EGRESS_DIR = path.join(import.meta.dir, "..", "docker", "egress")
+const DOCKER = path.join(import.meta.dir, "..", "docker")
+const HOSTS = ["identity.alterspective.com.au", "synapse2-api.alterspective.com.au"]
+const read = async (...parts: string[]) => (await readFile(path.join(DOCKER, ...parts), "utf8")).replaceAll("\r\n", "\n")
 
-// tinyproxy compiles each line as a POSIX ERE with REG_ICASE (FilterCaseSensitive defaults off).
-// For the subset the generator emits (^, $, \., :) JS RegExp semantics are identical.
-// With `FilterURLs On` the string tested is the request URL: `host:443` for CONNECT,
-// `http://host/...` for plain HTTP (observed in the tinyproxy log; proven in egress-live.test.ts).
-function matches(list: string, url: string): boolean {
-  return list
-    .split("\n")
-    .filter((line) => line && !line.startsWith("#"))
-    .some((line) => new RegExp(line, "i").test(url))
+type Server = { body: string; names: string[]; listen: string[] }
+
+/** Top-level `server { ... }` blocks of a generated config (no nested braces beyond location/if). */
+function servers(conf: string): Server[] {
+  const blocks = [...conf.matchAll(/^server \{\n([\s\S]*?)\n\}$/gm)].map((m) => m[1] ?? "")
+  return blocks.map((body) => ({
+    body,
+    names: [...body.matchAll(/^ {4}server_name ([^;]+);$/gm)].flatMap((m) => (m[1] ?? "").split(" ")),
+    listen: [...body.matchAll(/^ {4}listen ([^;]+);$/gm)].map((m) => m[1] ?? ""),
+  }))
 }
-const allows = (list: string, host: string) => matches(list, `${host}:443`)
 
-describe("egressAllowlist", () => {
-  const list = egressAllowlist(["identity.alterspective.com.au", "synapse2-api.alterspective.com.au"])
+describe("frontServers", () => {
+  const conf = frontServers(HOSTS)
+  const all = servers(conf)
+  const named = all.filter((s) => s.names.length > 0)
 
-  test("one exact host:443 anchored line per host, dots escaped", () => {
-    const lines = list.split("\n").filter((l) => l && !l.startsWith("#"))
-    expect(lines).toEqual(["^identity\\.alterspective\\.com\\.au:443$", "^synapse2-api\\.alterspective\\.com\\.au:443$"])
+  test("one server per allowed host, named exactly, TLS on 443", () => {
+    expect(named.map((s) => s.names)).toEqual(HOSTS.map((h) => [h]))
+    for (const s of named) expect(s.listen).toEqual(["443 ssl"])
   })
 
-  test("allows the listed hosts", () => {
-    expect(allows(list, "identity.alterspective.com.au")).toBe(true)
-    expect(allows(list, "synapse2-api.alterspective.com.au")).toBe(true)
+  test("the default server refuses: unknown SNI fails the handshake, any request that lands there gets 421", () => {
+    const fallback = all.filter((s) => s.listen.some((l) => l.includes("default_server")))
+    expect(fallback).toHaveLength(1)
+    expect(fallback[0]!.names).toEqual([])
+    expect(fallback[0]!.body).toContain("ssl_reject_handshake on;")
+    expect(fallback[0]!.body).toContain("return 421;")
+    expect(fallback[0]!.body).not.toContain("proxy_pass")
   })
 
-  test("plain-HTTP URLs never match, even for an allowed host (C-5)", () => {
-    for (const url of [
-      "http://identity.alterspective.com.au/",
-      "http://identity.alterspective.com.au:443/",
-      "http://identity.alterspective.com.au:443identity.alterspective.com.au:443",
-      "identity.alterspective.com.au:80",
-      "identity.alterspective.com.au:4430",
-      "identity.alterspective.com.au.:443",
-      "http://example.com/",
-    ]) {
-      expect({ url, allowed: matches(list, url) }).toEqual({ url, allowed: false })
+  test("each server forces one fixed upstream: proxy_pass, SNI and Host all name its own host", () => {
+    for (const s of named) {
+      const host = s.names[0]!
+      expect(s.body).toContain(`set $front_upstream "${host}";`)
+      expect([...s.body.matchAll(/proxy_pass (\S+);/g)].map((m) => m[1])).toEqual(["https://$front_upstream"])
+      expect(s.body).toContain(`proxy_ssl_name ${host};`)
+      expect(s.body).toContain(`proxy_set_header Host ${host};`)
+      expect(s.body).toContain("include /etc/nginx/front/upstream.conf;")
+      // No other host appears anywhere in this server.
+      for (const other of HOSTS.filter((h) => h !== host)) expect(s.body).not.toContain(other)
     }
   })
 
-  const refused = [
-    "identity.alterspective.com.au.evil.com",
-    "evilidentity.alterspective.com.au",
-    "x.identity.alterspective.com.au",
-    "identityXalterspective.com.au",
-    "identity.alterspectiveXcom.au",
-    "rag.alterspective.com.au",
-    "registry.npmjs.org",
-    "pypi.org",
-    "upload.pypi.org",
-    "",
-  ]
-  for (const host of refused) {
-    test(`does not match ${JSON.stringify(host)}`, () => expect(allows(list, host)).toBe(false))
-  }
+  test("a Host or SNI that differs from the server name gets 421 before any proxying", () => {
+    for (const s of named) {
+      const host = s.names[0]!
+      const sni = s.body.indexOf(`if ($ssl_server_name != "${host}") { return 421; }`)
+      const hostCheck = s.body.indexOf(`if ($host != "${host}") { return 421; }`)
+      expect(sni).toBeGreaterThan(0)
+      expect(hostCheck).toBeGreaterThan(0)
+      expect(Math.max(sni, hostCheck)).toBeLessThan(s.body.indexOf("location /"))
+    }
+  })
+
+  test("generated, do-not-edit header", () => {
+    expect(conf.split("\n")[0]).toBe("# Generated by src/guard/egress.ts from config.egressHosts. Do not edit.")
+    expect(frontHosts(HOSTS)).toBe(`# Generated by src/guard/egress.ts from config.egressHosts. Do not edit.\n${HOSTS.join("\n")}\n`)
+  })
 
   const invalid: Array<[string, string[]]> = [
     ["empty list", []],
@@ -69,7 +79,13 @@ describe("egressAllowlist", () => {
     ["port", ["identity.alterspective.com.au:443"]],
     ["scheme", ["https://identity.alterspective.com.au"]],
     ["single label", ["localhost"]],
-    ["whitespace", ["identity.alterspective.com.au\n.*"]],
+    ["newline (config injection)", ["identity.alterspective.com.au\nlocation / { proxy_pass https://evil.example; }"]],
+    ["semicolon (directive injection)", ["identity.alterspective.com.au; proxy_pass https://evil.example"]],
+    ["brace", ["identity.alterspective.com.au}"]],
+    ["quote", ['identity.alterspective.com.au"']],
+    ["dollar (nginx variable)", ["$host"]],
+    ["space", ["identity.alterspective.com.au evil.example"]],
+    ["trailing dot", ["identity.alterspective.com.au."]],
     ["npm registry (publish route, N3)", ["registry.npmjs.org"]],
     ["PyPI upload (publish route, N3)", ["upload.pypi.org"]],
     ["PyPI (N3)", ["pypi.org"]],
@@ -81,30 +97,95 @@ describe("egressAllowlist", () => {
     ["bracketed IPv6", ["[2001:db8::1]"]],
   ]
   for (const [label, hosts] of invalid) {
-    test(`refuses ${label}`, () => expect(() => egressAllowlist(hosts)).toThrow())
+    test(`refuses ${label}`, () => {
+      expect(() => frontServers(hosts)).toThrow()
+      expect(() => frontHosts(hosts)).toThrow()
+    })
   }
 
   test("normalises case and drops duplicates", () => {
-    expect(egressAllowlist(["Identity.Alterspective.com.au", "identity.alterspective.com.au"])).toBe(
-      egressAllowlist(["identity.alterspective.com.au"]),
-    )
+    expect(egressHostList(["Identity.Alterspective.com.au", "identity.alterspective.com.au"])).toEqual(["identity.alterspective.com.au"])
+    expect(frontServers(["Identity.Alterspective.com.au", "identity.alterspective.com.au"])).toBe(frontServers(["identity.alterspective.com.au"]))
   })
 })
 
-describe("committed egress files", () => {
-  test("docker/egress/allow.txt is the generated allowlist for the default config (no drift)", () => {
-    const committed = readFileSync(path.join(EGRESS_DIR, "allow.txt"), "utf8").replaceAll("\r\n", "\n")
-    expect(committed).toBe(egressAllowlist(defaultConfig({}).egressHosts))
+describe("committed front files", () => {
+  test("servers.conf and hosts.txt are the generated files for the default config (no drift)", async () => {
+    expect(await read("front", "servers.conf")).toBe(frontServers(defaultConfig({}).egressHosts))
+    expect(await read("front", "hosts.txt")).toBe(frontHosts(defaultConfig({}).egressHosts))
   })
 
-  test("tinyproxy.conf: default deny, CONNECT to 443 only, URL filter (plain HTTP never matches)", () => {
-    const conf = readFileSync(path.join(EGRESS_DIR, "tinyproxy.conf"), "utf8")
-    const directives = conf.split(/\r?\n/).filter((l) => l.trim() && !l.trim().startsWith("#"))
-    expect(directives).toContain("FilterDefaultDeny Yes")
-    expect(directives).toContain("FilterType ere")
-    expect(directives).toContain("FilterURLs On")
-    expect(directives.filter((l) => l.startsWith("ConnectPort"))).toEqual(["ConnectPort 443"])
-    expect(directives.some((l) => l.startsWith("FilterCaseSensitive"))).toBe(false)
-    expect(directives.some((l) => /^Upstream/.test(l))).toBe(false)
+  test("upstream.conf: verified TLS with forced SNI, HTTP/1.1, no buffering, long reads (SSE)", async () => {
+    const conf = (await read("front", "upstream.conf")).split("\n").filter((l) => l.trim() && !l.startsWith("#"))
+    for (const line of [
+      "proxy_ssl_server_name on;",
+      "proxy_ssl_verify on;",
+      "proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;",
+      "proxy_http_version 1.1;",
+      "proxy_buffering off;",
+      "proxy_request_buffering off;",
+      "proxy_read_timeout 3600s;",
+    ])
+      expect(conf).toContain(line)
+    expect(conf.some((l) => l.startsWith("proxy_pass") || l.includes("proxy_set_header Host"))).toBe(false)
+  })
+
+  test("nginx.conf resolves upstreams with its own resolver and includes only the generated servers", async () => {
+    const conf = await read("front", "nginx.conf")
+    expect(conf).toContain("include /tmp/front/resolver.conf;")
+    expect(conf).toContain("include /etc/nginx/front/servers.conf;")
+    expect(conf).not.toMatch(/^\s*(server|proxy_pass|listen)\b/m)
+  })
+
+  test("Dockerfile: pinned nginx base, no CONNECT proxy", async () => {
+    const dockerfile = await read("front", "Dockerfile")
+    expect(dockerfile).toMatch(/^FROM nginxinc\/nginx-unprivileged:\d+\.\d+\.\d+-alpine@sha256:[0-9a-f]{64}$/m)
+    const directives = dockerfile.split("\n").filter((line) => !line.startsWith("#")).join("\n")
+    expect(directives).not.toMatch(/tinyproxy|squid|privoxy/)
+  })
+
+  test("entrypoint: CA key stays in /ca/private, only the certificate is published, name-constrained", async () => {
+    const script = await read("front", "entrypoint.sh")
+    expect(script).toContain('cp "$PRIV/ca.pem" "$PUB/ca.pem.new"')
+    expect(script).not.toMatch(/\$PUB\/[^"\s]*\.key/)
+    expect(script).toContain("nameConstraints=critical,")
+    expect(script).toContain("basicConstraints=critical,CA:TRUE,pathlen:0")
+  })
+})
+
+describe("checkEgress (oc_doctor)", () => {
+  test("the committed files pass for the default config", () => {
+    expect(checkEgress(defaultConfig({}).egressHosts)).toEqual({
+      ok: true, control: "tls-front", source: "configuration", frontConfigMatches: true, aliasesMatch: true, connectProxy: false, problems: [],
+    })
+  })
+
+  test("a different host list fails: generated files and aliases no longer match", () => {
+    const check = checkEgress([...HOSTS, "rag.alterspective.com.au"])
+    expect(check).toMatchObject({ ok: false, frontConfigMatches: false, aliasesMatch: false, connectProxy: false })
+  })
+
+  test("an invalid host list fails closed", () => {
+    expect(checkEgress(["*.alterspective.com.au"]).ok).toBe(false)
+  })
+
+  test("a CONNECT proxy left in compose (egress service or a box proxy variable) fails, and a missing dir is reported", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "ocd-egress-"))
+    try {
+      await cp(DOCKER, dir, { recursive: true })
+      const compose = (await read("compose.yaml")).replace(
+        "      XDG_DATA_HOME: /data\n",
+        "      XDG_DATA_HOME: /data\n      HTTPS_PROXY: http://egress:8888\n",
+      )
+      await writeFile(path.join(dir, "compose.yaml"), compose)
+      const check = checkEgress(defaultConfig({}).egressHosts, dir)
+      expect(check).toMatchObject({ ok: false, connectProxy: true, frontConfigMatches: true })
+      expect(check.problems.join(" ")).toContain("HTTPS_PROXY")
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+    const missing = checkEgress(defaultConfig({}).egressHosts, path.join(os.tmpdir(), "ocd-egress-missing-dir"))
+    expect(missing.ok).toBe(false)
+    expect(missing.problems.some((p) => p.includes("unreadable"))).toBe(true)
   })
 })

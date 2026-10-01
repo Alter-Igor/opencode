@@ -105,6 +105,38 @@ describe("box manager", () => {
     expect(t.counts().ensures).toBe(2)
   })
 
+  test("R3-09: a new hub whose start() throws never leaves the stopped old hub in use", async () => {
+    const order: string[] = []
+    const hubs: FakeHub[] = []
+    let clock = 0
+    const targets = [A, B, B]
+    const m = createBoxManager({
+      supervisor: { ensure: async () => targets.shift() ?? B, replace: async () => ({ target: B, interrupted: 0 }) },
+      sessions: new Map(),
+      log: silentLogger,
+      api: () => new FakeApi(order),
+      hub: () => {
+        const hub = new FakeHub(order)
+        // The second hub (the first one on B) fails to start.
+        if (hubs.length === 1) hub.start = async () => Promise.reject(new Error("stream refused"))
+        hubs.push(hub)
+        return hub
+      },
+      now: () => clock,
+      revalidateMs: 1000,
+    })
+    const first = await m.box()
+    clock += 1500
+    await expect(m.box()).rejects.toThrow("stream refused")
+    expect(m.peek()).toBeUndefined()
+    expect(hubs[0]?.stopped).toBe(1)
+    expect(hubs[1]?.stopped).toBe(1)
+    const next = await m.box()
+    expect(next).not.toBe(first)
+    expect(next.hub).toBe(hubs[2] as FakeHub)
+    expect(m.peek()).toBe(next)
+  })
+
   test("a failed ensure is not cached", async () => {
     let calls = 0
     const m = createBoxManager({

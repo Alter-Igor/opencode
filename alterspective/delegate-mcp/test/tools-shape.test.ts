@@ -1,6 +1,7 @@
-// MOD-04 output shaping: the result budget (W3A-02 / W3C-04) and hidden-character stripping (W3C-05).
+// MOD-04 output shaping: the result budget (W3A-02 / W3C-04) and hidden-character stripping (W3C-05, R3-05).
 import { describe, expect, test } from "bun:test"
 import { untrusted as hubUntrusted, UNTRUSTED_MAX } from "../src/events/describe.ts"
+import { cleanInstructionText } from "../src/tools/core-box.ts"
 import { fitList, MAX_RESULT_CHARS, ok, TRUNCATION_HINT, untrusted, type ToolResult, type Truncation } from "../src/tools/shape.ts"
 
 const textOf = (result: ToolResult): string => result.content[0]?.text ?? ""
@@ -131,5 +132,31 @@ describe("untrusted text: hidden characters are stripped (W3C-05)", () => {
     expect(hubUntrusted(`${"⁠".repeat(UNTRUSTED_MAX)}ok`)).toBe("ok")
     // A zero-width space inside a token no longer hides it from scrub().
     expect(hubUntrusted("Authorization: Bearer abc123​DEF456ghi789")).toBe("Authorization: Bearer [redacted]")
+  })
+})
+
+// R3-05: invisible characters outside \p{Cf}: variation selectors (both blocks, can carry hidden
+// bytes), line/paragraph separators, Hangul fillers and the Braille blank.
+const INVISIBLE = ["\uFE00", "\uFE0E", "\uFE0F", "\u{E0100}", "\u{E0150}", "\u{E01EF}", "\u2028", "\u2029", "\u115F", "\u1160", "\u3164", "\uFFA0", "\u2800"]
+
+describe("untrusted text: invisible fillers and selectors are stripped (R3-05)", () => {
+  test("each one goes, in tool results, hub events and instruction text", () => {
+    for (const ch of INVISIBLE) {
+      expect(untrusted(`a${ch}b`)?.text).toBe("ab")
+      expect(hubUntrusted(`a${ch}b`)).toBe("ab")
+      expect(cleanInstructionText(`a${ch}b`)).toBe("ab")
+    }
+  })
+
+  test("a run of variation selectors cannot smuggle bytes or use up the cap", () => {
+    const hidden = Array.from({ length: 16 }, (_, i) => String.fromCodePoint(0xe0100 + i * 15)).join("")
+    expect(untrusted(`ok${hidden}`, 2)).toEqual({ text: "ok", truncated: false })
+  })
+
+  test("ordinary text stays: CJK, accents, Braille dots, newlines, tabs; an emoji loses only its VS16", () => {
+    const text = "第一行\n\tcafé naïve 한국어 ⠁⠃ ✓"
+    expect(untrusted(text)?.text).toBe(text)
+    expect(cleanInstructionText(`${text}\r\n`)).toBe(`${text}\n`)
+    expect(untrusted("❤\uFE0F 🙂")?.text).toBe("❤ 🙂")
   })
 })

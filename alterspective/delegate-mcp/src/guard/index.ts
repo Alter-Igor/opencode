@@ -17,4 +17,5 @@ export function createGuard(config: Pick<BridgeConfig, "keystoneOrigin">): Guard
 export { KS_NAME, KS_PATH, validateEntries } from "./entries.ts"
 export { checkRuntime, judgeMcpStatus } from "./runtime.ts"
 export { checkPermissionReply, permissionBaseline, type Rule } from "./permissions.ts"
-export { egressAllowlist, REGISTRY_HOSTS } from "./egress.ts"
+export { egressHostList, frontHosts, frontServers, REGISTRY_HOSTS } from "./egress.ts"
+export { checkEgress, type EgressCheck } from "./egress-check.ts"

@@ -10,6 +10,7 @@ describe("box env override: reserved names", () => {
     const reserved = [
       "INBOX_ADMIN_TOKEN", "OPENCODE_SERVER_PASSWORD", "OPENCODE_MCP_ALLOW", "OPENCODE_DISABLE_PROJECT_CONFIG", "OCD_INBOX_URL", "OCD_ANYTHING",
       "HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy", "ALL_PROXY", "HOME", "PATH", "XDG_CONFIG_HOME", "npm_config_registry", "PIP_INDEX_URL",
+      "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO", "GIT_SSL_NO_VERIFY", "REQUESTS_CA_BUNDLE", "NODE_TLS_REJECT_UNAUTHORIZED",
     ]
     for (const name of reserved) {
       const error = (() => {
@@ -28,7 +29,7 @@ describe("box env override: reserved names", () => {
 
   test("every variable compose.yaml sets for the box is reserved, so the override cannot replace it", async () => {
     const yaml = (await readFile(path.join(import.meta.dir, "..", "docker", "compose.yaml"), "utf8")).replace(/\r\n/g, "\n")
-    const box = yaml.slice(yaml.indexOf("\n  box:"), yaml.indexOf("\n  gate:"))
+    const box = yaml.slice(yaml.indexOf("\n  box:"), yaml.indexOf("\n  gate-box:"))
     const env = box.slice(box.indexOf("\n    environment:"), box.indexOf("\n    healthcheck:"))
     const names = [...env.matchAll(/^ {6}([A-Za-z_][A-Za-z0-9_]*):/gm)].map((m) => m[1]!)
     expect(names.length).toBeGreaterThan(20)

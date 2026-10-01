@@ -27,7 +27,8 @@ export type SnapshotEntry = {
   /** The session's real directory when it differs from the tracked one. */
   directory?: string
 }
-export type EntryView = { sessionID: string; directory: string; state: Derived; detail?: string; since: number; pending: string[]; parentID?: string; lastError?: string }
+/** `directory` is where the session was tracked; `reportedDirectory` is where the server says it lives now, when that differs (box data). */
+export type EntryView = { sessionID: string; directory: string; reportedDirectory?: string; state: Derived; detail?: string; since: number; pending: string[]; parentID?: string; lastError?: string }
 export type Tracked = { sessionID: string; directory: string }
 
 export const NOT_STARTED_MS = 10_000
@@ -42,6 +43,9 @@ const SETTLED = new Set<Derived>(["unresolved", "idle", "error", "aborted", "not
 
 type Entry = {
   sessionID: string
+  /** The directory given at track time: the only one views and events report (R3-03). */
+  home: string
+  /** Where server reads go; follows the server when it reports the session elsewhere (W2A-08). */
   directory: string
   parentID?: string
   children: Set<string>
@@ -106,7 +110,8 @@ export class SessionTable {
   get(sessionID: string): EntryView | undefined {
     const e = this.entries.get(sessionID)
     if (!e) return undefined
-    const view: EntryView = { sessionID, directory: e.directory, state: e.state, detail: e.stateDetail, since: e.since, pending: this.pendingOf(e) }
+    const view: EntryView = { sessionID, directory: e.home, state: e.state, detail: e.stateDetail, since: e.since, pending: this.pendingOf(e) }
+    if (e.directory !== e.home) view.reportedDirectory = e.directory
     if (e.parentID) view.parentID = e.parentID
     if (e.lastError) view.lastError = e.lastError.label
     return view
@@ -283,7 +288,7 @@ export class SessionTable {
 
   private add(sessionID: string, directory: string, parentID: string | undefined, auto: boolean): boolean {
     if (this.entries.has(sessionID)) return false
-    const e: Entry = { sessionID, directory, children: new Set(), auto, base: "unresolved", pending: new Map(), awaitingStart: false, state: "unresolved", since: this.now() }
+    const e: Entry = { sessionID, home: directory, directory, children: new Set(), auto, base: "unresolved", pending: new Map(), awaitingStart: false, state: "unresolved", since: this.now() }
     const parent = parentID === undefined ? undefined : this.entries.get(parentID)
     if (parent && parentID !== sessionID) {
       e.parentID = parentID
@@ -377,7 +382,7 @@ export class SessionTable {
     if (state === e.state) return []
     e.state = state
     e.since = this.now()
-    const change: Change = { sessionID: e.sessionID, directory: e.directory, state, detail }
+    const change: Change = { sessionID: e.sessionID, directory: e.home, state, detail }
     if (e.parentID) change.parentID = e.parentID
     return [change]
   }

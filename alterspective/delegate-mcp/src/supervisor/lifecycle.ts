@@ -2,7 +2,7 @@
 // Start, reuse and stop all run under the host start lock, and this bridge's lease is taken
 // before any health wait, so another bridge's release can never stop a box this bridge is
 // about to use (A-02). Every public call is logged with the bridge id and a correlation id.
-// A running set is reused only when the box AND its egress/cache siblings match (N-9).
+// A running set is reused only when the box AND its front/cache siblings match (N-9).
 // replace() (oc_server_restart) is the way out of profile_changed: down + start under the lock.
 import { chmod, mkdir, writeFile } from "node:fs/promises"
 import path from "node:path"
@@ -98,7 +98,7 @@ export function checkReusable(deps: SupervisorDeps, box: BoxInspect, hash: strin
 }
 
 /**
- * egress, the caches and the inbox must come from the same checkout as the box (review N-9) and
+ * front, the caches and the inbox must come from the same checkout as the box (review N-9) and
  * must be running (W2C-12): reusing a box whose inbox or proxy has stopped would give a sandbox
  * that half works.
  */

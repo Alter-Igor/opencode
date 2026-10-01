@@ -17,8 +17,10 @@ networks:
   # No default route: the box can only reach services on this network.
   sealed:
     internal: true
-  # MOD-05 (W2C-05): gate <-> inbox admin listener only. The box is NOT on this network, and the
-  # sidecar binds its admin listener to its address here, so the box has no route to it.
+  # MOD-05 (W2C-05, R3-02): gate-admin <-> inbox admin listener only. The box is NOT on this
+  # network, the sidecar binds its admin listener to its address here, and the only listener that
+  # forwards to it (gate-admin) is on `admin` + `outside`, never on `sealed`. So no network the box
+  # is on holds a path to the admin routes (test/egress-compose.test.ts).
   admin:
     internal: true
   outside: {}
@@ -30,6 +32,10 @@ volumes:
   pypi-storage: {}
   # MOD-05 inbox messages (append-only JSONL). Never mounted into the box (review G5).
   inbox-storage: {}
+  # R3-01: the internal CA. Its private key lives only here, mounted only in `front`.
+  front-ca-private: {}
+  # The CA certificate (public) that front publishes; mounted read-only in the box.
+  front-ca-public: {}
 
 x-hardened: &hardened
   cap_drop: [ALL]
@@ -75,17 +81,22 @@ services:
       - ${OCD_HANDOFF_DIR:?OCD_HANDOFF_DIR is set by the bridge}/in:/handoff/in:ro
       - ${OCD_HANDOFF_DIR:?OCD_HANDOFF_DIR is set by the bridge}/out:/handoff/out
       - ${OCD_PROFILE_DIR:?OCD_PROFILE_DIR is set by the bridge}:/profile:ro
+      # front's CA certificate only (the key never leaves front).
+      - front-ca-public:/etc/ocd-front-ca:ro
     environment:
       XDG_CONFIG_HOME: /profile
       XDG_DATA_HOME: /data
       HOME: /home/agent
       # Box environment contract: docker/caches/README.md "Environment the box needs".
-      HTTPS_PROXY: http://egress:8888
-      HTTP_PROXY: http://egress:8888
-      https_proxy: http://egress:8888
-      http_proxy: http://egress:8888
-      NO_PROXY: localhost,127.0.0.1,npm-cache,pypi-cache,inbox
-      no_proxy: localhost,127.0.0.1,npm-cache,pypi-cache,inbox
+      # No proxy variables (R3-01): the allowed hosts resolve to `front` on `sealed` (its network
+      # aliases), and the caches and inbox are plain service names on the same network.
+      # front's internal CA: Bun (OpenCode) and Node read NODE_EXTRA_CA_CERTS at process start;
+      # curl, git and Python read the others. Bun proven live (docker/caches/README.md "front").
+      NODE_EXTRA_CA_CERTS: /etc/ocd-front-ca/ca.pem
+      SSL_CERT_FILE: /etc/ocd-front-ca/ca.pem
+      CURL_CA_BUNDLE: /etc/ocd-front-ca/ca.pem
+      GIT_SSL_CAINFO: /etc/ocd-front-ca/ca.pem
+      REQUESTS_CA_BUNDLE: /etc/ocd-front-ca/ca.pem
       # MOD-05: the in-box inbox tools post here. No token: box messages are stored unverified.
       OCD_INBOX_URL: http://inbox:8080
       npm_config_registry: http://npm-cache:4873/
@@ -118,26 +129,25 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
-    depends_on: [egress, inbox]
+    depends_on:
+      # The CA file must exist before OpenCode starts: Bun reads NODE_EXTRA_CA_CERTS once.
+      front: { condition: service_healthy }
+      inbox: { condition: service_started }
     command: ["opencode", "serve", "--hostname", "0.0.0.0", "--port", "4096"]
 
-  # Publishes the box API and the inbox admin API on the host loopback only (the box itself has
-  # no route out). Two socat listeners; if either exits, the container exits and is restarted.
-  gate:
+  # Publishes the box API on the host loopback only. On `sealed` (to reach the box) and `outside`
+  # (internal networks cannot publish ports). It forwards to the box only: the inbox admin API
+  # has its own gate (R3-02), so nothing on `sealed` forwards to inbox-admin.
+  gate-box:
     <<: *hardened
     # Pinned by version and digest (review C-7); resolved 2026-10-01 with
     # `docker buildx imagetools inspect alpine/socat:1.8.1.3` (same index digest as :latest then).
     image: alpine/socat:1.8.1.3@sha256:5ffbd6ae916cbad86a58fabe0d6d5a6fd5c2b47ddf031e82996baac9300e732f
-    container_name: ${OCD_CONTAINER:-opencode-delegate}-gate
+    container_name: ${OCD_CONTAINER:-opencode-delegate}-gate-box
     user: "65534:65534"
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - >-
-        socat TCP-LISTEN:4096,fork,reuseaddr TCP:box:4096 & box=$$!;
-        socat TCP-LISTEN:8081,fork,reuseaddr TCP:inbox-admin:8081 & admin=$$!;
-        while kill -0 $$box && kill -0 $$admin; do sleep 5; done; exit 1
-    networks: [sealed, outside, admin]
-    ports: ["127.0.0.1:${OCD_PORT}:4096", "127.0.0.1:${OCD_INBOX_PORT}:8081"]
+    command: ["TCP-LISTEN:4096,fork,reuseaddr", "TCP:box:4096"]
+    networks: [sealed, outside]
+    ports: ["127.0.0.1:${OCD_PORT}:4096"]
     restart: unless-stopped
     # socat forks one process per connection (event streams stay open).
     pids_limit: 256
@@ -146,22 +156,71 @@ services:
     cpus: 0.5
     depends_on: [box]
 
-  # The three services below are built from docker/ too (review N-9). Their images are named
-  # after the box image, so a new checkout (a new OCD_IMAGE) builds new ones instead of reusing
-  # stale ones; Compose builds a missing image on `up`. Each container carries the image label,
-  # and the supervisor refuses to reuse a running set whose labels differ (profile_changed).
-  # Default-deny HTTPS proxy: the box's only way out (owned by MOD-02, docker/egress).
-  egress:
+  # Publishes the inbox admin API on the host loopback only (R3-02). On `admin` + `outside`, never
+  # on `sealed`, so the box has no network path to any listener that forwards to inbox-admin.
+  gate-admin:
     <<: *hardened
-    build: ./egress
-    image: ${OCD_IMAGE}-egress
-    container_name: ${OCD_CONTAINER:-opencode-delegate}-egress
+    image: alpine/socat:1.8.1.3@sha256:5ffbd6ae916cbad86a58fabe0d6d5a6fd5c2b47ddf031e82996baac9300e732f
+    container_name: ${OCD_CONTAINER:-opencode-delegate}-gate-admin
+    user: "65534:65534"
+    command: ["TCP-LISTEN:8081,fork,reuseaddr", "TCP:inbox-admin:8081"]
+    networks: [admin, outside]
+    ports: ["127.0.0.1:${OCD_INBOX_PORT}:8081"]
+    restart: unless-stopped
+    pids_limit: 64
+    mem_limit: 64m
+    memswap_limit: 64m
+    cpus: 0.5
+    depends_on: [inbox]
+
+  # The services below are built from docker/ too (review N-9). Their images are named after the
+  # box image, so a new checkout (a new OCD_IMAGE) builds new ones instead of reusing stale ones;
+  # Compose builds a missing image on `up`. Each container carries the image label, and the
+  # supervisor refuses to reuse a running set whose labels differ (profile_changed).
+  #
+  # front (R3-01, owned by MOD-02, docker/front): the box's only way out. A TLS-terminating
+  # reverse proxy with ONE fixed upstream per allowed host (SNI, Host and certificate check forced
+  # by front), replacing the old CONNECT proxy that let the box choose SNI/Host after CONNECT.
+  # Name resolution (choice): network ALIASES on `sealed` plus an explicit nginx `resolver`.
+  # - The box resolves each allowed name through Docker's DNS to front's `sealed` address.
+  # - front would resolve its own aliases the same way (a loop, observed 2026-10-01), so nginx
+  #   resolves upstreams with its own resolver (OCD_FRONT_RESOLVER, default 1.1.1.1 1.0.0.1, IPv4
+  #   only). A spoofed answer cannot redirect traffic: front verifies the upstream certificate.
+  # - Not a static IP + extra_hosts: that needs a fixed `sealed` subnet, which clashes between two
+  #   projects (the default box and a throwaway test project) and with other Docker networks.
+  # The aliases must equal config.egressHosts (src/guard/egress-check.ts checks this file).
+  front:
+    <<: *hardened
+    build: ./front
+    image: ${OCD_IMAGE}-front
+    container_name: ${OCD_CONTAINER:-opencode-delegate}-front
     labels:
       com.alterspective.opencode-delegate.image: ${OCD_IMAGE}
-    networks: [sealed, outside]
+    networks:
+      sealed:
+        aliases:
+          - identity.alterspective.com.au
+          - synapse2-api.alterspective.com.au
+      outside: {}
+    # Binds :443 as uid 101 with no capabilities: this sysctl is per network namespace, so it
+    # changes nothing outside this container.
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: "0"
+    environment:
+      OCD_FRONT_RESOLVER: ${OCD_FRONT_RESOLVER:-1.1.1.1 1.0.0.1}
+    tmpfs: ["/tmp:uid=101,gid=101,mode=0700,nosuid,nodev,noexec"]
+    volumes:
+      - front-ca-private:/ca/private
+      - front-ca-public:/ca/public
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /ca/public/ca.pem && test -s /tmp/front/leaf.pem && test -s /tmp/nginx.pid"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
     restart: unless-stopped
-    # tinyproxy runs a thread per client (MaxClients 100); the pids limit counts threads.
-    pids_limit: 256
+    # One nginx worker (nginx.conf) plus the master and the healthcheck shell.
+    pids_limit: 64
     mem_limit: 128m
     memswap_limit: 128m
     cpus: 1
@@ -205,7 +264,7 @@ services:
   # - Box listener :8080 on `sealed`: the box reaches it as http://inbox:8080 with no token, so
   #   box messages are stored verified:false.
   # - Admin listener :8081, bound to its `admin` address (alias inbox-admin, which exists only on
-  #   that network). The gate publishes it on host 127.0.0.1:${OCD_INBOX_PORT}; bridges call it with
+  #   that network). gate-admin publishes it on host 127.0.0.1:${OCD_INBOX_PORT}; bridges call it with
   #   INBOX_ADMIN_TOKEN (by NAME only: from the compose child env, set on THIS service only, never
   #   on the box).
   inbox:

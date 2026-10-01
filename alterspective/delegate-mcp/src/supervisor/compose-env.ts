@@ -17,7 +17,7 @@ export const INSPECT_ENV = [PASSWORD_ENV, MCP_ALLOW_ENV]
  * other bridges with `docker inspect <project>-inbox`. Never written to a file or logged.
  */
 export const INBOX_ADMIN_TOKEN_ENV = "INBOX_ADMIN_TOKEN"
-/** Label on the inbox container: the 127.0.0.1 host port of its admin routes (published by the gate, W2C-05). */
+/** Label on the inbox container: the 127.0.0.1 host port of its admin routes (published by gate-admin, W2C-05, R3-02). */
 export const INBOX_PORT_LABEL = "com.alterspective.opencode-delegate.inbox-port"
 export type InboxStart = { port: number; token: string }
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
@@ -42,7 +42,7 @@ export function containerName(config: Pick<BridgeConfig, "project">): string {
  * `${OCD_IMAGE}-<service>` and its container `<project>-<service>` carries the image label, so a
  * running set built from another checkout is caught on reuse.
  */
-export const SIBLING_SERVICES = ["egress", "npm-cache", "pypi-cache", "inbox"] as const
+export const SIBLING_SERVICES = ["front", "npm-cache", "pypi-cache", "inbox"] as const
 
 export function siblingContainers(config: Pick<BridgeConfig, "project">): Array<{ service: string; container: string }> {
   return SIBLING_SERVICES.map((service) => ({ service, container: `${containerName(config)}-${service}` }))
@@ -51,10 +51,13 @@ export function siblingContainers(config: Pick<BridgeConfig, "project">): Array<
 /**
  * Names the box env list may never carry (W2C-14): the override file is merged after
  * compose.yaml, so a listed name would replace what compose.yaml sets for the box (the inbox URL,
- * the proxies, the OpenCode lock-down flags, the package indexes) with a host value, or put a
- * bridge-only secret into the box. Matched without regard to case.
+ * front's CA, the OpenCode lock-down flags, the package indexes) with a host value, or put a
+ * bridge-only secret into the box. Proxy names stay reserved: the box has no proxy (R3-01) and a
+ * host value must not give it one. Matched without regard to case.
  */
-const RESERVED_EXACT = new Set(["INBOX_ADMIN_TOKEN", "HOME", "PATH", "BUN_CONFIG_REGISTRY"])
+/** TLS trust settings: the box trusts front's internal CA only, and nothing may turn checks off (R3-01). */
+const TLS_TRUST_ENV = ["NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO", "GIT_SSL_NO_VERIFY", "REQUESTS_CA_BUNDLE", "NODE_TLS_REJECT_UNAUTHORIZED"]
+const RESERVED_EXACT = new Set(["INBOX_ADMIN_TOKEN", "HOME", "PATH", "BUN_CONFIG_REGISTRY", ...TLS_TRUST_ENV])
 const RESERVED_PREFIX = ["OCD_", "OPENCODE_", "INBOX_", "XDG_", "NPM_CONFIG_", "PIP_", "UV_"]
 const RESERVED_SUFFIX = ["_PROXY"]
 
@@ -80,6 +83,13 @@ export type ComposeInputs = {
   hostEnv: NodeJS.ProcessEnv
   image: string
   opencodeVersion: string
+}
+
+/** front's upstream DNS resolver (compose.yaml front), passed on only when the owner set it; not a secret. */
+export const FRONT_RESOLVER_ENV = "OCD_FRONT_RESOLVER"
+function frontEnv(hostEnv: NodeJS.ProcessEnv): Record<string, string> {
+  const value = hostEnv[FRONT_RESOLVER_ENV]
+  return value ? { [FRONT_RESOLVER_ENV]: value } : {}
 }
 
 /** Values of the approved box env vars present on the host (for the child env and for redaction). */
@@ -108,6 +118,7 @@ export function composeDownEnv(inputs: ComposeInputs): Record<string, string> {
     OCD_CONTAINER: containerName(inputs.config),
     OCD_PROFILE_DIR: dirs.profile,
     OCD_HANDOFF_DIR: dirs.handoff,
+    ...frontEnv(inputs.hostEnv),
   })
 }
 
@@ -124,6 +135,7 @@ export function composeEnv(inputs: ComposeInputs, built: BuiltProfile, port: num
     OCD_CONTAINER: containerName(inputs.config),
     OCD_PROFILE_DIR: dirs.profile,
     OCD_HANDOFF_DIR: dirs.handoff,
+    ...frontEnv(inputs.hostEnv),
     [MCP_ALLOW_ENV]: mcpAllowPolicy(inputs.config),
     [PASSWORD_ENV]: password,
     ...inboxEnv,

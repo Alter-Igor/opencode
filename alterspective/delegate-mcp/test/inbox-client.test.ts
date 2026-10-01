@@ -238,12 +238,14 @@ describe("compose wiring for the inbox", () => {
 
   test("compose.yaml gives the admin token to the inbox service only, by name, and the box only the URL", async () => {
     const yaml = (await readFile(path.join(import.meta.dir, "..", "docker", "compose.yaml"), "utf8")).replace(/\r\n/g, "\n")
-    const box = yaml.slice(yaml.indexOf("\n  box:"), yaml.indexOf("\n  gate:"))
-    const gate = yaml.slice(yaml.indexOf("\n  gate:"), yaml.indexOf("\n  egress:"))
+    const box = yaml.slice(yaml.indexOf("\n  box:"), yaml.indexOf("\n  gate-box:"))
+    // R3-02: the admin API has its own gate, which is not on `sealed`.
+    const gate = yaml.slice(yaml.indexOf("\n  gate-admin:"), yaml.indexOf("\n  front:"))
     const inbox = yaml.slice(yaml.indexOf("\n  inbox:"))
     expect(box).not.toContain("INBOX_ADMIN_TOKEN")
     expect(box).toContain("OCD_INBOX_URL: http://inbox:8080")
-    expect(box).toMatch(/NO_PROXY: [^\n]*\binbox\b/)
+    // R3-01: no proxy variables; the inbox is reached by service name on `sealed`.
+    expect(box).not.toMatch(/_PROXY:/i)
     expect(box).toContain("networks: [sealed]")
     expect(inbox).toMatch(/\n {6}INBOX_ADMIN_TOKEN:\n/)
     expect(inbox).toContain("image: ${OCD_IMAGE}-inbox")
@@ -254,12 +256,12 @@ describe("compose wiring for the inbox", () => {
     expect(inbox).not.toContain("outside")
     expect(gate).toContain('"127.0.0.1:${OCD_INBOX_PORT}:8081"')
     expect(gate).toContain("TCP:inbox-admin:8081")
-    expect(gate).toContain("networks: [sealed, outside, admin]")
+    expect(gate).toContain("networks: [admin, outside]")
   })
 
   test("the box never loads a delegated repo's own OpenCode config, plugins or skills", async () => {
     const yaml = (await readFile(path.join(import.meta.dir, "..", "docker", "compose.yaml"), "utf8")).replace(/\r\n/g, "\n")
-    const box = yaml.slice(yaml.indexOf("\n  box:"), yaml.indexOf("\n  gate:"))
+    const box = yaml.slice(yaml.indexOf("\n  box:"), yaml.indexOf("\n  gate-box:"))
     for (const flag of ["OPENCODE_DISABLE_PROJECT_CONFIG", "OPENCODE_DISABLE_EXTERNAL_SKILLS", "OPENCODE_DISABLE_CLAUDE_CODE"]) expect(box).toContain(`${flag}: "1"`)
     // ~/.opencode is loaded regardless of the flag, so it is a read-only, root-owned empty mount.
     expect(box).toContain("- /home/agent/.opencode:uid=0,gid=0,mode=0555,")
@@ -270,7 +272,7 @@ describe("compose wiring for the inbox", () => {
     const anchor = yaml.slice(yaml.indexOf("x-hardened:"), yaml.indexOf("\nservices:"))
     expect(anchor).toMatch(/logging:\n {4}driver: local\n {4}options:\n {6}max-size: "10m"\n {6}max-file: "3"/)
     const services = yaml.slice(yaml.indexOf("\nservices:")).split(/\n {2}(?=[a-z-]+:\n)/).slice(1)
-    expect(services.length).toBe(6)
+    expect(services.length).toBe(7)
     for (const service of services) expect(service).toContain("<<: *hardened")
   })
 })

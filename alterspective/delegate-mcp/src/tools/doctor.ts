@@ -6,6 +6,7 @@ import type { SupervisorStatus } from "../supervisor/status.ts"
 import type { Verdict } from "../shared/contracts.ts"
 import type { McpStatus, OpencodeApi } from "../shared/opencode-api.ts"
 import { KS_NAME } from "../guard/entries.ts"
+import { checkEgress, type EgressCheck } from "../guard/egress-check.ts"
 import type { ToolContext } from "./context.ts"
 import { defineTool } from "./define.ts"
 import { ok, untrusted } from "./shape.ts"
@@ -84,6 +85,14 @@ function summaryOf(status: SupervisorStatus, mcp: McpReport | undefined, verdict
   return `${verified ? "Verified" : "NOT verified"}: sandbox running (${checks}); ${entries}; guard ${verdict.ok ? "ok" : verdict.code}.`
 }
 
+/** R3-01: the egress control the sandbox files describe (configuration, not measured traffic). */
+function egressReport(egress: EgressCheck): Record<string, unknown> {
+  return { ...egress, problems: egress.problems.map((problem) => problem.slice(0, 300)) }
+}
+
+const egressSummary = (egress: EgressCheck) =>
+  ` Egress: TLS front (fixed upstreams, no CONNECT proxy) ${egress.ok ? "configured as generated from egressHosts" : `MISMATCH (${egress.problems.length} problem${egress.problems.length === 1 ? "" : "s"})`}.`
+
 async function inspect(ctx: ToolContext, start: boolean, correlationId: string) {
   if (start && !ctx.peekBox()) await ctx.box()
   const status = await ctx.supervisorService.status()
@@ -98,13 +107,14 @@ export const doctorTool = defineTool({
   name: "oc_doctor",
   title: "Check the OpenCode sandbox",
   description:
-    "Health check: sandbox state and Docker health, image and MCP-policy checks, the Keystone MCP entries and their sign-in state, the policy guard verdict and this bridge's name and version, plus the configured egress allowlist and isolation level (configuration, not measured). `verified` is true only when every check ran and passed. Does not start the sandbox unless start is true.",
+    "Health check: sandbox state and Docker health, image and MCP-policy checks, the Keystone MCP entries and their sign-in state, the policy guard verdict and this bridge's name and version, plus the configured egress allowlist, the egress control check (the TLS front generated from that allowlist, no CONNECT proxy) and isolation level (configuration, not measured). `verified` is true only when every check ran and passed. Does not start the sandbox unless start is true.",
   input: { start: z.boolean().optional().describe("Start (or reuse) the sandbox first. Default false.") },
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   async run(args, ctx, correlationId) {
     const { status, mcp, verdict, held } = await inspect(ctx, args.start === true, correlationId)
-    const verified = isVerified(status, mcp, verdict)
-    return ok(summaryOf(status, mcp, verdict, verified), {
+    const egress = checkEgress(ctx.config.egressHosts)
+    const verified = isVerified(status, mcp, verdict) && egress.ok
+    return ok(summaryOf(status, mcp, verdict, verified) + egressSummary(egress), {
       verified,
       bridge: { name: ctx.supervisor.replace(/^supervisor:/, ""), supervisor: ctx.supervisor, bridgeId: ctx.bridgeId, version: ctx.version, holdsBox: held, sessions: ctx.sessions.size },
       isolation: { level: "S", source: "configuration" },
@@ -112,6 +122,7 @@ export const doctorTool = defineTool({
       mcp: mcp ?? { unavailable: "the sandbox is not running" },
       guard: guardReport(verdict),
       egressHostsConfigured: ctx.config.egressHosts,
+      egress: egressReport(egress),
       keystoneOrigin: ctx.config.keystoneOrigin,
       roots: ctx.config.roots,
     })

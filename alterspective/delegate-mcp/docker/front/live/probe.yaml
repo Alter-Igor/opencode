@@ -1,0 +1,30 @@
+# Live red/green check for `front` (review R3-01). Run by test/egress-live.test.ts (set
+# OCD_LIVE_EGRESS=1) as an OVERLAY on the real docker/compose.yaml, under a throwaway project name,
+# starting only `front` and these probes; then `down -v`. It never touches `opencode-delegate`.
+# Paths are relative to docker/ (the first -f file's folder).
+# Both probes join ONLY `sealed` (internal), like the box, and mount front's public CA like it.
+services:
+  probe:
+    # Same pin as the box's runtime stage (docker/box/Dockerfile).
+    image: node:22-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d3a30b772c
+    entrypoint: ["sleep", "600"]
+    networks: [sealed]
+    volumes:
+      - ./front/live/client.mjs:/check/client.mjs:ro
+      - front-ca-public:/etc/ocd-front-ca:ro
+    depends_on:
+      front: { condition: service_healthy }
+
+  # OpenCode is a Bun binary: this proves Bun's fetch trusts front's CA through
+  # NODE_EXTRA_CA_CERTS (and fails without it). Same Bun as docker/box/Dockerfile's build stage.
+  probe-bun:
+    image: oven/bun:1.3.14@sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4
+    entrypoint: ["sleep", "600"]
+    networks: [sealed]
+    environment:
+      NODE_EXTRA_CA_CERTS: /etc/ocd-front-ca/ca.pem
+    volumes:
+      - ./front/live/bun-fetch.mjs:/check/bun-fetch.mjs:ro
+      - front-ca-public:/etc/ocd-front-ca:ro
+    depends_on:
+      front: { condition: service_healthy }

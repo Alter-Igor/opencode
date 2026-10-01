@@ -3,7 +3,7 @@
 // to subscribers. On every (re)connect, in-stream gap or instance dispose the affected state is
 // re-read from the server while stream events queue, and the queue is applied on top, so a gap can
 // never be papered over by a stale snapshot or a lost `idle`.
-import { SESSION_ID_RE, type Cursor, type EventHub, type HubEvent, type InboxMessage, type SessionView } from "../shared/contracts.ts"
+import { BOX_DIRECTORY_RE, SESSION_ID_RE, type Cursor, type EventHub, type HubEvent, type InboxMessage, type SessionView } from "../shared/contracts.ts"
 import { safeLog, silentLogger, type Logger } from "../shared/log.ts"
 import { createApi, type ApiTarget, type OpencodeApi } from "../shared/opencode-api.ts"
 import { EventBuffer, viewMatches, type Filter, type HubEventInput, type Page, type WaitInput, type WaitResult } from "./buffer.ts"
@@ -133,7 +133,8 @@ class Hub implements DelegateHub {
     if (known && TRUSTED.has(known.state)) return entryView(known)
     const detail = known ? `read from the server (hub state ${known.state})` : "read from the server"
     try {
-      return remoteView(sessionID, await readRemote(this.api, sessionID, known?.directory), this.timers.now(), detail, known)
+      const remote = await readRemote(this.api, sessionID, known?.reportedDirectory ?? known?.directory)
+      return remoteView(sessionID, remote, this.timers.now(), detail, known)
     } catch (error) {
       const view = failedView(sessionID, known?.directory ?? "", error, this.timers.now())
       safeLog(this.log, "warn", "events", "view could not read the server", { sessionID, state: view.state, detail: view.detail })
@@ -174,7 +175,9 @@ class Hub implements DelegateHub {
   }
 
   private publish(input: HubEventInput): HubEvent {
-    const event = this.buffer.append(input)
+    // R3-03: subagent and moved-session directories come from the box; keep only a well-formed box path.
+    const { directory, ...rest } = input
+    const event = this.buffer.append(directory === undefined || BOX_DIRECTORY_RE.test(directory) ? input : rest)
     for (const listener of [...this.listeners]) {
       try {
         listener(event)

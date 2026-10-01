@@ -3,7 +3,7 @@
 // a bridge restart with a fixed name (W3A-05) the host records bring its sessions back: they are
 // adopted when the box still has them, or shown as not_tracked / not_found with a note.
 import { z } from "zod"
-import type { SessionView } from "../shared/contracts.ts"
+import { BOX_DIRECTORY_RE, type SessionView } from "../shared/contracts.ts"
 import { DelegateError } from "../shared/errors.ts"
 import type { Box, ToolContext } from "./context.ts"
 import { SESSION_ID_RE, ownSession, ownedStates, sessionIdSchema, type RemoteSession } from "./core-session.ts"
@@ -13,7 +13,6 @@ import { ok, untrusted } from "./shape.ts"
 const LIST_LIMIT = 200
 /** Sessions of ours missing from the listing that are re-read one by one (the rest are "unknown"). */
 const MAX_RECHECK = 20
-const DIRECTORY_RE = /^\/sessions\/[a-z0-9-]{1,64}$/
 const SUPERVISOR_RE = /^supervisor:[a-z0-9-]{1,40}$/
 
 async function listRemote(box: Box, correlationId: string): Promise<RemoteSession[]> {
@@ -31,7 +30,7 @@ async function ownedIds(ctx: ToolContext): Promise<Set<string>> {
 
 /** Box data: only validated shapes outside `untrusted` (W3A-06 / W3C-03). */
 function listed(s: RemoteSession, mine: boolean) {
-  const directory = typeof s.directory === "string" && DIRECTORY_RE.test(s.directory) ? { directory: s.directory } : { untrustedDirectory: untrusted(typeof s.directory === "string" ? s.directory : "", 200) }
+  const directory = typeof s.directory === "string" && BOX_DIRECTORY_RE.test(s.directory) ? { directory: s.directory } : { untrustedDirectory: untrusted(typeof s.directory === "string" ? s.directory : "", 200) }
   const claimed = s.metadata?.supervisor
   const updated = s.time?.updated
   return {

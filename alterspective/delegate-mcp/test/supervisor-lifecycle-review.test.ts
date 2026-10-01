@@ -48,13 +48,13 @@ describe("supervisor: round-2 review fixes", () => {
     return { running: true, labels: { [L.hash]: hash, [L.port]: "4711", [L.image]: IMAGE }, env: ["OPENCODE_SERVER_PASSWORD=x", `OPENCODE_MCP_ALLOW=${mcpAllowPolicy(defaultConfig())}`] }
   }
 
-  test("reuse checks egress and the caches came from the same checkout (N-9)", async () => {
+  test("reuse checks front (egress) and the caches came from the same checkout (N-9)", async () => {
     const box = await reusable()
     expect((await supervisor(deps(fakeDocker(box, []))).ensure()).baseUrl).toBe("http://127.0.0.1:4711")
-    const stale = { "opencode-delegate-egress": inspectJson({ [L.image]: "img:0.9.0-1111111" }) }
+    const stale = { "opencode-delegate-front": inspectJson({ [L.image]: "img:0.9.0-1111111" }) }
     const error = await fail(supervisor(deps(fakeDocker(box, [], { containers: stale }))).ensure())
     expect(error.code).toBe("profile_changed")
-    expect(error.message).toContain("egress")
+    expect(error.message).toContain("front")
     expect(error.detail).toContain("img:0.9.0-1111111")
     const missing = { "opencode-delegate-pypi-cache": { code: 1, stdout: "", stderr: "Error: No such container: opencode-delegate-pypi-cache" } }
     const gone = await fail(supervisor(deps(fakeDocker(box, [], { containers: missing }))).ensure())

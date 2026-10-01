@@ -1,4 +1,4 @@
-# FEAT-OCD-001 — Technical design (revision 3, after review round 2 and Wave 0 spikes)
+# FEAT-OCD-001 — Technical design (revision 4: front proxy after review round 3; revision 3 after round 2 and Wave 0 spikes)
 
 No implementation code here — contracts, data shapes and behaviour only. Paths are relative to the repo root. Revision 2 changes are driven by `evidence/adversarial-review.md` (C1, C2, H1–H4, M1–M6).
 
@@ -31,16 +31,16 @@ flowchart LR
     D[(data volume: own DB, own mcp-auth.json with ks-* only)]
     R[/work = C:\GitHub bind mount/]
   end
-  API -- egress via allowlist proxy --> PX[egress proxy]
-  PX --> K[(identity.alterspective.com.au)]
-  PX --> M[(model provider hosts on the allowlist)]
-  PX -. everything else refused .-> X((blocked))
+  API -- "allowed names resolve to front (TLS, private CA)" --> PX[front proxy]
+  PX -- "fixed SNI + Host" --> K[(identity.alterspective.com.au)]
+  PX -- "fixed SNI + Host" --> M[(synapse2-api.alterspective.com.au)]
+  PX -. "other SNI: handshake refused; other Host: 421" .-> X((blocked))
 ```
 
 **Boundaries.**
 - The bridge never holds Keystone tokens. OpenCode's MCP client (inside the box) does OAuth 2.1 + PKCE with Keystone and stores tokens in the box's own data volume, keyed by entry name (`packages/opencode/src/mcp/auth.ts:9-37`). Those tokens only work at the Keystone relay (RFC 8707 audience binding), so even if the agent reads them, use still goes through Keystone, as the owner, audited (BFA-007).
 - The container has **no** host environment, no `HKCU` secrets, no `~/.config/opencode`, no owner `mcp-auth.json`, no `%ProgramData%\opencode`. Config sources outside the profile (review H4) do not exist inside the box by construction.
-- Network: the container joins an internal Docker network with no default route; its only way out is an egress proxy that allows `identity.alterspective.com.au:443` plus the model hosts on the owner-approved list. Everything else is refused (fails closed). This is the control that makes R7 hold even if the agent learns the server password (C2).
+- Network: the container joins an internal Docker network with no default route. Its only way out is the `front` proxy (revision 4, review R3-01). Inside the box, each allowed name (`identity.alterspective.com.au`, the approved model host) is a network alias of `front`. `front` ends TLS with a leaf from a private CA made inside it (key never leaves its volume; name-constrained to the allowed hosts) and opens its own TLS connection to the one real host, with SNI and `Host` fixed and the upstream certificate verified. An unknown SNI is refused at the handshake and a `Host` that does not match gets `421`. There is no CONNECT proxy: a host-name CONNECT allowlist was not enough, because the box owned the TLS session and could swap SNI or `Host` to reach other sites on the same Cloudflare / Azure front door. Upstream names are looked up with `OCD_FRONT_RESOLVER` (public DNS by default; fails closed). This is the control that makes R7 hold even if the agent learns the server password (C2).
 
 **Location.** `alterspective/delegate-mcp/` (bridge, watch CLI, profile template, `Dockerfile`, compose file). Outside the Bun workspace globs (`package.json:25-32`) with its own lockfile. The image builds the fork from this checkout, so the patch in §3.4 ships with it.
 
@@ -82,7 +82,7 @@ Before each `oc_send`: `GET /mcp?directory=<session dir>` → every entry name m
 
 - Image: built from this checkout (fork + patch), plugin deps pre-installed (review L5), `git`, `bun`, `node`, common toolchains. Tag = package version + git SHA.
 - One container per user, name `opencode-delegate`. Mounts: profile → global config dir (ro, ships a `.gitignore` so OpenCode never writes there — spike T0.1), named volume → data dir, named volume → `/sessions` (session clones), host hand-off folders → `/handoff/in` (**read-only** in the box; the host writes fresh, exclusively-created bundle names) and `/handoff/out` (the box writes; the host moves a bundle into a never-mounted quarantine folder before checking it is a regular file under the 500 MB cap) (review C-4). **The owner's repos are never mounted** (review N2; bind mounts measured at ~2–4 ms per file and git refuses them — `evidence/wave0-spikes.md`).
-- Env: `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `HTTPS_PROXY`, `OPENCODE_DISABLE_MODELS_FETCH=1`, `OPENCODE_DISABLE_AUTOUPDATE=1`, `OPENCODE_MCP_ALLOW`, `OPENCODE_SERVER_PASSWORD`, and the approved model key (`SYNAPSE_API_KEY`). Nothing else from the host.
+- Env: `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `NODE_EXTRA_CA_CERTS` (the front CA, public cert only), `OPENCODE_DISABLE_MODELS_FETCH=1`, `OPENCODE_DISABLE_AUTOUPDATE=1`, `OPENCODE_MCP_ALLOW`, `OPENCODE_SERVER_PASSWORD`, and the approved model key (`SYNAPSE_API_KEY`). Nothing else from the host.
 - Filesystem read-only except tmpfs `/tmp`, `/home/agent` and the volumes; server runs as non-root `agent` (uid 10001); OpenCode install owned by root (review N1).
 - Password: 24 random bytes (base64url) generated by the first bridge, passed as container env, kept in bridge memory. Other bridges and the watch CLI get it from the container (`docker inspect` needs the owner's Docker access, not a file the agent can read). **[U]**: lock file in the owner's profile + `OPENCODE_DB=opencode-delegate.db` + explicit env allowlist.
 - Port: container publishes `127.0.0.1:<random>` only.
@@ -134,12 +134,12 @@ As revision 1: stable error codes (`server_down`, `profile_invalid`, `profile_ch
 
 | Concern | Applicable? | Planned approach | Rule IDs | Verification |
 |---|---|---|---|---|
-| Keystone-only MCP | YES | Egress allowlist + fork allowlist patch + bridge guard, all fail closed | BFA-007, MCP-CONSUME-01 | T0.1, T2.x red→green; F5 runtime incl. `curl` to a direct endpoint from an agent shell → refused |
+| Keystone-only MCP | YES | Front proxy (fixed upstreams) + fork allowlist patch + bridge guard, all fail closed | BFA-007, MCP-CONSUME-01 | T0.1, T2.x red→green; F5 runtime incl. `curl` to a direct endpoint from an agent shell → refused |
 | Per-user OAuth | YES | OpenCode MCP OAuth in the box; tokens in box volume only | BFA-004, BFA-005 | T0.3 + F6 audit |
 | stdio transport | YES | Local-only; exclusion recorded after approval | BFA-003 | Q1 |
 | Secrets | YES | No host secrets in the box; approved env vars passed one by one; password in memory/env only | ASR-04, SEC-CRED-CLI-01 | secret scan inside the box (`env`, files) |
 | Input validation | YES | zod; path translation; allowlist regex | SECURITY :517 | unit tests |
-| Fail closed | YES | Egress default-deny; guard refuses unverified | SECURITY :832 | red tests |
+| Fail closed | YES | Front: unknown SNI refused, wrong `Host` 421, no other names resolve; guard refuses unverified | SECURITY :832 | red tests |
 | Sensitive actions | YES | `always` refused; asks as convenience | MCP-STANDARDS :707, ETHICS-AGENT-02 | T4.4 |
 | Untrusted output | YES | Fencing; request IDs from `oc_pending` only | ETHICS-AGENT-01 | T4.5 |
 | Errors | YES | Stable codes, split texts | ERR-SPLIT-01, ERR-MSG-03, ERR-ENF-01 | unit |

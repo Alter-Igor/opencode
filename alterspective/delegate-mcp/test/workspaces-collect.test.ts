@@ -105,6 +105,26 @@ describe("workspaces: collect errors are specific", () => {
   )
 
   test(
+    "R3-07: a box commit that fails git's object check is policy_violation and never lands on the host",
+    async () => {
+      const ws = await fx.workspaces().open(fx.hostRepo, "fsck-key")
+      await fx.boxCommit("fsck-key", { "a.txt": "1\n" }, "one")
+      const [tree, parent] = await Promise.all([fx.boxGit("fsck-key", ["rev-parse", "HEAD^{tree}"]), fx.boxGit("fsck-key", ["rev-parse", "HEAD"])])
+      // A commit with an impossible time zone: git writes it with --literally, and fsck rejects it (badTimezone).
+      const raw = path.join(fx.tmp, "bad-commit.txt")
+      writeFileSync(raw, `tree ${tree.trim()}\nparent ${parent.trim()}\nauthor A <a@example.test> 1700000000 +99999\ncommitter A <a@example.test> 1700000000 +0000\n\nbad\n`)
+      const bad = (await fx.boxGit("fsck-key", ["hash-object", "-t", "commit", "-w", "--literally", raw])).trim()
+      await fx.boxGit("fsck-key", ["update-ref", "refs/heads/delegate/fsck-key", bad])
+      const error = await failure(fx.workspaces().collect(ws))
+      expect(error.code).toBe("policy_violation")
+      expect(error.message).toContain("object check")
+      expect(await fx.hostHas("delegate/fsck-key")).toBe(false)
+      expect(fx.incoming()).toEqual([])
+    },
+    T,
+  )
+
+  test(
     "collecting into a branch the owner has checked out is directory_busy",
     async () => {
       const workspaces = fx.workspaces()

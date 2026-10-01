@@ -25,8 +25,8 @@ function unavailable(message: string, detail: string): DelegateError {
 /** Repo-relative folder of the box Dockerfile (forward slashes: it is also a git pathspec). */
 const BOX_DIR = "alterspective/delegate-mcp/docker/box"
 /**
- * Everything the running set is built from (review N-9): the box, egress and cache Dockerfiles
- * and configs, and compose.yaml. A change anywhere here gives a new tag, so the egress and cache
+ * Everything the running set is built from (review N-9): the box, front and cache Dockerfiles
+ * and configs, and compose.yaml. A change anywhere here gives a new tag, so the front and cache
  * images (named after the box image in compose.yaml) are rebuilt too.
  */
 export const DOCKER_DIR = "alterspective/delegate-mcp/docker"

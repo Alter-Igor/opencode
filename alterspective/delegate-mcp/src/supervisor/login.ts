@@ -11,6 +11,10 @@ import { expectOk, type McpStatus, type OpencodeApi } from "../shared/opencode-a
 
 export const LOGIN_PORT = 19876
 export const CALLBACK_PATH = "/mcp/oauth/callback"
+/** Keystone's authorization_endpoint path (its discovery metadata: `${issuer}/api/oauth/authorize`). */
+export const AUTHORIZE_PATH = "/api/oauth/authorize"
+/** An RFC 7636 S256 code challenge: base64url, 43-128 characters. */
+const CODE_CHALLENGE_RE = /^[A-Za-z0-9_-]{43,128}$/
 export const LOGIN_TIMEOUT_MS = 5 * 60 * 1000
 /** Entry names: the guard's KS_NAME (one rule for profile, runtime and sign-in; review A-20). */
 const MAX_ENTRY_LENGTH = 67
@@ -92,14 +96,36 @@ async function openListener(port: number, logger: Logger): Promise<Listener> {
   return { expect: (state) => (holder.state = state), received, close }
 }
 
-function checkAuthUrl(raw: string, authOrigin: string): void {
-  let origin: string
+/** The redirect_uri the box must send: this bridge's loopback listener (OpenCode's default callback). */
+export const loopbackRedirect = (port: number) => `http://127.0.0.1:${port}${CALLBACK_PATH}`
+
+function parseUrl(raw: string): URL | undefined {
   try {
-    origin = new URL(raw).origin
+    return new URL(raw)
   } catch {
-    origin = ""
+    return undefined
   }
-  if (origin !== authOrigin) throw new DelegateError("policy_violation", "The sign-in URL from the box is not a Keystone URL; it was not opened.", "Run oc_doctor.")
+}
+
+/** Exactly one value for `key` (a repeated parameter could be read differently by Keystone). */
+function single(q: URLSearchParams, key: string): string | undefined {
+  const values = q.getAll(key)
+  return values.length === 1 ? values[0] : undefined
+}
+
+/**
+ * The URL comes from the box, and the bridge opens it in the owner's signed-in browser. So only an
+ * authorization-code request with PKCE (S256) to Keystone's authorize endpoint, redirecting back to
+ * this listener, is opened (R3-06); any other Keystone page or redirect target is refused.
+ */
+function checkAuthUrl(raw: string, authOrigin: string, port: number): void {
+  const url = parseUrl(raw)
+  if (url?.origin !== authOrigin || url.username || url.password) throw new DelegateError("policy_violation", "The sign-in URL from the box is not a Keystone URL; it was not opened.", "Run oc_doctor.")
+  const q = url.searchParams
+  const pkce = CODE_CHALLENGE_RE.test(single(q, "code_challenge") ?? "") && single(q, "code_challenge_method") === "S256"
+  if (url.pathname !== AUTHORIZE_PATH || single(q, "response_type") !== "code" || !pkce || single(q, "redirect_uri") !== loopbackRedirect(port)) {
+    throw new DelegateError("policy_violation", "The sign-in URL from the box is not a Keystone authorization request back to this bridge; it was not opened.", "Run oc_doctor.")
+  }
 }
 
 async function entryStatus(api: OpencodeApi, entry: string, directory: string): Promise<"connected" | "failed"> {
@@ -160,13 +186,14 @@ async function signIn(api: OpencodeApi, entry: string, opts: LoginOptions, logge
     throw new DelegateError("invalid_input", "Only ks-* entries can be signed in.", "Pass a ks-* server name (lower-case, for example ks-delegate).")
   }
   const directory = opts.directory ?? "/sessions"
-  const listener = await openListener(opts.port ?? LOGIN_PORT, logger)
+  const port = opts.port ?? LOGIN_PORT
+  const listener = await openListener(port, logger)
   let timer: ReturnType<typeof setTimeout> | undefined
   try {
     const started = expectOk(await api.call<{ authorizationUrl?: string; oauthState?: string }>({ method: "POST", path: `/mcp/${entry}/auth`, directory, body: {} }), "start the Keystone sign-in")
     if (!started.authorizationUrl) return await entryStatus(api, entry, directory) // already signed in
     if (!started.oauthState) throw new DelegateError("upstream_error", "The delegate box did not return a sign-in state.", "Retry oc_login.")
-    checkAuthUrl(started.authorizationUrl, opts.authOrigin)
+    checkAuthUrl(started.authorizationUrl, opts.authOrigin, port)
     listener.expect(started.oauthState)
     ;(opts.opener ?? defaultOpener)(started.authorizationUrl)
     logger.log("info", "login", "browser opened; waiting for the loopback redirect", { entry })

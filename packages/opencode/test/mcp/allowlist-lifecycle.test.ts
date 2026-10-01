@@ -1,6 +1,6 @@
 import fs from "node:fs"
 import path from "node:path"
-import { expect } from "bun:test"
+import { expect, spyOn } from "bun:test"
 import { Server } from "@modelcontextprotocol/sdk/server/index.js"
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js"
 import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js"
@@ -8,30 +8,39 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Effect } from "effect"
 import { McpAllow } from "../../src/mcp/allowlist"
 import { MCP } from "../../src/mcp/index"
+import { McpOAuthCallback } from "../../src/mcp/oauth-callback"
+import * as OAuthProvider from "../../src/mcp/oauth-provider"
 import { TestInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 
 const it = testEffect(LayerNode.compile(MCP.node))
 
-// Plain MCP server that records every request it receives.
-function recordingServer() {
+// Plain MCP server that records every request it receives. `stateless`: a new server per
+// request, so more than one client (connect, then startAuth) can initialize.
+function recordingServer(options: { stateless?: boolean } = {}) {
   return Effect.acquireRelease(
     Effect.promise(async () => {
-      const protocol = new Server({ name: "allowlist", version: "1.0.0" }, { capabilities: { tools: {} } })
-      protocol.setRequestHandler(ListToolsRequestSchema, () =>
-        Promise.resolve({ tools: [{ name: "probe", inputSchema: { type: "object" } }] }),
-      )
-      const transport = new WebStandardStreamableHTTPServerTransport({
-        sessionIdGenerator: () => crypto.randomUUID(),
-        enableJsonResponse: true,
-      })
-      await protocol.connect(transport)
+      const session = async () => {
+        const protocol = new Server({ name: "allowlist", version: "1.0.0" }, { capabilities: { tools: {} } })
+        protocol.setRequestHandler(ListToolsRequestSchema, () =>
+          Promise.resolve({ tools: [{ name: "probe", inputSchema: { type: "object" } }] }),
+        )
+        const transport = new WebStandardStreamableHTTPServerTransport({
+          sessionIdGenerator: options.stateless ? undefined : () => crypto.randomUUID(),
+          enableJsonResponse: true,
+        })
+        await protocol.connect(transport)
+        return { protocol, transport }
+      }
+      const { protocol, transport } = await session()
       const requests: string[] = []
       const http = Bun.serve({
         port: 0,
-        fetch(request) {
+        async fetch(request) {
           requests.push(`${request.method} ${new URL(request.url).pathname}`)
-          return transport.handleRequest(request)
+          if (!options.stateless) return transport.handleRequest(request)
+          if (request.method === "GET") return new Response(null, { status: 405 })
+          return (await session()).transport.handleRequest(request)
         },
       })
       return {
@@ -129,5 +138,29 @@ it.instance("startAuth refuses a blocked entry before any request", () =>
     expect(exit._tag).toBe("Failure")
     expect(String(exit)).toContain("blocked by OPENCODE_MCP_ALLOW")
     expect(server.requests).toEqual([])
+  }),
+)
+
+// startAuth's transport sends through the single-flight fetch too, so a sign-in that overlaps a
+// refresh elsewhere in the process cannot present the same refresh token twice (review R3-04).
+it.instance("startAuth sends through the single-flight refresh fetch", () =>
+  Effect.gen(function* () {
+    const server = yield* recordingServer({ stateless: true })
+    yield* withPolicy(server.origin)
+    yield* Effect.addFinalizer(() => Effect.promise(() => McpOAuthCallback.stop()).pipe(Effect.ignore))
+    const spy = yield* Effect.acquireRelease(
+      Effect.sync(() => spyOn(OAuthProvider, "refreshSingleFlightFetch")),
+      (s) => Effect.sync(() => s.mockRestore()),
+    )
+    const mcp = yield* MCP.Service
+    yield* mcp.add("ks-signin", { type: "remote", url: server.url })
+    // The spy sees the connect transports, which already use it: the probe itself works.
+    expect(spy).toHaveBeenCalled()
+    spy.mockClear()
+
+    yield* mcp.startAuth("ks-signin")
+
+    expect(spy).toHaveBeenCalled()
+    expect(server.requests.length).toBeGreaterThan(0)
   }),
 )

@@ -205,11 +205,17 @@ async function discard(ctx: Ctx, key: string): Promise<void> {
   removeHostState(ctx.stateDir, key)
 }
 
+/** The box made this pack: every object is checked before it reaches the owner's object store (R3-07). */
+const FSCK_FETCH = ["-c", "transfer.fsckObjects=true", "-c", "fetch.fsckObjects=true"]
+
 /** Fetch delegate/<key> from a bundle file; git runs no hook from the bundle. Non-fast-forward is refused. */
 async function fetchBranch(ctx: Ctx, repo: string, bundle: string, branch: string): Promise<void> {
   // No --quiet: git then prints nothing for a rejected (non-fast-forward) ref, and the cause is lost.
-  const result = await ctx.host(["git", "-C", repo, "fetch", "--no-tags", bundle, `${branch}:${branch}`], { timeoutMs: ctx.timeouts.long })
+  const result = await ctx.host(["git", ...FSCK_FETCH, "-C", repo, "fetch", "--no-tags", bundle, `${branch}:${branch}`], { timeoutMs: ctx.timeouts.long })
   if (result.code === 0) return
+  if (/fsck error|index-pack failed|unpack-objects failed/i.test(result.stderr)) {
+    throw new DelegateError("policy_violation", `${branch} from the box failed git's object check, so nothing was fetched.`, "Treat the session's commits as suspect: check them with oc_result before collecting again.", result.stderr.trim())
+  }
   if (/non-fast-forward|\[rejected\]/i.test(result.stderr)) {
     throw new DelegateError("branch_diverged", `${branch} changed on the host and in the box (not a fast-forward); nothing was overwritten.`, `Rename or delete the host branch ${branch} (or merge it by hand), then collect again.`, result.stderr.trim())
   }

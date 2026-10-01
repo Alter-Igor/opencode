@@ -12,7 +12,7 @@ export type BridgeConfig = {
   /** Keystone origin and the connections pinned in addition to /mcp/dynamic. */
   keystoneOrigin: string
   pinnedConnections: string[]
-  /** Hosts the egress proxy allows (exact names). */
+  /** Hosts the front proxy serves, each with one fixed upstream (exact names). */
   egressHosts: string[]
   /** Host env vars copied into the box, one by one. Nothing else crosses. */
   boxEnv: string[]

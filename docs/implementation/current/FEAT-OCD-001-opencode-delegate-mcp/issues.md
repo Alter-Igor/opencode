@@ -8,6 +8,8 @@
 | G-4 | Gap | Fork missing from `repository-tracker-registry.yaml`. | Open — separate change in Alterspective-Intelligence |
 | G-5 | Gap | `KB-AI-016` has no `keystone-dynamic` row; its `keystone` row still shows `/api/mcp` with a shared key. | Open — KB follow-up |
 | G-6 | Gap | Host session records (`<home>/workspaces/<key>.json`) are never pruned. `discard` removes one, but records of sessions deleted in the box stay. Small files, no security effect: adoption also needs the box session. | Open — follow-up after the PR |
+| G-7 | Gap (R3-08) | `/handoff/out` is a writable bind of a host folder, so the box can fill the owner's disk. The size check runs before the fetch only. (The Docker VM disk can be filled through the box volumes anyway.) | Open — follow-up: `docker cp` from a box-only path, or a size-capped volume |
+| R3-01 | Bug (Critical, review round 3) | Egress allowlist checked only the CONNECT host; the box owned TLS, so SNI or `Host` swaps reached other Cloudflare / Azure-fronted sites. | Fixed: TLS-terminating fixed-upstream `front` proxy; live red/green 6 pass (SNI swap refused, Host swap 421, no CONNECT) and e2e-w3 PASS through it |
 | D-1 | Deviation | Logs to stderr + file, not stdout (`OBS-SNK-01`): stdout carries the MCP protocol. | Proposed |
 | D-2 | Deviation (A-U only) | A-U would store the server password in a lock file (`ASR-04`). A-S keeps it in bridge memory + container env only. | Resolved by A-S |
 | D-3 | Decision | `ERR-COPY-*` / `ERR-PRES-*` apply to CLI text only; tool results go to AI clients and use stable codes + short messages. | Proposed |

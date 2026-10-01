@@ -21,7 +21,7 @@ const GIT_TIMEOUT_MS = 20_000
 /** `failed`: files the repository has at the base commit that could not be read (never silently "absent"). */
 export type Instructions = { system?: string; files: string[]; truncated: boolean; skipped?: string; failed?: string[] }
 
-/** Control, format (bidi, zero-width) and tag characters are removed from instruction text; tab and newline stay. */
+/** Control, format (bidi, zero-width), tag and invisible filler characters are removed from instruction text (shared/text.ts); tab and newline stay. */
 export function cleanInstructionText(text: string): string {
   return stripUnsafe(text.replace(/\r\n/g, "\n")).replace(/\r/g, "")
 }
