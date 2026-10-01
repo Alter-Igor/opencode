@@ -23,6 +23,7 @@ import { createHash } from "node:crypto"
 import { writeFileSync } from "node:fs"
 import path from "node:path"
 import { defaultConfig, type BridgeConfig } from "../shared/config.ts"
+import { SYNAPSE_HOST, authLocationLines } from "../synapse/auth-conf.ts"
 import { identityLocations } from "./egress-identity.ts"
 
 // Lower-case DNS name, at least two labels, no wildcard, port, scheme, quote, space or brace.
@@ -77,12 +78,13 @@ export function egressHostList(hosts: readonly string[]): string[] {
   return unique
 }
 
-/** The whole-host location of a non-Keystone server (the model gateway). */
+/** The whole-host location of a non-Keystone server (the model gateway: front sets its credential, WS2). */
 function wholeHost(host: string): string[] {
   return [
     "    location / {",
     "        # A variable makes nginx resolve at run time with the resolver (front's own aliases would loop).",
     `        set $front_upstream "${host}";`,
+    ...(host === SYNAPSE_HOST ? authLocationLines(FRONT_GENERATED_MOUNT) : []),
     "        proxy_pass https://$front_upstream;",
     `        proxy_ssl_name ${host};`,
     `        proxy_set_header Host ${host};`,

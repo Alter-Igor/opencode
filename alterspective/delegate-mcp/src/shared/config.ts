@@ -5,6 +5,7 @@ import os from "node:os"
 import path from "node:path"
 import { DEFAULT_KEYSTONE, connectionPathPattern, readKeystoneSet, type KeystoneSet } from "./keystone.ts"
 import { CEILING_ENV, DEFAULT_TOOL_DENY, TOOL_DENY_ENV, enforceCeiling, envList } from "./keystone-policy.ts"
+import { DelegateError } from "./errors.ts"
 
 export type BridgeConfig = {
   /** Host folder for lock-free state: logs, hand-off bundles, profile. Never mounted rw into the box except `handoff`. */
@@ -27,9 +28,12 @@ export type BridgeConfig = {
   keystoneToolDeny: string[]
   /** Hosts the front proxy serves, each with one fixed upstream (exact names). */
   egressHosts: string[]
-  /** Host env vars copied into the box, one by one. Nothing else crosses. */
+  /**
+   * Host env vars copied into the box, one by one. Nothing else crosses. Empty by default (WS2 #48):
+   * the box holds no Synapse credential; front sets the owner's delegated token (src/synapse).
+   */
   boxEnv: string[]
-  /** Docker names. */
+  /** Docker names. `project` is the compose project (OPENCODE_DELEGATE_PROJECT); the box container is named after it. */
   project: string
   image: string
 }
@@ -46,10 +50,21 @@ export function defaultConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfi
     ...(allowed ? { keystoneAllowed: allowed } : {}),
     keystoneToolDeny: envList(env[TOOL_DENY_ENV]) ?? [...DEFAULT_TOOL_DENY],
     egressHosts: ["identity.alterspective.com.au", "synapse2-api.alterspective.com.au"],
-    boxEnv: ["SYNAPSE_API_KEY"],
-    project: "opencode-delegate",
+    boxEnv: [],
+    project: projectName(env.OPENCODE_DELEGATE_PROJECT),
     image: "opencode-delegate-box",
   }
+}
+
+export const DEFAULT_PROJECT = "opencode-delegate"
+/** A compose project name (and so the box container name): like a bridge name, starting with a letter or digit. */
+export const PROJECT_RE = /^[a-z0-9][a-z0-9-]{0,39}$/
+
+/** OPENCODE_DELEGATE_PROJECT, checked; unset or empty is the default project. */
+export function projectName(value: string | undefined): string {
+  if (value === undefined || value === "") return DEFAULT_PROJECT
+  if (!PROJECT_RE.test(value)) throw new DelegateError("invalid_input", "OPENCODE_DELEGATE_PROJECT is not a valid project name.", "Use 1-40 characters: a-z, 0-9 and '-', starting with a letter or digit.")
+  return value
 }
 
 export type KeystoneConfig = Pick<BridgeConfig, "home" | "keystoneConnections" | "keystoneAllowed">

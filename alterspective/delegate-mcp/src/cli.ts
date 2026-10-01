@@ -11,6 +11,7 @@ import { scrub } from "./shared/log.ts"
 import { createRuntime, readVersion, shutdownSignal, type Runtime, type VersionInfo } from "./runtime.ts"
 import { createServer } from "./server.ts"
 import { doctorTool } from "./tools/doctor.ts"
+import { loginTool } from "./tools/login.ts"
 
 export const EXIT = { ok: 0, failed: 1, usage: 2 } as const
 
@@ -20,6 +21,7 @@ Usage:
   opencode-delegate [mcp] [--channels]   Run the stdio MCP server (what an AI client starts)
   opencode-delegate watch [options]      One line per session event that needs attention (see: watch --help)
   opencode-delegate doctor               Print the oc_doctor report as JSON (never starts the sandbox; exit 1 unless verified)
+  opencode-delegate login synapse        Sign in to Synapse on this computer (browser), like oc_login {server:"synapse"}
   opencode-delegate --version [--json]   Print the version
   opencode-delegate -h | --help | help   Show this help
 
@@ -32,6 +34,7 @@ Environment:
                             restarted bridge adopt its own sessions
   OPENCODE_DELEGATE_ROOTS   ';'-separated folders sessions may start from (default C:\\GitHub)
   OPENCODE_DELEGATE_HOME    Bridge state and logs (default ~/.local/share/opencode-delegate)
+  OPENCODE_DELEGATE_PROJECT Docker compose project (default opencode-delegate); a separate box per project
 
 Examples:
   claude mcp add opencode-delegate -- bun C:\\GitHub\\opencode\\alterspective\\delegate-mcp\\src\\cli.ts mcp
@@ -45,6 +48,7 @@ export type Command =
   | { kind: "mcp"; channels: boolean }
   | { kind: "watch"; args: string[] }
   | { kind: "doctor" }
+  | { kind: "login"; server: "synapse" }
   | { kind: "version"; json: boolean }
   | { kind: "help" }
   | { kind: "error"; message: string }
@@ -78,6 +82,7 @@ export function parseCli(argv: string[]): Command {
     const parsed = parseFlags(flagArgs, [])
     return "error" in parsed ? { kind: "error", message: parsed.error } : { kind: "doctor" }
   }
+  if (command === "login") return flagArgs.length === 1 && flagArgs[0] === "synapse" ? { kind: "login", server: "synapse" } : { kind: "error", message: "Usage: login synapse" }
   return { kind: "error", message: `Unknown command: ${printable(command)}. Run with --help.` }
 }
 
@@ -111,7 +116,10 @@ async function runMcp(channels: boolean): Promise<number> {
   const stopped = shutdownSignal(process)
   await server.connect(new StdioServerTransport())
   runtime.ctx.log.log("info", "cli", "MCP server listening on stdio", { bridge: runtime.name, channels })
+  // WS2 (#48): renew the owner's Synapse token on the host while this bridge runs.
+  const stopRefresh = runtime.synapse?.start() ?? (() => {})
   const reason = await stopped
+  stopRefresh()
   await close().catch(() => undefined)
   await runtime.shutdown(reason)
   return EXIT.ok
@@ -126,6 +134,18 @@ export async function runDoctor(io: Io, make: () => Promise<Runtime> = createRun
     return !result.isError && result.structuredContent?.verified === true ? EXIT.ok : EXIT.failed
   } finally {
     await runtime.shutdown("doctor done")
+  }
+}
+
+/** `login synapse`: the host sign-in, printed as the oc_login result (never a token). */
+export async function runLogin(io: Io, make: () => Promise<Runtime> = createRuntime): Promise<number> {
+  const runtime = await make()
+  try {
+    const result = await loginTool.run({ server: "synapse" }, runtime.ctx, runtime.ctx.correlationId())
+    io.out(JSON.stringify(result.structuredContent ?? {}, null, 2))
+    return result.isError ? EXIT.failed : EXIT.ok
+  } finally {
+    await runtime.shutdown("login done")
   }
 }
 
@@ -154,6 +174,8 @@ export async function main(argv: string[], io: Io = processIo): Promise<number> 
       return runWatch(command.args)
     case "doctor":
       return runDoctor(io)
+    case "login":
+      return runLogin(io)
     case "mcp":
       return runMcp(command.channels)
   }

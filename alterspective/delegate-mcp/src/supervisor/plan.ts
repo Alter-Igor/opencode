@@ -17,7 +17,7 @@ export type Plan = {
   front: FrontFiles
 }
 
-type PlanDeps = Pick<SupervisorDeps, "config" | "profileFs" | "ownerConfigDir" | "permission" | "keyEnv">
+type PlanDeps = Pick<SupervisorDeps, "config" | "profileFs" | "ownerConfigDir" | "permission" | "keyEnv" | "frontAuth">
 
 /** front's generated servers file for a config whose keystoneConnections is the effective set. */
 export function frontFilesFor(config: BridgeConfig): FrontFiles {
@@ -35,6 +35,6 @@ export async function planFor(deps: PlanDeps, keystone?: readonly string[]): Pro
   const config = keystone ? { ...deps.config, keystoneConnections: keystoneIds(keystone) } : effectiveConfig(deps.config)
   enforceCeiling(config.keystoneConnections, deps.config)
   const ownerConfigs = await readOwnerConfigs(deps.profileFs, deps.ownerConfigDir)
-  const built = buildProfile({ ownerConfigs, config, permission: deps.permission, keyEnv: deps.keyEnv })
+  const built = buildProfile({ ownerConfigs, config, permission: deps.permission, keyEnv: deps.keyEnv, frontAuth: deps.frontAuth })
   return { config, built, front: frontFilesFor(config) }
 }

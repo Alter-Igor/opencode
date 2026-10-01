@@ -12,6 +12,7 @@ import { defaultConfig } from "../src/shared/config.ts"
 import type { Cursor, HubEvent, InboxMessage, Verdict } from "../src/shared/contracts.ts"
 import { DelegateError } from "../src/shared/errors.ts"
 import { silentLogger } from "../src/shared/log.ts"
+import { fakeSynapse } from "./synapse-fixture.ts"
 import type { Call, OpencodeApi } from "../src/shared/opencode-api.ts"
 import type { DelegateSupervisor } from "../src/supervisor/lifecycle.ts"
 import type { Box, SessionRecord, ToolContext } from "../src/tools/context.ts"
@@ -132,6 +133,7 @@ export function fixture(sessions: SessionRecord[] = []): Fixture {
     bridgeId: "bridge-test",
     version: "0.0.0-test",
     log: silentLogger,
+    synapse: fakeSynapse(),
     guard,
     supervisorService: {} as unknown as DelegateSupervisor,
     workspaces: { open: unused, collect: unused, resolveRepo: unused, bindSession: unused, sessionState: async () => undefined, listSessionStates: async () => [], discard: async () => {} },

@@ -13,6 +13,7 @@ import type { ToolContext } from "./context.ts"
 import { defineTool } from "./define.ts"
 import { keystoneLine, keystoneReport, type KeystoneReport } from "./keystone-report.ts"
 import { ok, untrusted } from "./shape.ts"
+import type { SynapseReport } from "../synapse/index.ts"
 
 export const PROBE_DIRECTORY = "/sessions"
 const ENTRY_NAME = /^[a-z0-9-]{1,67}$/
@@ -131,20 +132,30 @@ function liveSummary(live: LiveChecks | undefined): string {
   return `${state} Removed earlier from the box (Keystone cannot revoke them for the bridge; revoke by client id in Keystone if not done): ${list}.`
 }
 
+/** WS2 (#48): the owner's Synapse token, by state only (never a value). */
+export function synapseLine(report: SynapseReport): string {
+  if (report.state === "needs_sign_in") return ` Synapse: NEEDS SIGN-IN (no model calls until then; run oc_login {server: "synapse"})${report.lastError ? `; last error: ${report.lastError}` : ""}.`
+  if (report.state === "expired") return ` Synapse: token EXPIRED at ${report.expiresAt ?? "unknown"} (renewal failing${report.lastError ? `: ${report.lastError}` : ""}; run oc_login {server: "synapse"} if it lasts).`
+  const live = "unavailable" in report.live ? `front: ${report.live.unavailable}` : report.live.shapeOk && report.live.hasToken ? "front has it loaded" : "front's loaded copy is NOT the expected one-variable file"
+  return ` Synapse: signed in${report.user ? ` as ${report.user}` : ""}${report.actor ? ` via ${report.actor}` : ""}, token until ${report.expiresAt}, renews from ${report.refreshAt}; ${live}.`
+}
+
 export const doctorTool = defineTool({
   name: "oc_doctor",
   title: "Check the OpenCode sandbox",
   description:
-    "Health check: sandbox state and Docker health, image, MCP-policy and front-config checks, the chosen Keystone services (`keystone`: the box-wide set, saved or default, each entry's sign-in state, the owner's allowed list `ceiling` and high-risk `warnings`), live checks (`live`: sign-ins stored in the box are only for the chosen set, front's loaded config and mount modes; entries removed earlier), the policy guard verdict and this bridge's name and version, plus the configured egress allowlist, the egress control check (the TLS front generated from that allowlist and the Keystone set, no CONNECT proxy) and isolation level (configuration, not measured). `verified` is true only when every check ran and passed. Does not start the sandbox unless start is true.",
+    "Health check: sandbox state and Docker health, image, MCP-policy and front-config checks, the chosen Keystone services (`keystone`: the box-wide set, saved or default, each entry's sign-in state, the owner's allowed list `ceiling` and high-risk `warnings`), live checks (`live`: sign-ins stored in the box are only for the chosen set, front's loaded config and mount modes; entries removed earlier), the owner's Synapse token (`synapse`: signed_in / expired / needs_sign_in, expiry and renewal time, refresh token stored on the host, front's loaded auth include has the strict shape; never a value), the policy guard verdict and this bridge's name and version, plus the configured egress allowlist, the egress control check (the TLS front generated from that allowlist and the Keystone set, no CONNECT proxy) and isolation level (configuration, not measured). `verified` is true only when every check ran and passed. Does not start the sandbox unless start is true.",
   input: { start: z.boolean().optional().describe("Start (or reuse) the sandbox first. Default false.") },
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   async run(args, ctx, correlationId) {
     const { status, mcp, verdict, live, held } = await inspect(ctx, args.start === true, correlationId)
     const keystone = keystoneReport(ctx.config, mcp && "entries" in mcp ? statusMap(mcp) : undefined)
     const egress = egressFor(ctx, keystone)
-    const verified = isVerified(status, mcp, verdict) && egress.ok && !("unavailable" in keystone) && live?.ok === true
-    return ok(`${summaryOf(status, mcp, verdict, verified)} ${keystoneLine(keystone)}.${egressSummary(egress)}${liveSummary(live)}`, {
+    const synapse = await ctx.synapse.status()
+    const verified = isVerified(status, mcp, verdict) && egress.ok && !("unavailable" in keystone) && live?.ok === true && synapse.ok
+    return ok(`${summaryOf(status, mcp, verdict, verified)} ${keystoneLine(keystone)}.${egressSummary(egress)}${liveSummary(live)}${synapseLine(synapse)}`, {
       verified,
+      synapse,
       bridge: { name: ctx.supervisor.replace(/^supervisor:/, ""), supervisor: ctx.supervisor, bridgeId: ctx.bridgeId, version: ctx.version, holdsBox: held, sessions: ctx.sessions.size },
       isolation: { level: "S", source: "configuration" },
       box: boxReport(status),

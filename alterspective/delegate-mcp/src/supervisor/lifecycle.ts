@@ -14,6 +14,7 @@ import { DelegateError, isDelegateError } from "../shared/errors.ts"
 import type { Logger } from "../shared/log.ts"
 import type { ApiTarget } from "../shared/opencode-api.ts"
 import { FRONT_SERVERS_NAME } from "../guard/egress.ts"
+import { ensureAuthConf } from "../synapse/auth-conf.ts"
 import { INSPECT_ENV, MCP_ALLOW_ENV, approvedValues, boxEnvOverride, composeDownEnv, composeEnv, siblingContainers } from "./compose-env.ts"
 import { LABEL, dockerArgs, imageExists, inspectBox, redactAll, requireDocker, type BoxInspect, type Exec, type ExecResult } from "./docker.ts"
 import { waitHealthy } from "./health.ts"
@@ -45,6 +46,8 @@ export type SupervisorDeps = {
   /** From MOD-02 Guard.permissionBaseline("standard"). */
   permission: PermissionRule[]
   keyEnv?: Record<string, string>
+  /** WS2 (#48): providers whose credential front sets (profile.ts frontAuth). */
+  frontAuth?: string[]
   hostEnv: NodeJS.ProcessEnv
   exec: Exec
   profileFs: ProfileFs
@@ -168,6 +171,8 @@ async function prepareFiles(run: Run, plan: Plan): Promise<void> {
     // front's servers for this Keystone set (R4-01); compose mounts the folder read-only into front.
     await mkdir(dirs.front, { recursive: true })
     await writeFile(path.join(dirs.front, FRONT_SERVERS_NAME), plan.front.servers, "utf8")
+    // WS2 (#48): servers.conf includes the Synapse auth file, so it must exist (empty = no credential).
+    await ensureAuthConf(dirs.front)
   } catch (error) {
     throw fsFailure("prepare the sandbox folders", error, deps.config.home)
   }

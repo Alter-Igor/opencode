@@ -8,6 +8,7 @@ import type { DelegateHub } from "../events/index.ts"
 import type { BridgeInbox } from "../inbox/index.ts"
 import type { DelegateSupervisor, ReplaceOptions } from "../supervisor/lifecycle.ts"
 import type { DelegateWorkspaces } from "../supervisor/workspaces.ts"
+import type { SynapseAuth } from "../synapse/index.ts"
 
 /** A session this bridge started: where it lives on the host and in the box. */
 export type SessionRecord = {
@@ -69,6 +70,8 @@ export type ToolContext = {
   hostExec: CommandRunner
   /** Sessions started by this bridge, by sessionID. */
   sessions: Map<string, SessionRecord>
+  /** WS2 (#48): the owner's host-held Synapse token (sign-in, renewal, doctor report). */
+  synapse: Pick<SynapseAuth, "signIn" | "status" | "refresh">
   /** A fresh correlation id for one tool call (OBS-ID-01). */
   correlationId(): string
 }
