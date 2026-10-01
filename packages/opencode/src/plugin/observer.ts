@@ -182,6 +182,12 @@ class SessionObserverManager {
     sessionId: string,
     workspaceDir?: string,
   ): Promise<SessionRetrospective | null> {
+    if (process.env.OPENCODE_DISABLE_SESSION_RETROSPECTIVES === "1") {
+      this.trajectories.delete(sessionId)
+      this.sessionStartTimes.delete(sessionId)
+      return null
+    }
+
     const records = this.trajectories.get(sessionId) ?? []
     const startTime = this.sessionStartTimes.get(sessionId) ?? Date.now()
     const endTime = Date.now()
