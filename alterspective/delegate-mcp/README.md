@@ -67,6 +67,8 @@ The box can use only the Keystone connections you choose. The default set is `ra
 
 `rag-read` is the owner's **private** connection over the Keystone service **Alterspective RAG (read-only)** (service id `rag-read`, created 2026-10-01; its tool policy allows only read tools). Connection ids are unique in Keystone, so anyone else creates their own: *Account → AI connections → New*, pick that service, give it an id such as `rag-read-<name>`. Then set that id in place of `rag-read` in `OPENCODE_DELEGATE_KEYSTONE` and `OPENCODE_DELEGATE_KEYSTONE_ALLOWED`.
 
+**Upgrading from `rag-global`:** a saved choice (`keystone.json`) that still lists `rag-global` is outside the new default ceiling, so the bridge refuses it and says so. Either pick the new set with `oc_server_restart {confirm: true, keystone: ["rag-read", "github", "seqlogs"]}`, or, if you really want `rag-global`, add it to `OPENCODE_DELEGATE_KEYSTONE_ALLOWED` yourself. Run `oc_login` once for `ks-rag-read`.
+
 - **See the set:** `oc_doctor` (`keystone`, with each entry's sign-in state) or `oc_list_models` (`keystone.connections`).
 - **Change it for the whole box:** `oc_server_restart {confirm: true, keystone: ["rag-read", "github"]}`. The choice is saved in the bridge home (`keystone.json`), so later restarts and other bridges use it. It rebuilds the profile, the MCP policy and the front proxy's Keystone paths, then restarts the box. Other bridges' sessions are interrupted, so it needs `force: true` while other bridges use the box.
 - **Narrow one session:** `oc_start_session {..., keystone: ["rag-read"]}`. It must be a subset of the box-wide set. Convenience only (see "Other known limits").
