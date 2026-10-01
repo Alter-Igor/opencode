@@ -20,6 +20,8 @@ export const LOGIN_PATH = "/api/auth/login"
 const ERROR_CODE = /^[a-z_]{1,64}$/
 /** Keystone calls give up after this (review L5); a hung call must not hold the refresh lock. */
 export const KEYSTONE_TIMEOUT_MS = 30_000
+/** A token with this little life left is treated as expired (review N3). */
+export const MIN_LIFETIME_SEC = 60
 
 export type TokenSet = { accessToken: string; refreshToken?: string; expiresInSec: number }
 export type Fetch = (input: string, init: RequestInit) => Promise<Response>
@@ -74,9 +76,11 @@ async function tokenCall(fetcher: Fetch, origin: string, body: URLSearchParams, 
   const json = (await response.json().catch(() => ({}))) as { access_token?: unknown; refresh_token?: unknown; expires_in?: unknown; error?: unknown }
   const code = typeof json.error === "string" && ERROR_CODE.test(json.error) ? json.error : "unknown"
   if (!response.ok || typeof json.access_token !== "string") throw tokenError(step, response.status, code)
+  const lifetime = lifetimeSec(json.access_token, typeof json.expires_in === "number" && json.expires_in > 0 ? json.expires_in : 3600)
+  // Review N3: a token that is already (nearly) expired is a passing upstream fault: retry, never adopt.
+  if (lifetime <= MIN_LIFETIME_SEC) throw new DelegateError("upstream_error", "Keystone returned a Synapse token that is already expired.", "Retry later; check the PC's clock; run oc_doctor.", `${step}: lifetime ${lifetime}s`)
   if (!isTokenShape(json.access_token)) throw new DelegateError("upstream_error", "Keystone returned a Synapse token the bridge does not recognise.", "Run oc_login {server: \"synapse\"} again.", `${step}: token shape`)
-  const expires = lifetimeSec(json.access_token, typeof json.expires_in === "number" && json.expires_in > 0 ? json.expires_in : 3600)
-  return { accessToken: json.access_token, ...(typeof json.refresh_token === "string" && json.refresh_token ? { refreshToken: json.refresh_token } : {}), expiresInSec: expires }
+  return { accessToken: json.access_token, ...(typeof json.refresh_token === "string" && json.refresh_token ? { refreshToken: json.refresh_token } : {}), expiresInSec: lifetime }
 }
 
 /** min(expires_in, the JWT's own `exp`) (review L4): never trust the token past either. */

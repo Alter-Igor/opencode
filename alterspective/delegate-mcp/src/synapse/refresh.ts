@@ -7,7 +7,7 @@ import { isDelegateError } from "../shared/errors.ts"
 import { safeLog } from "../shared/log.ts"
 import { authConfHasToken, authConfPath, writeAuthConf } from "./auth-conf.ts"
 import { refreshSynapse } from "./keystone-token.ts"
-import { TICK_MS, adopt, failClosed, isDue, readState, reloadFront, savePending, writeState, type Refreshed, type SynapseDeps, type TokenState } from "./token-manager.ts"
+import { TICK_MS, adopt, currentPending, failClosed, isDue, pendingElsewhere, readState, reloadFront, savePending, writeState, type Refreshed, type SynapseDeps, type TokenState } from "./token-manager.ts"
 
 export const RETRY_BASE_MS = 30_000
 export const RETRY_MAX_MS = 10 * 60_000
@@ -17,19 +17,20 @@ export const backoffMs = (failures: number) => Math.min(RETRY_MAX_MS, RETRY_BASE
 const includeHasToken = async (deps: SynapseDeps) => authConfHasToken(await readFile(authConfPath(deps.frontDir), "utf8").catch(() => ""))
 const pastExpiry = (state: TokenState | undefined, now: number) => state !== undefined && now >= state.expiresAt
 
-/** Refresh when due (or `force`), one bridge at a time. Never throws for a failed refresh. */
-export async function refreshIfDue(deps: SynapseDeps, force = false): Promise<Refreshed> {
-  if (deps.memory.pendingRefresh !== undefined) await deps.lock(() => savePending(deps))
-  const state = await readState(deps.home)
-  const now = deps.now()
-  if (!force && !isDue(state, now, deps.refreshFraction) && !(pastExpiry(state, now) && (await includeHasToken(deps)))) return { outcome: "fresh" }
+/**
+ * Refresh when due (or `force`), one bridge at a time. Never throws for a failed refresh. Every
+ * read that decides anything happens under the lock (review N2): one tick = one short lock.
+ */
+export function refreshIfDue(deps: SynapseDeps, force = false): Promise<Refreshed> {
   return deps.lock(() => refreshLocked(deps, force))
 }
 
 async function refreshLocked(deps: SynapseDeps, force: boolean): Promise<Refreshed> {
-  // Another bridge may have refreshed while this one waited for the lock.
+  await savePending(deps)
   const state = await readState(deps.home)
   if (!force && !isDue(state, deps.now(), deps.refreshFraction)) return expireIfPast(deps, state)
+  // N1: another bridge holds the rotated refresh token in memory; the stored one is stale. Wait for it.
+  if (!force && pendingElsewhere(deps, state)) return { ...(await expireIfPast(deps, state)), error: "another bridge holds an unsaved refresh token" }
   const stored = await readRefreshToken(deps)
   if ("error" in stored) return retryLater(deps, state, stored.error)
   if (stored.token === undefined) return failClosed(deps, "no stored refresh token")
@@ -47,7 +48,8 @@ async function refreshLocked(deps: SynapseDeps, force: boolean): Promise<Refresh
 
 /** The token to refresh with: one held in memory first, else the store. A read ERROR is not "missing". */
 async function readRefreshToken(deps: SynapseDeps): Promise<{ token: string | undefined } | { error: string }> {
-  if (deps.memory.pendingRefresh !== undefined) return { token: deps.memory.pendingRefresh }
+  const pending = currentPending(deps, await readState(deps.home))
+  if (pending !== undefined) return { token: pending }
   return deps.store.read().then(
     (token) => ({ token }),
     () => ({ error: `refresh token store (${deps.store.kind}) could not be read` }),

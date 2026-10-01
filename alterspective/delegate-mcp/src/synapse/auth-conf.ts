@@ -6,8 +6,9 @@
 // The file can only ever set one nginx variable to "" or to "Bearer <JWT>". The writer refuses any
 // other value, and oc_doctor checks the loaded copy against the same strict shape, so the include
 // cannot be used to change anything else in front. Token values are never logged or returned.
-import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises"
+import { chmod, mkdir, readFile, writeFile } from "node:fs/promises"
 import path from "node:path"
+import { renameWithRetry } from "./fs-retry.ts"
 
 /** The model gateway host whose credential front sets. */
 export const SYNAPSE_HOST = "synapse2-api.alterspective.com.au"
@@ -46,7 +47,7 @@ export async function writeAuthConf(frontDir: string, token: string | undefined)
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`
   await writeFile(tmp, text, { encoding: "utf8", mode: 0o600 })
   await chmod(tmp, 0o600).catch(() => undefined)
-  await rename(tmp, file)
+  await renameWithRetry(tmp, file)
 }
 
 /** Before `compose up`: front's include must exist. A missing or malformed file becomes the empty one. */

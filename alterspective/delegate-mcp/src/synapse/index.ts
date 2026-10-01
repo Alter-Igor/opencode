@@ -1,4 +1,5 @@
 // WS2 (#48): wiring for the host-held Synapse token (token-manager.ts) and its oc_doctor report.
+import { randomUUID } from "node:crypto"
 import path from "node:path"
 import { frontDir, type BridgeConfig } from "../shared/config.ts"
 import type { Logger } from "../shared/log.ts"
@@ -39,17 +40,19 @@ export function createSynapseAuth(config: Pick<BridgeConfig, "home" | "keystoneO
     throw error
   }))
   const lockFile = path.join(config.home, "synapse", "refresh.lock")
+  let startedAt: Promise<number> | undefined
   const deps: SynapseDeps = {
     home: config.home,
     frontDir: frontDir(config),
     origin: config.keystoneOrigin,
     frontContainer: `${config.project}-front`,
     store: dpapiStore(refreshStoreFile(config.home)),
-    memory: {},
+    memory: { id: `${process.pid}-${randomUUID()}` },
     secrets: loadSecrets,
     fetch: (input, init) => fetch(input, init),
     exec: bunExec,
-    lock: async (fn) => withStartLock(nodeLeaseFs, lockFile, fn, { now: Date.now, sleep: (ms) => new Promise((r) => setTimeout(r, ms)), probe: nodeProcessProbe, self: { pid: process.pid, startedAt: await ownStartTime(nodeProcessProbe) }, waitMs: LOCK_WAIT_MS, staleMs: LOCK_WAIT_MS }),
+    // The tick takes the lock every time (review N2), so this process's start time is read once, not per call.
+    lock: async (fn) => withStartLock(nodeLeaseFs, lockFile, fn, { now: Date.now, sleep: (ms) => new Promise((r) => setTimeout(r, ms)), probe: nodeProcessProbe, self: { pid: process.pid, startedAt: await (startedAt ??= ownStartTime(nodeProcessProbe)) }, waitMs: LOCK_WAIT_MS, staleMs: LOCK_WAIT_MS }),
     now: Date.now,
     refreshFraction: refreshFraction(env),
     opener: defaultOpener,

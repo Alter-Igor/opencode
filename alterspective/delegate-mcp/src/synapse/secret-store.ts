@@ -7,8 +7,9 @@
 // same user-bound protection through System.Security.Cryptography.ProtectedData with no
 // dependency. Only the same Windows user on the same machine can decrypt it; the file sits under
 // the user's profile. The secret crosses to PowerShell on stdin only (never argv, never env).
-import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises"
+import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises"
 import path from "node:path"
+import { renameWithRetry } from "./fs-retry.ts"
 
 export type SecretStore = {
   /** The stored secret, or undefined when none is stored. Throws when it exists but cannot be read. */
@@ -64,7 +65,7 @@ export function dpapiStore(file: string, ps: PowerShell = windowsPowerShell, pla
       await mkdir(path.dirname(file), { recursive: true })
       const tmp = `${file}.${process.pid}.tmp`
       await writeFile(tmp, cipher, { encoding: "utf8", mode: 0o600 })
-      await rename(tmp, file)
+      await renameWithRetry(tmp, file)
     },
     remove: () => rm(file, { force: true }),
     has: async () => (await stat(file).catch(() => undefined))?.isFile() === true,

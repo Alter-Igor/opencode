@@ -8,16 +8,21 @@
 //   - Anything passing (Keystone down, a store read error): keep retrying with backoff. The token
 //     stays in front until it expires; then the include is emptied (no credential leaves front)
 //     but the bridge keeps retrying, and front gets a token again as soon as a refresh works.
-// - A refresh token that could not be saved stays in memory and is saved on later ticks (M1).
+// - A refresh token that could not be saved stays in memory and is saved on later ticks (M1). It is
+//   tagged with the `obtainedAt` of its adopt and dropped once the state moves on (another sign-in,
+//   a refresh elsewhere, needs-sign-in), so a late save can never overwrite a newer token (N1). While
+//   it is pending, the state carries a marker (`pendingBy`, no token): other bridges then do not
+//   refresh with the stale stored token; they wait. A bridge exit loses an unsaved token.
 // State on disk (<home>/synapse/state.json) holds times and the owner's id claims, never a token.
 // Every write of the include or the state happens under the lock (review L1).
 import { randomUUID } from "node:crypto"
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises"
+import { mkdir, readFile, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { DelegateError } from "../shared/errors.ts"
 import { safeLog, type Logger } from "../shared/log.ts"
 import type { Exec } from "../supervisor/docker.ts"
 import { writeAuthConf } from "./auth-conf.ts"
+import { renameWithRetry } from "./fs-retry.ts"
 import { catchHandoff } from "./handoff-login.ts"
 import { exchangeHandoff, jwtClaims, type Fetch, type TokenSet } from "./keystone-token.ts"
 import type { AppSecrets } from "./secrets.ts"
@@ -37,7 +42,14 @@ export type TokenState = {
   /** Passing failures in a row, and when the next attempt may run (backoff). */
   failures?: number
   retryAt?: number
+  /** N1: a bridge holds this token set's refresh token in memory, unsaved (no value here). */
+  pendingBy?: string
+  /** When that bridge last tried to save it; an old marker (holder gone) stops counting. */
+  pendingAt?: number
 }
+
+/** A pending marker older than this is from a bridge that went away (it retries every tick). */
+export const PENDING_STALE_MS = 2 * 60_000
 export type Reload = "reloaded" | "front_not_running" | "config_invalid"
 export type Refreshed = { outcome: "fresh" | "refreshed" | "retrying" | "expired" | "failed_closed"; reload?: Reload; error?: string }
 
@@ -48,7 +60,7 @@ export type SynapseDeps = {
   frontContainer: string
   store: SecretStore
   /** A rotated refresh token the store could not save yet (this bridge only, never on disk unencrypted). */
-  memory: { pendingRefresh?: string }
+  memory: { pendingRefresh?: { token: string; obtainedAt: number }; id: string }
   secrets: () => Promise<AppSecrets>
   fetch: Fetch
   exec: Exec
@@ -78,7 +90,7 @@ export async function writeState(home: string, state: TokenState): Promise<void>
   await mkdir(path.dirname(file), { recursive: true })
   const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`
   await writeFile(tmp, JSON.stringify(state, null, 2), { encoding: "utf8", mode: 0o600 })
-  await rename(tmp, file)
+  await renameWithRetry(tmp, file)
 }
 
 /** When a refresh is due: `fraction` of the way through the token's lifetime. */
@@ -113,25 +125,42 @@ export async function adopt(deps: SynapseDeps, tokens: TokenSet): Promise<Reload
   const state: TokenState = { obtainedAt: now, expiresAt: now + tokens.expiresInSec * 1000, ...(user ? { user } : {}), ...(typeof act === "string" ? { actor: act } : {}) }
   await writeState(deps.home, state)
   if (tokens.refreshToken) {
-    deps.memory.pendingRefresh = tokens.refreshToken
+    deps.memory.pendingRefresh = { token: tokens.refreshToken, obtainedAt: now }
     await savePending(deps)
   }
   return reloadFront(deps.exec, deps.frontContainer)
 }
 
-/** Save a refresh token held in memory; on failure keep it and record why (no value). */
-export async function savePending(deps: SynapseDeps): Promise<void> {
+/** This bridge's pending token, if it still belongs to the token set in force (N1); else it is dropped. */
+export function currentPending(deps: SynapseDeps, state: TokenState | undefined): string | undefined {
   const pending = deps.memory.pendingRefresh
-  if (pending === undefined) return
-  const saved = await deps.store.write(pending).then(() => true, () => false)
+  if (pending === undefined) return undefined
+  if (state === undefined || state.needsSignIn || state.obtainedAt !== pending.obtainedAt) {
+    deps.memory.pendingRefresh = undefined
+    safeLog(deps.log, "info", "synapse", "dropped an unsaved refresh token: a newer sign-in or refresh replaced it", {})
+    return undefined
+  }
+  return pending.token
+}
+
+/** Another bridge holds an unsaved refresh token for the current set (and is still trying). */
+export const pendingElsewhere = (deps: SynapseDeps, state: TokenState | undefined) =>
+  state?.pendingBy !== undefined && state.pendingBy !== deps.memory.id && deps.now() - (state.pendingAt ?? 0) < PENDING_STALE_MS
+
+/** Save a refresh token held in memory (call under the lock); on failure keep it, mark the state, retry later. */
+export async function savePending(deps: SynapseDeps): Promise<void> {
   const state = await readState(deps.home)
+  const pending = currentPending(deps, state)
+  if (pending === undefined || state === undefined) return
+  const saved = await deps.store.write(pending).then(() => true, () => false)
   if (saved) {
     deps.memory.pendingRefresh = undefined
-    if (state?.lastError?.startsWith("refresh token not saved")) await writeState(deps.home, { ...state, lastError: undefined })
+    const { pendingBy: _by, pendingAt: _at, ...rest } = state
+    await writeState(deps.home, { ...rest, ...(state.lastError?.startsWith("refresh token not saved") ? { lastError: undefined } : {}) })
     return
   }
   safeLog(deps.log, "warn", "synapse", "synapse refresh token not saved; kept in memory, will retry", { store: deps.store.kind })
-  if (state) await writeState(deps.home, { ...state, lastError: `refresh token not saved (${deps.store.kind}); retrying` })
+  await writeState(deps.home, { ...state, lastError: `refresh token not saved (${deps.store.kind}); retrying`, pendingBy: deps.memory.id, pendingAt: deps.now() })
 }
 
 /** Keystone refused, or nothing is stored (call under the lock): empty the include; only a sign-in helps. */

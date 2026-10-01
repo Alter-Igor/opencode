@@ -43,7 +43,7 @@ function harness(over: Partial<SynapseDeps> = {}) {
     origin: "https://identity.alterspective.com.au",
     frontContainer: "ocd-test-front",
     store: memoryStore("rt-1"),
-    memory: {},
+    memory: { id: "bridge-a" },
     secrets: async () => ({ brokerKey: "bk", clientSecret: "cs" }),
     fetch: fetcher,
     exec,
@@ -194,7 +194,7 @@ describe("M1: a store that cannot save never throws the new tokens away", () => 
     h.advance(900_000)
     expect((await refreshIfDue(h.deps)).outcome).toBe("refreshed")
     expect(authConfHasToken(h.conf())).toBe(true)
-    expect(h.deps.memory.pendingRefresh).toBe("rt-rotated")
+    expect(h.deps.memory.pendingRefresh?.token).toBe("rt-rotated")
     expect(store.value).toBe("rt-1")
     expect((await readState(h.home))?.lastError).toContain("refresh token not saved")
     expect((await synapseReport(h.deps, h.deps.exec)).pendingSave).toBe(true)
@@ -209,6 +209,61 @@ describe("M1: a store that cannot save never throws the new tokens away", () => 
     expect(h.deps.memory.pendingRefresh).toBeUndefined()
     expect(store.value).toBe("rt-3")
     expect((await readState(h.home))?.lastError).toBeUndefined()
+  })
+})
+
+describe("N1: an unsaved refresh token is never used stale, and never saved over a newer one", () => {
+  test("(a) while bridge A holds the rotated token unsaved, bridge B waits instead of refreshing with the stale stored one", async () => {
+    const store = flakyStore("rt-1", { write: true })
+    const h = harness({ store })
+    await h.signedIn()
+    h.advance(800_000)
+    expect((await refreshIfDue(h.deps)).outcome).toBe("refreshed") // A: rt-rotated unsaved, marker set
+    expect(await readState(h.home)).toMatchObject({ pendingBy: "bridge-a" })
+    const b: SynapseDeps = { ...h.deps, memory: { id: "bridge-b" } }
+    h.advance(700_000)
+    await refreshIfDue(h.deps) // A ticks: not due, save fails again, marker refreshed
+    h.advance(100_000) // now due
+    const sent: string[] = []
+    const record: Fetch = async (_url, init) => (sent.push(new URLSearchParams(String(init.body)).get("refresh_token") ?? ""), ok("rt-3"))
+    h.deps.fetch = record
+    b.fetch = record
+    const fromB = await refreshIfDue(b)
+    expect(fromB.error).toContain("another bridge holds an unsaved refresh token")
+    expect(sent).toEqual([]) // B never used the stale stored rt-1
+    expect((await refreshIfDue(h.deps)).outcome).toBe("refreshed")
+    expect(sent).toEqual(["rt-rotated"])
+  })
+
+  test("(b) after a new sign-in elsewhere, A drops its stale pending token instead of saving it over the new one", async () => {
+    const store = flakyStore("rt-1", { write: true })
+    const h = harness({ store })
+    await h.signedIn()
+    h.advance(800_000)
+    await refreshIfDue(h.deps) // A: rt-rotated pending
+    store.heal()
+    h.advance(5_000)
+    const b: SynapseDeps = { ...h.deps, memory: { id: "bridge-b" } }
+    await b.lock(() => adopt(b, { accessToken: ACCESS, refreshToken: "rt-new", expiresInSec: 1000 })) // the owner signs in again via B
+    expect(store.value).toBe("rt-new")
+    await refreshIfDue(h.deps) // A's tick: its pending token belongs to an older set
+    expect(h.deps.memory.pendingRefresh).toBeUndefined()
+    expect(store.value).toBe("rt-new")
+  })
+
+  test("needs sign-in drops a pending token too", async () => {
+    const store = flakyStore("rt-1", { write: true })
+    const h = harness({ store })
+    await h.signedIn()
+    h.advance(800_000)
+    await refreshIfDue(h.deps)
+    h.deps.fetch = async () => new Response(JSON.stringify({ error: "invalid_grant" }), { status: 400 })
+    h.advance(800_000)
+    expect((await refreshIfDue(h.deps)).outcome).toBe("failed_closed")
+    store.heal()
+    await refreshIfDue(h.deps)
+    expect(store.value).toBe("rt-1")
+    expect(h.deps.memory.pendingRefresh).toBeUndefined()
   })
 })
 

@@ -95,6 +95,16 @@ describe("refresh", () => {
   })
 })
 
+describe("N3: an already-expired token is never adopted", () => {
+  test("a token with 60 s or less to live is upstream_error (retried with backoff)", async () => {
+    const soon = jwt({ sub: "x", exp: Math.floor(Date.now() / 1000) + 30 })
+    const error = await refreshSynapse(recorder(200, { access_token: soon, expires_in: 3600 }).fetch, ORIGIN, "rt", "s").catch((e: unknown) => e)
+    expect((error as DelegateError).code).toBe("upstream_error")
+    const fine = jwt({ sub: "x", exp: Math.floor(Date.now() / 1000) + 600 })
+    expect((await refreshSynapse(recorder(200, { access_token: fine, expires_in: 3600 }).fetch, ORIGIN, "rt", "s")).expiresInSec).toBeLessThanOrEqual(600)
+  })
+})
+
 describe("L4: lifetime = min(expires_in, JWT exp)", () => {
   test("the shorter of the two wins; no exp claim keeps expires_in", () => {
     const now = 1_790_000_000_000

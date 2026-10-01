@@ -44,7 +44,7 @@ export async function synapseReport(deps: SynapseDeps, exec: Exec): Promise<Syna
   const state = await readState(deps.home)
   const conf = await readFile(authConfPath(deps.frontDir), "utf8").catch(() => "")
   const stored = await deps.store.has()
-  const pendingSave = deps.memory.pendingRefresh !== undefined
+  const pendingSave = deps.memory.pendingRefresh !== undefined || state?.pendingBy !== undefined
   const hostFile = { shapeOk: isAuthConf(conf), hasToken: authConfHasToken(conf) }
   const needsSignIn = !state || state.needsSignIn === true || (!stored && !pendingSave)
   const kind = needsSignIn ? "needs_sign_in" : deps.now() >= state.expiresAt || !hostFile.hasToken ? "expired" : "signed_in"

@@ -8,7 +8,8 @@
 // plugin (packages/opencode/src/plugin/synapse.ts) adds no fetch of its own when the box holds no
 // stored auth (its loader returns baseURL + headers only). The SDK's chat model posts to
 // `${baseURL}/chat/completions`. OpenCode does not fetch the model list in the box
-// (OPENCODE_DISABLE_MODELS_FETCH=1); GET /v1/models is allowed because it is a read-only list a
+// (OPENCODE_DISABLE_MODELS_FETCH=1); GET (and so HEAD: nginx's `limit_except GET` admits HEAD) /v1/models
+// is allowed because it is a read-only list a
 // delegated user may always call (playbook §8) and lets in-box code see what `auto` can route to.
 // No embeddings, responses, usage, fleet, operator, judgment, health or MCP route is allowed.
 import { AUTH_FILE_NAME, AUTH_VAR } from "./auth-conf.ts"
