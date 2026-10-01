@@ -2,7 +2,8 @@
 // Keystone server, sent byte for byte over TLS with NO credentials. Prints one JSON object:
 // probe name → { statuses: [HTTP status of each response], front: whether the first answer is
 // front's own error page (a refusal that never reached Keystone) }. The test judges the results.
-// The live front is generated for the default set, so /mcp/c/github is an allowed path.
+// The live front is generated for an explicit set (test/egress-live.test.ts LIVE_SET) that has github,
+// so /mcp/c/github is an allowed path.
 import { readFileSync } from "node:fs"
 import tls from "node:tls"
 

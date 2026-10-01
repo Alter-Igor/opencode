@@ -46,11 +46,24 @@ export type TokenState = {
   pendingBy?: string
   /** When that bridge last tried to save it; an old marker (holder gone) stops counting. */
   pendingAt?: number
+  /** Review M3: when this bridge home last wrote front's include (any value). */
+  includeAt?: number
+  /** Review M3: the last reload of front and when; oc_doctor needs one that worked after includeAt. */
+  lastReload?: { result: Reload; at: number }
 }
 
 /** A pending marker older than this is from a bridge that went away (it retries every tick). */
 export const PENDING_STALE_MS = 2 * 60_000
-export type Reload = "reloaded" | "front_not_running" | "config_invalid"
+/**
+ * reloaded; front_not_running; config_invalid (nginx -t refused, or the reload failed: front keeps
+ * the last good config); config_changed (review M1: front-reload refused because servers.conf is not
+ * the file front started with, or the include is not the strict shape; nothing was reloaded).
+ */
+export type Reload = "reloaded" | "front_not_running" | "config_invalid" | "config_changed"
+/** Review M1: baked into the front image (docker/front/front-reload.sh); the only reload path. */
+export const FRONT_RELOAD = "/usr/local/bin/front-reload"
+/** front-reload's exit code when the generated files are not the ones front started with. */
+const FILES_CHANGED = 3
 export type Refreshed = { outcome: "fresh" | "refreshed" | "retrying" | "expired" | "failed_closed"; reload?: Reload; error?: string }
 
 export type SynapseDeps = {
@@ -100,15 +113,26 @@ export const refreshAt = (state: Pick<TokenState, "obtainedAt" | "expiresAt">, f
 export const isDue = (state: TokenState | undefined, now: number, fraction: number) =>
   state !== undefined && !state.needsSignIn && now >= Math.max(refreshAt(state, fraction), state.retryAt ?? 0)
 
-/** Check, then reload. A config nginx refuses is never loaded (front keeps the last good one). */
-export async function reloadFront(exec: Exec, container: string): Promise<Reload> {
-  const test = await exec(["docker", "exec", container, "nginx", "-t", "-q"], { timeoutMs: 20_000 })
-  if (test.code !== 0) {
-    const running = await exec(["docker", "inspect", "--type", "container", "--format", "{{.State.Running}}", container], { timeoutMs: 20_000 })
-    return running.code === 0 && running.stdout.trim() === "true" ? "config_invalid" : "front_not_running"
-  }
-  const reload = await exec(["docker", "exec", container, "nginx", "-s", "reload"], { timeoutMs: 20_000 })
-  return reload.code === 0 ? "reloaded" : "config_invalid"
+/**
+ * Reload front through its baked `front-reload` (review M1): it checks servers.conf against the hash
+ * front started with and the include's strict shape, then `nginx -t`, then reloads. A refusal never
+ * loads anything (front keeps the last good config). The result and its time go into the state
+ * (review M3), so oc_doctor can tell whether front loaded the include written last. Call under the lock.
+ */
+export async function reloadFront(deps: Pick<SynapseDeps, "exec" | "frontContainer" | "home" | "now" | "log">): Promise<Reload> {
+  const run = await deps.exec(["docker", "exec", deps.frontContainer, FRONT_RELOAD], { timeoutMs: 30_000 })
+  const result: Reload = run.code === 0 ? "reloaded" : run.code === FILES_CHANGED ? "config_changed" : await notReloaded(deps)
+  // front-reload prints fixed messages only (never the include); the last line says why.
+  const reason = run.stderr.trim().split("\n").at(-1)?.slice(0, 300)
+  safeLog(deps.log, result === "reloaded" ? "info" : "warn", "synapse", result === "reloaded" ? "front reloaded" : "front NOT reloaded", { result, ...(result === "reloaded" ? {} : { exit: run.code, reason }) })
+  const state = await readState(deps.home)
+  if (state) await writeState(deps.home, { ...state, lastReload: { result, at: deps.now() } })
+  return result
+}
+
+async function notReloaded(deps: Pick<SynapseDeps, "exec" | "frontContainer">): Promise<Reload> {
+  const running = await deps.exec(["docker", "inspect", "--type", "container", "--format", "{{.State.Running}}", deps.frontContainer], { timeoutMs: 20_000 })
+  return running.code === 0 && running.stdout.trim() === "true" ? "config_invalid" : "front_not_running"
 }
 
 /**
@@ -122,13 +146,13 @@ export async function adopt(deps: SynapseDeps, tokens: TokenSet): Promise<Reload
   const act = claims.act && typeof claims.act === "object" ? (claims.act as Record<string, unknown>).sub : undefined
   const user = typeof claims.email === "string" ? claims.email : typeof claims.sub === "string" ? claims.sub : undefined
   const now = deps.now()
-  const state: TokenState = { obtainedAt: now, expiresAt: now + tokens.expiresInSec * 1000, ...(user ? { user } : {}), ...(typeof act === "string" ? { actor: act } : {}) }
+  const state: TokenState = { obtainedAt: now, expiresAt: now + tokens.expiresInSec * 1000, includeAt: now, ...(user ? { user } : {}), ...(typeof act === "string" ? { actor: act } : {}) }
   await writeState(deps.home, state)
   if (tokens.refreshToken) {
     deps.memory.pendingRefresh = { token: tokens.refreshToken, obtainedAt: now }
     await savePending(deps)
   }
-  return reloadFront(deps.exec, deps.frontContainer)
+  return reloadFront(deps)
 }
 
 /** This bridge's pending token, if it still belongs to the token set in force (N1); else it is dropped. */
@@ -168,9 +192,9 @@ export async function failClosed(deps: SynapseDeps, reason: string): Promise<Ref
   await writeAuthConf(deps.frontDir, undefined)
   deps.memory.pendingRefresh = undefined
   const state = await readState(deps.home)
-  await writeState(deps.home, { obtainedAt: state?.obtainedAt ?? 0, expiresAt: state?.expiresAt ?? 0, ...(state?.user ? { user: state.user } : {}), lastError: reason.slice(0, 200), needsSignIn: true })
+  await writeState(deps.home, { obtainedAt: state?.obtainedAt ?? 0, expiresAt: state?.expiresAt ?? 0, ...(state?.user ? { user: state.user } : {}), lastError: reason.slice(0, 200), needsSignIn: true, includeAt: deps.now() })
   safeLog(deps.log, "warn", "synapse", "synapse token failed closed", { reason: reason.slice(0, 200) })
-  return { outcome: "failed_closed", reload: await reloadFront(deps.exec, deps.frontContainer), error: reason }
+  return { outcome: "failed_closed", reload: await reloadFront(deps), error: reason }
 }
 
 /** Sign the owner in on the host and adopt the exchanged token. */

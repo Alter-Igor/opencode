@@ -2,7 +2,7 @@
 // home), the two kinds of failure (review M2), a store that cannot save (M1), and the store itself.
 // Keystone and docker are fakes.
 import { describe, expect, test } from "bun:test"
-import { mkdtempSync, readFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { silentLogger } from "../src/shared/log.ts"
@@ -10,12 +10,14 @@ import type { Exec } from "../src/supervisor/docker.ts"
 import { nodeLeaseFs } from "../src/supervisor/leases.ts"
 import { nodeProcessProbe } from "../src/supervisor/process.ts"
 import { withStartLock } from "../src/supervisor/start-lock.ts"
-import { authConfHasToken, authConfPath, isAuthConf } from "../src/synapse/auth-conf.ts"
+import { authConf, authConfHasToken, authConfPath, ensureAuthConf, isAuthConf, writeAuthConf } from "../src/synapse/auth-conf.ts"
 import { refreshFraction } from "../src/synapse/index.ts"
 import { RETRY_BASE_MS, backoffMs, refreshIfDue } from "../src/synapse/refresh.ts"
-import { synapseReport } from "../src/synapse/report.ts"
+import { LOADED_AUTH_SHA, synapseReport } from "../src/synapse/report.ts"
+import { createHash } from "node:crypto"
+import { synapseLine } from "../src/tools/doctor.ts"
 import { dpapiStore, memoryStore, type PowerShell, type SecretStore } from "../src/synapse/secret-store.ts"
-import { adopt, isDue, readState, refreshAt, type SynapseDeps } from "../src/synapse/token-manager.ts"
+import { FRONT_RELOAD, adopt, isDue, readState, refreshAt, type SynapseDeps } from "../src/synapse/token-manager.ts"
 import type { Fetch } from "../src/synapse/keystone-token.ts"
 import { jwt } from "./synapse-fixture.ts"
 
@@ -27,8 +29,18 @@ function harness(over: Partial<SynapseDeps> = {}) {
   const calls = { fetch: 0, exec: [] as string[][] }
   let clock = 1_000_000
   let reply: () => Response = () => ok()
+  // front: `front-reload` exits with `docker.reload` (0 reloaded, 3 files changed, 4 nginx -t refused);
+  // `docker inspect` says whether it runs. Like the real script, a reload that works records the
+  // include's sha256 (review N2), which `cat /tmp/front/loaded-auth.sha` then returns.
+  const docker: { reload: number; running: string; loadedSha?: string } = { reload: 0, running: "true" }
   const exec: Exec = async (argv) => {
     calls.exec.push(argv)
+    if (argv.includes(FRONT_RELOAD)) {
+      if (docker.reload === 0) docker.loadedSha = createHash("sha256").update(readFileSync(authConfPath(path.join(home, "front")), "utf8")).digest("hex")
+      return { code: docker.reload, stdout: "", stderr: docker.reload ? "front-reload: refused\n" : "" }
+    }
+    if (argv.includes("{{.State.Running}}")) return { code: 0, stdout: `${docker.running}\n`, stderr: "" }
+    if (argv.includes(LOADED_AUTH_SHA)) return docker.loadedSha ? { code: 0, stdout: `${docker.loadedSha}\n`, stderr: "" } : { code: 1, stdout: "", stderr: "no such file" }
     return { code: argv.includes("-T") ? 1 : 0, stdout: "", stderr: "" }
   }
   const fetcher: Fetch = async () => {
@@ -55,7 +67,7 @@ function harness(over: Partial<SynapseDeps> = {}) {
     ...over,
   }
   const signedIn = () => deps.lock(() => adopt(deps, { accessToken: ACCESS, expiresInSec: 1000 }))
-  return { deps, calls, home, signedIn, setReply: (fn: () => Response) => (reply = fn), advance: (ms: number) => (clock += ms), conf: () => readFileSync(authConfPath(deps.frontDir), "utf8") }
+  return { deps, calls, home, docker, clock: () => clock, signedIn, setReply: (fn: () => Response) => (reply = fn), advance: (ms: number) => (clock += ms), conf: () => readFileSync(authConfPath(deps.frontDir), "utf8") }
 }
 
 /** A store whose write and/or read fail until `heal()` (a DPAPI hiccup). */
@@ -108,10 +120,8 @@ describe("refreshIfDue", () => {
     expect(await refreshIfDue(h.deps)).toEqual({ outcome: "refreshed", reload: "reloaded" })
     expect((h.deps.store as ReturnType<typeof memoryStore>).value).toBe("rt-rotated")
     expect(authConfHasToken(h.conf())).toBe(true)
-    expect(h.calls.exec).toEqual([
-      ["docker", "exec", "ocd-test-front", "nginx", "-t", "-q"],
-      ["docker", "exec", "ocd-test-front", "nginx", "-s", "reload"],
-    ])
+    // Review M1: only the baked script, which checks the files before `nginx -t` and the reload.
+    expect(h.calls.exec).toEqual([["docker", "exec", "ocd-test-front", "/usr/local/bin/front-reload"]])
     const state = await readState(h.home)
     expect(state).toMatchObject({ user: "owner@example.test", actor: "service:opencode" })
     expect(JSON.stringify(state)).not.toContain(ACCESS)
@@ -294,5 +304,93 @@ describe("refresh-token store", () => {
     await broken.write("rt")
     expect(broken.read()).rejects.toThrow("DPAPI")
     expect(dpapiStore(path.join(dir, "x.dpapi"), async () => "x", "linux").write("rt")).rejects.toThrow("Windows DPAPI")
+  })
+})
+
+describe("review M1 / M3: the reload goes through front-reload, and its result is recorded", () => {
+  test("a refusal (files changed) is config_changed, is recorded with its time, and the doctor is not ok", async () => {
+    const h = harness()
+    await h.signedIn()
+    expect((await synapseReport(h.deps, h.deps.exec)).loadedSinceWrite).toBe(true)
+    h.docker.reload = 3
+    // A new access token, so the include changes (front still holds the old one: N2's sha differs).
+    const next = jwt({ sub: "oid-1", email: "owner@example.test", act: { sub: "service:opencode" }, iat: 2 })
+    h.setReply(() => new Response(JSON.stringify({ access_token: next, refresh_token: "rt-2", expires_in: 1000 }), { status: 200 }))
+    h.advance(800_000)
+    expect(await refreshIfDue(h.deps)).toEqual({ outcome: "refreshed", reload: "config_changed" })
+    const state = await readState(h.home)
+    expect(state?.lastReload).toEqual({ result: "config_changed", at: h.clock() })
+    expect(state?.includeAt).toBe(h.clock())
+    const report = await synapseReport(h.deps, h.deps.exec)
+    expect(report).toMatchObject({ loadedSinceWrite: false, lastReload: { result: "config_changed" }, ok: false })
+    expect(synapseLine(report)).toContain("front has NOT loaded the include written last (last reload: config_changed")
+  })
+
+  test("nginx -t refused while front runs: config_invalid; front gone: front_not_running", async () => {
+    const h = harness()
+    h.docker.reload = 4
+    expect(await h.signedIn()).toBe("config_invalid")
+    h.docker.running = "false"
+    expect(await h.signedIn()).toBe("front_not_running")
+    expect((await readState(h.home))?.lastReload?.result).toBe("front_not_running")
+  })
+
+  test("review N2: loaded means front's recorded sha256 equals the host include's; no clock is involved", async () => {
+    const h = harness()
+    h.docker.reload = 1
+    h.docker.running = "false"
+    await h.signedIn()
+    // No record (front not running, never reloaded): not loaded, whatever the clocks say.
+    expect((await synapseReport(h.deps, h.deps.exec)).loadedSinceWrite).toBe(false)
+    // front (re)started and its entrypoint recorded THIS include: loaded.
+    h.docker.loadedSha = createHash("sha256").update(h.conf()).digest("hex")
+    expect((await synapseReport(h.deps, h.deps.exec)).loadedSinceWrite).toBe(true)
+    // It recorded another include (an older token): not loaded. A garbled record counts as none.
+    h.docker.loadedSha = "0".repeat(64)
+    expect((await synapseReport(h.deps, h.deps.exec)).loadedSinceWrite).toBe(false)
+    h.docker.loadedSha = "not-a-sha"
+    expect((await synapseReport(h.deps, h.deps.exec)).loadedSinceWrite).toBe(false)
+  })
+
+  test("a failure kept retrying keeps the reload record (retryLater rebuilds the state)", async () => {
+    const h = harness()
+    await h.signedIn()
+    h.setReply(() => new Response("{}", { status: 503 }))
+    h.advance(900_000)
+    expect((await refreshIfDue(h.deps)).outcome).toBe("retrying")
+    expect((await readState(h.home))?.lastReload?.result).toBe("reloaded")
+  })
+})
+
+describe("review L5: the include is created only when missing; an empty include is its own state", () => {
+  test("ensureAuthConf never replaces a token include, nor one it cannot read; it creates a missing one", async () => {
+    const h = harness()
+    await writeAuthConf(h.deps.frontDir, ACCESS)
+    await ensureAuthConf(h.deps.frontDir)
+    expect(authConfHasToken(h.conf())).toBe(true)
+    const other = path.join(h.home, "front2")
+    await ensureAuthConf(other)
+    expect(readFileSync(authConfPath(other), "utf8")).toBe(authConf(undefined))
+    // Unreadable (here: a folder in its place): left alone, never "repaired" over a write in flight.
+    const odd = path.join(h.home, "front3")
+    mkdirSync(authConfPath(odd), { recursive: true })
+    await ensureAuthConf(odd)
+    // A damaged file is still made the empty one (fail closed).
+    writeFileSync(authConfPath(other), "set $x 1;\n")
+    await ensureAuthConf(other)
+    expect(readFileSync(authConfPath(other), "utf8")).toBe(authConf(undefined))
+  })
+
+  test("signed in, not expired, include empty: include_empty (not EXPIRED), and the next tick writes it again", async () => {
+    const h = harness()
+    await h.signedIn()
+    await ensureAuthConf(h.deps.frontDir)
+    await writeAuthConf(h.deps.frontDir, undefined)
+    const report = await synapseReport(h.deps, h.deps.exec)
+    expect(report.state).toBe("include_empty")
+    expect(synapseLine(report)).not.toContain("EXPIRED")
+    expect(synapseLine(report)).toContain("front's include has NO token")
+    expect((await refreshIfDue(h.deps)).outcome).toBe("refreshed")
+    expect(authConfHasToken(h.conf())).toBe(true)
   })
 })

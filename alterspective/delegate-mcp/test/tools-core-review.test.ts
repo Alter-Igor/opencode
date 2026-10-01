@@ -49,7 +49,7 @@ describe("oc_wait (W3A-03 / W3A-11)", () => {
 })
 
 describe("oc_doctor (W3A-09 / W3C-09)", () => {
-  const healthy = (f: ReturnType<typeof fakeContext>) => f.api.on("GET /mcp", { status: 200, data: { "ks-rag-read": { status: "connected" } } })
+  const healthy = (f: ReturnType<typeof fakeContext>) => f.api.on("GET /mcp", { status: 200, data: { "ks-rag-read": { status: "connected" }, "ks-github": { status: "connected" }, "ks-seqlogs": { status: "connected" } } })
 
   test("all checks passed: verified true", async () => {
     const f = fakeContext({ boxHeld: false })

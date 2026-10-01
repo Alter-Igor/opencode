@@ -4,6 +4,7 @@
 import path from "node:path"
 import { frontDir, mcpAllowPolicy, type BridgeConfig } from "../shared/config.ts"
 import { DelegateError } from "../shared/errors.ts"
+import { synapseLockFile } from "../synapse/lock.ts"
 import { childEnv } from "./docker.ts"
 import type { BuiltProfile } from "./profile.ts"
 
@@ -31,6 +32,8 @@ export function paths(config: BridgeConfig) {
     handoff: path.join(config.home, "handoff"),
     leases: path.join(config.home, "leases"),
     startLock: path.join(config.home, "start.lock"),
+    /** Review N1: the Synapse refresh lock; taken after the start lock to write front's generated files. */
+    synapseLock: synapseLockFile(config.home),
     boxEnvOverride: path.join(config.home, "compose.box-env.yaml"),
     /** Generated front config, mounted read-only into front (never into the box). */
     front: frontDir(config),
