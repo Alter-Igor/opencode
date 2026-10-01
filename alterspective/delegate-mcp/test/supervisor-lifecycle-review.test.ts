@@ -7,7 +7,7 @@ import { DelegateError } from "../src/shared/errors.ts"
 import type { Level, Logger } from "../src/shared/log.ts"
 import type { Exec, ExecOptions, ExecResult } from "../src/supervisor/docker.ts"
 import { nodeLeaseFs, type LeaseFs } from "../src/supervisor/leases.ts"
-import { boxEnvOverride, composeEnv, createSupervisor, handoffOutMode, type DelegateSupervisor, type SupervisorDeps } from "../src/supervisor/lifecycle.ts"
+import { boxEnvOverride, composeEnv, createSupervisor, type DelegateSupervisor, type SupervisorDeps } from "../src/supervisor/lifecycle.ts"
 import type { ProcessProbe } from "../src/supervisor/process.ts"
 import { frontFilesFor } from "../src/supervisor/plan.ts"
 import { buildProfile, nodeProfileFs } from "../src/supervisor/profile.ts"
@@ -119,10 +119,10 @@ describe("supervisor: round-2 review fixes", () => {
     expect((await fail(broken.ensure())).code).toBe("sandbox_unavailable")
   })
 
-  test("handoff/out is opened for uid 10001 only on non-Windows hosts (N-12)", () => {
-    expect(handoffOutMode("win32")).toBeUndefined()
-    expect(handoffOutMode("linux")).toBe(0o777)
-    expect(handoffOutMode("darwin")).toBe(0o777)
+  test("G-7: start makes the read-only handoff/in source but no host handoff/out folder", async () => {
+    const sup = supervisor(deps(fakeDocker({ running: false, labels: {}, env: [] }, [])))
+    await sup.ensure()
+    expect(await readdir(path.join(home, "handoff"))).toEqual(["in"])
   })
 })
 

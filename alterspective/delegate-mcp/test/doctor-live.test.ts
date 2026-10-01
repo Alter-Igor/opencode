@@ -17,12 +17,12 @@ const dump = (servers: string) =>
 
 const FRONT_OK = [{ Destination: "/etc/nginx/front-gen", RW: false }, { Destination: "/ca/private", RW: true }, { Destination: "/ca/public", RW: true }]
 const BOX_OK = [
-  { Destination: "/data", RW: true },
-  { Destination: "/sessions", RW: true },
-  { Destination: "/handoff/in", RW: false },
-  { Destination: "/handoff/out", RW: true },
-  { Destination: "/profile", RW: false },
-  { Destination: "/etc/ocd-front-ca", RW: false },
+  { Destination: "/data", RW: true, Type: "volume" },
+  { Destination: "/sessions", RW: true, Type: "volume" },
+  { Destination: "/handoff/in", RW: false, Type: "bind" },
+  { Destination: "/handoff/out", RW: true, Type: "volume" },
+  { Destination: "/profile", RW: false, Type: "bind" },
+  { Destination: "/etc/ocd-front-ca", RW: false, Type: "volume" },
 ]
 
 describe("front's loaded config (R5-05)", () => {
@@ -47,6 +47,9 @@ describe("front's loaded config (R5-05)", () => {
     expect(checkMounts(FRONT_OK, [...BOX_OK, { Destination: "/bridge-home", RW: true }])).toMatchObject({ boxMountsOk: false, problems: [expect.stringContaining("/bridge-home")] })
     expect(checkMounts(FRONT_OK, BOX_OK.map((m) => (m.Destination === "/profile" ? { ...m, RW: true } : m)))).toMatchObject({ boxMountsOk: false })
     expect(checkMounts(undefined, undefined)).toMatchObject({ mountReadOnly: false, boxMountsOk: false })
+    // G-7: a writable host folder in the box (the old /handoff/out bind) fails the check.
+    const oldBind = checkMounts(FRONT_OK, BOX_OK.map((m) => (m.Destination === "/handoff/out" ? { ...m, Type: "bind" } : m)))
+    expect(oldBind).toMatchObject({ boxMountsOk: false, problems: [expect.stringContaining("writable bind mount")] })
   })
 })
 

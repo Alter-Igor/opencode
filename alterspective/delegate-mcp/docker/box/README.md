@@ -2,24 +2,18 @@
 
 The box image is built from `Dockerfile` in this folder. `Dockerfile.dockerignore` lists the only files that enter the build. This README is not one of them.
 
-## The hand-off `out/` folder on a Linux Docker host (review N-12)
+## The hand-off folders (review C-4, N-12, R3-08 / issue G-7)
 
-The box writes its session bundle to `/handoff/out`. That path is a bind mount of the host folder `<home>/handoff/out`, where `<home>` is `OPENCODE_DELEGATE_HOME`.
+- `/handoff/in` is a **read-only** bind of the host folder `<home>/handoff/in` (`<home>` is `OPENCODE_DELEGATE_HOME`). The host writes the owner's bundle there; the box only reads it.
+- `/handoff/out` is the named volume `handoff-out`. It is **not** a host folder, so code in the box cannot write anything on the host. The image creates `/handoff/out` owned by the box user (uid `10001`); Docker copies that owner into the empty volume on first use, on Windows and Linux alike. No host folder mode needs opening (the old `0777` on `<home>/handoff/out` is gone).
 
-- **Windows (Docker Desktop):** Docker Desktop maps permissions for bind mounts. The box user can write there. Nothing else is needed.
-- **Linux (and any other non-Windows host):** a bind mount keeps the host owner and mode. The box runs as uid `10001`. So the host folder must be writable by uid `10001`. The supervisor sets mode `0777` on `<home>/handoff/out`, and only on that folder, whenever the host is not Windows (`handoffOutMode` in `src/supervisor/lifecycle.ts`).
+How the session bundle leaves the box (`src/supervisor/workspaces-copyout.ts`):
 
-### Why `0777` on that one folder is safe
+1. In the box, `stat` (no `-L`) must report a regular file within the 500 MB cap, or nothing is copied.
+2. The bridge runs `docker cp <box>:/handoff/out/<name> -` and reads the tar stream itself. It accepts exactly one regular-file entry no larger than the cap, and stops reading at the cap plus 64 KB. A link, folder, device or second entry is refused. So a file swapped in after step 1 can never put more than the cap on the host.
+3. The bridge writes the file with an exclusive create into a host-only folder (`<home>/workspaces/incoming`, never mounted), then checks it again: a regular file of exactly the streamed size, within the cap. Only then does it run `git fetch` (no hooks, every object checked).
 
-- The host never runs anything from `out/`. It only reads bundles from there.
-- The host treats everything in `out/` as untrusted, whoever wrote it (the box, or another local user):
-  - it clears anything already sitting at the fresh bundle name before the box writes;
-  - it takes the bundle by **rename** into a host-only folder (`<home>/workspaces/incoming`, never mounted), so nobody can swap it after the check;
-  - it then refuses anything that is not a regular file (`lstat`: links are never followed) or is over the size cap;
-  - only then does it run `git fetch` from the bundle, which runs no hooks.
-- `in/` stays with the default mode and is mounted read-only in the box. Only `out/` is opened up.
-
-The worst another local user can do is put a bad bundle in `out/`. The checks above refuse it, or the fetch fails. It can never run code on the host.
+The bridge removes the bundle from the volume after every collect.
 
 ## Base images
 

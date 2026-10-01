@@ -183,7 +183,7 @@ Not a finding: in-box code can read and write every session's clone (one shared 
 | R3-05 | **Fixed.** | 3 cases in `test/tools-shape.test.ts`, red first |
 | R3-06 | **Fixed.** Path, `response_type`, S256 challenge and loopback `redirect_uri` required. Path matches Keystone's live discovery (`/api/oauth/authorize`, `S256`). | `test/login.test.ts`, red first |
 | R3-07 | **Fixed** (`fetch.fsckObjects`). | `test/workspaces-collect.test.ts`, red first |
-| R3-08 | **Open**, issue G-7. | — |
+| R3-08 | **Fixed** later (issue #54, G-7): box-only `handoff-out` volume, bundle taken by `docker cp` as a parsed, capped tar stream, host re-check. | `test/workspaces-copyout.test.ts`, `test/handoff-compose.test.ts`, `test/doctor-live.test.ts`, red first |
 | R3-09 | **Fixed.** | `test/tools-core-runtime.test.ts`, red first |
 | R3-10 | **Fixed** with the above: README security rows and compose comments rewritten; technical design revision 4. | — |
 

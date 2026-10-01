@@ -8,7 +8,7 @@ import { createHash } from "node:crypto"
 import { FRONT_GENERATED_MOUNT, FRONT_SERVERS_NAME } from "../guard/egress.ts"
 import type { Exec } from "./docker.ts"
 
-export type Mount = { Destination?: unknown; RW?: unknown }
+export type Mount = { Destination?: unknown; RW?: unknown; Type?: unknown }
 export type FrontLive = { ok: boolean; loadedConfigMatches: boolean; mountReadOnly: boolean; boxMountsOk: boolean; problems: string[] }
 
 const SERVERS_HEADER = `# configuration file ${FRONT_GENERATED_MOUNT}/${FRONT_SERVERS_NAME}:\n`
@@ -43,6 +43,8 @@ function boxMountProblems(box: Mount[] | undefined): string[] {
     seen.add(destination)
     if (!(destination in BOX_MOUNTS)) problems.push(`the box has an unexpected mount at ${destination}`)
     else if (BOX_MOUNTS[destination] === false && mount.RW !== false) problems.push(`the box's ${destination} is mounted read-write`)
+    // G-7: the box may write named volumes only, never a host folder.
+    else if (mount.Type !== "volume" && mount.RW !== false) problems.push(`the box's ${destination} is a writable ${typeof mount.Type === "string" ? mount.Type.slice(0, 20) : "unknown"} mount, not a box-only volume`)
   }
   for (const destination of Object.keys(BOX_MOUNTS)) if (!seen.has(destination)) problems.push(`the box has no mount at ${destination}`)
   return problems
