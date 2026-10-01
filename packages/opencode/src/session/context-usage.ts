@@ -108,9 +108,18 @@ function textOf(content: ModelMessage["content"]) {
   return content
     .map((part) => {
       if (part.type === "text") return part.text
+      if (part.type === "tool-result") return toolOutputText(part.output)
       return ""
     })
     .join("")
+}
+
+function toolOutputText(output: { type: string; value?: unknown }) {
+  if (output.type === "text" || output.type === "error-text") return typeof output.value === "string" ? output.value : ""
+  if (output.type === "json" || output.type === "error-json") return JSON.stringify(output.value ?? null)
+  if (output.type === "content" && Array.isArray(output.value))
+    return output.value.map((item: { type?: string; text?: string }) => (item.type === "text" ? item.text ?? "" : "")).join("")
+  return ""
 }
 
 function estimate(chars: number) {

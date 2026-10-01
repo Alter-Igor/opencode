@@ -381,6 +381,13 @@ export function normalizeSystemMessages(
   return [{ ...systemTemplate, role: "system", content: systemTexts.join("\n\n") }, ...rest]
 }
 
+/** Collapse the system blocks, in order, into a single entry (mutates `system`). */
+export function foldSystemBlocks(system: string[]): void {
+  const joined = system.filter((block) => block.trim()).join("\n\n")
+  system.length = 0
+  if (joined) system.push(joined)
+}
+
 export function sanitizeMessagesForSynapse(
   rawMessages: Array<{ role?: string; content?: any }>,
 ): Array<{ role: "system" | "user" | "assistant"; content: string }> {
@@ -1488,6 +1495,10 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
           ...learningsBlock,
         ].join("\n"),
       )
+      // vLLM rejects a second system message. The fetch wrapper's normalizeSystemMessages
+      // only runs when a `synapse` auth entry is stored; a config/env apiKey (the delegate box)
+      // skips the loader entirely. Fold here so every auth path sends one system message.
+      if (_input.model?.providerID === "synapse") foldSystemBlocks(output.system)
     },
     tool: {
       synapse_record_learning: tool({

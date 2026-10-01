@@ -47,7 +47,17 @@ describe("measureContextUsage", () => {
     const rows = measureContextUsage({
       messages: [
         { role: "user", content: "read the file" },
-        { role: "tool", content: "x".repeat(400) },
+        {
+          role: "tool",
+          content: [
+            {
+              type: "tool-result",
+              toolCallId: "call_1",
+              toolName: "read",
+              output: { type: "text", value: "x".repeat(400) },
+            },
+          ],
+        },
       ],
       tools: {},
     })

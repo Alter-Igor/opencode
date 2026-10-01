@@ -1,0 +1,49 @@
+# npm-cache: read-only pull-through cache of registry.npmjs.org (FEAT-OCD-001 §4, review N3).
+# The box can install packages but can never publish, unpublish, tag or log in:
+# - no user can exist: registration is disabled and the htpasswd file is an empty, root-owned,
+#   read-only file baked into the image;
+# - every write action needs an authenticated group (`$authenticated`-only rights), and no one
+#   can authenticate, so every write is refused;
+# - the audit passthrough (POSTs to npmjs) and the web UI are switched off.
+storage: /verdaccio/storage/data
+plugins: /verdaccio/plugins
+listen: 0.0.0.0:4873
+
+web:
+  enable: false
+
+auth:
+  htpasswd:
+    file: /verdaccio/conf/htpasswd
+    max_users: -1
+
+uplinks:
+  npmjs:
+    url: https://registry.npmjs.org/
+    timeout: 60s
+    maxage: 10m
+    cache: true
+
+packages:
+  '@*/*':
+    access: $all
+    publish: $nobody
+    unpublish: $nobody
+    proxy: npmjs
+  '**':
+    access: $all
+    publish: $nobody
+    unpublish: $nobody
+    proxy: npmjs
+
+publish:
+  allow_offline: false
+
+middlewares:
+  audit:
+    enabled: false
+
+server:
+  keepAliveTimeout: 60
+
+log: { type: stdout, format: json, level: http }

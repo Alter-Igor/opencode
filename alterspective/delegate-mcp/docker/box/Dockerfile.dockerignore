@@ -1,0 +1,24 @@
+# Build context for docker/box/Dockerfile is the repo root. BuildKit uses this file
+# (named after the Dockerfile) instead of the root .dockerignore.
+# Allowlist: only what `bun install` + packages/opencode/script/build.ts need.
+*
+!package.json
+!bun.lock
+!bunfig.toml
+!tsconfig.json
+!turbo.json
+!patches
+!packages
+!.github/TEAM_MEMBERS
+
+# Never ship host installs, build output or caches.
+**/node_modules
+**/dist
+**/.turbo
+**/.output
+**/.vite
+**/coverage
+**/.sst
+**/.wrangler
+# Untracked web-UI bundle a local --embed build leaves behind (we build --skip-embed-web-ui).
+packages/opencode/opencode-web-ui.gen.ts

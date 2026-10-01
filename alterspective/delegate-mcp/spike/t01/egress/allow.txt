@@ -1,0 +1,2 @@
+^identity\.alterspective\.com\.au$
+^synapse2-api\.alterspective\.com\.au$
