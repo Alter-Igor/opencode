@@ -1,0 +1,12 @@
+.git
+.sst
+.turbo
+.wrangler
+node_modules
+**/node_modules
+**/.output
+**/dist
+**/.turbo
+.handovers
+alterspective/delegate-mcp
+alterspective/sandbox-worker/runs
