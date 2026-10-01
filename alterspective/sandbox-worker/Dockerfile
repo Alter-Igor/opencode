@@ -25,6 +25,10 @@ RUN apt-get update \
   && mv "/tmp/gh_${GH_VERSION}_linux_amd64/bin/gh" /usr/local/bin/gh \
   && rm -rf /tmp/gh_* /var/lib/apt/lists/*
 
+# Real Node.js and npm. The bun base image ships a `node` shim that cannot run `node --test`;
+# in the first real run the agent spent 39 shell calls working out why (fork issue #47).
+# Copying the node image's /usr/local replaces that shim and leaves bun in place.
+COPY --from=node:22-bookworm-slim /usr/local /usr/local
 COPY --from=build /src/packages/opencode/dist/opencode-linux-x64/bin/opencode /usr/local/bin/opencode
 COPY alterspective/sandbox-worker/supervisor /opt/sbxw/supervisor
 COPY alterspective/sandbox-worker/plugins /opt/sbxw/plugins
@@ -34,7 +38,7 @@ COPY alterspective/sandbox-worker/plugins /opt/sbxw/plugins
 RUN useradd -m -u 10001 agent \
   && mkdir -p /data /work /run/sbxw \
   && chown agent:agent /data /work /run/sbxw \
-  && opencode --version
+  && opencode --version && node --version && npm --version && bun --version
 
 USER agent
 ENV XDG_DATA_HOME=/data \

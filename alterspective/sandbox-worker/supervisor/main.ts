@@ -28,20 +28,19 @@ const repoDir = "/work/repo"
 
 // One provider, one model, nothing else enabled. The model is fixed by the manifest, which
 // CAS derives from its policy decision; the agent cannot pick another provider.
+// The provider id is `synapse` so the fork's built-in Synapse plugin wraps every request: it
+// merges system messages into one leading message (on-prem backends reject any other shape,
+// "System message must be at the beginning.") and recovers text-form tool calls.
 const config = {
   $schema: "https://opencode.ai/config.json",
-  model: `sbxw/${manifest.model.id}`,
-  small_model: `sbxw/${manifest.model.id}`,
-  enabled_providers: ["sbxw"],
+  model: `synapse/${manifest.model.id}`,
+  small_model: `synapse/${manifest.model.id}`,
+  enabled_providers: ["synapse"],
   provider: {
-    sbxw: {
+    synapse: {
       npm: "@ai-sdk/openai-compatible",
       name: "Sandbox model route",
-      options: {
-        baseURL: manifest.model.baseURL,
-        apiKey: "{env:SBXW_MODEL_KEY}",
-        headers: manifest.model.headers ?? {},
-      },
+      options: { headers: manifest.model.headers ?? {} },
       models: { [manifest.model.id]: { name: manifest.model.id } },
     },
   },
@@ -83,9 +82,18 @@ const port = manifest.listen?.port ?? 4096
 const { SBXW_SERVER_PASSWORD: _drop, SBXW_MANIFEST: _manifest, ...env } = process.env
 console.log(`[sbxw] task ${manifest.taskId}: base ${baseSha || "(empty repo)"}, serving on ${hostname}:${port}`)
 
+// The Synapse plugin reads its base URL from SYNAPSE_BASE_URL and its key from stored auth;
+// OPENCODE_AUTH_CONTENT supplies that auth without writing a file. Spike only: Phase 2 points
+// SYNAPSE_BASE_URL at the gateway and the sandbox holds no key.
+const auth = process.env.SBXW_MODEL_KEY ? { synapse: { type: "api", key: process.env.SBXW_MODEL_KEY } } : {}
 const child = Bun.spawn(["opencode", "serve", "--hostname", hostname, "--port", String(port)], {
   cwd: repoDir,
-  env: { ...env, OPENCODE_SERVER_PASSWORD: password },
+  env: {
+    ...env,
+    OPENCODE_SERVER_PASSWORD: password,
+    SYNAPSE_BASE_URL: manifest.model.baseURL,
+    OPENCODE_AUTH_CONTENT: JSON.stringify(auth),
+  },
   stdio: ["ignore", "inherit", "inherit"],
 })
 for (const signal of ["SIGTERM", "SIGINT"] as const) process.on(signal, () => child.kill(signal))

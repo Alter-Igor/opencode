@@ -106,7 +106,8 @@ const probe = await client.session.shell(
   {
     sessionID: session.id,
     agent: "build",
-    command: 'test -z "$OPENCODE_SERVER_PASSWORD" && test -z "$SBXW_MODEL_KEY" && echo SCRUB_OK || echo SCRUB_FAIL',
+    command:
+      'test -z "$OPENCODE_SERVER_PASSWORD" && test -z "$SBXW_MODEL_KEY" && test -z "$OPENCODE_AUTH_CONTENT" && echo SCRUB_OK || echo SCRUB_FAIL',
   },
   { throwOnError: true },
 )

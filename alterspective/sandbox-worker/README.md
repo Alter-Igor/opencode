@@ -76,7 +76,10 @@ Containers are named `sbxw-<id>`, labelled `alterspective.sandbox-worker=spike`,
   CAS restart therefore cannot replay from `/api` on this path. It has to use `/event` plus the
   `/permission`, `/question` and message lists. Caveat: that run's model call failed straight away
   (dummy key), so recheck after a real model turn.
-- [ ] A real model run (needs a named spike key).
+- [x] A real model run (2026-10-01). Task: add `clamp` to `math.js` plus `node:test` tests, on a two-file
+  test repository, model `auto` through Synapse prod with a labelled `gpapp_` app credential. The
+  patch was checked by re-running the tests in the box (`node --test`: 2 pass, 0 fail), not taken
+  from the agent's report.
 - [ ] A run on the CAS #962 corpus, compared with the CAS agent loop.
 
 ## Findings so far
@@ -88,5 +91,19 @@ Containers are named `sbxw-<id>`, labelled `alterspective.sandbox-worker=spike`,
   `.git/info/exclude`. The same files will appear in any user's repository the fork runs in.
 - **First start is fast.** The server listened 1.3 s after the container started, and a plumbing run
   (session, shell probe, prompt, collection) took 10–12 s of wall time.
+- **A missing tool costs many turns.** The bun base image's `node` is a shim that cannot run
+  `node --test`. On the first real run the agent spent 39 shell calls finding that out. With real
+  Node 22 in the image, the same task took 8 turns instead of 42, 33 s instead of 173 s, and 67,572
+  input tokens instead of 509,418. The image now carries Node 22 and npm.
+- **The provider must be the fork's `synapse` provider.** With a plain OpenAI-compatible provider,
+  Synapse's on-prem backend rejected every request ("System message must be at the beginning."),
+  because OpenCode sends several system messages. The fork's Synapse plugin merges them
+  (`packages/opencode/src/plugin/synapse.ts:353-380`) but only wraps the provider id `synapse`.
+  The supervisor now uses that id, `SYNAPSE_BASE_URL`, and `OPENCODE_AUTH_CONTENT` for the key.
+- **OpenCode reports cost 0** for model `auto`, because it has no price for it. Spend has to come
+  from the gateway's ledger (Phase 2), not from OpenCode.
+- **Personal Keystone tokens do not work on Synapse yet.** A `ks_live_` token with `gpaas:inference`
+  gets 401 on prod and staging (Alterspective-Engine/Alterspective-Synapse#1365). The spike uses a
+  `gpapp_` app credential, which is Synapse's documented pattern for machine callers.
 - **Docker publishes only to loopback** (`127.0.0.1:<port>`), and the server rejects requests without
   the password (401).
