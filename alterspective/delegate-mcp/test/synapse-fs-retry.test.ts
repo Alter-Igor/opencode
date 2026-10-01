@@ -20,7 +20,7 @@ describe("renameWithRetry", () => {
       let calls = 0
       const waits: number[] = []
       const result = renameWithRetry("a", "b", async () => ((calls++, Promise.reject(fail(code))) as Promise<void>), async (ms) => void waits.push(ms))
-      expect(result).rejects.toThrow(code)
+      await expect(result).rejects.toThrow(code)
       await result.catch(() => {})
       expect(calls).toBe(RENAME_TRIES)
       expect(waits.reduce((a, b) => a + b, 0)).toBeLessThanOrEqual(200)

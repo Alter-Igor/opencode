@@ -35,7 +35,13 @@ export function refreshIfDue(deps: SynapseDeps, force = false): Promise<Refreshe
 async function refreshLocked(deps: SynapseDeps, force: boolean): Promise<Refreshed> {
   await savePending(deps)
   const state = await readState(deps.home)
-  if (!force && !isDue(state, deps.now(), deps.refreshFraction) && !(await includeLost(deps, state))) return expireIfPast(deps, state)
+  if (!force && !isDue(state, deps.now(), deps.refreshFraction) && !(await includeLost(deps, state))) {
+    const expired = await expireIfPast(deps, state)
+    if (expired.reload || !state?.lastReload || state.lastReload.result === "reloaded") return expired
+    // Publishing the token and loading it are separate steps. Retry a failed load every tick,
+    // without rotating again or waiting until the newly issued token's next renewal point.
+    return { ...expired, reload: await reloadFront(deps) }
+  }
   // N1: another bridge holds the rotated refresh token in memory; the stored one is stale. Wait for it.
   if (!force && pendingElsewhere(deps, state)) return { ...(await expireIfPast(deps, state)), error: "another bridge holds an unsaved refresh token" }
   const stored = await readRefreshToken(deps)
@@ -49,7 +55,7 @@ async function refreshLocked(deps: SynapseDeps, force: boolean): Promise<Refresh
   } catch (error) {
     const reason = isDelegateError(error) ? (error.detail ?? error.message) : "refresh failed"
     if (isDelegateError(error) && error.code === "needs_auth") return failClosed(deps, reason)
-    return retryLater(deps, state, reason)
+    return retryLater(deps, await readState(deps.home), reason)
   }
 }
 
@@ -66,7 +72,7 @@ async function readRefreshToken(deps: SynapseDeps): Promise<{ token: string | un
 /** A passing failure: back off, keep the state signed in, and empty the include only once expired. */
 async function retryLater(deps: SynapseDeps, state: TokenState | undefined, reason: string): Promise<Refreshed> {
   const failures = (state?.failures ?? 0) + 1
-  const next: TokenState = { obtainedAt: state?.obtainedAt ?? 0, expiresAt: state?.expiresAt ?? 0, ...(state?.user ? { user: state.user } : {}), ...(state?.actor ? { actor: state.actor } : {}), ...(state?.includeAt !== undefined ? { includeAt: state.includeAt } : {}), ...(state?.lastReload ? { lastReload: state.lastReload } : {}), lastError: reason.slice(0, 200), failures, retryAt: deps.now() + backoffMs(failures) }
+  const next: TokenState = { ...state, obtainedAt: state?.obtainedAt ?? 0, expiresAt: state?.expiresAt ?? 0, lastError: reason.slice(0, 200), failures, retryAt: deps.now() + backoffMs(failures) }
   await writeState(deps.home, next)
   safeLog(deps.log, "warn", "synapse", "synapse refresh failed; will retry", { reason: reason.slice(0, 200), failures })
   const expired = await expireIfPast(deps, next)

@@ -73,7 +73,7 @@ export type SynapseDeps = {
   frontContainer: string
   store: SecretStore
   /** A rotated refresh token the store could not save yet (this bridge only, never on disk unencrypted). */
-  memory: { pendingRefresh?: { token: string; obtainedAt: number }; id: string }
+  memory: { pendingRefresh?: { token: string; obtainedAt: number; unpublishedAt?: number }; id: string }
   secrets: () => Promise<AppSecrets>
   fetch: Fetch
   exec: Exec
@@ -136,20 +136,27 @@ async function notReloaded(deps: Pick<SynapseDeps, "exec" | "frontContainer">): 
 }
 
 /**
- * Take a fresh token set (call under the lock): access token to front and state first, so a store
- * failure can never throw the new tokens away (M1); then the refresh token to the store, or to
- * memory when the store fails (saved on a later tick).
+ * Keep the rotated refresh token before publishing the access token. Keystone has already
+ * consumed the old refresh token, so a failed include/state write must not lose its replacement.
+ * Until publication succeeds, an unsaved token belongs to the previous state and blocks peers.
  */
 export async function adopt(deps: SynapseDeps, tokens: TokenSet): Promise<Reload> {
+  const now = deps.now()
+  if (tokens.refreshToken) {
+    const previous = await readState(deps.home)
+    deps.memory.pendingRefresh = { token: tokens.refreshToken, obtainedAt: previous?.obtainedAt ?? now, unpublishedAt: now }
+    // A new owner sign-in also replaces a failed-closed state. Its new token is retryable.
+    await savePending(deps, { ...(previous ?? { obtainedAt: now, expiresAt: 0 }), needsSignIn: undefined })
+  }
   await writeAuthConf(deps.frontDir, tokens.accessToken)
   const claims = jwtClaims(tokens.accessToken) ?? {}
   const act = claims.act && typeof claims.act === "object" ? (claims.act as Record<string, unknown>).sub : undefined
   const user = typeof claims.email === "string" ? claims.email : typeof claims.sub === "string" ? claims.sub : undefined
-  const now = deps.now()
   const state: TokenState = { obtainedAt: now, expiresAt: now + tokens.expiresInSec * 1000, includeAt: now, ...(user ? { user } : {}), ...(typeof act === "string" ? { actor: act } : {}) }
   await writeState(deps.home, state)
-  if (tokens.refreshToken) {
-    deps.memory.pendingRefresh = { token: tokens.refreshToken, obtainedAt: now }
+  if (deps.memory.pendingRefresh) {
+    deps.memory.pendingRefresh.obtainedAt = now
+    delete deps.memory.pendingRefresh.unpublishedAt
     await savePending(deps)
   }
   return reloadFront(deps)
@@ -159,6 +166,9 @@ export async function adopt(deps: SynapseDeps, tokens: TokenSet): Promise<Reload
 export function currentPending(deps: SynapseDeps, state: TokenState | undefined): string | undefined {
   const pending = deps.memory.pendingRefresh
   if (pending === undefined) return undefined
+  // Publication may fail along with the secret store. A missing/repaired older state cannot
+  // discard the only rotated token. A later sign-in still supersedes this adoption.
+  if (pending.unpublishedAt !== undefined && (!state || state.obtainedAt <= pending.unpublishedAt)) return pending.token
   if (state === undefined || state.needsSignIn || state.obtainedAt !== pending.obtainedAt) {
     deps.memory.pendingRefresh = undefined
     safeLog(deps.log, "info", "synapse", "dropped an unsaved refresh token: a newer sign-in or refresh replaced it", {})
@@ -172,15 +182,16 @@ export const pendingElsewhere = (deps: SynapseDeps, state: TokenState | undefine
   state?.pendingBy !== undefined && state.pendingBy !== deps.memory.id && deps.now() - (state.pendingAt ?? 0) < PENDING_STALE_MS
 
 /** Save a refresh token held in memory (call under the lock); on failure keep it, mark the state, retry later. */
-export async function savePending(deps: SynapseDeps): Promise<void> {
-  const state = await readState(deps.home)
+export async function savePending(deps: SynapseDeps, initial?: TokenState): Promise<void> {
+  const unpublished = deps.memory.pendingRefresh?.unpublishedAt
+  const state = initial ?? await readState(deps.home) ?? (unpublished === undefined ? undefined : { obtainedAt: unpublished, expiresAt: 0 })
   const pending = currentPending(deps, state)
   if (pending === undefined || state === undefined) return
   const saved = await deps.store.write(pending).then(() => true, () => false)
   if (saved) {
-    deps.memory.pendingRefresh = undefined
     const { pendingBy: _by, pendingAt: _at, ...rest } = state
     await writeState(deps.home, { ...rest, ...(state.lastError?.startsWith("refresh token not saved") ? { lastError: undefined } : {}) })
+    deps.memory.pendingRefresh = undefined
     return
   }
   safeLog(deps.log, "warn", "synapse", "synapse refresh token not saved; kept in memory, will retry", { store: deps.store.kind })

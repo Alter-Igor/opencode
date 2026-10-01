@@ -1,6 +1,16 @@
-# FEAT-OCD-001 — Technical design (revision 5: chosen Keystone services after review round 4; revision 4: front proxy after round 3; revision 3 after round 2 and Wave 0 spikes)
+# FEAT-OCD-001 — Technical design (revision 6: confirmed front reloads and token recovery)
 
 No implementation code here — contracts, data shapes and behaviour only. Paths are relative to the repo root. Revision 2 changes are driven by `evidence/adversarial-review.md` (C1, C2, H1–H4, M1–M6).
+
+Revision 6, 2026-10-02: [PR #58 review](evidence/pr58-fresh-review.md), issues #59 and #60. Earlier revisions added chosen Keystone services (5), the front proxy (4), and Wave 0 corrections (3).
+
+### Synapse publication and loaded config
+
+The host keeps a rotated refresh token in the secret store or bridge memory before writing the access-token include. Failed filesystem reads remain retryable. Pending tokens survive failed state publication, but a later sign-in supersedes them. The existing home lock serializes these steps; the accepted clock-skew and bridge-exit residuals remain.
+
+`front-reload` copies `servers.conf` and the auth include into front-only storage, checks the copies, and gives nginx immutable paths. It tests the config, signals the master, then waits at most 20 seconds for a worker to return a unique attempt ID and the source hashes. A signal alone is not success. Timed-out copies remain available for a late reload; old copies are pruned after a new worker acknowledges. Failed loads are retried on the next bridge tick without rotating a fresh token again.
+
+Doctor reads the worker marker on front's loopback port 19091, checks the immutable files against those hashes, then compares the source config, auth shape, host include and allowed model routes. The listener returns no credential and is not published or reachable from the box. An unavailable marker fails verification. `nginx -T` and a file written by the reload caller do not prove what a worker loaded.
 
 ## 0. The key fact that shaped revision 2
 

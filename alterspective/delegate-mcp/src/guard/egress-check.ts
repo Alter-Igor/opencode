@@ -27,7 +27,7 @@ export type EgressCheck = {
   keystonePaths: string[]
   /** <home>/front/servers.conf and docker/front/hosts.txt equal what the hosts and the Keystone set generate. */
   frontConfigMatches: boolean
-  /** compose mounts the generated folder read-only into front, and nginx.conf includes the file from there. */
+  /** compose mounts the source folder read-only, and nginx.conf includes the checked runtime generation. */
   frontMountReadOnly: boolean
   /** front's network aliases on `sealed` are exactly the allowed hosts. */
   aliasesMatch: boolean
@@ -81,13 +81,13 @@ function frontMatches(dir: string, input: EgressInput, problems: string[]): bool
   return ok
 }
 
-/** front gets the generated folder read-only, at the path nginx.conf includes it from. */
+/** front gets generated sources read-only; nginx consumes front-reload's checked snapshots. */
 function frontMountReadOnly(dir: string, front: Service | undefined, problems: string[]): boolean {
   const volumes = Array.isArray(front?.volumes) ? front.volumes.map(String) : []
   const mounted = volumes.some((volume) => volume.endsWith(`:${FRONT_GENERATED_MOUNT}:ro`))
-  const included = (readText(dir, "front/nginx.conf", problems) ?? "").includes(`include ${FRONT_GENERATED_MOUNT}/${FRONT_SERVERS_NAME};`)
+  const included = (readText(dir, "front/nginx.conf", problems) ?? "").includes("include /tmp/front/current.conf;")
   if (!mounted) problems.push(`compose.yaml does not mount the generated front folder read-only at ${FRONT_GENERATED_MOUNT}`)
-  if (!included) problems.push(`front/nginx.conf does not include ${FRONT_GENERATED_MOUNT}/${FRONT_SERVERS_NAME}`)
+  if (!included) problems.push("front/nginx.conf does not include the checked /tmp/front/current.conf")
   return mounted && included
 }
 

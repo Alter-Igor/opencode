@@ -1,33 +1,21 @@
-// R5-05: what `front` is RUNNING, as oc_doctor sees it. The label and compose.yaml say what front
-// was started with; this reads what nginx actually parses now (`nginx -T` inside front) and the
-// live mount modes (`docker inspect`). If front was restarted after the bridge wrote another set's
-// servers.conf (restart: unless-stopped), the label would still match while the config does not.
+// R5-05: compare the immutable generation attested by a RUNNING worker, and live mount modes.
+// Labels and nginx -T only describe requested/on-disk config, not what the worker loaded.
 // Every check fails closed and names why. Output read here is from our own containers, but the
 // box's mounts are compared against a fixed list, never echoed beyond their destination.
 import { createHash } from "node:crypto"
-import { FRONT_GENERATED_MOUNT, FRONT_SERVERS_NAME } from "../guard/egress.ts"
+import { FRONT_GENERATED_MOUNT } from "../guard/egress.ts"
 import type { Exec } from "./docker.ts"
+import { readFrontGeneration } from "./front-generation.ts"
 
 export type Mount = { Destination?: unknown; RW?: unknown; Type?: unknown; Name?: unknown; Driver?: unknown }
 /** `docker volume inspect` Options per volume name; undefined when that inspect failed. */
 export type VolumeOptions = Record<string, Record<string, string> | null | undefined>
 export type FrontLive = { ok: boolean; loadedConfigMatches: boolean; mountReadOnly: boolean; boxMountsOk: boolean; problems: string[] }
 
-const SERVERS_HEADER = `# configuration file ${FRONT_GENERATED_MOUNT}/${FRONT_SERVERS_NAME}:\n`
-const NEXT_HEADER = "\n# configuration file "
 /** The box's mounts (docker/compose.yaml) and whether each may be written. Nothing else may appear. */
 const BOX_MOUNTS: Record<string, boolean> = { "/data": true, "/sessions": true, "/handoff/in": false, "/handoff/out": true, "/profile": false, "/etc/ocd-front-ca": false }
 
 const sha = (text: string) => createHash("sha256").update(text).digest("hex")
-
-/** The servers.conf text in an `nginx -T` dump (nginx prints each file, then one newline). */
-export function serversSection(dump: string): string | undefined {
-  const at = dump.indexOf(SERVERS_HEADER)
-  if (at === -1) return undefined
-  const start = at + SERVERS_HEADER.length
-  const next = dump.indexOf(NEXT_HEADER, start)
-  return next === -1 ? dump.slice(start).replace(/\n$/, "") : dump.slice(start, next)
-}
 
 function frontMountProblems(front: Mount[] | undefined): string[] {
   if (!front) return ["front's mounts could not be read from docker inspect"]
@@ -73,13 +61,12 @@ export function checkMounts(front: Mount[] | undefined, box: Mount[] | undefined
   return { mountReadOnly: frontProblems.length === 0, boxMountsOk: boxProblems.length === 0, problems: [...frontProblems, ...boxProblems] }
 }
 
-export type FrontLiveInput = { dump: string | undefined; expected: string; frontMounts: Mount[] | undefined; boxMounts: Mount[] | undefined; boxVolumes: VolumeOptions }
+export type FrontLiveInput = { loaded: string | undefined; expected: string; frontMounts: Mount[] | undefined; boxMounts: Mount[] | undefined; boxVolumes: VolumeOptions }
 
 export function frontLiveFrom(input: FrontLiveInput): FrontLive {
   const problems: string[] = []
-  const loaded = input.dump === undefined ? undefined : serversSection(input.dump)
-  if (input.dump === undefined) problems.push("`nginx -T` in front failed, so the loaded config is unknown")
-  else if (loaded === undefined) problems.push(`\`nginx -T\` in front does not include ${FRONT_GENERATED_MOUNT}/${FRONT_SERVERS_NAME}`)
+  const loaded = input.loaded
+  if (loaded === undefined) problems.push("front's running worker did not attest a readable, matching generation; the loaded config is unknown")
   const loadedConfigMatches = loaded !== undefined && loaded === input.expected
   if (loaded !== undefined && !loadedConfigMatches)
     problems.push(`front's loaded servers.conf (sha256 ${sha(loaded).slice(0, 12)}) is not the one generated for the chosen Keystone set (${sha(input.expected).slice(0, 12)}); restart the sandbox with oc_server_restart`)
@@ -116,8 +103,8 @@ async function volumeOptionsOf(exec: Exec, mounts: Mount[] | undefined): Promise
 /** Read front's loaded config and both containers' mounts, and compare with `expected` (the generated servers file). */
 export async function readFrontLive(exec: Exec, box: string, expected: string): Promise<FrontLive> {
   const front = `${box}-front`
-  const dumped = await exec(["docker", "exec", front, "nginx", "-T"], { timeoutMs: 20_000 })
+  const generation = await readFrontGeneration(exec, front)
   const boxMounts = await mountsOf(exec, box)
   const boxVolumes = await volumeOptionsOf(exec, boxMounts)
-  return frontLiveFrom({ dump: dumped.code === 0 ? dumped.stdout.replaceAll("\r\n", "\n") : undefined, expected, frontMounts: await mountsOf(exec, front), boxMounts, boxVolumes })
+  return frontLiveFrom({ loaded: generation?.servers, expected, frontMounts: await mountsOf(exec, front), boxMounts, boxVolumes })
 }

@@ -89,9 +89,8 @@ rm -f "$RUN/leaf.csr" "$RUN/openssl.err"
 
 actual=$(sha256sum /etc/nginx/front-gen/servers.conf | cut -d' ' -f1)
 [ "$actual" = "$OCD_FRONT_HASH" ] || { log "servers.conf does not match OCD_FRONT_HASH; refusing to start (restart the sandbox through the bridge)"; exit 1; }
-# 6. Review Low 4: the same checks the bridge's reloads go through (front-reload), including the
-#    strict shape of the Synapse include, before nginx ever reads it. It also records the checked
-#    include's sha256 in /tmp/front/loaded-auth.sha for oc_doctor (review N2).
+# 6. Snapshot and check the same files reloads use before nginx reads them. Startup prepares a
+#    generation, but never claims it is loaded: oc_doctor reads the running worker's loopback marker.
 /usr/local/bin/front-reload --start || { log "the generated files failed front-reload --start; refusing to start"; exit 1; }
 
 log "ready: $(echo $names) (CA $(openssl x509 -noout -fingerprint -sha256 -in "$PUB/ca.pem" | cut -d= -f2))"
