@@ -64,10 +64,10 @@ describe("front refuses to start with a servers file that is not the labelled on
 })
 
 describe("oc_doctor live checks", () => {
-  const CHOSEN = { "ks-rag-global": { status: "connected" }, "ks-github": { status: "connected" }, "ks-seqlogs": { status: "connected" } }
+  const CHOSEN = { "ks-rag-read": { status: "connected" }, "ks-github": { status: "connected" }, "ks-seqlogs": { status: "connected" } }
   const liveOk: LiveChecks = {
     ok: true,
-    signIns: { ok: true, names: ["ks-rag-global", "ks-github", "ks-seqlogs"], stale: [], unrecognised: 0, removedBefore: [] },
+    signIns: { ok: true, names: ["ks-rag-read", "ks-github", "ks-seqlogs"], stale: [], unrecognised: 0, removedBefore: [] },
     front: { ok: true, loadedConfigMatches: true, mountReadOnly: true, boxMountsOk: true, problems: [] },
     problems: [],
   }

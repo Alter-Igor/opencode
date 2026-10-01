@@ -205,7 +205,7 @@ function withCorrelation(logger: Logger, correlationId: string): Logger {
 
 async function signIn(api: OpencodeApi, entry: string, opts: LoginOptions, logger: Logger): Promise<"connected" | "failed"> {
   if (!KS_NAME.test(entry) || entry.length > MAX_ENTRY_LENGTH) {
-    throw new DelegateError("invalid_input", "Only ks-* entries can be signed in.", "Pass a ks-<id> server name (lower-case, for example ks-rag-global).")
+    throw new DelegateError("invalid_input", "Only ks-* entries can be signed in.", "Pass a ks-<id> server name (lower-case, for example ks-rag-read).")
   }
   const directory = opts.directory ?? "/sessions"
   const port = opts.port ?? LOGIN_PORT

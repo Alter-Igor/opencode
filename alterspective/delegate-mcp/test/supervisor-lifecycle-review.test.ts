@@ -52,7 +52,7 @@ describe("supervisor: round-2 review fixes", () => {
 
   test("reuse refuses a front started with another Keystone set's config (R4-01)", async () => {
     const box = await reusable()
-    const other = frontFilesFor({ ...defaultConfig({}), keystoneConnections: ["rag-global"] }).hash
+    const other = frontFilesFor({ ...defaultConfig({}), keystoneConnections: ["rag-read"] }).hash
     const front = { "opencode-delegate-front": inspectJson({ [L.image]: IMAGE, [L.front]: other }) }
     const error = await fail(supervisor(deps(fakeDocker(box, [], { containers: front }))).ensure())
     expect(error.code).toBe("profile_changed")

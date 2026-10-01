@@ -22,7 +22,7 @@ const send = (f: Fake, args: Partial<Parameters<typeof sendTool.run>[0]> = {}) =
 function ready(f: Fake, remote: Record<string, unknown> = {}) {
   ours(f)
   f.api.on(`GET /session/${SID}`, { status: 200, data: remoteSession(f, remote) })
-  f.api.on("GET /mcp", { status: 200, data: { "ks-rag-global": { status: "connected" } } })
+  f.api.on("GET /mcp", { status: 200, data: { "ks-rag-read": { status: "connected" } } })
   f.api.on(`POST /session/${SID}/prompt_async`, { status: 204 })
 }
 
@@ -56,7 +56,7 @@ describe("oc_send", () => {
   test("a non-Keystone MCP entry refuses the send with policy_violation and nothing is sent", async () => {
     const f = fakeContext()
     ready(f)
-    f.api.on("GET /mcp", { status: 200, data: { "ks-rag-global": { status: "connected" }, github: { status: "connected" } } })
+    f.api.on("GET /mcp", { status: 200, data: { "ks-rag-read": { status: "connected" }, github: { status: "connected" } } })
     const result = await send(f)
     expect(result.isError).toBe(true)
     expect(data(result).code).toBe("policy_violation")

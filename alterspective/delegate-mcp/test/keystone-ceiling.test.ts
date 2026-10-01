@@ -20,9 +20,9 @@ const keepOf = (call: Call | undefined) => JSON.parse(call?.argv.at(-2) ?? "null
 describe("owner ceiling (R5-03)", () => {
   test("read from the launch env; without it the ceiling is the default set", () => {
     expect(defaultConfig({}).keystoneAllowed).toBeUndefined()
-    expect(ceilingOf(defaultConfig({}))).toEqual(["rag-global", "github", "seqlogs"])
-    expect(ceilingOf(defaultConfig({ [CEILING_ENV]: "rag-global, m365 ,github" }))).toEqual(["rag-global", "m365", "github"])
-    expect(() => ceilingOf(defaultConfig({ [CEILING_ENV]: "rag-global,Bad" }))).toThrow(DelegateError)
+    expect(ceilingOf(defaultConfig({}))).toEqual(["rag-read", "github", "seqlogs"])
+    expect(ceilingOf(defaultConfig({ [CEILING_ENV]: "rag-read, m365 ,github" }))).toEqual(["rag-read", "m365", "github"])
+    expect(() => ceilingOf(defaultConfig({ [CEILING_ENV]: "rag-read,Bad" }))).toThrow(DelegateError)
   })
 
   test("ids outside the ceiling are policy_violation, and the message tells the owner what to do", () => {
@@ -53,14 +53,14 @@ describe("owner ceiling (R5-03)", () => {
     await writeOwner()
     const calls: Call[] = []
     const d = deps(fakeDocker({ running: false, labels: {}, env: [] }, calls))
-    const config = { ...d.config, keystoneAllowed: ["rag-global", "m365"] }
+    const config = { ...d.config, keystoneAllowed: ["rag-read", "m365"] }
     const result = await supervisor({ ...d, config }).replace({ force: false, keystone: ["m365"] })
     expect(result.keystone).toEqual(["m365"])
   })
 
   test("a saved set outside the ceiling fails closed (the box is never started with it)", async () => {
     await writeOwner()
-    writeFileSync(path.join(home, "keystone.json"), JSON.stringify({ connections: ["rag-global", "m365"] }))
+    writeFileSync(path.join(home, "keystone.json"), JSON.stringify({ connections: ["rag-read", "m365"] }))
     expect(() => currentKeystone(defaultConfig({ OPENCODE_DELEGATE_HOME: home }))).toThrow(DelegateError)
     const calls: Call[] = []
     const error = await fail(supervisor(deps(fakeDocker({ running: false, labels: {}, env: [] }, calls))).ensure())
@@ -76,20 +76,20 @@ describe("owner ceiling (R5-03)", () => {
 
 describe("high-risk ids (R5-04)", () => {
   test("prefix match on the known list", () => {
-    expect(highRiskIds(["rag-global", "github", "seqlogs"])).toEqual([])
+    expect(highRiskIds(["rag-read", "github", "seqlogs"])).toEqual([])
     expect(highRiskIds(["cas", "vault-global", "keystone-admin-global", "m365", "monday-prod", "hubspot-mcp-prod", "stripe", "xero", "sharedo-mb-uat", "github"])).toEqual(["cas", "vault-global", "keystone-admin-global", "m365", "monday-prod", "hubspot-mcp-prod", "stripe", "xero", "sharedo-mb-uat"])
   })
 
   test("the Keystone report shows the ceiling and warns for high-risk ids in the ceiling or the set", () => {
     const plain = keystoneReport(defaultConfig({ OPENCODE_DELEGATE_HOME: home }))
-    expect(plain).toMatchObject({ ceiling: ["rag-global", "github", "seqlogs"], highRisk: [] })
-    const wide = keystoneReport({ ...defaultConfig({ OPENCODE_DELEGATE_HOME: home }), keystoneAllowed: ["rag-global", "cas", "vault-global"] })
+    expect(plain).toMatchObject({ ceiling: ["rag-read", "github", "seqlogs"], highRisk: [] })
+    const wide = keystoneReport({ ...defaultConfig({ OPENCODE_DELEGATE_HOME: home }), keystoneAllowed: ["rag-read", "cas", "vault-global"] })
     expect(wide).toMatchObject({ highRisk: ["cas", "vault-global"], warnings: [expect.stringContaining("cas")] })
   })
 })
 
 describe("stored sign-ins outside the set are removed (R5-01)", () => {
-  const pruneReply = (removed: unknown[] = []) => ({ code: 0, stdout: JSON.stringify({ names: ["ks-rag-global"], removed }), stderr: "" })
+  const pruneReply = (removed: unknown[] = []) => ({ code: 0, stdout: JSON.stringify({ names: ["ks-rag-read"], removed }), stderr: "" })
 
   test("a start prunes with keep = the chosen entries, records names only, and logs no token", async () => {
     await writeOwner()
@@ -100,7 +100,7 @@ describe("stored sign-ins outside the set are removed (R5-01)", () => {
     await supervisor({ ...deps(exec), log }).ensure()
     const prune = calls.filter(isExec).find((c) => c.argv.includes("prune"))
     expect(prune?.argv.slice(0, 3)).toEqual(["docker", "exec", "opencode-delegate"])
-    expect(keepOf(prune)).toEqual(["ks-rag-global", "ks-github", "ks-seqlogs"])
+    expect(keepOf(prune)).toEqual(["ks-rag-read", "ks-github", "ks-seqlogs"])
     const record = JSON.parse(readFileSync(path.join(home, "auth-pruned.json"), "utf8")) as { removed: Array<{ name: string }> }
     expect(record.removed.map((r) => r.name)).toEqual(["ks-delegate"])
     const line = log.lines.find((l) => l.msg.includes("removed stored sign-ins"))
