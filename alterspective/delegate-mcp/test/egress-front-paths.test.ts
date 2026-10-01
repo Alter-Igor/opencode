@@ -12,7 +12,7 @@ import { frontServers } from "../src/guard/egress.ts"
 
 const HOSTS = ["identity.alterspective.com.au", "synapse2-api.alterspective.com.au"]
 const IDENTITY = "identity.alterspective.com.au"
-const CHOSEN = ["rag-global", "github", "seqlogs"]
+const CHOSEN = ["rag-read", "github", "seqlogs"]
 const conf = frontServers(HOSTS, { host: IDENTITY, connections: CHOSEN })
 
 /** The body of the `server { ... }` block named `host`. */
@@ -96,8 +96,8 @@ describe("generated identity server (R4-01)", () => {
       "/.well-known/openid-configuration": "GET",
       "/api/oauth/register": "POST",
       "/api/oidc/token": "POST",
-      "/.well-known/oauth-protected-resource/mcp/c/rag-global": "GET",
-      "/mcp/c/rag-global": "GET POST DELETE",
+      "/.well-known/oauth-protected-resource/mcp/c/rag-read": "GET",
+      "/mcp/c/rag-read": "GET POST DELETE",
       "/.well-known/oauth-protected-resource/mcp/c/github": "GET",
       "/mcp/c/github": "GET POST DELETE",
       "/.well-known/oauth-protected-resource/mcp/c/seqlogs": "GET",
@@ -109,10 +109,11 @@ describe("generated identity server (R4-01)", () => {
     expect(identity).not.toContain("location = /api/mcp")
   })
 
-  test("the model gateway server is unchanged (whole host, raw URI)", () => {
+  test("the model gateway server: 403 by default, exact model routes only (WS2 #48, review H1)", () => {
     const synapse = locations(serverBody(conf, "synapse2-api.alterspective.com.au"))
-    expect(synapse.map((l) => [l.exact, l.match])).toEqual([[false, "/"]])
-    expect(synapse[0]!.body).toContain("proxy_pass https://$front_upstream;")
+    expect(synapse.map((l) => [l.exact, l.match])).toEqual([[false, "/"], [true, "/v1/chat/completions"], [true, "/v1/models"]])
+    expect(synapse[0]!.body.trim()).toBe("return 403;")
+    expect(synapse[1]!.body).toContain("proxy_pass https://$front_upstream/v1/chat/completions;")
   })
 
   test("no connections: only the OAuth paths, every /mcp/c/* refused", () => {
@@ -129,10 +130,10 @@ describe("generated identity server (R4-01)", () => {
 
 describe("routing through the identity server (nginx URI semantics)", () => {
   test("allowed calls are forwarded with exactly their own path", () => {
-    expect(route("POST", "/mcp/c/rag-global")).toEqual({ status: 0, upstream: "/mcp/c/rag-global" })
+    expect(route("POST", "/mcp/c/rag-read")).toEqual({ status: 0, upstream: "/mcp/c/rag-read" })
     expect(route("GET", "/mcp/c/github")).toEqual({ status: 0, upstream: "/mcp/c/github" })
     expect(route("DELETE", "/mcp/c/seqlogs")).toEqual({ status: 0, upstream: "/mcp/c/seqlogs" })
-    expect(route("GET", "/.well-known/oauth-protected-resource/mcp/c/rag-global")).toEqual({ status: 0, upstream: "/.well-known/oauth-protected-resource/mcp/c/rag-global" })
+    expect(route("GET", "/.well-known/oauth-protected-resource/mcp/c/rag-read")).toEqual({ status: 0, upstream: "/.well-known/oauth-protected-resource/mcp/c/rag-read" })
     expect(route("GET", "/.well-known/oauth-authorization-server")).toEqual({ status: 0, upstream: "/.well-known/oauth-authorization-server" })
     expect(route("POST", "/api/oauth/register")).toEqual({ status: 0, upstream: "/api/oauth/register" })
     expect(route("POST", "/api/oidc/token")).toEqual({ status: 0, upstream: "/api/oidc/token" })

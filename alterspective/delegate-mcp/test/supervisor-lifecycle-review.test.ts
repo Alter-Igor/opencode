@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { defaultConfig, mcpAllowPolicy } from "../src/shared/config.ts"
@@ -7,7 +7,7 @@ import { DelegateError } from "../src/shared/errors.ts"
 import type { Level, Logger } from "../src/shared/log.ts"
 import type { Exec, ExecOptions, ExecResult } from "../src/supervisor/docker.ts"
 import { nodeLeaseFs, type LeaseFs } from "../src/supervisor/leases.ts"
-import { boxEnvOverride, composeEnv, createSupervisor, handoffOutMode, type DelegateSupervisor, type SupervisorDeps } from "../src/supervisor/lifecycle.ts"
+import { boxEnvOverride, composeEnv, createSupervisor, type DelegateSupervisor, type SupervisorDeps } from "../src/supervisor/lifecycle.ts"
 import type { ProcessProbe } from "../src/supervisor/process.ts"
 import { frontFilesFor } from "../src/supervisor/plan.ts"
 import { buildProfile, nodeProfileFs } from "../src/supervisor/profile.ts"
@@ -52,7 +52,7 @@ describe("supervisor: round-2 review fixes", () => {
 
   test("reuse refuses a front started with another Keystone set's config (R4-01)", async () => {
     const box = await reusable()
-    const other = frontFilesFor({ ...defaultConfig({}), keystoneConnections: ["rag-global"] }).hash
+    const other = frontFilesFor({ ...defaultConfig({}), keystoneConnections: ["rag-read"] }).hash
     const front = { "opencode-delegate-front": inspectJson({ [L.image]: IMAGE, [L.front]: other }) }
     const error = await fail(supervisor(deps(fakeDocker(box, [], { containers: front }))).ensure())
     expect(error.code).toBe("profile_changed")
@@ -119,10 +119,40 @@ describe("supervisor: round-2 review fixes", () => {
     expect((await fail(broken.ensure())).code).toBe("sandbox_unavailable")
   })
 
-  test("handoff/out is opened for uid 10001 only on non-Windows hosts (N-12)", () => {
-    expect(handoffOutMode("win32")).toBeUndefined()
-    expect(handoffOutMode("linux")).toBe(0o777)
-    expect(handoffOutMode("darwin")).toBe(0o777)
+  test("G-7: start makes the read-only handoff/in source but no host handoff/out folder", async () => {
+    const sup = supervisor(deps(fakeDocker({ running: false, labels: {}, env: [] }, [])))
+    await sup.ensure()
+    expect(await readdir(path.join(home, "handoff"))).toEqual(["in"])
+  })
+
+  test("L6: start removes an empty legacy handoff/out with rmdir, and leaves a non-empty one (logged)", async () => {
+    await mkdir(path.join(home, "handoff", "out"), { recursive: true })
+    await supervisor(deps(fakeDocker({ running: false, labels: {}, env: [] }, []))).ensure()
+    expect(await readdir(path.join(home, "handoff"))).toEqual(["in"])
+    await supervisor(deps(fakeDocker({ running: true, labels: {}, env: [] }, []))).release().catch(() => undefined)
+    await mkdir(path.join(home, "handoff", "out"), { recursive: true })
+    await writeFile(path.join(home, "handoff", "out", "keep.txt"), "x")
+    const log = recorder()
+    await supervisor(deps(fakeDocker({ running: false, labels: {}, env: [] }, []), { log })).ensure()
+    expect(await readdir(path.join(home, "handoff", "out"))).toEqual(["keep.txt"])
+    expect(log.lines.find((l) => l.msg === "left the legacy handoff/out folder in place")?.fields.code).toBe("ENOTEMPTY")
+  })
+
+  test("L5/N1: every start and every reuse sweeps only old leftover bundles, with no shell", async () => {
+    const isSweep = (c: Call) => c.argv[1] === "exec" && c.argv[3] === "find"
+    const started: Call[] = []
+    const box = { running: false, labels: {}, env: [] as string[] }
+    await supervisor(deps(fakeDocker(box, started))).ensure()
+    expect(started.filter(isSweep).map((c) => c.argv)).toEqual([["docker", "exec", "opencode-delegate", "find", "/handoff/out", "-maxdepth", "1", "-type", "f", "-name", "*-out.bundle", "-mmin", "+30", "-delete"]])
+    const reused: Call[] = []
+    await supervisor(deps(fakeDocker(box, reused))).ensure()
+    expect(reused.some((c) => c.argv.includes("up"))).toBe(false)
+    expect(reused.filter(isSweep)).toHaveLength(1)
+    // A failed sweep is logged, never fatal.
+    const log = recorder()
+    const failing = fakeDocker(box, [], { exec: (argv) => (argv[3] === "find" ? { code: 1, stdout: "", stderr: "boom" } : { code: 0, stdout: JSON.stringify({ names: [], removed: [] }), stderr: "" }) })
+    expect((await supervisor(deps(failing, { log })).ensure()).baseUrl).toContain("127.0.0.1")
+    expect(log.lines.some((l) => l.msg === "could not sweep leftover session bundles from the box")).toBe(true)
   })
 })
 

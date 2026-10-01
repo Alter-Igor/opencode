@@ -16,7 +16,7 @@ const SECRET_ACCESS = "access-SECRET-a1b2c3"
 const SECRET_REFRESH = "refresh-SECRET-d4e5f6"
 const entry = (url: string, clientId = "dcr-0000aaaa") => ({ tokens: { accessToken: SECRET_ACCESS, refreshToken: SECRET_REFRESH, expiresAt: 1 }, clientInfo: { clientId }, serverUrl: url })
 const STORE = {
-  "ks-rag-global": entry("https://identity.alterspective.com.au/mcp/c/rag-global"),
+  "ks-rag-read": entry("https://identity.alterspective.com.au/mcp/c/rag-read"),
   "ks-github": entry("https://identity.alterspective.com.au/mcp/c/github"),
   "ks-delegate": entry("https://identity.alterspective.com.au/mcp/dynamic", "dcr-0226f1c0"),
   "ks-test-stale": { serverUrl: "https://identity.alterspective.com.au/mcp/c/test-stale" },
@@ -43,17 +43,17 @@ function run(dir: string, mode: "list" | "prune", file: string, keep: string[] =
 describe("in-box auth store script (R5-01)", () => {
   test("prune keeps only the chosen ks-<id> entries, reports the others by name, and never prints a token", () => {
     const { dir, file } = home(STORE)
-    const out = run(dir, "prune", file, ["ks-rag-global", "ks-github"])
+    const out = run(dir, "prune", file, ["ks-rag-read", "ks-github"])
     expect(out.code).toBe(0)
     expect(out.stdout).not.toContain("SECRET")
     const result = parseAuthResult(out.stdout)
-    expect(result.names).toEqual(["ks-rag-global", "ks-github"])
+    expect(result.names).toEqual(["ks-rag-read", "ks-github"])
     expect(result.removed).toEqual([
       { name: "ks-delegate", clientId: "dcr-0226f1c0", server: "/mcp/dynamic", hadRefresh: true },
       { name: "ks-test-stale", server: "/mcp/c/test-stale", hadRefresh: false },
     ])
     const after = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>
-    expect(Object.keys(after)).toEqual(["ks-rag-global", "ks-github"])
+    expect(Object.keys(after)).toEqual(["ks-rag-read", "ks-github"])
     expect(after["ks-github"]).toEqual(STORE["ks-github"])
     if (process.platform !== "win32") expect(statSync(file).mode & 0o777).toBe(0o600)
     // No temp file or lock left behind.

@@ -1,6 +1,9 @@
 // Runs INSIDE a sealed probe container (docker/front/live/probe.yaml): node:22-slim and the real
-// box image (R4-04). Prints one JSON object. Argument: the `sealed` network's gateway address.
-// Every request is a public, read-only GET or a bare TCP connect. No credentials are ever sent.
+// box image (R4-04). Prints one JSON object. Arguments: the `sealed` network's gateway address, and
+// the one Keystone connection id the live front was generated for besides github and seqlogs
+// (test/egress-live.test.ts passes it explicitly, so the probes never drift from the default set).
+// Every request is a public, read-only GET, an unauthenticated POST or a bare TCP connect. No real
+// credential is ever sent: the one Authorization header below is a made-up JWT-shaped string.
 import dns from "node:dns/promises"
 import { readFileSync } from "node:fs"
 import https from "node:https"
@@ -14,6 +17,10 @@ const IDENTITY = "identity.alterspective.com.au"
 const SYNAPSE = "synapse2-api.alterspective.com.au"
 const T = 20_000
 const GATEWAY = process.argv[2] ?? ""
+/** The chosen RAG connection in the live front (review M2 of 90434eaaf5: explicit, not the default). */
+const CONN = process.argv[3] ?? "rag-read"
+/** A made-up bearer the box might send itself; front must drop it (WS2 #48). Never a real token. */
+const BOX_BEARER = "Bearer aaaaaaaaaaaa.bbbbbbbbbbbb.cccccccccccc"
 /** Cloudflare's public DNS over IPv6: a public v6 address that answers on 443 when reachable. */
 const PUBLIC_V6 = "2606:4700:4700::1111"
 /** The Docker host side of `sealed` (R4-04): SSH, DNS, HTTP(S) and the Docker API ports. */
@@ -61,14 +68,20 @@ function rawTls({ connectTo, sni, payload, verify = true }) {
  * refusal that never reached Keystone).
  */
 function keystoneRequest(method, target) {
+  return rawRequest(IDENTITY, method, target)
+}
+
+/** The same raw request to any front host, with extra header lines; the body's first 300 characters too. */
+function rawRequest(host, method, target, extra = []) {
   return new Promise((resolve) => {
-    const socket = tls.connect({ host: IDENTITY, port: 443, servername: IDENTITY, ca: CA, timeout: T })
+    const socket = tls.connect({ host, port: 443, servername: host, ca: CA, timeout: T })
     const body = method === "POST" ? "{}" : ""
     const head = [
       `${method} ${target} HTTP/1.1`,
-      `Host: ${IDENTITY}`,
+      `Host: ${host}`,
       "Accept: application/json, text/event-stream",
       ...(body ? ["Content-Type: application/json", `Content-Length: ${body.length}`] : []),
+      ...extra,
       "Connection: close",
     ]
     let buffer = ""
@@ -77,7 +90,7 @@ function keystoneRequest(method, target) {
     const parse = () => {
       const statusLine = buffer.slice(0, buffer.indexOf("\r\n"))
       const page = buffer.slice(buffer.indexOf("\r\n\r\n") + 4)
-      return { status: Number(statusLine.split(" ")[1]), front: page.includes("<center>nginx</center>") }
+      return { status: Number(statusLine.split(" ")[1]), front: page.includes("<center>nginx</center>"), body: page.slice(0, 300) }
     }
     socket.on("secureConnect", () => socket.write(`${head.join("\r\n")}\r\n\r\n${body}`))
     socket.on("data", (chunk) => {
@@ -90,34 +103,36 @@ function keystoneRequest(method, target) {
   })
 }
 
-/** R4-01 path probes: [name, method, request-target]. Chosen connection in the live front: rag-global. */
+/** R4-01 path probes: [name, method, request-target]. Chosen connection in the live front: CONN. */
 const KEYSTONE_PATHS = [
   // Allowed (Keystone answers; no credentials, so the MCP endpoint says 401).
   ["discovery", "GET", "/.well-known/oauth-authorization-server"],
-  ["resourceMetadata", "GET", "/.well-known/oauth-protected-resource/mcp/c/rag-global"],
-  ["mcpNoAuth", "POST", "/mcp/c/rag-global"],
+  ["resourceMetadata", "GET", `/.well-known/oauth-protected-resource/mcp/c/${CONN}`],
+  ["mcpNoAuth", "POST", `/mcp/c/${CONN}`],
   // Spellings nginx normalises INTO the allowed path: forwarded as the literal allowed path.
-  ["encodedAllowed", "POST", "/mcp/c/r%61g-global"],
-  ["dotsIntoAllowed", "POST", "/mcp/dynamic/../c/rag-global"],
+  ["encodedAllowed", "POST", `/mcp/c/%${CONN.charCodeAt(0).toString(16)}${CONN.slice(1)}`],
+  ["dotsIntoAllowed", "POST", `/mcp/dynamic/../c/${CONN}`],
   // Refused by front (403, never forwarded) or rejected by nginx itself (400).
   ["dynamicPost", "POST", "/mcp/dynamic"],
   ["dynamicGet", "GET", "/mcp/dynamic"],
   ["adminMcp", "POST", "/api/mcp"],
   ["otherConnection", "POST", "/mcp/c/m365"],
   ["dynamicMetadata", "GET", "/.well-known/oauth-protected-resource/mcp/dynamic"],
-  ["traversal", "POST", "/mcp/c/rag-global/../../dynamic"],
-  ["encodedSlashTraversal", "POST", "/mcp/c/rag-global%2F..%2F..%2Fdynamic"],
+  ["traversal", "POST", `/mcp/c/${CONN}/../../dynamic`],
+  ["encodedSlashTraversal", "POST", `/mcp/c/${CONN}%2F..%2F..%2Fdynamic`],
   ["encodedDots", "POST", "/mcp/c/%2e%2e/dynamic"],
   ["encodedDynamic", "POST", "/mcp/%64ynamic"],
   ["doubleSlashes", "POST", "//mcp//dynamic"],
   ["upperCase", "POST", "/MCP/DYNAMIC"],
-  ["semicolon", "POST", "/mcp/c/rag-global;/../../dynamic"],
-  ["queryString", "POST", "/mcp/c/rag-global?x=1"],
-  ["trailingSlash", "POST", "/mcp/c/rag-global/"],
+  ["semicolon", "POST", `/mcp/c/${CONN};/../../dynamic`],
+  ["queryString", "POST", `/mcp/c/${CONN}?x=1`],
+  ["trailingSlash", "POST", `/mcp/c/${CONN}/`],
+  // Not chosen in the live front: the read-write RAG connection.
+  ["ragGlobal", "POST", "/mcp/c/rag-global"],
   ["tokenWrongMethod", "GET", "/api/oidc/token"],
   ["authorize", "GET", "/api/oauth/authorize"],
   ["otherApi", "GET", "/api/users/me"],
-  ["nul", "POST", "/mcp/c/rag-global%00"],
+  ["nul", "POST", `/mcp/c/${CONN}%00`],
   ["absoluteForm", "POST", `https://${IDENTITY}/mcp/dynamic`],
 ]
 
@@ -217,6 +232,15 @@ const result = {
   gateway: { ip: GATEWAY, ports: await gatewayPorts() },
   // (h) R4-01: on Keystone, only the chosen connections' paths (and the OAuth paths) pass front.
   keystonePaths: await keystonePaths(),
+  // (j) WS2 #48, review M2: Synapse from inside the sealed network. The live front's include is the
+  // empty one (no owner token), so a model route reaches Synapse with no credential: 401 from Synapse.
+  synapse: {
+    usageMe: await rawRequest(SYNAPSE, "GET", "/v1/usage/me"),
+    modelsNoToken: await rawRequest(SYNAPSE, "GET", "/v1/models"),
+    chatNoToken: await rawRequest(SYNAPSE, "POST", "/v1/chat/completions"),
+    // A box-supplied Authorization and x-api-key are dropped by front: same 401 as with none.
+    chatBoxHeaders: await rawRequest(SYNAPSE, "POST", "/v1/chat/completions", [`Authorization: ${BOX_BEARER}`, "x-api-key: box-supplied-key"]),
+  },
   // (g) IPv6: no address, no route, and no AAAA answer that could go round front.
   ipv6: {
     addresses: globalV6(),

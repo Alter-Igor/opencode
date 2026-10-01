@@ -17,6 +17,7 @@ import { bunExec } from "./supervisor/docker.ts"
 import { createSupervisor, defaultSupervisorDeps, type DelegateSupervisor, type ReplaceOptions } from "./supervisor/lifecycle.ts"
 import { login } from "./supervisor/login.ts"
 import { createWorkspaces } from "./supervisor/workspaces.ts"
+import { createSynapseAuth, type SynapseAuth } from "./synapse/index.ts"
 import { cleanEnv, runCommand } from "./supervisor/workspaces-exec.ts"
 import type { Box, CommandRunner, RestartedBox, SessionRecord, ToolContext } from "./tools/context.ts"
 
@@ -198,7 +199,7 @@ function lazySupervisor(make: () => Promise<DelegateSupervisor>): DelegateSuperv
   }
 }
 
-export type Runtime = { ctx: ToolContext; versionInfo: VersionInfo; name: string; shutdown(reason: string): Promise<void> }
+export type Runtime = { ctx: ToolContext; versionInfo: VersionInfo; name: string; synapse?: Pick<SynapseAuth, "start">; shutdown(reason: string): Promise<void> }
 
 export type RuntimeOptions = { env?: NodeJS.ProcessEnv; config?: BridgeConfig; log?: Logger; version?: VersionInfo }
 
@@ -235,6 +236,7 @@ export async function createRuntime(options: RuntimeOptions = {}): Promise<Runti
   const manager = createBoxManager({ supervisor: supervisorService, sessions, log })
   const inboxTarget = cachedTarget(() => inboxTargetFromDocker(bunExec, config))
   const container = containerName(config)
+  const synapse = createSynapseAuth(config, env, log)
   const ctx: ToolContext = {
     config,
     supervisor: `supervisor:${name}`,
@@ -256,10 +258,11 @@ export async function createRuntime(options: RuntimeOptions = {}): Promise<Runti
     boxExec: (argv, timeoutMs) => runCommand(["docker", "exec", container, ...argv], cleanEnv(), timeoutMs ?? 60_000),
     hostExec: (argv, timeoutMs) => hostRunner(argv, timeoutMs ?? 60_000),
     sessions,
+    synapse,
     correlationId: () => randomUUID(),
   }
   log.log("info", "runtime", "bridge created", { bridge: name, bridgeId, version: versionInfo.version, roots: config.roots.length })
-  return { ctx, versionInfo, name, shutdown: shutdownOnce(manager, supervisorService, log) }
+  return { ctx, versionInfo, name, synapse, shutdown: shutdownOnce(manager, supervisorService, log) }
 }
 
 /**

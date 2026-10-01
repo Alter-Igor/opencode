@@ -24,12 +24,12 @@ describe("permissionBaseline narrowing", () => {
   })
 
   test("standard: only the named connections' tools stay allowed; the others are denied, MCP resource reads too", () => {
-    const rules = permissionBaseline("standard", ["rag-global"])
-    expect(decide(rules, "ks-rag-global_search")).toBe("allow")
+    const rules = permissionBaseline("standard", ["rag-read"])
+    expect(decide(rules, "ks-rag-read_search")).toBe("allow")
     expect(decide(rules, "ks-github_create_issue")).toBe("deny")
     expect(decide(rules, "ks-seqlogs_query")).toBe("deny")
     expect(decide(rules, "read", "mcp:ks-github:repo://x")).toBe("deny")
-    expect(decide(rules, "read", "mcp:ks-rag-global:doc://x")).toBe("allow")
+    expect(decide(rules, "read", "mcp:ks-rag-read:doc://x")).toBe("allow")
     // Other permissions are not touched.
     expect(decide(rules, "edit")).toBe("allow")
     expect(decide(rules, "read", "/sessions/s-1/README.md")).toBe("allow")
@@ -44,12 +44,12 @@ describe("permissionBaseline narrowing", () => {
   test("readonly keeps asking for the named connections and denies the rest", () => {
     const rules = permissionBaseline("readonly", ["github"])
     expect(decide(rules, "ks-github_create_issue")).toBe("ask")
-    expect(decide(rules, "ks-rag-global_search")).toBe("deny")
+    expect(decide(rules, "ks-rag-read_search")).toBe("deny")
   })
 
   test("an empty list denies every Keystone tool", () => {
     const rules = permissionBaseline("standard", [])
-    expect(decide(rules, "ks-rag-global_search")).toBe("deny")
+    expect(decide(rules, "ks-rag-read_search")).toBe("deny")
   })
 
   test("invalid ids are refused", () => {
@@ -63,21 +63,21 @@ describe("oc_start_session {keystone}", () => {
   test("sends the narrowed rules, records the list on the host, and reports it", async () => {
     const f = fakeContext()
     canCreate(f)
-    const result = await invoke(startSessionTool, { directory: "C:\\GitHub\\demo", keystone: ["rag-global"] }, f.ctx)
+    const result = await invoke(startSessionTool, { directory: "C:\\GitHub\\demo", keystone: ["rag-read"] }, f.ctx)
     expect(result.isError).toBeUndefined()
     const create = f.api.find("POST", "/session")?.body as { permission: unknown }
     // The guard's baseline: the narrowing, then the tool deny list last (R5-02).
-    expect(create.permission).toEqual(f.ctx.guard.permissionBaseline("standard", ["rag-global"]))
+    expect(create.permission).toEqual(f.ctx.guard.permissionBaseline("standard", ["rag-read"]))
     const key = f.opened[0]?.[1] ?? ""
-    expect(f.states.get(key)).toMatchObject({ sessionID: SID, keystone: ["rag-global"] })
-    expect(f.ctx.sessions.get(SID)).toMatchObject({ keystone: ["rag-global"] })
-    expect(data(result)).toMatchObject({ keystone: ["rag-global"] })
+    expect(f.states.get(key)).toMatchObject({ sessionID: SID, keystone: ["rag-read"] })
+    expect(f.ctx.sessions.get(SID)).toMatchObject({ keystone: ["rag-read"] })
+    expect(data(result)).toMatchObject({ keystone: ["rag-read"] })
   })
 
   test("refuses a connection that is not in the box-wide set, before anything is opened", async () => {
     const f = fakeContext()
     canCreate(f)
-    const result = await invoke(startSessionTool, { directory: "C:\\GitHub\\demo", keystone: ["rag-global", "m365"] }, f.ctx)
+    const result = await invoke(startSessionTool, { directory: "C:\\GitHub\\demo", keystone: ["rag-read", "m365"] }, f.ctx)
     expect(data(result)).toMatchObject({ code: "invalid_input" })
     expect(String(data(result).message)).toContain("m365")
     expect(f.opened).toEqual([])
@@ -88,7 +88,7 @@ describe("oc_start_session {keystone}", () => {
     f.ctx.config.home = mkdtempSync(path.join(os.tmpdir(), "ocd-session-ks-"))
     saveKeystoneSet(f.ctx.config.home, ["seqlogs"])
     canCreate(f)
-    expect(data(await invoke(startSessionTool, { directory: "C:\\GitHub\\demo", keystone: ["rag-global"] }, f.ctx))).toMatchObject({ code: "invalid_input" })
+    expect(data(await invoke(startSessionTool, { directory: "C:\\GitHub\\demo", keystone: ["rag-read"] }, f.ctx))).toMatchObject({ code: "invalid_input" })
     expect((await invoke(startSessionTool, { directory: "C:\\GitHub\\demo", keystone: ["seqlogs"] }, f.ctx)).isError).toBeUndefined()
   })
 
@@ -103,22 +103,22 @@ describe("oc_start_session {keystone}", () => {
 
 describe("oc_send on a narrowed session", () => {
   function ready(f: Fake, permission: unknown) {
-    ours(f, { keystone: ["rag-global"] })
+    ours(f, { keystone: ["rag-read"] })
     f.api.on(`GET /session/${SID}`, { status: 200, data: remoteSession(f, { permission }) })
-    f.api.on("GET /mcp", { status: 200, data: { "ks-rag-global": { status: "connected" } } })
+    f.api.on("GET /mcp", { status: 200, data: { "ks-rag-read": { status: "connected" } } })
     f.api.on(`POST /session/${SID}/prompt_async`, { status: 204 })
   }
 
   test("accepted while the session has exactly its narrowed rules", async () => {
     const f = fakeContext()
-    ready(f, f.ctx.guard.permissionBaseline("standard", ["rag-global"]))
+    ready(f, f.ctx.guard.permissionBaseline("standard", ["rag-read"]))
     const result = await invoke(sendTool, { sessionID: SID, message: "go" }, f.ctx)
     expect(result.isError).toBeUndefined()
   })
 
   test("refused when the tool deny list was dropped from the session's rules (R5-02, policy_violation)", async () => {
     const f = fakeContext()
-    ready(f, permissionBaseline("standard", ["rag-global"]))
+    ready(f, permissionBaseline("standard", ["rag-read"]))
     const result = await invoke(sendTool, { sessionID: SID, message: "go" }, f.ctx)
     expect(data(result)).toMatchObject({ code: "policy_violation" })
   })
@@ -135,8 +135,8 @@ describe("host record", () => {
   const raw = (keystone: unknown) => JSON.stringify({ hostRepo: "C:\\GitHub\\demo", base: BASE, sessionID: SID, supervisor: "supervisor:x", profile: "standard", keystone })
 
   test("a valid narrowing list is kept; a damaged one is dropped (the next send then fails closed)", () => {
-    expect(parseHostState(raw(["rag-global"]), "s-0000000001")?.keystone).toEqual(["rag-global"])
-    for (const bad of [["../x"], "rag-global", [1], Array.from({ length: 21 }, (_, i) => `c${i}`)])
+    expect(parseHostState(raw(["rag-read"]), "s-0000000001")?.keystone).toEqual(["rag-read"])
+    for (const bad of [["../x"], "rag-read", [1], Array.from({ length: 21 }, (_, i) => `c${i}`)])
       expect(parseHostState(raw(bad), "s-0000000001")?.keystone).toBeUndefined()
   })
 })

@@ -11,7 +11,7 @@ import { defaultConfig } from "../src/shared/config.ts"
 
 const DOCKER = path.join(import.meta.dir, "..", "docker")
 const HOSTS = ["identity.alterspective.com.au", "synapse2-api.alterspective.com.au"]
-const KS = { host: "identity.alterspective.com.au", connections: ["rag-global", "github", "seqlogs"] }
+const KS = { host: "identity.alterspective.com.au", connections: ["rag-read", "github", "seqlogs"] }
 const read = async (...parts: string[]) => (await readFile(path.join(DOCKER, ...parts), "utf8")).replaceAll("\r\n", "\n")
 
 type Server = { body: string; names: string[]; listen: string[] }
@@ -50,9 +50,9 @@ describe("frontServers", () => {
       const host = s.names[0]!
       expect(s.body).toContain(`set $front_upstream "${host}";`)
       const passes = [...s.body.matchAll(/proxy_pass (\S+);/g)].map((m) => m[1] ?? "")
-      // The model gateway: the whole host. Keystone: one literal path per allowed location (R4-01).
-      if (host === KS.host) for (const pass of passes) expect(pass).toMatch(/^https:\/\/\$front_upstream\/[a-z0-9./-]+$/)
-      else expect(passes).toEqual(["https://$front_upstream"])
+      // Keystone (R4-01) and the model gateway (WS2 #48, H1): one literal path per allowed location.
+      for (const pass of passes) expect(pass).toMatch(/^https:\/\/\$front_upstream\/[a-z0-9./-]+$/)
+      expect(passes.length).toBeGreaterThan(0)
       expect(s.body).toContain(`proxy_ssl_name ${host};`)
       expect(s.body).toContain(`proxy_set_header Host ${host};`)
       expect(s.body).toContain("include /etc/nginx/front/upstream.conf;")
@@ -183,7 +183,7 @@ describe("checkEgress (oc_doctor)", () => {
       ok: true, control: "tls-front", source: "configuration", keystoneConnections: KS.connections,
       keystonePaths: [
         "/.well-known/oauth-authorization-server", "/.well-known/openid-configuration", "/api/oauth/register", "/api/oidc/token",
-        "/.well-known/oauth-protected-resource/mcp/c/rag-global", "/mcp/c/rag-global",
+        "/.well-known/oauth-protected-resource/mcp/c/rag-read", "/mcp/c/rag-read",
         "/.well-known/oauth-protected-resource/mcp/c/github", "/mcp/c/github",
         "/.well-known/oauth-protected-resource/mcp/c/seqlogs", "/mcp/c/seqlogs",
       ],
@@ -192,7 +192,7 @@ describe("checkEgress (oc_doctor)", () => {
   })
 
   test("a generated file for another Keystone set, or none at all, fails (R4-01)", async () => {
-    const other = await generatedHome(["rag-global"])
+    const other = await generatedHome(["rag-read"])
     const check = checkEgress({ ...other, keystone: KS })
     expect(check).toMatchObject({ ok: false, frontConfigMatches: false })
     expect(check.problems.join(" ")).toContain("chosen Keystone set")

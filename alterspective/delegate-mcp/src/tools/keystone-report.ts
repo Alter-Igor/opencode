@@ -44,7 +44,7 @@ export function keystoneReport(config: KeystoneConfig, statuses?: ReadonlyMap<st
   }
 }
 
-/** One line for a tool summary, e.g. `Keystone: rag-global, github (default)`. */
+/** One line for a tool summary, e.g. `Keystone: rag-read, github (default)`. */
 export function keystoneLine(report: KeystoneReport): string {
   if ("unavailable" in report) return `Keystone services: UNAVAILABLE (${report.unavailable.slice(0, 160)})`
   const list = report.connections.length ? report.connections.join(", ") : "none"

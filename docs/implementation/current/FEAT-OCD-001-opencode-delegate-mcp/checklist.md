@@ -29,7 +29,7 @@ Each task is 50–200 LOC, under 2 hours, and ends in something that can be chec
 - [x] **T3.2 State machine + absent states** — MOD-03 · LOC ~150 · Verification: one test per absent-state row (`technical-design.md` §6) · Rules: TST-VAL-01
 - [x] **T3.3 Reconnect + rebuild** — MOD-03 · LOC ~100 · Verification: kill stream mid-task; state recovers
 - [x] **T3.4 Watch CLI** — MOD-03 · LOC ~90 · Verification: run under Claude Code Monitor; lines arrive · Rules: CLI-UX-06, -07, -20
-- [ ] **T3.5 Channel push (optional)** — MOD-03 · LOC ~60 · Verification: manual; else recorded "not verified" — built in Wave 3 (`src/channels.ts`, unit tests); live Claude Code check **not verified**
+- [x] **T3.5 Channel push (optional)** — MOD-03 · LOC ~60 · Verification: manual; else recorded "not verified" — verified live 2026-10-01 in an interactive Claude Code session (`evidence/wave3-e2e.md` "T3.5")
 - [x] **T5.1 Inbox sidecar** — MOD-05 · Deliverable: Bun HTTP service, own volume, admin token for bridges only (box posts stored `verified:false` with the claimed sender — inside the box a sender cannot be proven), hop/rate/size limits counted by the sidecar · Verification: box cannot forge `verified:true` or read supervisor inboxes; admin needs the token; loop bounded by rate limits (hop limit per thread) · LOC ~150 · Rules: ETHICS-AGENT-03
 - [x] **T5.2 In-box tools** — MOD-05 · Deliverable: profile `tool/message_supervisor.ts`, `message_session.ts`, `read_inbox.ts` calling the sidecar · Verification: a session calls each; records appear · LOC ~100
 

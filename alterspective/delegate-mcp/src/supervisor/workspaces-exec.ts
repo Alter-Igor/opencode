@@ -55,6 +55,14 @@ export async function systemSubst(): Promise<Record<string, string>> {
   return result.code === 0 ? parseSubst(result.stdout) : {}
 }
 
+/** A failed `docker exec` / `docker cp`: a stopped or missing box is sandbox_unavailable. */
+export function boxFailure(what: string, stderr: string, timedOut: boolean | undefined): DelegateError {
+  if (timedOut) return new DelegateError("upstream_error", `The delegate box took too long to ${what}.`, "Retry; if it repeats, run oc_doctor.", "timeout")
+  const down = /no such container|cannot connect|error during connect|is not running/i.test(stderr)
+  const action = down ? "Run oc_doctor to start the box." : "Retry; if it repeats, run oc_doctor."
+  return new DelegateError(down ? "sandbox_unavailable" : "upstream_error", `The delegate box failed to ${what}.`, action, stderr.trim())
+}
+
 /** directory_invalid with an action that names the configured roots (review A-22). */
 export function invalidFolder(roots: readonly string[], message: string, detail?: string): DelegateError {
   const where = roots.length > 0 ? roots.join("; ") : "(none configured: set OPENCODE_DELEGATE_ROOTS)"

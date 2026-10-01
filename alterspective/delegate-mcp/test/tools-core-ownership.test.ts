@@ -17,7 +17,7 @@ function forged(f: Fake, overrides: Record<string, unknown> = {}) {
 }
 
 function box(f: Fake) {
-  f.api.on("GET /mcp", { status: 200, data: { "ks-rag-global": { status: "connected" } } })
+  f.api.on("GET /mcp", { status: 200, data: { "ks-rag-read": { status: "connected" } } })
   f.api.on(`POST /session/${OTHER_SID}/prompt_async`, { status: 204 })
   f.api.on(`POST /session/${SID}/prompt_async`, { status: 204 })
   f.setHost((argv) => (argv.includes("ls-tree") ? okCmd(`100644 blob ${"c".repeat(40)}\tAGENTS.md\u0000`) : okCmd("rules")))

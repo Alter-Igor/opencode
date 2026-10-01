@@ -5,8 +5,9 @@
 // A running set is reused only when the box AND its front/cache siblings match (N-9).
 // replace() (oc_server_restart) is the way out of profile_changed: down + start under the lock.
 // It can also change the box-wide Keystone set (review R4-01), saved in the bridge home.
-import { chmod, mkdir, writeFile } from "node:fs/promises"
+import { mkdir, writeFile } from "node:fs/promises"
 import path from "node:path"
+import { removeLegacyOut, sweepOutBundles } from "./handoff-hygiene.ts"
 import { mcpAllowPolicy, type BridgeConfig } from "../shared/config.ts"
 import { saveKeystoneSet } from "../shared/keystone.ts"
 import type { Supervisor } from "../shared/contracts.ts"
@@ -14,6 +15,8 @@ import { DelegateError, isDelegateError } from "../shared/errors.ts"
 import type { Logger } from "../shared/log.ts"
 import type { ApiTarget } from "../shared/opencode-api.ts"
 import { FRONT_SERVERS_NAME } from "../guard/egress.ts"
+import { ensureAuthConf } from "../synapse/auth-conf.ts"
+import { SYNAPSE_LOCK_WAIT_MS } from "../synapse/lock.ts"
 import { INSPECT_ENV, MCP_ALLOW_ENV, approvedValues, boxEnvOverride, composeDownEnv, composeEnv, siblingContainers } from "./compose-env.ts"
 import { LABEL, dockerArgs, imageExists, inspectBox, redactAll, requireDocker, type BoxInspect, type Exec, type ExecResult } from "./docker.ts"
 import { waitHealthy } from "./health.ts"
@@ -45,6 +48,8 @@ export type SupervisorDeps = {
   /** From MOD-02 Guard.permissionBaseline("standard"). */
   permission: PermissionRule[]
   keyEnv?: Record<string, string>
+  /** WS2 (#48): providers whose credential front sets (profile.ts frontAuth). */
+  frontAuth?: string[]
   hostEnv: NodeJS.ProcessEnv
   exec: Exec
   profileFs: ProfileFs
@@ -146,6 +151,7 @@ async function reuse(run: Run, box: BoxInspect, plan: Plan): Promise<ApiTarget> 
     await waitHealthy(run.deps, target, run.container)
     // R5-01: sign-ins of entries that left the set must not stay in the box, even on reuse.
     await pruneSignIns(run, plan)
+    await sweepOutBundles(run)
     run.note("info", "reusing running sandbox", { health: box.health })
     return target
   })
@@ -158,31 +164,29 @@ async function prepareFiles(run: Run, plan: Plan): Promise<void> {
   if (onDisk !== built.hash)
     throw new DelegateError("profile_invalid", "The profile on disk does not match what was built.", "Retry; check that nothing else writes the profile folder.", `on disk ${onDisk.slice(0, 12)} != built ${built.hash.slice(0, 12)}`)
   try {
-    // Both bind sources must exist before `up`, or Docker creates them root-owned (review C-4).
+    // The bind source must exist before `up`, or Docker creates it root-owned (review C-4).
+    // There is no host out/ folder: the box's out/ is a box-only volume (G-7).
     await mkdir(path.join(dirs.handoff, "in"), { recursive: true })
-    const out = path.join(dirs.handoff, "out")
-    await mkdir(out, { recursive: true })
-    const mode = handoffOutMode(process.platform)
-    if (mode !== undefined) await chmod(out, mode)
+    await removeLegacyOut(run)
     await writeBoxEnvOverride(run)
-    // front's servers for this Keystone set (R4-01); compose mounts the folder read-only into front.
     await mkdir(dirs.front, { recursive: true })
-    await writeFile(path.join(dirs.front, FRONT_SERVERS_NAME), plan.front.servers, "utf8")
+    await mkdir(path.dirname(dirs.synapseLock), { recursive: true })
   } catch (error) {
     throw fsFailure("prepare the sandbox folders", error, deps.config.home)
   }
-}
-
-/**
- * Mode for <home>/handoff/out on the host (review N-12, docker/box/README.md). On a Linux Docker
- * host the bind mount keeps host ownership, and the box user (uid 10001) must write its bundle
- * there, so the folder is opened to all (0777). Safe because the host never runs anything from
- * it and takes each bundle by rename into a host-only folder, then checks type and size
- * (workspaces-handoff.ts). On Windows, Docker Desktop maps permissions itself and POSIX modes
- * mean nothing to NTFS, so the folder is left alone.
- */
-export function handoffOutMode(platform: NodeJS.Platform): number | undefined {
-  return platform === "win32" ? undefined : 0o777
+  // Review N1: front's generated files are written under the Synapse refresh lock (src/synapse/lock.ts),
+  // so a token refresh never reloads front between its check and a file written here. The caller
+  // holds the start lock: start lock first, then this one (the Synapse code never takes the start lock).
+  await withStartLock(deps.leaseFs, dirs.synapseLock, async () => {
+    try {
+      // front's servers for this Keystone set (R4-01); compose mounts the folder read-only into front.
+      await writeFile(path.join(dirs.front, FRONT_SERVERS_NAME), plan.front.servers, "utf8")
+      // WS2 (#48): servers.conf includes the Synapse auth file, so it must exist (empty = no credential).
+      await ensureAuthConf(dirs.front)
+    } catch (error) {
+      throw fsFailure("write front's generated files", error, deps.config.home)
+    }
+  }, { ...(await lockOptions(run)), waitMs: SYNAPSE_LOCK_WAIT_MS, staleMs: SYNAPSE_LOCK_WAIT_MS })
 }
 
 async function writeBoxEnvOverride(run: Run): Promise<void> {
@@ -217,6 +221,7 @@ async function start(run: Run, plan: Plan): Promise<ApiTarget> {
     run.state.startedHere = true
     // R5-01: the data volume outlives the box, so every start (and every set change) cleans it.
     await pruneSignIns(run, plan)
+    await sweepOutBundles(run)
     return target
   })
 }

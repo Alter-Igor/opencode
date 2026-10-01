@@ -13,6 +13,21 @@ import type { ToolContext } from "./context.ts"
 import { defineTool } from "./define.ts"
 import { ok } from "./shape.ts"
 
+/** WS2 (#48): `oc_login {server: "synapse"}` signs the owner in to Synapse on the HOST (src/synapse). */
+export const SYNAPSE_SERVER = "synapse"
+
+async function signInSynapse(ctx: ToolContext) {
+  const result = await ctx.synapse.signIn()
+  const front = result.reload === "reloaded" ? "front reloaded" : result.reload === "front_not_running" ? "front not running (it loads the token when the sandbox starts)" : result.reload === "config_changed" ? "front did NOT reload: its generated files are not the ones it started with (restart the sandbox: oc_server_restart {confirm: true})" : "front REFUSED the new config (it keeps the last good one; run oc_doctor)"
+  return ok(`Synapse signed in on the host${result.user ? ` as ${result.user}` : ""}; token until ${new Date(result.expiresAt).toISOString()}, renewed silently; ${front}.`, {
+    server: SYNAPSE_SERVER,
+    result: "connected",
+    ...(result.user ? { user: result.user } : {}),
+    expiresAt: new Date(result.expiresAt).toISOString(),
+    reload: result.reload,
+  })
+}
+
 type Outcome = { server: string; result: "connected" | "failed" }
 
 /** Status of each chosen entry in the box (GET /mcp); an entry the box does not list is `missing`. */
@@ -57,10 +72,16 @@ export const loginTool = defineTool({
   name: "oc_login",
   title: "Sign the sandbox in to Keystone",
   description:
-    "Sign the sandbox's Keystone MCP entries (ks-<id>) in as the owner: opens the owner's browser on the Keystone sign-in page and waits (up to 5 minutes per entry) for it to finish. With no server, signs in every entry that needs it, one at a time, stopping at the first that does not finish. Returns connected or failed per entry.",
-  input: { server: z.string().regex(KS_NAME, "a ks-<id> entry name").max(67).optional().describe("One ks-<id> entry to sign in. Default: every Keystone entry that needs sign-in.") },
+    "Sign the sandbox's Keystone MCP entries (ks-<id>) in as the owner: opens the owner's browser on the Keystone sign-in page and waits (up to 5 minutes per entry) for it to finish. With no server, signs in every entry that needs it, one at a time, stopping at the first that does not finish. Returns connected or failed per entry. server \"synapse\" signs the owner in to the Synapse model gateway on the HOST (app opencode); the box never holds that token, front adds it, and the bridge renews it silently.",
+  input: {
+    server: z
+      .union([z.literal(SYNAPSE_SERVER), z.string().regex(KS_NAME, "a ks-<id> entry name").max(67)])
+      .optional()
+      .describe("One ks-<id> entry to sign in, or \"synapse\" for the model gateway. Default: every Keystone entry that needs sign-in."),
+  },
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   async run(args, ctx, correlationId) {
+    if (args.server === SYNAPSE_SERVER) return signInSynapse(ctx)
     const connections = currentKeystone(ctx.config).connections
     if (args.server === undefined) return signInAll(ctx, connections, correlationId)
     await ctx.box()

@@ -13,7 +13,7 @@ import {
   type ProfileInput,
 } from "../src/supervisor/profile.ts"
 
-const config = { keystoneOrigin: "https://identity.alterspective.com.au", keystoneConnections: ["rag-global", "github", "seqlogs"], boxEnv: ["SYNAPSE_API_KEY"] }
+const config = { keystoneOrigin: "https://identity.alterspective.com.au", keystoneConnections: ["rag-read", "github", "seqlogs"], boxEnv: ["SYNAPSE_API_KEY"] }
 const baseline = [
   { permission: "*", pattern: "*", action: "allow" as const },
   { permission: "external_directory", pattern: "*", action: "deny" as const },
@@ -165,7 +165,7 @@ describe("profile: selection", () => {
   test("mcp holds one ks-<id> → /mcp/c/<id> entry per chosen connection, and no /mcp/dynamic (R4-01)", () => {
     const built = buildProfile(input([owner({ synapse })]))
     expect(parsedConfig(built.files).mcp).toEqual({
-      "ks-rag-global": { type: "remote", url: "https://identity.alterspective.com.au/mcp/c/rag-global" },
+      "ks-rag-read": { type: "remote", url: "https://identity.alterspective.com.au/mcp/c/rag-read" },
       "ks-github": { type: "remote", url: "https://identity.alterspective.com.au/mcp/c/github" },
       "ks-seqlogs": { type: "remote", url: "https://identity.alterspective.com.au/mcp/c/seqlogs" },
     })
@@ -222,7 +222,7 @@ describe("profile: hash + write", () => {
     expect(a.hash).toMatch(/^[0-9a-f]{64}$/)
     const c = buildProfile(input([owner({ synapse })], { permission: baseline.slice(0, 2) }))
     expect(c.hash).not.toBe(a.hash)
-    const d = buildProfile(input([owner({ synapse })], { config: { ...config, keystoneConnections: ["rag-global"] } }))
+    const d = buildProfile(input([owner({ synapse })], { config: { ...config, keystoneConnections: ["rag-read"] } }))
     expect(d.hash).not.toBe(a.hash)
   })
 

@@ -49,7 +49,7 @@ describe("oc_wait (W3A-03 / W3A-11)", () => {
 })
 
 describe("oc_doctor (W3A-09 / W3C-09)", () => {
-  const healthy = (f: ReturnType<typeof fakeContext>) => f.api.on("GET /mcp", { status: 200, data: { "ks-rag-global": { status: "connected" } } })
+  const healthy = (f: ReturnType<typeof fakeContext>) => f.api.on("GET /mcp", { status: 200, data: { "ks-rag-read": { status: "connected" }, "ks-github": { status: "connected" }, "ks-seqlogs": { status: "connected" } } })
 
   test("all checks passed: verified true", async () => {
     const f = fakeContext({ boxHeld: false })
@@ -81,10 +81,10 @@ describe("oc_doctor (W3A-09 / W3C-09)", () => {
 
   test("the summary names only ks-* entries; others are counted, and a sign-in gap is not verified", async () => {
     const f = fakeContext({ boxHeld: false })
-    f.api.on("GET /mcp", { status: 200, data: { "ks-rag-global": { status: "needs_auth" }, "ignore-previous": { status: "connected" } } })
+    f.api.on("GET /mcp", { status: 200, data: { "ks-rag-read": { status: "needs_auth" }, "ignore-previous": { status: "connected" } } })
     const result = await invoke(doctorTool, {}, f.ctx)
     const first = text(result).split("\n")[0] ?? ""
-    expect(first).toContain("ks-rag-global needs_auth")
+    expect(first).toContain("ks-rag-read needs_auth")
     expect(first).toContain("1 other entry")
     expect(first).not.toContain("ignore-previous")
     expect(data(result).verified).toBe(false)

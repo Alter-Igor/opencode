@@ -5,8 +5,11 @@
 // checkout's bridge would run (identity.ts), built first if it is missing, exactly as the bridge
 // would build it. That image is kept (it is the bridge's own); the throwaway front image is removed.
 // Only public, read-only GETs, unauthenticated requests and bare TCP connects are sent; never credentials.
-// R4-01 (h): front's Keystone server is generated for the default Keystone set and probed with
-// path tricks; only the chosen connections' paths may reach Keystone.
+// R4-01 (h): front's Keystone server is generated for an EXPLICIT Keystone set (LIVE_SET, today's
+// default) and probed with path tricks; only the chosen connections' paths may reach Keystone.
+// (j) WS2 #48 (review M2 of 90434eaaf5): front's Synapse include is the empty one the bridge writes
+// before any sign-in, so no owner token is ever involved: /v1/usage/me is refused by front, and the
+// model routes reach Synapse with no credential (401), even when the box sends its own.
 // R5-08 (i): the round 5 raw-socket probes (docker/front/live/paths.mjs): paths, methods, absolute
 // form and Host tricks, smuggling and pipelining, from both probe images.
 //   OCD_LIVE_EGRESS=1 bun test test/egress-live.test.ts
@@ -16,6 +19,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { frontConfigHash, frontServersFor } from "../src/guard/egress.ts"
+import { AUTH_FILE_NAME, authConf } from "../src/synapse/auth-conf.ts"
 import { KEYSTONE_OAUTH_PATHS } from "../src/guard/egress-identity.ts"
 import { defaultConfig } from "../src/shared/config.ts"
 import { buildIdentity } from "../src/supervisor/identity.ts"
@@ -31,7 +35,7 @@ const BUILD_T = 30 * 60_000
 
 type Reply = { status?: number; body?: string; error?: string; message?: string }
 type V6 = { lookup: string[]; aaaa: string[] }
-type KsReply = { status?: number; front?: boolean; error?: string }
+type KsReply = { status?: number; front?: boolean; body?: string; error?: string }
 type Probe = {
   frontIp: string
   dns: Record<string, string[]>
@@ -51,6 +55,7 @@ type Probe = {
   gateway: { ip: string; ports: Record<string, string> }
   ipv6: { addresses: string[]; direct: string; names: Record<string, V6> }
   keystonePaths: Record<string, KsReply>
+  synapse: Record<"usageMe" | "modelsNoToken" | "chatNoToken" | "chatBoxHeaders", KsReply>
 }
 type BunFetch = { ok: boolean; status?: number; issuer?: string | null; error?: string }
 
@@ -62,8 +67,13 @@ let boxImage = ""
 let boxTitle = ""
 let gateway = ""
 let scratch = ""
-/** front's servers for the default Keystone set (rag-global, github, seqlogs), as the bridge writes them. */
-const SERVERS = frontServersFor(defaultConfig({}))
+/**
+ * The Keystone set the live front is generated for, explicitly (it was the default's rag-global
+ * before issue #56; the probes follow this list, not the default). paths.mjs probes `github`.
+ */
+const LIVE_SET = ["rag-read", "github", "seqlogs"]
+/** front's servers for LIVE_SET, as the bridge writes them. */
+const SERVERS = frontServersFor({ ...defaultConfig({}), keystoneConnections: LIVE_SET })
 
 // compose.yaml needs its interpolation variables even for the services this test does not start.
 const env = (extra: Record<string, string> = {}) => ({
@@ -140,6 +150,8 @@ describe.skipIf(!LIVE)("front live red/green (throwaway project)", () => {
     scratch = await mkdtemp(path.join(os.tmpdir(), "ocd-front-live-"))
     await mkdir(path.join(scratch, "front"))
     await writeFile(path.join(scratch, "front", "servers.conf"), SERVERS)
+    // servers.conf includes the Synapse auth file; the bridge writes the empty one before any sign-in.
+    await writeFile(path.join(scratch, "front", AUTH_FILE_NAME), authConf(undefined))
     boxImage = await realBoxImage()
     const up = await compose("up", "-d", "--build", "front", "probe", "probe-bun", "probe-box")
     if (up.code !== 0) throw new Error(`compose up failed: ${up.stderr.slice(-800)}`)
@@ -149,7 +161,7 @@ describe.skipIf(!LIVE)("front live red/green (throwaway project)", () => {
     // its "public roots only" probe must not also trust front's CA (the box's env adds it; bun-fetch
     // below covers the env variable itself).
     for (const [label, service] of PROBES) {
-      probes[label] = await json<Probe>(`${PROJECT}-${service}-1`, "env", "-u", "NODE_EXTRA_CA_CERTS", "node", "/check/client.mjs", gateway)
+      probes[label] = await json<Probe>(`${PROJECT}-${service}-1`, "env", "-u", "NODE_EXTRA_CA_CERTS", "node", "/check/client.mjs", gateway, LIVE_SET[0]!)
       paths[label] = await json<Record<string, PathReply>>(`${PROJECT}-${service}-1`, "env", "-u", "NODE_EXTRA_CA_CERTS", "node", "/check/paths.mjs")
       console.log(JSON.stringify({ label, image: label === "box image" ? boxImage : service, gateway: probes[label]!.gateway, ipv6: probes[label]!.ipv6 }))
     }
@@ -237,6 +249,18 @@ describe.skipIf(!LIVE)("front live red/green (throwaway project)", () => {
       const refused = Object.keys(ks).filter((name) => !["discovery", "resourceMetadata", "mcpNoAuth", "encodedAllowed", "dotsIntoAllowed"].includes(name))
       expect(refused.length).toBeGreaterThanOrEqual(19)
       for (const name of refused) expect({ name, reply: ks[name], front: refusedByFront(ks[name]) }).toEqual({ name, reply: ks[name]!, front: true })
+    })
+
+    test(`(j) ${label}: Synapse from the box: usage refused by front; model routes reach Synapse with no credential (401), box headers dropped`, () => {
+      const s = p().synapse
+      expect({ status: s.usageMe.status, front: s.usageMe.front }).toEqual({ status: 403, front: true })
+      for (const name of ["modelsNoToken", "chatNoToken", "chatBoxHeaders"] as const) expect({ name, status: s[name].status, front: s[name].front }).toEqual({ name, status: 401, front: false })
+      // Synapse answers a missing and an invalid key alike, so the 401 alone does not prove the drop;
+      // the same answer with and without the box's headers, plus the generated config
+      // (proxy_set_header Authorization $synapse_auth; x-api-key ""), together do.
+      expect(s.chatBoxHeaders.body).toBe(s.chatNoToken.body)
+      expect(SERVERS).toContain("proxy_set_header Authorization $synapse_auth;")
+      expect(SERVERS).toContain('proxy_set_header x-api-key "";')
     })
 
     test(`(i) ${label}: round 5 raw-socket probes (R5-08): only spellings of an allowed path reach Keystone`, () => {
