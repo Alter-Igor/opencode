@@ -8,6 +8,7 @@ import { DelegateError } from "../shared/errors.ts"
 import type { ApiTarget } from "../shared/opencode-api.ts"
 import { INSPECT_ENV, MCP_ALLOW_ENV, PASSWORD_ENV } from "./compose-env.ts"
 import { LABEL, builtFrom, inspectBox, requireDocker, type BoxInspect } from "./docker.ts"
+import type { LiveChecks } from "./live.ts"
 import { frontFilesFor } from "./plan.ts"
 import { toDelegateError, type Run } from "./run.ts"
 
@@ -42,6 +43,8 @@ export interface DelegateSupervisor extends Supervisor {
    * under the start lock. Refused with profile_changed while other bridges hold it, unless force.
    */
   replace(options: ReplaceOptions): Promise<ReplaceResult>
+  /** oc_doctor (R5-01, R5-05): the running box's sign-in store and front's loaded config and mounts. Never throws. */
+  verifyLive(): Promise<LiveChecks>
 }
 
 export function targetOf(box: BoxInspect, project: string): ApiTarget {

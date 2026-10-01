@@ -84,7 +84,7 @@ describe("saved set in the bridge home", () => {
     expect(readKeystoneSet(dir, ["rag-global"])).toEqual({ connections: ["rag-global"], source: "default" })
     expect(saveKeystoneSet(dir, ["github", "github", "seqlogs"])).toEqual(["github", "seqlogs"])
     expect(readKeystoneSet(dir, ["rag-global"])).toEqual({ connections: ["github", "seqlogs"], source: "saved" })
-    expect(currentKeystone({ home: dir, keystoneConnections: ["rag-global"] }).connections).toEqual(["github", "seqlogs"])
+    expect(currentKeystone({ home: dir, keystoneConnections: ["rag-global"], keystoneAllowed: ["rag-global", "github", "seqlogs"] }).connections).toEqual(["github", "seqlogs"])
     expect(effectiveConfig({ ...defaultConfig({}), home: dir }).keystoneConnections).toEqual(["github", "seqlogs"])
     for (const text of ["not json", "{}", '{"connections":"github"}', '{"connections":["../x"]}', "null"]) {
       writeFileSync(path.join(dir, "keystone.json"), text)

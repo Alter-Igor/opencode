@@ -191,6 +191,7 @@ function lazySupervisor(make: () => Promise<DelegateSupervisor>): DelegateSuperv
   return {
     ensure: async () => (await get()).ensure(),
     status: async () => (await get()).status(),
+    verifyLive: async () => (await get()).verifyLive(),
     release: async () => (made ? (await made).release() : undefined),
     replace: async (options) => (await get()).replace(options),
     login: async (entry, opener) => (await get()).login(entry, opener),

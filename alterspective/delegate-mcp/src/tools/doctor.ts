@@ -2,6 +2,7 @@
 // starts the box (and never takes a lease) unless called with start:true; a box another bridge
 // started is read through its status() target. Names and errors the box reports are box data.
 import { z } from "zod"
+import type { LiveChecks } from "../supervisor/live.ts"
 import type { SupervisorStatus } from "../supervisor/status.ts"
 import type { Verdict } from "../shared/contracts.ts"
 import type { McpStatus, OpencodeApi } from "../shared/opencode-api.ts"
@@ -115,28 +116,41 @@ async function inspect(ctx: ToolContext, start: boolean, correlationId: string) 
   const api = held?.api ?? (status.state === "running" ? ctx.apiFor(status.target) : undefined)
   const mcp = api ? await readMcp(api, correlationId) : undefined
   const verdict: Verdict = api ? await ctx.guard.checkRuntime(api, PROBE_DIRECTORY) : { ok: false, code: "policy_unverified", reason: "the sandbox is not running" }
-  return { status, mcp, verdict, held: held !== undefined }
+  // R5-01 / R5-05: what is running, not what the labels say.
+  const live = status.state === "running" ? await ctx.supervisorService.verifyLive() : undefined
+  return { status, mcp, verdict, live, held: held !== undefined }
+}
+
+/** Live checks in one sentence, with each failure's reason, and earlier removals the owner should revoke. */
+function liveSummary(live: LiveChecks | undefined): string {
+  if (!live) return ""
+  const state = live.ok ? " Live: stored sign-ins only for the chosen set; front runs the generated config with its folder read-only." : ` Live checks FAILED: ${live.problems.join("; ").slice(0, 600)}.`
+  const removed = live.signIns.removedBefore
+  if (removed.length === 0) return state
+  const list = removed.slice(-10).map((entry) => `${entry.name}${entry.clientId ? ` (client ${entry.clientId})` : ""}`).join(", ")
+  return `${state} Removed earlier from the box (Keystone cannot revoke them for the bridge; revoke by client id in Keystone if not done): ${list}.`
 }
 
 export const doctorTool = defineTool({
   name: "oc_doctor",
   title: "Check the OpenCode sandbox",
   description:
-    "Health check: sandbox state and Docker health, image, MCP-policy and front-config checks, the chosen Keystone services (`keystone`: the box-wide set, saved or default, and each entry's sign-in state), the policy guard verdict and this bridge's name and version, plus the configured egress allowlist, the egress control check (the TLS front generated from that allowlist and the Keystone set, no CONNECT proxy) and isolation level (configuration, not measured). `verified` is true only when every check ran and passed. Does not start the sandbox unless start is true.",
+    "Health check: sandbox state and Docker health, image, MCP-policy and front-config checks, the chosen Keystone services (`keystone`: the box-wide set, saved or default, each entry's sign-in state, the owner's allowed list `ceiling` and high-risk `warnings`), live checks (`live`: sign-ins stored in the box are only for the chosen set, front's loaded config and mount modes; entries removed earlier), the policy guard verdict and this bridge's name and version, plus the configured egress allowlist, the egress control check (the TLS front generated from that allowlist and the Keystone set, no CONNECT proxy) and isolation level (configuration, not measured). `verified` is true only when every check ran and passed. Does not start the sandbox unless start is true.",
   input: { start: z.boolean().optional().describe("Start (or reuse) the sandbox first. Default false.") },
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   async run(args, ctx, correlationId) {
-    const { status, mcp, verdict, held } = await inspect(ctx, args.start === true, correlationId)
+    const { status, mcp, verdict, live, held } = await inspect(ctx, args.start === true, correlationId)
     const keystone = keystoneReport(ctx.config, mcp && "entries" in mcp ? statusMap(mcp) : undefined)
     const egress = egressFor(ctx, keystone)
-    const verified = isVerified(status, mcp, verdict) && egress.ok && !("unavailable" in keystone)
-    return ok(`${summaryOf(status, mcp, verdict, verified)} ${keystoneLine(keystone)}.${egressSummary(egress)}`, {
+    const verified = isVerified(status, mcp, verdict) && egress.ok && !("unavailable" in keystone) && live?.ok === true
+    return ok(`${summaryOf(status, mcp, verdict, verified)} ${keystoneLine(keystone)}.${egressSummary(egress)}${liveSummary(live)}`, {
       verified,
       bridge: { name: ctx.supervisor.replace(/^supervisor:/, ""), supervisor: ctx.supervisor, bridgeId: ctx.bridgeId, version: ctx.version, holdsBox: held, sessions: ctx.sessions.size },
       isolation: { level: "S", source: "configuration" },
       box: boxReport(status),
       mcp: mcp ?? { unavailable: "the sandbox is not running" },
       guard: guardReport(verdict),
+      live: live ?? { unavailable: "the sandbox is not running" },
       keystone,
       egressHostsConfigured: ctx.config.egressHosts,
       egress: egressReport(egress),

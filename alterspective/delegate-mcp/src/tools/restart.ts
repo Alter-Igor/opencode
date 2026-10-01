@@ -5,7 +5,9 @@
 // interrupted; the result says how many were. confirm:true is always required.
 // `keystone` (review R4-01) changes the box-wide set of Keystone services: the profile, the MCP
 // policy and the front proxy's allowed Keystone paths are all regenerated for it, and the choice
-// is saved in the bridge home so later bridges and restarts reuse it.
+// is saved in the bridge home so later bridges and restarts reuse it. Ids must sit inside the
+// owner's ceiling (OPENCODE_DELEGATE_KEYSTONE_ALLOWED, launch env, R5-03): this tool cannot raise
+// it, because `confirm` is a value the calling model supplies.
 import { z } from "zod"
 import { CONNECTION_ID, MAX_CONNECTIONS } from "../shared/keystone.ts"
 import { DelegateError } from "../shared/errors.ts"
@@ -24,7 +26,8 @@ export const restartTool = defineTool({
   title: "Restart the sandbox",
   description:
     "Replace the OpenCode sandbox: stop it and start it again with this bridge's profile and image (fixes profile_changed). Interrupts running sessions. Refused while other bridges use the sandbox unless force is true. Requires confirm: true. " +
-    "Optional keystone: the Keystone connection ids the box may use from now on (box-wide, saved for later restarts; default rag-global, github, seqlogs). Only these services are reachable from the box; new ones may need oc_login.",
+    "Optional keystone: the Keystone connection ids the box may use from now on (box-wide, saved for later restarts; default rag-global, github, seqlogs). Only these services are reachable from the box; new ones may need oc_login. " +
+    "Ids must be in the owner's allowed list (OPENCODE_DELEGATE_KEYSTONE_ALLOWED in this MCP server's env; default: the default set); others are refused with policy_violation and only the owner can add them. One connection can relay to other services (e.g. agents that read mail, admin tools, secrets), so a chosen id may reach more than its name says.",
   input: {
     confirm: z.boolean().describe("Must be true: running sessions are interrupted."),
     force: z.boolean().optional().describe("Replace the sandbox even while other bridges use it (their running sessions are interrupted). Default false."),

@@ -55,10 +55,14 @@ describe("oc_doctor egress check", () => {
   test("a saved set is shown as the saved choice; a chosen entry the box does not list is `missing` and NOT verified", async () => {
     const f = fakeContext({ boxHeld: false })
     f.ctx.config.home = startedHome(["rag-global", "m365"])
+    // m365 is outside the default ceiling; the owner allowed it at launch (R5-03).
+    f.ctx.config.keystoneAllowed = ["rag-global", "m365"]
     f.api.on("GET /mcp", { status: 200, data: { "ks-rag-global": { status: "connected" } } })
     const result = await invoke(doctorTool, {}, f.ctx)
     expect(data(result)).toMatchObject({ keystone: { connections: ["rag-global", "m365"], source: "saved", entries: [{ name: "ks-rag-global", status: "connected" }, { name: "ks-m365", status: "missing" }] } })
-    expect(text(result)).toContain("Keystone services: rag-global, m365 (saved choice).")
+    // m365 is a high-risk id (R5-04): the summary and the report warn.
+    expect(text(result)).toContain("Keystone services: rag-global, m365 (saved choice; WARNING high-risk allowed or chosen: m365).")
+    expect(data(result)).toMatchObject({ keystone: { ceiling: ["rag-global", "m365"], highRisk: ["m365"], warnings: [expect.stringContaining("m365")] } })
   })
 
   test("a box running an entry outside the chosen set is NOT verified (guard policy_violation)", async () => {

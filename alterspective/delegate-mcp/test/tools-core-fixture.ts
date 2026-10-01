@@ -10,6 +10,7 @@ import type { Cursor, HubEvent, SessionView, WaitUntil } from "../src/shared/con
 import { silentLogger } from "../src/shared/log.ts"
 import type { ApiTarget, Call, OpencodeApi } from "../src/shared/opencode-api.ts"
 import type { DelegateHub } from "../src/events/index.ts"
+import type { LiveChecks } from "../src/supervisor/live.ts"
 import type { SupervisorStatus } from "../src/supervisor/status.ts"
 import type { HostSessionState } from "../src/supervisor/workspaces-state.ts"
 import type { Box, CommandResult, SessionRecord, ToolContext } from "../src/tools/context.ts"
@@ -124,6 +125,15 @@ export type Fake = {
   setHost(fn: (argv: string[]) => CommandResult): void
   setBox(fn: (argv: string[]) => CommandResult): void
   status: { value: SupervisorStatus }
+  /** What supervisor.verifyLive() reports (R5-01, R5-05); all checks pass by default. */
+  live: { value: LiveChecks }
+}
+
+export const LIVE_OK: LiveChecks = {
+  ok: true,
+  signIns: { ok: true, names: ["ks-rag-global", "ks-github", "ks-seqlogs"], stale: [], unrecognised: 0, removedBefore: [] },
+  front: { ok: true, loadedConfigMatches: true, mountReadOnly: true, boxMountsOk: true, problems: [] },
+  problems: [],
 }
 
 export const okCmd = (stdout = ""): CommandResult => ({ code: 0, stdout, stderr: "" })
@@ -137,6 +147,7 @@ function fakeServices(f: Fake): Pick<ToolContext, "supervisorService" | "workspa
     supervisorService: {
       ensure: async () => TARGET,
       status: async () => f.status.value,
+      verifyLive: async () => f.live.value,
       release: async () => {},
       replace: async () => ({ target: TARGET, interrupted: f.restart.interrupted, keystone: [] }),
       login: async () => "connected",
@@ -183,6 +194,7 @@ export function fakeContext(options: { boxHeld?: boolean } = {}): Fake {
     setHost: (fn) => (host = fn),
     setBox: (fn) => (inBox = fn),
     status: { value: { state: "running", target: TARGET, imageTag: "img:1", startedBy: "other", health: "healthy", policyVerified: true, frontMatches: true, imageMatches: true } },
+    live: { value: LIVE_OK },
     ctx: undefined as unknown as ToolContext,
   }
   f.ctx = {

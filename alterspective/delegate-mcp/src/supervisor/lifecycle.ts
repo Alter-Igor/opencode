@@ -17,6 +17,7 @@ import { FRONT_SERVERS_NAME } from "../guard/egress.ts"
 import { INSPECT_ENV, MCP_ALLOW_ENV, approvedValues, boxEnvOverride, composeDownEnv, composeEnv, siblingContainers } from "./compose-env.ts"
 import { LABEL, dockerArgs, imageExists, inspectBox, redactAll, requireDocker, type BoxInspect, type Exec, type ExecResult } from "./docker.ts"
 import { waitHealthy } from "./health.ts"
+import { pruneSignIns, verifyLive } from "./live.ts"
 import type { LeaseFs } from "./leases.ts"
 import type { ProcessProbe } from "./process.ts"
 import { planFor, type Plan } from "./plan.ts"
@@ -143,6 +144,8 @@ async function reuse(run: Run, box: BoxInspect, plan: Plan): Promise<ApiTarget> 
   const target = targetOf(box, run.deps.config.project)
   return withLease(run, async () => {
     await waitHealthy(run.deps, target, run.container)
+    // R5-01: sign-ins of entries that left the set must not stay in the box, even on reuse.
+    await pruneSignIns(run, plan)
     run.note("info", "reusing running sandbox", { health: box.health })
     return target
   })
@@ -212,6 +215,8 @@ async function start(run: Run, plan: Plan): Promise<ApiTarget> {
     const target = { baseUrl: `http://127.0.0.1:${port}`, password }
     await waitHealthy(deps, target, run.container)
     run.state.startedHere = true
+    // R5-01: the data volume outlives the box, so every start (and every set change) cleans it.
+    await pruneSignIns(run, plan)
     return target
   })
 }
@@ -301,6 +306,7 @@ export function createSupervisor(deps: SupervisorDeps): DelegateSupervisor {
   return {
     ensure: () => traced(ctx, "ensure", ensure),
     status: () => traced(ctx, "status", statusOf),
+    verifyLive: () => traced(ctx, "verifyLive", verifyLive),
     release: () => traced(ctx, "release", release),
     replace: (options) => traced(ctx, "replace", (run) => replace(run, options)),
     login: (entry, opener) =>

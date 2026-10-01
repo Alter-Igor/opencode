@@ -7,6 +7,10 @@
 # 2. Only the CA certificate (public) is copied to /ca/public, which the box mounts read-only.
 # 3. A fresh leaf certificate for the allowed hosts is made on every start, on the /tmp tmpfs.
 # 4. The nginx resolver line is written from OCD_FRONT_RESOLVER (IPv4 addresses only).
+# 5. The generated servers.conf must have the hash the bridge started front with (OCD_FRONT_HASH,
+#    also the front-config label, review R5-05). The bridge writes the file before `compose up`;
+#    if `up` failed while an older front kept running, a later restart would otherwise load the
+#    new file under the old label. A mismatch stops front, so the box has no way out at all.
 set -eu
 umask 077
 
@@ -82,6 +86,9 @@ openssl x509 -req -in "$RUN/leaf.csr" -CA "$PRIV/ca.pem" -CAkey "$PRIV/ca.key" \
   -extfile "$RUN/leaf.ext" -out "$RUN/leaf.pem" 2> "$RUN/openssl.err" \
   || { cat "$RUN/openssl.err" >&2; exit 1; }
 rm -f "$RUN/leaf.csr" "$RUN/openssl.err"
+
+actual=$(sha256sum /etc/nginx/front-gen/servers.conf | cut -d' ' -f1)
+[ "$actual" = "$OCD_FRONT_HASH" ] || { log "servers.conf does not match OCD_FRONT_HASH; refusing to start (restart the sandbox through the bridge)"; exit 1; }
 
 log "ready: $(echo $names) (CA $(openssl x509 -noout -fingerprint -sha256 -in "$PUB/ca.pem" | cut -d= -f2))"
 exec nginx -g 'daemon off;'

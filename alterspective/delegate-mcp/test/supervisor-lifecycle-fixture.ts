@@ -31,6 +31,8 @@ export type Overrides = {
   inspect?: ExecResult
   /** Inspect result for a named container (the box's egress/cache siblings, N-9). */
   containers?: Record<string, ExecResult>
+  /** `docker exec` into the box (R5-01 sign-in store). Default: an empty store, nothing removed. */
+  exec?: (argv: string[]) => ExecResult
 }
 
 export let home: string
@@ -55,6 +57,7 @@ export const owner = JSON.stringify({
 export function fakeDocker(state: Box, calls: Call[], over: Overrides = {}): Exec {
   return async (argv: string[], options?: ExecOptions) => {
     calls.push({ argv, env: options?.env, cwd: options?.cwd })
+    if (argv[1] === "exec") return over.exec?.(argv) ?? { code: 0, stdout: JSON.stringify({ names: [], removed: [] }), stderr: "" }
     const sub = argv.slice(1).find((a) => ["version", "inspect", "image", "compose"].includes(a))
     if (sub === "version") return { code: 0, stdout: "29.8.0\n", stderr: "" }
     if (sub === "image") return over.imageMissing ? { code: 1, stdout: "", stderr: "No such image" } : { code: 0, stdout: "sha256:x", stderr: "" }

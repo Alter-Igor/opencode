@@ -4,6 +4,7 @@
 import os from "node:os"
 import path from "node:path"
 import { DEFAULT_KEYSTONE, connectionPathPattern, readKeystoneSet, type KeystoneSet } from "./keystone.ts"
+import { CEILING_ENV, DEFAULT_TOOL_DENY, TOOL_DENY_ENV, enforceCeiling, envList } from "./keystone-policy.ts"
 
 export type BridgeConfig = {
   /** Host folder for lock-free state: logs, hand-off bundles, profile. Never mounted rw into the box except `handoff`. */
@@ -17,6 +18,13 @@ export type BridgeConfig = {
    * oc_server_restart {keystone} in the bridge home wins over this (keystone.ts). Never /mcp/dynamic.
    */
   keystoneConnections: string[]
+  /**
+   * The owner's ceiling (R5-03): the only connection ids any set may use. Read once at bridge start
+   * from OPENCODE_DELEGATE_KEYSTONE_ALLOWED, never from a tool call. Unset: the default set above.
+   */
+  keystoneAllowed?: string[]
+  /** `ks-<id>_<tool>` names denied in the box profile and every session (R5-02; convenience, not a wall). */
+  keystoneToolDeny: string[]
   /** Hosts the front proxy serves, each with one fixed upstream (exact names). */
   egressHosts: string[]
   /** Host env vars copied into the box, one by one. Nothing else crosses. */
@@ -28,12 +36,15 @@ export type BridgeConfig = {
 
 export function defaultConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfig {
   const home = env.OPENCODE_DELEGATE_HOME ?? path.join(os.homedir(), ".local", "share", "opencode-delegate")
-  const keystone = env.OPENCODE_DELEGATE_KEYSTONE?.split(",").map((id) => id.trim()).filter(Boolean)
+  const keystone = envList(env.OPENCODE_DELEGATE_KEYSTONE)
+  const allowed = envList(env[CEILING_ENV])
   return {
     home,
     roots: (env.OPENCODE_DELEGATE_ROOTS ?? "C:\\GitHub").split(";").filter(Boolean),
     keystoneOrigin: "https://identity.alterspective.com.au",
     keystoneConnections: keystone ?? [...DEFAULT_KEYSTONE],
+    ...(allowed ? { keystoneAllowed: allowed } : {}),
+    keystoneToolDeny: envList(env[TOOL_DENY_ENV]) ?? [...DEFAULT_TOOL_DENY],
     egressHosts: ["identity.alterspective.com.au", "synapse2-api.alterspective.com.au"],
     boxEnv: ["SYNAPSE_API_KEY"],
     project: "opencode-delegate",
@@ -41,13 +52,21 @@ export function defaultConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfi
   }
 }
 
-/** The box-wide Keystone set right now (saved choice, else the config default). Throws profile_invalid on a damaged file. */
-export function currentKeystone(config: Pick<BridgeConfig, "home" | "keystoneConnections">): KeystoneSet {
-  return readKeystoneSet(config.home, config.keystoneConnections)
+export type KeystoneConfig = Pick<BridgeConfig, "home" | "keystoneConnections" | "keystoneAllowed">
+
+/**
+ * The box-wide Keystone set right now (saved choice, else the config default). Throws
+ * profile_invalid on a damaged file, and policy_violation when the set leaves the owner's ceiling
+ * (R5-03: a saved set is only as trusted as the tool call that saved it).
+ */
+export function currentKeystone(config: KeystoneConfig): KeystoneSet {
+  const set = readKeystoneSet(config.home, config.keystoneConnections)
+  enforceCeiling(set.connections, config)
+  return set
 }
 
 /** `config` with keystoneConnections replaced by the box-wide set in force now. */
-export function effectiveConfig<C extends Pick<BridgeConfig, "home" | "keystoneConnections">>(config: C): C {
+export function effectiveConfig<C extends KeystoneConfig>(config: C): C {
   return { ...config, keystoneConnections: currentKeystone(config).connections }
 }
 

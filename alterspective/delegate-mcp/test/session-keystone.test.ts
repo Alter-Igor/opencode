@@ -66,7 +66,8 @@ describe("oc_start_session {keystone}", () => {
     const result = await invoke(startSessionTool, { directory: "C:\\GitHub\\demo", keystone: ["rag-global"] }, f.ctx)
     expect(result.isError).toBeUndefined()
     const create = f.api.find("POST", "/session")?.body as { permission: unknown }
-    expect(create.permission).toEqual(permissionBaseline("standard", ["rag-global"]))
+    // The guard's baseline: the narrowing, then the tool deny list last (R5-02).
+    expect(create.permission).toEqual(f.ctx.guard.permissionBaseline("standard", ["rag-global"]))
     const key = f.opened[0]?.[1] ?? ""
     expect(f.states.get(key)).toMatchObject({ sessionID: SID, keystone: ["rag-global"] })
     expect(f.ctx.sessions.get(SID)).toMatchObject({ keystone: ["rag-global"] })
@@ -95,7 +96,7 @@ describe("oc_start_session {keystone}", () => {
     const f = fakeContext()
     canCreate(f)
     await invoke(startSessionTool, { directory: "C:\\GitHub\\demo" }, f.ctx)
-    expect((f.api.find("POST", "/session")?.body as { permission: unknown }).permission).toEqual(permissionBaseline("standard"))
+    expect((f.api.find("POST", "/session")?.body as { permission: unknown }).permission).toEqual(f.ctx.guard.permissionBaseline("standard"))
     expect(f.states.get(f.opened[0]?.[1] ?? "")?.keystone).toBeUndefined()
   })
 })
@@ -110,14 +111,21 @@ describe("oc_send on a narrowed session", () => {
 
   test("accepted while the session has exactly its narrowed rules", async () => {
     const f = fakeContext()
-    ready(f, permissionBaseline("standard", ["rag-global"]))
+    ready(f, f.ctx.guard.permissionBaseline("standard", ["rag-global"]))
     const result = await invoke(sendTool, { sessionID: SID, message: "go" }, f.ctx)
     expect(result.isError).toBeUndefined()
   })
 
+  test("refused when the tool deny list was dropped from the session's rules (R5-02, policy_violation)", async () => {
+    const f = fakeContext()
+    ready(f, permissionBaseline("standard", ["rag-global"]))
+    const result = await invoke(sendTool, { sessionID: SID, message: "go" }, f.ctx)
+    expect(data(result)).toMatchObject({ code: "policy_violation" })
+  })
+
   test("refused when the narrowing was dropped from the session's rules (policy_violation)", async () => {
     const f = fakeContext()
-    ready(f, permissionBaseline("standard"))
+    ready(f, f.ctx.guard.permissionBaseline("standard"))
     const result = await invoke(sendTool, { sessionID: SID, message: "go" }, f.ctx)
     expect(data(result)).toMatchObject({ code: "policy_violation" })
   })

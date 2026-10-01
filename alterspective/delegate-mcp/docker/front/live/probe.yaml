@@ -11,6 +11,7 @@ services:
     networks: [sealed]
     volumes:
       - ./front/live/client.mjs:/check/client.mjs:ro
+      - ./front/live/paths.mjs:/check/paths.mjs:ro
       - front-ca-public:/etc/ocd-front-ca:ro
     depends_on:
       front: { condition: service_healthy }
@@ -46,6 +47,7 @@ services:
       NODE_EXTRA_CA_CERTS: /etc/ocd-front-ca/ca.pem
     volumes:
       - ./front/live/client.mjs:/check/client.mjs:ro
+      - ./front/live/paths.mjs:/check/paths.mjs:ro
       - ./front/live/bun-fetch.mjs:/check/bun-fetch.mjs:ro
       - front-ca-public:/etc/ocd-front-ca:ro
     depends_on:

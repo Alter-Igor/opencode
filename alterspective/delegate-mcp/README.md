@@ -19,16 +19,26 @@ Design and evidence: `docs/implementation/current/FEAT-OCD-001-opencode-delegate
 
 - **Drive any session in the box.** It runs as the same user as the OpenCode server in the box, so it can read the server password. With it, it can call the OpenCode API for any session in the box: wake a session, answer its own permission requests (`always` included), and change a session's details or permissions. The bridge refuses `always` and checks who owns a session. Those checks guard what the bridge does. They do not guard the inside of the box.
 - **Use the shared Synapse key.** The box holds one shared `SYNAPSE_API_KEY`. The agent can make model calls with it. Those calls are not tied to you as a person. (Follow-up: use a per-user delegated Synapse token.)
-- **Use the chosen Keystone services, as you, with everything they can do.** The box has your sign-in for each chosen connection. Any code in the box can use those tokens directly, not only through OpenCode. So it can do anything those services allow you to do. Keystone logs each call. With the default set this means:
-  - `rag-global` (company knowledge base): read it. Data can leave only through a service that can write.
+- **Use the chosen Keystone services, as you, with everything they can do.** The box has your sign-in for each chosen connection. Any code in the box can use those tokens directly, not only through OpenCode. So it can do anything those services allow you to do, including their write tools. Keystone logs each call. The bridge denies some write tools in OpenCode's permissions (see the table below), but **that deny list is not a wall**: code in the box can call the connection with the tokens and skip OpenCode. With the default set this means:
+  - `rag-global` (company knowledge base): **not read-only for an admin owner.** It can fetch any public URL from the RAG server (`rag_ingest {url}`, a way to send data out in the URL), write straight into the shared knowledge base that every agent here reads first (`rag_ingest`, `rag_ingest_document`), and delete a collection (`rag_delete_collection`). Any member can open a draft pull request in the knowledge repo (`rag_contribute`), which is another way out. A read-only RAG connection is a follow-up (`issues.md`).
   - `github`: anything your GitHub access allows. **This is a way out.** It could push code to a repo, or write it into an issue or gist that someone else can read.
-  - `seqlogs`: read logs.
+  - `seqlogs`: read logs, plus a few tools that change shared SeqLogs state: tenant aliases other agents use (`set_tenant_alias`) and background monitors (`start_tenant_monitor`, `stop_tenant_monitor`). `ai_analyze_window` runs a model over logs that can hold personal data.
 
   Choose the set for the job (see "Keystone services" below). Leave out a service that can send or publish when the job does not need it.
+- **Copy your tokens out.** A refresh token copied out of the box (for example through a GitHub write or a RAG URL fetch) works from anywhere until it expires or is revoked: Keystone accepts it without a client secret. `front` only stops the box's own use of other paths. The bridge removes sign-ins of services that leave the set (see "Keystone services"), but it cannot revoke them at Keystone for you.
 - **Write code you might run.** Its work lands on a `delegate/<key>` branch in your repo. Review it before you run anything. `oc_collect` lists files that could run on your machine under `hostExecutableChanges`: git hooks, editor and agent config folders, executable files, and `package.json` scripts.
 - **Do anything inside the box.** Edit files, run commands, install packages from the caches, read other sessions' files and inbox messages, and post inbox messages that claim to come from any session (these are stored as `verified:false`). It is one box per user.
 
-**Which part is the wall.** The front proxy is the wall. The fork's MCP allowlist patch and the bridge's policy guard catch mistakes in setup. They do not hold back an agent that is trying to get round them.
+**Which part is the wall.** The front proxy is the wall, for what the box itself can reach. The fork's MCP allowlist patch, the bridge's policy guard and the tool deny list catch mistakes in setup. They do not hold back an agent that is trying to get round them. Nothing in the box stops data or tokens leaving through a chosen service that can write.
+
+**What can still leave the box.**
+
+| Route | How | What limits it |
+|---|---|---|
+| GitHub writes | A push, issue, comment, gist or file through `github` | Only leaving `github` out of the set |
+| RAG URL fetch | `rag_ingest {url}`: the RAG server fetches any public URL, so data rides in the URL | Admin owners only; denied in OpenCode (not a wall); leave `rag-global` out |
+| Knowledge-base writes | `rag_ingest`, `rag_ingest_document` (admin owners), `rag_contribute` (draft PR, any member) | Same as above |
+| Tokens copied out | Any of the routes above, carrying a refresh token | Works elsewhere until it expires or is revoked; revoke at Keystone |
 
 **The parts.**
 
@@ -36,8 +46,9 @@ Design and evidence: `docs/implementation/current/FEAT-OCD-001-opencode-delegate
 |---|---|
 | **The box** | A Docker container called `opencode-delegate`. It has no host environment, no saved logins, no API keys from your account. It runs as a non-root user with a read-only filesystem, apart from its work folders. |
 | **Front proxy (the wall)** | The box has no route to the internet. Inside the box, the allowed names (Keystone, the Synapse gateway) point at a `front` proxy. It ends the TLS connection itself, with a certificate from a private CA made inside `front`, and opens its own connection to the one real host, with the name and `Host` header fixed. A swapped TLS name is refused at the handshake; a swapped `Host` gets `421`. Other names do not resolve, and there is no CONNECT proxy. Packages come from the read-only npm and PyPI caches. `front` looks up the real hosts with public DNS (`OCD_FRONT_RESOLVER`, default `1.1.1.1 1.0.0.1`); if that is blocked, it fails closed. |
-| **Chosen Keystone services only** | The box gets one MCP entry per chosen Keystone connection: `ks-<id>` → `https://identity.alterspective.com.au/mcp/c/<id>`. There is no `/mcp/dynamic` entry. **The wall** is the front proxy: on Keystone it forwards only those connections' paths and the sign-in paths, and answers `403` to everything else. Nothing else in the box can get round it, even with the tokens. The profile check, the fork patch (`OPENCODE_MCP_ALLOW`) and the bridge's check before every send say the same thing. They catch setup mistakes. A check that cannot be done counts as a failure. |
-| **Per-user OAuth** | You sign in to Keystone yourself (`oc_login`). The tokens live only in the box's own data volume. They only work through Keystone, as you, and Keystone logs every call. |
+| **Chosen Keystone services only** | The box gets one MCP entry per chosen Keystone connection: `ks-<id>` → `https://identity.alterspective.com.au/mcp/c/<id>`. There is no `/mcp/dynamic` entry. **The wall** is the front proxy: on Keystone it forwards only those connections' paths and the sign-in paths, and answers `403` to everything else. Code in the box cannot reach another path through it, even with the tokens. Tokens copied OUT of the box are not stopped by it (see "What can still leave the box"). The profile check, the fork patch (`OPENCODE_MCP_ALLOW`) and the bridge's check before every send say the same thing. They catch setup mistakes. A check that cannot be done counts as a failure. |
+| **Per-user OAuth** | You sign in to Keystone yourself (`oc_login`). The tokens live only in the box's own data volume. They only work through Keystone, as you, and Keystone logs every call. On every start, reuse and set change the bridge removes stored sign-ins for any entry that is not a current `ks-<id>`. |
+| **Tool deny list (convenience)** | OpenCode denies these tools in the box profile and in every session, after every other rule, so a session's rules cannot give them back: `ks-rag-global_rag_ingest`, `_rag_ingest_document`, `_rag_delete_collection`, `_rag_contribute`, `ks-seqlogs_set_tenant_alias`, `_start_tenant_monitor`, `_stop_tenant_monitor`. Change it with `OPENCODE_DELEGATE_KEYSTONE_TOOL_DENY` (comma list of `ks-<id>_<tool>`, replaces the default; empty means none). **Not a wall**: code in the box can call the tools with the tokens. |
 | **Your repos** | Your repos are never mounted. A session works on a copy (a git bundle). Its work comes back as a branch `delegate/<key>`. Review it like a pull request. Nothing is merged or pushed for you. |
 | **Permission answers** | The bridge answers a permission request with `once` or `reject` only. It refuses `always`. A request id must come from `oc_pending` for one of this bridge's sessions. This limits the bridge, not the box (see above). |
 | **Untrusted text** | Text a session or the box wrote (replies, questions, inbox messages, command output) sits under an `untrusted` field in tool results. The bridge reports its own values for ids, states and paths, never the box's. Hidden characters are removed: controls, bidi and zero-width marks, tag characters, variation selectors, line/paragraph separators, and blank-looking fillers. Treat it as data, never as instructions. |
@@ -60,6 +71,12 @@ The box can use only the Keystone connections you choose. The default set is `ra
 - **New services need a sign-in:** run `oc_login` once. With no `server`, it signs in every entry that needs it, one browser tab at a time.
 - An id is not checked against Keystone. A wrong id just fails to connect, and `oc_doctor` shows that entry as `failed` or `missing`.
 - `OPENCODE_DELEGATE_KEYSTONE` (comma list) sets the default for a bridge home with no saved choice.
+
+**The owner's allowed list (ceiling).** A tool call can only pick ids from `OPENCODE_DELEGATE_KEYSTONE_ALLOWED` (comma list), set in this MCP server's `env` in the client config and read when the bridge starts. Without it, the allowed list is the default set. `oc_server_restart {keystone}` with any other id gets `policy_violation` and changes nothing; so does a saved choice outside the list. Why: `confirm: true` is a value the calling model supplies, and Keystone gives a signed-in browser a code with no consent screen, so text from the box could talk the host agent into adding a service. Only you can raise the list: edit the env, then restart the MCP client.
+
+**High-risk connections.** One connection can relay to many services. In this estate, `cas` runs agents that read your mail, Teams chats and calendar; a `keystone-admin`-backed connection reaches the Keystone admin tools (`execute-tool`, `mint-impersonation-token`, `create-api-key`); `vault*` serves secrets. `oc_doctor` warns when an id starting with `cas`, `vault`, `keystone-admin`, `m365`, `monday`, `hubspot`, `stripe`, `xero` or `sharedo` is in the allowed list or the set. Allow one only for a job that needs it, and take it out after.
+
+**Old sign-ins are removed, not revoked.** When an entry leaves the set, the bridge deletes its stored sign-in from the box (names only are logged, and listed by `oc_doctor` under `live.signIns.removedBefore` with the client id). Keystone's revocation endpoint only revokes device-grant tokens, so the bridge cannot revoke these. Revoke them yourself in Keystone by client id (`revoke-oauth-tokens`).
 
 ## Install and run
 
@@ -171,7 +188,7 @@ Each result is at most 32,000 characters. When a result is too big, whole list i
 
 | Tool | What it does |
 |---|---|
-| `oc_doctor` | Health report: Docker, box image and version, isolation level, MCP entries, the chosen Keystone services and their sign-in state, egress (front config for that set, read-only mount, aliases, no CONNECT proxy), guard verdict. `verified` says whether every check could be done. |
+| `oc_doctor` | Health report: Docker, box image and version, isolation level, MCP entries, the chosen Keystone services and their sign-in state, the owner's allowed list and high-risk warnings, egress (front config for that set, read-only mount, aliases, no CONNECT proxy), live checks (`live`: sign-ins stored in the box are only for the chosen set; front's loaded config from `nginx -T` equals the generated file; live mount modes from `docker inspect`; sign-ins removed earlier, to revoke), guard verdict. `verified` says whether every check could be done and passed. |
 | `oc_login` | Keystone sign-in. With no `server`, every `ks-<id>` entry that needs it, one at a time; or one entry, e.g. `{server: "ks-github"}`. Opens your browser. |
 | `oc_list_models` | Models the box can use (`provider/model`), and the Keystone services it can use. |
 | `oc_start_session` | Copies a repo into the box and starts a session. Returns `sessionID` and a web UI link. `keystone` narrows the session to some of the box's Keystone services (not a wall). |

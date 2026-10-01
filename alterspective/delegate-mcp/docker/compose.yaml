@@ -212,6 +212,9 @@ services:
       net.ipv4.ip_unprivileged_port_start: "0"
     environment:
       OCD_FRONT_RESOLVER: ${OCD_FRONT_RESOLVER:-1.1.1.1 1.0.0.1}
+      # R5-05: the entrypoint refuses to start nginx unless the mounted servers.conf has this hash
+      # (the same value as the front-config label), so a restart can never load another set's file.
+      OCD_FRONT_HASH: ${OCD_FRONT_HASH:?OCD_FRONT_HASH is set by the bridge}
     tmpfs: ["/tmp:uid=101,gid=101,mode=0700,nosuid,nodev,noexec"]
     volumes:
       - front-ca-private:/ca/private

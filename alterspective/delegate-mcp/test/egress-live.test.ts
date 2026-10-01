@@ -7,6 +7,8 @@
 // Only public, read-only GETs, unauthenticated requests and bare TCP connects are sent; never credentials.
 // R4-01 (h): front's Keystone server is generated for the default Keystone set and probed with
 // path tricks; only the chosen connections' paths may reach Keystone.
+// R5-08 (i): the round 5 raw-socket probes (docker/front/live/paths.mjs): paths, methods, absolute
+// form and Host tricks, smuggling and pipelining, from both probe images.
 //   OCD_LIVE_EGRESS=1 bun test test/egress-live.test.ts
 import { afterAll, beforeAll, describe, expect, test } from "bun:test"
 import { randomBytes } from "node:crypto"
@@ -53,6 +55,8 @@ type Probe = {
 type BunFetch = { ok: boolean; status?: number; issuer?: string | null; error?: string }
 
 const probes: Record<string, Probe> = {}
+type PathReply = { statuses?: number[]; front?: boolean; error?: string }
+const paths: Record<string, Record<string, PathReply>> = {}
 const bun: Record<string, { with: BunFetch; without: BunFetch }> = {}
 let boxImage = ""
 let boxTitle = ""
@@ -114,6 +118,18 @@ async function leftovers(): Promise<string[]> {
   return lists.flatMap((run, i) => run.stdout.split("\n").filter(Boolean).map((id) => `${["container", "volume", "network"][i]} ${id}`))
 }
 
+/** R5-08: probes front must refuse itself (its own error page), with the status nginx gives. */
+const FRONT_REFUSES: Record<string, number> = {
+  dotsOut: 403, dotsOutEncoded: 403, encSlashOut: 403, doubleSlashDynamic: 403, semicolon: 403, semicolonOut: 403,
+  upperCase: 403, upperPrefix: 403, trailingSlash: 403, query: 403, encodedQuery: 403, encodedHash: 403, encodedSpace: 403,
+  overlongSlash: 403, dynamic: 403, vaultConnection: 403, adminConnection: 403, adminApi: 403, revoke: 403,
+  deviceAuthorization: 403, userinfo: 403, tokenGet: 403, options: 403, put: 403, patch: 403, absoluteDynamic: 403,
+  hostWithPort: 403, nul: 400, trace: 405, connect: 400, teAndCl: 400, teObfuscated: 501,
+  absoluteOtherHost: 421, http10NoHost: 421, hostOther: 421,
+}
+/** R5-08: spellings nginx normalises INTO /mcp/c/github; front forwards the literal path and Keystone says 401 (no token). */
+const REACH_KEYSTONE = ["encSlashIn", "dotsIn", "dotIn", "doubleSlashIn", "emptyQuery", "rawHash", "encodedAllowed", "head", "absoluteAllowed"]
+
 const PROBES = [
   ["node:22-slim", "probe"],
   ["box image", "probe-box"],
@@ -134,6 +150,7 @@ describe.skipIf(!LIVE)("front live red/green (throwaway project)", () => {
     // below covers the env variable itself).
     for (const [label, service] of PROBES) {
       probes[label] = await json<Probe>(`${PROJECT}-${service}-1`, "env", "-u", "NODE_EXTRA_CA_CERTS", "node", "/check/client.mjs", gateway)
+      paths[label] = await json<Record<string, PathReply>>(`${PROJECT}-${service}-1`, "env", "-u", "NODE_EXTRA_CA_CERTS", "node", "/check/paths.mjs")
       console.log(JSON.stringify({ label, image: label === "box image" ? boxImage : service, gateway: probes[label]!.gateway, ipv6: probes[label]!.ipv6 }))
     }
     for (const [label, service] of [["oven/bun", "probe-bun"], ["box image", "probe-box"]] as const) {
@@ -220,6 +237,16 @@ describe.skipIf(!LIVE)("front live red/green (throwaway project)", () => {
       const refused = Object.keys(ks).filter((name) => !["discovery", "resourceMetadata", "mcpNoAuth", "encodedAllowed", "dotsIntoAllowed"].includes(name))
       expect(refused.length).toBeGreaterThanOrEqual(19)
       for (const name of refused) expect({ name, reply: ks[name], front: refusedByFront(ks[name]) }).toEqual({ name, reply: ks[name]!, front: true })
+    })
+
+    test(`(i) ${label}: round 5 raw-socket probes (R5-08): only spellings of an allowed path reach Keystone`, () => {
+      const got = paths[label]!
+      const seen = (name: string) => ({ name, statuses: got[name]?.statuses, front: got[name]?.front })
+      for (const [name, status] of Object.entries(FRONT_REFUSES)) expect(seen(name)).toEqual({ name, statuses: [status], front: true })
+      for (const name of REACH_KEYSTONE) expect(seen(name)).toEqual({ name, statuses: [401], front: false })
+      // Each pipelined request is matched on its own: the allowed one reaches Keystone, /mcp/dynamic does not.
+      expect(got.pipelined?.statuses).toEqual([401, 403])
+      expect(Object.keys(got).sort()).toEqual([...Object.keys(FRONT_REFUSES), ...REACH_KEYSTONE, "pipelined"].sort())
     })
 
     test(`(g) ${label} red: no IPv6 address or route, and no AAAA answer that could go round front`, () => {

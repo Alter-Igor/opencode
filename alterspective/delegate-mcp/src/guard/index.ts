@@ -2,10 +2,10 @@
 import { currentKeystone, type BridgeConfig } from "../shared/config.ts"
 import type { Guard, Verdict } from "../shared/contracts.ts"
 import { validateEntries } from "./entries.ts"
-import { checkPermissionReply, permissionBaseline } from "./permissions.ts"
+import { checkPermissionReply, permissionBaseline, toolDenyRules } from "./permissions.ts"
 import { checkRuntime } from "./runtime.ts"
 
-type GuardConfig = Pick<BridgeConfig, "keystoneOrigin" | "home" | "keystoneConnections">
+type GuardConfig = Pick<BridgeConfig, "keystoneOrigin" | "home" | "keystoneConnections" | "keystoneAllowed" | "keystoneToolDeny">
 
 /**
  * The chosen Keystone set, read on every check (another bridge may have changed it), or the
@@ -29,13 +29,15 @@ export function createGuard(config: GuardConfig): Guard {
       const connections = chosen(config)
       return Array.isArray(connections) ? checkRuntime(api, directory, connections) : connections
     },
-    permissionBaseline,
+    // R5-02: the deny list goes LAST, in the profile and in every session (the same function makes
+    // both), so neither the `ks-*_*` allow nor a session's narrowing can give a denied tool back.
+    permissionBaseline: (profile, keystone) => [...permissionBaseline(profile, keystone), ...toolDenyRules(config.keystoneToolDeny)],
     checkPermissionReply,
   }
 }
 
 export { KS_NAME, validateEntries } from "./entries.ts"
 export { checkRuntime, judgeMcpStatus } from "./runtime.ts"
-export { checkPermissionReply, permissionBaseline, type Rule } from "./permissions.ts"
+export { checkPermissionReply, permissionBaseline, toolDenyRules, type Rule } from "./permissions.ts"
 export { egressHostList, frontHosts, frontServers, REGISTRY_HOSTS } from "./egress.ts"
 export { checkEgress, type EgressCheck } from "./egress-check.ts"

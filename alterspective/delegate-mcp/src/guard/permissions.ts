@@ -14,6 +14,7 @@
 // the catch-all comes first and specific rules follow.
 import type { Verdict } from "../shared/contracts.ts"
 import { entryName, keystoneIds } from "../shared/keystone.ts"
+import { toolDenyNames } from "../shared/keystone-policy.ts"
 
 export type Rule = { permission: string; pattern: string; action: "allow" | "deny" | "ask" }
 
@@ -71,6 +72,15 @@ function narrowed(profile: "standard" | "readonly", ids: readonly string[]): Rul
 export function permissionBaseline(profile: "standard" | "readonly", keystone?: readonly string[]): Rule[] {
   const base = profile === "readonly" ? readonly() : standard()
   return keystone === undefined ? base : [...base, ...narrowed(profile, keystoneIds(keystone))]
+}
+
+/**
+ * R5-02 / R5-06: deny rules for write tools of the chosen services (`ks-<id>_<tool>`), to be put
+ * AFTER every other rule. CONVENIENCE, like the rest of this file: OpenCode then hides the tool and
+ * refuses calls to it, but in-box code can still call the connection with the box's tokens.
+ */
+export function toolDenyRules(names: readonly string[]): Rule[] {
+  return toolDenyNames(names).map((permission): Rule => ({ permission, pattern: "*", action: "deny" }))
 }
 
 /**

@@ -187,7 +187,7 @@ describe("oc_doctor, oc_login, oc_list_models, oc_server_restart", () => {
     const f = fakeContext()
     f.api.on("GET /config/providers", { status: 200, data: { providers: [{ id: "synapse", models: { auto: { id: "auto" }, bad: { id: "has space" } } }, { id: "x y", models: { m: {} } }], default: { synapse: "auto" } } })
     const all = await invoke(modelsTool, {}, f.ctx)
-    expect(data(all)).toEqual({ models: ["synapse/auto"], defaults: ["synapse/auto"], keystone: { connections: ["rag-global", "github", "seqlogs"], source: "default" } })
+    expect(data(all)).toEqual({ models: ["synapse/auto"], defaults: ["synapse/auto"], keystone: { connections: ["rag-global", "github", "seqlogs"], source: "default", ceiling: ["rag-global", "github", "seqlogs"], highRisk: [], warnings: [] } })
     expect(text(all).split("\n")[0]).toBe("1 model. Keystone services: rag-global, github, seqlogs (default).")
     const none = await invoke(modelsTool, { provider: "openai" }, f.ctx)
     expect(data(none).models).toEqual([])
