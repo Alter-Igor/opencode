@@ -78,6 +78,8 @@ export function createSessionPruner(options: { stateDir: string; boxSessions: st
     try {
       writeFileSync(tmp, last, { flag: "wx" })
       renameSync(tmp, cursorFile)
+    } catch {
+      // Cursor persistence is best effort; keep the result of records already removed.
     } finally {
       try { unlinkSync(tmp) } catch { /* renamed or already absent */ }
     }

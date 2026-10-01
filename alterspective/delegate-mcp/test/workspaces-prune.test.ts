@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test"
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { createWorkspaces, type ExecResult } from "../src/supervisor/workspaces.ts"
@@ -45,6 +45,17 @@ describe("deleted session host records", () => {
     expect(f.probes).toHaveLength(1)
     expect(f.probes[0]?.slice(-2)).toEqual([`/sessions/${s.state.sessionKey}`, "/sessions"])
     expect(f.probes.some((args) => args.includes("rm"))).toBe(false)
+  })
+
+  test("a failed cursor rename still returns completed removals and cleans its temporary file", async () => {
+    const f = fixture()
+    const s = f.seed(1)
+    const cursor = `.prune-${f.ctx.supervisor.slice("supervisor:".length)}.cursor`
+    // A real directory blocks the file rename on Windows and Linux without mocking filesystem calls.
+    mkdirSync(path.join(f.stateDir, cursor))
+    expect(await f.ctx.workspaces.pruneSessionStates(f.ctx.supervisor, async () => true)).toEqual([s.state.sessionKey])
+    expect(existsSync(s.file)).toBe(false)
+    expect(readdirSync(f.stateDir)).toEqual([cursor])
   })
 
   test("oldest records beyond newest-200 and first-20 live reads are reached across restarts", async () => {

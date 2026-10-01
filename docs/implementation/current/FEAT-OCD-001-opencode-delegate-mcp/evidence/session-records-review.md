@@ -28,3 +28,33 @@ Reviewed source SHA-256 values (unchanged after root review):
 - `src/tools/sessions-list.ts`: `F65AAA4D3B3BD2896D35149374322AD9CD5E98EE762C6C03484B7B2F411A7FA6`
 
 No owner session record was used in these tests. No merge or production change is claimed. PR delivery follows #55.
+
+## PR #63 follow-up: cursor persistence
+
+[CodeRabbit comment 4158727609](https://github.com/Alter-Igor/opencode/pull/63#discussion_r4158727609) found a Low result-reporting fault at `src/supervisor/workspaces-prune.ts:77` on head `a6e7b46953295686de86613f1b0e86fea75721c1`. Saving the page cursor could throw after records had already been removed, so the caller received a rejection instead of the removed keys. The list tool caught that rejection and logged a generic warning; its user response did not fail.
+
+The source trace was confirmed with a real filesystem regression. The test creates its own directory at the cursor destination, which makes the file rename fail. Before the fix, queue PID 78296 returned **15 passed, 1 failed** with an EPERM rename error. Cursor writes are now best effort; the existing temporary-file cleanup still runs and the completed removal list is returned. The same test then passed: **16 passed, 0 failed, 50 assertions**, followed by bridge typecheck, queue PID 69216. No existing host record was used.
+
+A separate agent reviewed the two-file code/test diff, the caller and the unchanged deletion guards. No blocker remained. The root reviewed that receipt and ran all 65 bridge test files again, using the same file groups in [session-records-tests.json](session-records-tests.json). The base remained `f20d17082ec9da05a7e02ac3cf95571f98cdd913`: **884 passed, 25 skipped, 0 failed**. Each row below exited 0; the counts do not include the earlier focused run.
+
+| Batch | Queue PID | Passed | Skipped |
+| --- | --- | --- | --- |
+| 1 | 82572 | 62 | 0 |
+| 2 | 8456 | 63 | 0 |
+| 3 | 56508 | 33 | 24 |
+| 4 | 81812 | 107 | 0 |
+| 5 | 98616 | 54 | 0 |
+| 6 | 97528 | 66 | 0 |
+| 7 | 88440 | 46 | 0 |
+| 8 | 27000 | 53 | 0 |
+| 9 | 95568 | 23 | 0 |
+| 10 | 103440 | 57 | 0 |
+| 11 | 88468 | 58 | 0 |
+| 12 | 52512 | 38 | 0 |
+| 13 | 46284 | 49 | 0 |
+| 14 | 61164 | 51 | 0 |
+| 15 | 32424 | 56 | 0 |
+| 16 | 39920 | 57 | 1 |
+| 17 | 68472 | 11 | 0 |
+
+Final bridge lint exited 0 with 0 errors and 354 warnings, unchanged from the prior run (queue PID 103020). The cursor fix does not change the API or clone absence checks, so the prior live proof remains evidence for those unchanged paths. It was not rerun for this host-only error handling change. No merge, owner-box restart or production change was made.
