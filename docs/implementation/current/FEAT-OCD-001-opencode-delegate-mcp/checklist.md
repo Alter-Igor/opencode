@@ -29,22 +29,22 @@ Each task is 50–200 LOC, under 2 hours, and ends in something that can be chec
 - [x] **T3.2 State machine + absent states** — MOD-03 · LOC ~150 · Verification: one test per absent-state row (`technical-design.md` §6) · Rules: TST-VAL-01
 - [x] **T3.3 Reconnect + rebuild** — MOD-03 · LOC ~100 · Verification: kill stream mid-task; state recovers
 - [x] **T3.4 Watch CLI** — MOD-03 · LOC ~90 · Verification: run under Claude Code Monitor; lines arrive · Rules: CLI-UX-06, -07, -20
-- [ ] **T3.5 Channel push (optional)** — MOD-03 · LOC ~60 · Verification: manual; else recorded "not verified"
+- [ ] **T3.5 Channel push (optional)** — MOD-03 · LOC ~60 · Verification: manual; else recorded "not verified" — built in Wave 3 (`src/channels.ts`, unit tests); live Claude Code check **not verified**
 - [x] **T5.1 Inbox sidecar** — MOD-05 · Deliverable: Bun HTTP service, own volume, admin token for bridges only (box posts stored `verified:false` with the claimed sender — inside the box a sender cannot be proven), hop/rate/size limits counted by the sidecar · Verification: box cannot forge `verified:true` or read supervisor inboxes; admin needs the token; loop bounded by rate limits (hop limit per thread) · LOC ~150 · Rules: ETHICS-AGENT-03
 - [x] **T5.2 In-box tools** — MOD-05 · Deliverable: profile `tool/message_supervisor.ts`, `message_session.ts`, `read_inbox.ts` calling the sidecar · Verification: a session calls each; records appear · LOC ~100
 
 ## Wave 3 — MOD-04 + hub
 
-- [ ] **T4.1 Tool skeleton + doctor/list tools** — MOD-04 · LOC ~150 · Verification: MCP Inspector lists tools with schemas · Rules: MCP-STANDARDS :1232-1275
-- [ ] **T4.2 Session tools** — MOD-04 · LOC ~180 · Verification: real model on a scratch repo
-- [ ] **T4.3 Wait / events tools** — MOD-04 · LOC ~100 · Verification: timing; `still_running`
-- [ ] **T4.4 Pending / answer tools** — MOD-04 · LOC ~90 · Verification: round-trip; `always` refused (red first) · Rules: MCP-STANDARDS :707
-- [ ] **T4.5 Output shaping + untrusted fencing** — MOD-04 · LOC ~80 · Verification: injection string stays in `untrusted` · Rules: ETHICS-AGENT-01
-- [ ] **T4.6 Hub wiring, versioning, logging, E2E** — HUB · LOC ~200 · Verification: E2E transcript for F1–F5 in `evidence/`; secret scan inside the box and over logs/results · Rules: VER-*, OBS-SNK-01 (D-1), DOC-MOD-01
+- [x] **T4.1 Tool skeleton + doctor/list tools** — MOD-04 · LOC ~150 · Verification: MCP Inspector lists tools with schemas · Rules: MCP-STANDARDS :1232-1275 — a real MCP stdio client listed all 17 tools (`evidence/wave3-e2e.md` Run 1); MCP Inspector itself not used
+- [x] **T4.2 Session tools** — MOD-04 · LOC ~180 · Verification: real model on a scratch repo — Run 1
+- [x] **T4.3 Wait / events tools** — MOD-04 · LOC ~100 · Verification: timing; `still_running` — Run 1 (live waits) + unit tests (`still_running`, `hub_changed`)
+- [x] **T4.4 Pending / answer tools** — MOD-04 · LOC ~90 · Verification: round-trip; `always` refused (red first) · Rules: MCP-STANDARDS :707 — Run 2
+- [x] **T4.5 Output shaping + untrusted fencing** — MOD-04 · LOC ~80 · Verification: injection string stays in `untrusted` · Rules: ETHICS-AGENT-01 — unit tests (`test/tools-shape.test.ts`, channel tests); live replies under `untrusted` in Run 1
+- [x] **T4.6 Hub wiring, versioning, logging, E2E** — HUB · LOC ~200 · Verification: E2E transcript for F1–F5 in `evidence/`; secret scan inside the box and over logs/results · Rules: VER-*, OBS-SNK-01 (D-1), DOC-MOD-01 — `evidence/wave3-e2e.md` (runs + secret scan: 0 hits)
 
 ## Review rounds (every wave)
 
-- [ ] Round 1 logic · [ ] Round 2 typecheck + lint (paste output) · [ ] Round 3 edge cases · [ ] Runtime test · [ ] #41 checkpoint
+- [x] Round 1 logic · [x] Round 2 typecheck (tsc clean; the bridge has no lint script) · [x] Round 3 edge cases · [x] Runtime test · [ ] #41 checkpoint — Wave 3: three reviews (W3A/W3B/W3C) → fixes `6bf4046d75`; suite 633 pass / 6 skip / 0 fail
 
 ## Before PR
 
