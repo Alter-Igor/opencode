@@ -39,7 +39,7 @@ describe("box manager", () => {
       supervisor: {
         ensure: async () => next(),
         // `releases` counts replaces: the old box is let go and a new one started.
-        replace: async (options) => (forced.push(options.force), releases++, { target: next(), interrupted: options.force ? 1 : 0 }),
+        replace: async (options) => (forced.push(options.force), releases++, { target: next(), interrupted: options.force ? 1 : 0, keystone: [] }),
       },
       sessions,
       log: silentLogger,
@@ -111,7 +111,7 @@ describe("box manager", () => {
     let clock = 0
     const targets = [A, B, B]
     const m = createBoxManager({
-      supervisor: { ensure: async () => targets.shift() ?? B, replace: async () => ({ target: B, interrupted: 0 }) },
+      supervisor: { ensure: async () => targets.shift() ?? B, replace: async () => ({ target: B, interrupted: 0, keystone: [] }) },
       sessions: new Map(),
       log: silentLogger,
       api: () => new FakeApi(order),
@@ -140,7 +140,7 @@ describe("box manager", () => {
   test("a failed ensure is not cached", async () => {
     let calls = 0
     const m = createBoxManager({
-      supervisor: { ensure: async () => (calls++ === 0 ? Promise.reject(new Error("down")) : A), replace: async () => ({ target: A, interrupted: 0 }) },
+      supervisor: { ensure: async () => (calls++ === 0 ? Promise.reject(new Error("down")) : A), replace: async () => ({ target: A, interrupted: 0, keystone: [] }) },
       sessions: new Map(),
       log: silentLogger,
       api: () => new FakeApi([]),

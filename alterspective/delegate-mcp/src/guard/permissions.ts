@@ -13,6 +13,7 @@
 // OpenCode evaluates rules last-match-wins (permission/index.ts `evaluate` uses findLast), so
 // the catch-all comes first and specific rules follow.
 import type { Verdict } from "../shared/contracts.ts"
+import { entryName, keystoneIds } from "../shared/keystone.ts"
 
 export type Rule = { permission: string; pattern: string; action: "allow" | "deny" | "ask" }
 
@@ -42,9 +43,34 @@ function readonly(): Rule[] {
   ]
 }
 
-/** A fresh ruleset each call, so callers may extend it without sharing state. */
-export function permissionBaseline(profile: "standard" | "readonly"): Rule[] {
-  return profile === "readonly" ? readonly() : standard()
+/**
+ * Per-session narrowing to a subset of the chosen Keystone connections (oc_start_session
+ * {keystone}). CONVENIENCE ONLY, like the rest of this file: in-box code can call Keystone with
+ * the box's tokens directly, so this only keeps a well-behaved agent to the named services; the
+ * front proxy enforces the box-wide set. Last-match-wins: first deny every Keystone tool and MCP
+ * resource read, then give the named connections back the profile's own Keystone action. MCP tool
+ * ids are `<entry>_<tool>` and resource reads ask `read` for `mcp:<entry>:<uri>`; entry names
+ * have no `_` or `:`, so `ks-<id>_*` and `mcp:ks-<id>:*` match that entry only.
+ */
+function narrowed(profile: "standard" | "readonly", ids: readonly string[]): Rule[] {
+  const action: Rule["action"] = profile === "readonly" ? "ask" : "allow"
+  return [
+    { permission: "ks-*_*", pattern: "*", action: "deny" },
+    { permission: "read", pattern: "mcp:ks-*:*", action: "deny" },
+    ...ids.flatMap((id): Rule[] => [
+      { permission: `${entryName(id)}_*`, pattern: "*", action },
+      { permission: "read", pattern: `mcp:${entryName(id)}:*`, action: "allow" },
+    ]),
+  ]
+}
+
+/**
+ * A fresh ruleset each call, so callers may extend it without sharing state. `keystone` (validated
+ * connection ids) narrows the session's Keystone tools to those connections; omitted, no narrowing.
+ */
+export function permissionBaseline(profile: "standard" | "readonly", keystone?: readonly string[]): Rule[] {
+  const base = profile === "readonly" ? readonly() : standard()
+  return keystone === undefined ? base : [...base, ...narrowed(profile, keystoneIds(keystone))]
 }
 
 /**

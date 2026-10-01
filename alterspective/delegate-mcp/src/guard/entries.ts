@@ -1,15 +1,13 @@
 // MOD-02 profile-time MCP allowlist (technical-design §3.2). Fails closed.
 // At least as strict as the fork patch (packages/opencode/src/mcp/allowlist.ts), and in
-// addition: names must be ks-*, the key set is closed, `headers` may not appear at all,
-// oauth values must be strings, and enabled:false entries are still validated.
+// addition: names must be ks-<id>, each entry must point at its own /mcp/c/<id>, the id must be
+// in the chosen Keystone set (R4-01: never /mcp/dynamic), the key set is closed, `headers` may not
+// appear at all, oauth values must be strings, and enabled:false entries are still validated.
 import type { McpEntry, Verdict } from "../shared/contracts.ts"
+import { idOfEntry } from "../shared/keystone.ts"
 
-/** Entry names the bridge accepts, both in the profile and in GET /mcp. */
-export const KS_NAME = /^ks-[a-z0-9-]+$/
-/** Same pattern as mcpAllowPolicy (shared/config.ts); a test keeps them equal. */
-export const KS_PATH = "^/mcp/(dynamic|c/[A-Za-z0-9_-]+)$"
-
-const PATH = new RegExp(KS_PATH)
+/** Entry names the bridge accepts, both in the profile and in GET /mcp: `ks-` + a connection id. */
+export const KS_NAME = /^ks-[a-z0-9][a-z0-9-]{0,62}$/
 const ENTRY_KEYS = new Set(["type", "url", "oauth", "enabled", "timeout"])
 const OAUTH_KEYS = new Set(["scope", "clientId"])
 
@@ -45,7 +43,7 @@ function checkOAuth(oauth: unknown): Check {
   return undefined
 }
 
-function checkUrl(raw: unknown, origin: string): Check {
+function checkUrl(raw: unknown, origin: string, id: string): Check {
   if (typeof raw !== "string" || !URL.canParse(raw)) return "url is missing or does not parse"
   const url = new URL(raw)
   if (url.username || url.password) return "url must not contain credentials"
@@ -54,27 +52,32 @@ function checkUrl(raw: unknown, origin: string): Check {
   if (url.protocol !== "https:" || url.origin !== origin) return `origin ${url.origin} is not ${origin}`
   // The parsed pathname is already normalised (".." and "%2e%2e" resolved) — that is what the
   // transport will request, so that is what is tested.
-  if (!PATH.test(url.pathname)) return `path ${url.pathname} is not /mcp/dynamic or /mcp/c/<connectionId>`
+  // Exact equality: one entry, one connection. /mcp/dynamic and any other Keystone path are refused.
+  if (url.pathname !== `/mcp/c/${id}`) return `path ${url.pathname} is not /mcp/c/${id}`
   return undefined
 }
 
-function checkEntry(name: string, entry: unknown, origin: string): Check {
-  if (!KS_NAME.test(name)) return "name must match ^ks-[a-z0-9-]+$"
+function checkEntry(name: string, entry: unknown, origin: string, allowed: ReadonlySet<string>): Check {
+  const id = KS_NAME.test(name) ? idOfEntry(name) : undefined
+  if (id === undefined) return "name must be ks-<connection id> (^ks-[a-z0-9][a-z0-9-]{0,62}$)"
+  if (!allowed.has(id)) return `connection ${id} is not in the chosen Keystone set`
   if (!isRecord(entry)) return "entry must be an object"
-  return checkKeys(entry) ?? checkOAuth(entry.oauth) ?? checkUrl(entry.url, origin)
+  return checkKeys(entry) ?? checkOAuth(entry.oauth) ?? checkUrl(entry.url, origin, id)
 }
 
 /**
  * Validate every MCP entry of a profile. `keystoneOrigin` is config.keystoneOrigin; it must be
- * an https origin itself, otherwise every entry is refused.
+ * an https origin itself, otherwise every entry is refused. `connections` is the chosen Keystone
+ * set (config.currentKeystone): an entry for any other connection is refused.
  */
-export function validateEntries(entries: Record<string, McpEntry>, keystoneOrigin: string): Verdict {
+export function validateEntries(entries: Record<string, McpEntry>, keystoneOrigin: string, connections: readonly string[]): Verdict {
   if (!URL.canParse(keystoneOrigin) || new URL(keystoneOrigin).origin !== keystoneOrigin || !keystoneOrigin.startsWith("https://")) {
     return { ok: false, code: "policy_violation", reason: `configured Keystone origin ${keystoneOrigin} is not an https origin` }
   }
   if (!isRecord(entries)) return { ok: false, code: "policy_violation", reason: "MCP entries must be an object" }
+  const allowed = new Set(connections)
   for (const [name, entry] of Object.entries(entries)) {
-    const problem = checkEntry(name, entry, keystoneOrigin)
+    const problem = checkEntry(name, entry, keystoneOrigin, allowed)
     if (problem) return violation(name, problem)
   }
   return { ok: true }

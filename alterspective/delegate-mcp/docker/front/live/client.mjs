@@ -29,7 +29,7 @@ function get({ connectTo, sni, host, path, trust = "front" }) {
         let body = ""
         res.setEncoding("utf8")
         res.on("data", (chunk) => (body.length < 4000 ? (body += chunk) : undefined))
-        res.on("end", () => resolve({ status: res.statusCode, body: body.slice(0, 400) }))
+        res.on("end", () => resolve({ status: res.statusCode, body: body.slice(0, 1500) }))
       },
     )
     req.on("timeout", () => req.destroy(new Error("timeout")))
@@ -53,6 +53,78 @@ function rawTls({ connectTo, sni, payload, verify = true }) {
     socket.on("error", (error) => done(`error: ${error.code ?? "error"} ${String(error.message).slice(0, 120)}`))
     socket.on("end", () => done(buffer || "closed"))
   })
+}
+
+/**
+ * R4-01: one request to Keystone through front, sent byte for byte (no client-side path clean-up),
+ * with NO credentials. Returns the status and whether the answer is front's own error page (a
+ * refusal that never reached Keystone).
+ */
+function keystoneRequest(method, target) {
+  return new Promise((resolve) => {
+    const socket = tls.connect({ host: IDENTITY, port: 443, servername: IDENTITY, ca: CA, timeout: T })
+    const body = method === "POST" ? "{}" : ""
+    const head = [
+      `${method} ${target} HTTP/1.1`,
+      `Host: ${IDENTITY}`,
+      "Accept: application/json, text/event-stream",
+      ...(body ? ["Content-Type: application/json", `Content-Length: ${body.length}`] : []),
+      "Connection: close",
+    ]
+    let buffer = ""
+    const done = (value) => (socket.destroy(), resolve(value))
+    // nginx hides the upstream Server header, so a refusal is told apart by front's own error page.
+    const parse = () => {
+      const statusLine = buffer.slice(0, buffer.indexOf("\r\n"))
+      const page = buffer.slice(buffer.indexOf("\r\n\r\n") + 4)
+      return { status: Number(statusLine.split(" ")[1]), front: page.includes("<center>nginx</center>") }
+    }
+    socket.on("secureConnect", () => socket.write(`${head.join("\r\n")}\r\n\r\n${body}`))
+    socket.on("data", (chunk) => {
+      buffer += chunk.toString("latin1")
+      if (buffer.length > 8000) done(parse())
+    })
+    socket.on("timeout", () => done({ error: "timeout" }))
+    socket.on("error", (error) => done({ error: error.code ?? "error" }))
+    socket.on("end", () => done(buffer.includes("\r\n\r\n") ? parse() : { error: "closed" }))
+  })
+}
+
+/** R4-01 path probes: [name, method, request-target]. Chosen connection in the live front: rag-global. */
+const KEYSTONE_PATHS = [
+  // Allowed (Keystone answers; no credentials, so the MCP endpoint says 401).
+  ["discovery", "GET", "/.well-known/oauth-authorization-server"],
+  ["resourceMetadata", "GET", "/.well-known/oauth-protected-resource/mcp/c/rag-global"],
+  ["mcpNoAuth", "POST", "/mcp/c/rag-global"],
+  // Spellings nginx normalises INTO the allowed path: forwarded as the literal allowed path.
+  ["encodedAllowed", "POST", "/mcp/c/r%61g-global"],
+  ["dotsIntoAllowed", "POST", "/mcp/dynamic/../c/rag-global"],
+  // Refused by front (403, never forwarded) or rejected by nginx itself (400).
+  ["dynamicPost", "POST", "/mcp/dynamic"],
+  ["dynamicGet", "GET", "/mcp/dynamic"],
+  ["adminMcp", "POST", "/api/mcp"],
+  ["otherConnection", "POST", "/mcp/c/m365"],
+  ["dynamicMetadata", "GET", "/.well-known/oauth-protected-resource/mcp/dynamic"],
+  ["traversal", "POST", "/mcp/c/rag-global/../../dynamic"],
+  ["encodedSlashTraversal", "POST", "/mcp/c/rag-global%2F..%2F..%2Fdynamic"],
+  ["encodedDots", "POST", "/mcp/c/%2e%2e/dynamic"],
+  ["encodedDynamic", "POST", "/mcp/%64ynamic"],
+  ["doubleSlashes", "POST", "//mcp//dynamic"],
+  ["upperCase", "POST", "/MCP/DYNAMIC"],
+  ["semicolon", "POST", "/mcp/c/rag-global;/../../dynamic"],
+  ["queryString", "POST", "/mcp/c/rag-global?x=1"],
+  ["trailingSlash", "POST", "/mcp/c/rag-global/"],
+  ["tokenWrongMethod", "GET", "/api/oidc/token"],
+  ["authorize", "GET", "/api/oauth/authorize"],
+  ["otherApi", "GET", "/api/users/me"],
+  ["nul", "POST", "/mcp/c/rag-global%00"],
+  ["absoluteForm", "POST", `https://${IDENTITY}/mcp/dynamic`],
+]
+
+async function keystonePaths() {
+  const out = {}
+  for (const [name, method, target] of KEYSTONE_PATHS) out[name] = await keystoneRequest(method, target)
+  return out
 }
 
 /** Plain TCP: did it connect, and what came back to `payload` (if any). */
@@ -143,6 +215,8 @@ const result = {
   },
   // (f) the Docker host side of `sealed`: nothing listens for the box there.
   gateway: { ip: GATEWAY, ports: await gatewayPorts() },
+  // (h) R4-01: on Keystone, only the chosen connections' paths (and the OAuth paths) pass front.
+  keystonePaths: await keystonePaths(),
   // (g) IPv6: no address, no route, and no AAAA answer that could go round front.
   ipv6: {
     addresses: globalV6(),

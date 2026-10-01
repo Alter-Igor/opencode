@@ -1,4 +1,4 @@
-# FEAT-OCD-001 — Technical design (revision 4: front proxy after review round 3; revision 3 after round 2 and Wave 0 spikes)
+# FEAT-OCD-001 — Technical design (revision 5: chosen Keystone services after review round 4; revision 4: front proxy after round 3; revision 3 after round 2 and Wave 0 spikes)
 
 No implementation code here — contracts, data shapes and behaviour only. Paths are relative to the repo root. Revision 2 changes are driven by `evidence/adversarial-review.md` (C1, C2, H1–H4, M1–M6).
 
@@ -23,24 +23,27 @@ flowchart LR
     B[opencode-delegate bridge] -- HTTP basic, 127.0.0.1:port --> API
     W[opencode-delegate watch] -- SSE --> API
     WEB[Browser: web UI] --> API
-    B --- ST[(bridge dir: lock, inbox, logs — NOT mounted)]
+    B --- ST[(bridge home: lock, logs, keystone.json, front/ — not mounted in the box)]
   end
   subgraph Box["Docker container 'opencode-delegate' (one per user)"]
     API[opencode serve + fork MCP allowlist patch]
     P[profile: read-only mount]
     D[(data volume: own DB, own mcp-auth.json with ks-* only)]
-    R[/work = C:\GitHub bind mount/]
+    S[(sessions volume: repo copies from git bundles)]
+    HO[/handoff: in read-only, out for result bundles/]
   end
+  ST -. "front/servers.conf, read-only" .-> PX
   API -- "allowed names resolve to front (TLS, private CA)" --> PX[front proxy]
-  PX -- "fixed SNI + Host" --> K[(identity.alterspective.com.au)]
+  PX -- "fixed SNI + Host; only /mcp/c/chosen ids + OAuth paths" --> K[(identity.alterspective.com.au)]
   PX -- "fixed SNI + Host" --> M[(synapse2-api.alterspective.com.au)]
-  PX -. "other SNI: handshake refused; other Host: 421" .-> X((blocked))
+  PX -. "other SNI: handshake refused; other Host: 421; other Keystone path: 403" .-> X((blocked))
 ```
 
 **Boundaries.**
 - The bridge never holds Keystone tokens. OpenCode's MCP client (inside the box) does OAuth 2.1 + PKCE with Keystone and stores tokens in the box's own data volume, keyed by entry name (`packages/opencode/src/mcp/auth.ts:9-37`). Those tokens only work at the Keystone relay (RFC 8707 audience binding), so even if the agent reads them, use still goes through Keystone, as the owner, audited (BFA-007).
 - The container has **no** host environment, no `HKCU` secrets, no `~/.config/opencode`, no owner `mcp-auth.json`, no `%ProgramData%\opencode`. Config sources outside the profile (review H4) do not exist inside the box by construction.
 - Network: the container joins an internal Docker network with no default route. Its only way out is the `front` proxy (revision 4, review R3-01). Inside the box, each allowed name (`identity.alterspective.com.au`, the approved model host) is a network alias of `front`. `front` ends TLS with a leaf from a private CA made inside it (key never leaves its volume; name-constrained to the allowed hosts) and opens its own TLS connection to the one real host, with SNI and `Host` fixed and the upstream certificate verified. An unknown SNI is refused at the handshake and a `Host` that does not match gets `421`. There is no CONNECT proxy: a host-name CONNECT allowlist was not enough, because the box owned the TLS session and could swap SNI or `Host` to reach other sites on the same Cloudflare / Azure front door. Upstream names are looked up with `OCD_FRONT_RESOLVER` (public DNS by default; fails closed). This is the control that makes R7 hold even if the agent learns the server password (C2).
+- Keystone paths (revision 5, review R4-01). Reaching Keystone is not enough: `/mcp/dynamic` relays to every service on the owner's account (mail, remote code). On the Keystone host, `front` forwards only `/mcp/c/<id>` for each **chosen** connection, that connection's `/.well-known/oauth-protected-resource/mcp/c/<id>`, and the OAuth paths the MCP client calls (`/.well-known/oauth-authorization-server`, `/.well-known/openid-configuration`, `/api/oauth/register`, `/api/oidc/token`). Every other path gets `403` from `front` and never reaches Keystone. Each path is an exact `location =` match on nginx's normalised URI, and each forwards its own **literal** path, with no query string, so no spelling (`..`, `%2F`, `//`, `;`, case) can reach another path. The chosen set is picked at runtime (`oc_server_restart {keystone}`, default `rag-global`, `github`, `seqlogs`) and saved in the bridge home. The bridge writes `front`'s servers file there and mounts it read-only; its hash is a `front` label, so a `front` with another set is never reused. What the chosen services can do still leaves the box, for example a GitHub write: choose the set for the job.
 
 **Location.** `alterspective/delegate-mcp/` (bridge, watch CLI, profile template, `Dockerfile`, compose file). Outside the Bun workspace globs (`package.json:25-32`) with its own lockfile. The image builds the fork from this checkout, so the patch in §3.4 ships with it.
 
@@ -59,14 +62,14 @@ flowchart LR
 
 ### 3.1 Profile (read-only mount at the container's global config dir)
 - `provider`, `model`, `small_model` copied from the owner's global config **only** if values are `{env:…}` references; the referenced variables are passed into the container **one by one** from an owner-approved list (e.g. the Synapse gateway key). Literal secrets → `profile_invalid`.
-- `mcp`: allowlisted entries only (§3.2). `permission`: baseline (§3.3). `instructions`: set per session by the bridge to the repo's `AGENTS.md`/`CLAUDE.md` (review M4).
+- `mcp`: one `ks-<id>` entry per chosen Keystone connection, allowlisted (§3.2). `permission`: baseline (§3.3). `instructions`: set per session by the bridge to the repo's `AGENTS.md`/`CLAUDE.md` (review M4).
 - Whole profile directory hashed; mounted read-only (review M2).
 
 ### 3.2 Allowlist rule (fails closed)
-Allowed only if **all** hold: `type:"remote"`; URL origin exactly `https://identity.alterspective.com.au`; path `^/mcp/(dynamic|c/[A-Za-z0-9_-]+)$`; no `headers` (a static header means a shared key — BFA-007; it does not disable OAuth, review row 28); `oauth` is absent or contains only `scope` and/or `clientId` (strings); no `clientSecret`, `redirectUri`, `callbackPort` (review M6); only the keys `type`, `url`, `oauth`, `enabled`, `timeout` are accepted; name matches `^ks-[a-z0-9-]+$`; an `enabled:false` entry is still validated. Default: `ks-delegate` → `/mcp/dynamic`; pinned: `ks-<connectionId>` → `/mcp/c/<connectionId>`.
+Allowed only if **all** hold: `type:"remote"`; URL origin exactly `https://identity.alterspective.com.au`; name `ks-<id>` and path exactly `/mcp/c/<id>`, with `<id>` (`^[a-z0-9][a-z0-9-]{0,62}$`) in the chosen Keystone set (revision 5, R4-01: no `/mcp/dynamic`); the fork patch policy is `^/mcp/c/(<id1>|<id2>|...)$` with the ids regex-escaped; no `headers` (a static header means a shared key — BFA-007; it does not disable OAuth, review row 28); `oauth` is absent or contains only `scope` and/or `clientId` (strings); no `clientSecret`, `redirectUri`, `callbackPort` (review M6); only the keys `type`, `url`, `oauth`, `enabled`, `timeout` are accepted; an `enabled:false` entry is still validated. Entries: `ks-<id>` → `/mcp/c/<id>` for each chosen id; default set `rag-global`, `github`, `seqlogs`. These checks catch setup mistakes; the wall is `front` (§1).
 
 ### 3.3 Permission baseline (convenience, not the security boundary)
-In the profile config **and** on each session (`session/session.ts:260-270`): `* allow`, `external_directory deny`, `webfetch ask`, `bash ask` for push/merge/destructive patterns, `doom_loop ask`, `ks-*_* allow`. The `readonly` profile adds `edit deny`, `bash ask` for everything, and ends with `ks-*_* ask` so Keystone tools that can write need an answer (review A-16). Pattern asks are bypassable (review G1) and subagents drop `ask` rules (`agent/subagent-permissions.ts:20-23`), so **no R7 claim rests on them**. The bridge never sends the deprecated `tools` field (`session/prompt.ts:1060-1066`), and re-reads `session.permission` before each send (H3). `always` replies are refused by the bridge.
+In the profile config **and** on each session (`session/session.ts:260-270`): `* allow`, `external_directory deny`, `webfetch ask`, `bash ask` for push/merge/destructive patterns, `doom_loop ask`, `ks-*_* allow`. A session started with `keystone: [...]` (a subset of the box-wide set) also gets `ks-*_* deny` and `read mcp:ks-*:* deny`, then `ks-<id>_*` and `read mcp:ks-<id>:*` back for the named ids. That narrowing is a convenience: in-box code can still use every connection of the box-wide set. The `readonly` profile adds `edit deny`, `bash ask` for everything, and ends with `ks-*_* ask` so Keystone tools that can write need an answer (review A-16). Pattern asks are bypassable (review G1) and subagents drop `ask` rules (`agent/subagent-permissions.ts:20-23`), so **no R7 claim rests on them**. The bridge never sends the deprecated `tools` field (`session/prompt.ts:1060-1066`), and re-reads `session.permission` before each send (H3). `always` replies are refused by the bridge.
 
 ### 3.4 Fork patch (defence in depth; review H1, H2)
 Small, test-covered change in `packages/opencode/src/mcp/`:
@@ -76,7 +79,7 @@ Small, test-covered change in `packages/opencode/src/mcp/`:
 Recorded in the fork notes of `AGENTS.md` with the regression test to run after every upstream sync. Kill criterion: if the patch cannot stay under ~150 LOC in these files, stop and report.
 
 ### 3.5 Runtime guard (bridge)
-Before each `oc_send`: `GET /mcp?directory=<session dir>` → every entry name must be `ks-*` (the fork patch has already refused any entry whose URL fails §3.2, so names are enough **only while the patch is active**); read failure → `policy_unverified`. The supervisor therefore also verifies, on start and reuse, that the box runs the expected image and that its `OPENCODE_MCP_ALLOW` equals the bridge's policy; a mismatch is `profile_changed` (review A-04/A-05). Always sends `directory` (review M5). Also polls `GET /mcp` for busy directories every 15 s (no event exists for `MCP.add`, review row 22) and aborts on violation.
+Before each `oc_send`: `GET /mcp?directory=<session dir>` → every entry name must be `ks-<id>` for a chosen id (the fork patch has already refused any entry whose URL fails §3.2, so names are enough **only while the patch is active**); read failure → `policy_unverified`. The supervisor therefore also verifies, on start and reuse, that the box runs the expected image and that its `OPENCODE_MCP_ALLOW` equals the bridge's policy; a mismatch is `profile_changed` (review A-04/A-05). Always sends `directory` (review M5). Also polls `GET /mcp` for busy directories every 15 s (no event exists for `MCP.add`, review row 22) and aborts on violation.
 
 ## 4. Container lifecycle (MOD-01)
 
@@ -86,7 +89,7 @@ Before each `oc_send`: `GET /mcp?directory=<session dir>` → every entry name m
 - Filesystem read-only except tmpfs `/tmp`, `/home/agent` and the volumes; server runs as non-root `agent` (uid 10001); OpenCode install owned by root (review N1).
 - Password: 24 random bytes (base64url) generated by the first bridge, passed as container env, kept in bridge memory. Other bridges and the watch CLI get it from the container (`docker inspect` needs the owner's Docker access, not a file the agent can read). **[U]**: lock file in the owner's profile + `OPENCODE_DB=opencode-delegate.db` + explicit env allowlist.
 - Port: container publishes `127.0.0.1:<random>` only.
-- Keystone sign-in (`oc_login`), **proven in T0.3**: `POST /mcp/ks-delegate/auth` → authorization URL + `oauthState`; the bridge opens the owner's browser and listens on host `127.0.0.1:19876` for the loopback redirect, checks `state`, then relays only the `code` to `POST /mcp/ks-delegate/auth/callback`. A clash with the owner's TUI sign-in on 19876 is possible but short-lived (review L3): the bridge reports `port_busy` and retries.
+- Keystone sign-in (`oc_login`), **proven in T0.3**: `POST /mcp/ks-<id>/auth` → authorization URL + `oauthState`; the bridge opens the owner's browser only for an S256 PKCE code request to Keystone's authorize path, back to its loopback listener, whose `resource` is that entry's own `/mcp/c/<id>` (revision 5); it listens on host `127.0.0.1:19876` for the loopback redirect, checks `state`, then relays only the `code` to `POST /mcp/ks-<id>/auth/callback`. With no `server`, `oc_login` signs in every chosen entry that is `needs_auth`, one at a time, and stops at the first that does not finish. A clash with the owner's TUI sign-in on 19876 is possible but short-lived (review L3): the bridge reports `port_busy` and retries.
 - Workspaces (replaces path translation): `oc_start_session {directory}` → the bridge runs `git bundle create <handoff>/in/<fresh>.bundle --all` in the owner's repo (no hooks run) → the box clones it (`--no-checkout`) into a temp folder, checks out `delegate/<session>` at the recorded base and moves it to `/sessions/<session>`; an existing folder → `directory_busy`. `oc_result`/`oc_collect` → the box writes `/handoff/out/<fresh>.bundle`; the bridge runs `git fetch <bundle> delegate/<session>:delegate/<session>` in the owner's repo (no hooks from the bundle run). The owner reviews that branch like any PR. Repos must be under `C:\GitHub` (`X:` subst normalised); anything else → `directory_invalid`.
 - Package installs: the box reaches npm and PyPI only through read-only pull-through caches on the internal network (publish disabled; review N3). Built in Wave 1.
 - Stop: `docker compose -p opencode-delegate down` (volumes kept) when the last bridge lease ends, run under the start lock so a starting bridge cannot be stopped mid-start (review A-02). No process-class kills (AILES-026).
@@ -97,10 +100,10 @@ All tools: zod-validated input; short JSON + one-line summary; session text wrap
 
 | Tool | Input | Result |
 |---|---|---|
-| `oc_doctor` | — | container state, image version/SHA, isolation level (S/U), profile MCP list with URLs, `ks-*` auth states, egress allowlist, guard verdict |
-| `oc_login` | `server?` (default `ks-delegate`) | `needs_auth` → browser → `connected` / `failed` |
-| `oc_list_models` | `provider?` | `providerID/modelID` list |
-| `oc_start_session` | `directory`, `title?`, `agent?`, `model?`, `profile?` (`standard`/`readonly`), `allowShared?` | `sessionID`, `webUrl` (never contains the password, L6) |
+| `oc_doctor` | — | container state, image version/SHA, isolation level (S/U), the chosen Keystone set (saved or default) with each `ks-<id>` auth state, egress check (front config for that set, read-only mount), `frontMatches`, guard verdict |
+| `oc_login` | `server?` (default: every chosen `ks-<id>` that is `needs_auth`) | `needs_auth` → browser → `connected` / `failed` |
+| `oc_list_models` | `provider?` | `providerID/modelID` list, plus `keystone` (the box-wide set) |
+| `oc_start_session` | `directory`, `title?`, `agent?`, `model?`, `profile?` (`standard`/`readonly`), `allowShared?`, `keystone?` (subset of the box-wide set; convenience only) | `sessionID`, `webUrl` (never contains the password, L6) |
 | `oc_send` | `sessionID`, `message`, `model?`, `agent?`, `correlationId?` | `accepted` \| `not_started` \| `refused(policy_*)` |
 | `oc_status` | `sessionID?` | state (§6), since, todos, tokens, last error |
 | `oc_wait` | `sessionIDs[]`, `until[]`, `timeoutSec` ≤240, `cursor?` | events + cursor, or `still_running` |
@@ -111,6 +114,7 @@ All tools: zod-validated input; short JSON + one-line summary; session text wrap
 | `oc_abort` | `sessionID` | `ok` |
 | `oc_list_sessions` | `directory?`, `mine?` | sessions + supervisor + state |
 | `oc_post` / `oc_inbox` | `to`, `text`, `wake?` / `cursor?` | agent inbox (§7) |
+| `oc_server_restart` | `confirm`, `force?`, `keystone?` (new box-wide set, saved) | restarted, interrupted bridges, the set it runs with |
 
 Optional Claude channel push as in revision 1 (off by default).
 
@@ -160,7 +164,7 @@ As revision 1: stable error codes (`server_down`, `profile_invalid`, `profile_ch
 1. Two bridges start at once → a start lock file (`<home>/start.lock`, owner PID + heartbeat) serialises `compose up`; the loser waits and reuses (review A-01).
 2. Container crash → `server_down`, restart, sessions `unknown` until rebuilt; history persists in the volume.
 3. Provider config uses a literal key → `profile_invalid` naming the key path, value never copied.
-4. `ks-delegate` needs sign-in mid-task → task continues without MCP tools; `oc_status` shows `needs_auth`.
+4. A `ks-<id>` entry needs sign-in mid-task → task continues without MCP tools; `oc_status` shows `needs_auth`.
 5. Keystone `relay_error` → reported; retry advice 30–90 s (AILES-043).
 6. Repo path on `X:` (subst of `C:\GitHub`) → normalised before translation.
 7. Two sessions, one folder → `directory_busy` unless `allowShared`.

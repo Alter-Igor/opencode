@@ -1,22 +1,34 @@
 // MOD-02: oc_doctor's egress check (review R3-01). It reads the files the sandbox is started from
-// (this checkout's docker/ folder) and says whether the egress control they describe is the
-// fixed-upstream TLS front generated from config.egressHosts, with no CONNECT proxy left, that
-// front verifies its upstreams (upstream.conf), and that the box sits on the internal `sealed`
-// network only (R4-05).
+// (this checkout's docker/ folder, and the servers file the bridge generated into its home) and
+// says whether the egress control they describe is the fixed-upstream TLS front generated from
+// config.egressHosts and the chosen Keystone connections (R4-01: only their Keystone paths), that
+// front reads that file read-only, with no CONNECT proxy left, that front verifies its upstreams
+// (upstream.conf), and that the box sits on the internal `sealed` network only (R4-05).
 // It checks CONFIGURATION, not traffic: the live red/green proof is test/egress-live.test.ts
 // (OCD_LIVE_EGRESS=1). Never throws: an unreadable file is a failed check with a reason.
 import { readFileSync } from "node:fs"
 import path from "node:path"
-import { FRONT_HOSTS_FILE, FRONT_SERVERS_FILE, egressHostList, frontHosts, frontServers } from "./egress.ts"
+import { FRONT_GENERATED_MOUNT, FRONT_HOSTS_FILE, FRONT_SERVERS_NAME, egressHostList, frontHosts, frontServers, type FrontKeystone } from "./egress.ts"
+import { identityPaths } from "./egress-identity.ts"
+import { frontDir, type BridgeConfig } from "../shared/config.ts"
 
 export const DOCKER_DIR = path.join(import.meta.dir, "..", "..", "docker")
+
+/** What the front should be generated from: the egress hosts, the Keystone host + chosen set, and the bridge's front folder. */
+export type EgressInput = { hosts: readonly string[]; keystone: FrontKeystone; frontDir: string }
 
 export type EgressCheck = {
   ok: boolean
   control: "tls-front"
   source: "configuration"
-  /** docker/front/servers.conf and hosts.txt equal what config.egressHosts generates. */
+  /** The chosen Keystone connections the front was checked against (R4-01). */
+  keystoneConnections: string[]
+  /** The only Keystone paths front forwards for that set; everything else on Keystone gets 403. */
+  keystonePaths: string[]
+  /** <home>/front/servers.conf and docker/front/hosts.txt equal what the hosts and the Keystone set generate. */
   frontConfigMatches: boolean
+  /** compose mounts the generated folder read-only into front, and nginx.conf includes the file from there. */
+  frontMountReadOnly: boolean
   /** front's network aliases on `sealed` are exactly the allowed hosts. */
   aliasesMatch: boolean
   /** A CONNECT proxy (the old tinyproxy `egress`) or a proxy variable in the box env is present. */
@@ -28,7 +40,7 @@ export type EgressCheck = {
   problems: string[]
 }
 
-type Service = { networks?: unknown; environment?: unknown; image?: unknown; build?: unknown }
+type Service = { networks?: unknown; environment?: unknown; image?: unknown; build?: unknown; volumes?: unknown }
 type Compose = { services?: Record<string, Service>; networks?: Record<string, { internal?: unknown } | null> }
 
 /** Shared upstream settings; included by every generated server in servers.conf. */
@@ -47,21 +59,36 @@ function readText(dir: string, file: string, problems: string[]): string | undef
   }
 }
 
-function frontMatches(dir: string, hosts: readonly string[], problems: string[]): boolean {
-  let expected: [string, string][]
+function frontMatches(dir: string, input: EgressInput, problems: string[]): boolean {
+  let servers: string
+  let hosts: string
   try {
-    expected = [[FRONT_SERVERS_FILE, frontServers(hosts)], [FRONT_HOSTS_FILE, frontHosts(hosts)]]
+    servers = frontServers(input.hosts, input.keystone)
+    hosts = frontHosts(input.hosts)
   } catch (error) {
-    problems.push(`config.egressHosts refused: ${error instanceof Error ? error.message : "invalid"}`)
+    problems.push(`config.egressHosts or the Keystone set refused: ${error instanceof Error ? error.message : "invalid"}`)
     return false
   }
   let ok = true
-  for (const [file, text] of expected) {
-    if (readText(dir, file, problems) === text) continue
-    problems.push(`${file} is not the generated file for config.egressHosts (run: bun src/guard/egress.ts)`)
+  if (readText(dir, FRONT_HOSTS_FILE, problems) !== hosts) {
+    problems.push(`${FRONT_HOSTS_FILE} is not the generated file for config.egressHosts (run: bun src/guard/egress.ts)`)
+    ok = false
+  }
+  if (readText(input.frontDir, FRONT_SERVERS_NAME, problems) !== servers) {
+    problems.push(`the bridge's ${FRONT_SERVERS_NAME} is not the one generated for the egress hosts and the chosen Keystone set (restart the sandbox with oc_server_restart)`)
     ok = false
   }
   return ok
+}
+
+/** front gets the generated folder read-only, at the path nginx.conf includes it from. */
+function frontMountReadOnly(dir: string, front: Service | undefined, problems: string[]): boolean {
+  const volumes = Array.isArray(front?.volumes) ? front.volumes.map(String) : []
+  const mounted = volumes.some((volume) => volume.endsWith(`:${FRONT_GENERATED_MOUNT}:ro`))
+  const included = (readText(dir, "front/nginx.conf", problems) ?? "").includes(`include ${FRONT_GENERATED_MOUNT}/${FRONT_SERVERS_NAME};`)
+  if (!mounted) problems.push(`compose.yaml does not mount the generated front folder read-only at ${FRONT_GENERATED_MOUNT}`)
+  if (!included) problems.push(`front/nginx.conf does not include ${FRONT_GENERATED_MOUNT}/${FRONT_SERVERS_NAME}`)
+  return mounted && included
 }
 
 function aliasesOf(front: Service | undefined): string[] {
@@ -153,16 +180,35 @@ function boxSealed(compose: Compose, problems: string[]): boolean {
   return internal && only
 }
 
-/** The egress control the sandbox's files describe, for `hosts` (config.egressHosts). */
-export function checkEgress(hosts: readonly string[], dir: string = DOCKER_DIR): EgressCheck {
+function pathsOf(input: EgressInput, problems: string[]): string[] {
+  try {
+    return identityPaths(input.keystone.connections).map((allowed) => allowed.path)
+  } catch {
+    problems.push("the chosen Keystone set is not valid")
+    return []
+  }
+}
+
+/** The egress control the sandbox's files describe, for the egress hosts and the chosen Keystone set. */
+export function checkEgress(input: EgressInput, dir: string = DOCKER_DIR): EgressCheck {
   const problems: string[] = []
-  const frontConfigMatches = frontMatches(dir, hosts, problems)
+  const keystonePaths = pathsOf(input, problems)
+  const frontConfigMatches = frontMatches(dir, input, problems)
   const upstreamTls = upstreamTlsVerified(dir, problems)
   const compose = parseCompose(dir, problems)
-  const aliases = compose ? aliasesMatch(compose, hosts, problems) : false
+  const aliases = compose ? aliasesMatch(compose, input.hosts, problems) : false
   if (compose && !compose.services?.front) problems.push("compose.yaml has no `front` service")
+  const mountRo = compose ? frontMountReadOnly(dir, compose.services?.front, problems) : false
   const connectProxy = compose ? hasConnectProxy(compose, problems) : true
   const sealed = compose ? boxSealed(compose, problems) : false
-  const ok = frontConfigMatches && upstreamTls && aliases && !connectProxy && sealed && compose?.services?.front !== undefined
-  return { ok, control: "tls-front", source: "configuration", frontConfigMatches, aliasesMatch: aliases, connectProxy, upstreamTlsVerified: upstreamTls, boxSealed: sealed, problems }
+  const ok = frontConfigMatches && mountRo && upstreamTls && aliases && !connectProxy && sealed && compose?.services?.front !== undefined
+  return {
+    ok, control: "tls-front", source: "configuration", keystoneConnections: [...input.keystone.connections], keystonePaths,
+    frontConfigMatches, frontMountReadOnly: mountRo, aliasesMatch: aliases, connectProxy, upstreamTlsVerified: upstreamTls, boxSealed: sealed, problems,
+  }
+}
+
+/** The EgressInput for a config whose keystoneConnections is already the effective set (effectiveConfig). */
+export function egressInput(config: Pick<BridgeConfig, "egressHosts" | "keystoneOrigin" | "keystoneConnections" | "home">): EgressInput {
+  return { hosts: config.egressHosts, keystone: { host: new URL(config.keystoneOrigin).hostname, connections: config.keystoneConnections }, frontDir: frontDir(config) }
 }

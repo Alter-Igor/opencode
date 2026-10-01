@@ -2,12 +2,13 @@
 // { state: "unavailable", reason } and logged with its code and detail.
 // The running state also says whether the box's MCP allow policy (the fork patch input) and
 // image match this bridge, and the Docker health status.
-import { mcpAllowPolicy } from "../shared/config.ts"
+import { effectiveConfig, mcpAllowPolicy } from "../shared/config.ts"
 import type { BoxState, Supervisor } from "../shared/contracts.ts"
 import { DelegateError } from "../shared/errors.ts"
 import type { ApiTarget } from "../shared/opencode-api.ts"
 import { INSPECT_ENV, MCP_ALLOW_ENV, PASSWORD_ENV } from "./compose-env.ts"
 import { LABEL, builtFrom, inspectBox, requireDocker, type BoxInspect } from "./docker.ts"
+import { frontFilesFor } from "./plan.ts"
 import { toDelegateError, type Run } from "./run.ts"
 
 type Running = Extract<BoxState, { state: "running" }>
@@ -17,8 +18,10 @@ export type SupervisorStatus =
   | Exclude<BoxState, { state: "running" }>
   | (Running & {
       health: BoxInspect["health"]
-      /** OPENCODE_MCP_ALLOW in the box equals this bridge's mcpAllowPolicy(config). */
+      /** OPENCODE_MCP_ALLOW in the box equals mcpAllowPolicy for the Keystone set in force now. */
       policyVerified: boolean
+      /** The running front was started with the servers file for the Keystone set in force now (R4-01). */
+      frontMatches: boolean
       /** The box was built from the same build inputs (image label = content-hash tag) as this bridge wants. */
       imageMatches: boolean
       /** Information only: the git sha baked into the image when it was built (`<sha>[+dirty.<hash>]`). */
@@ -27,9 +30,10 @@ export type SupervisorStatus =
       bridgeAt?: string
     })
 
-export type ReplaceOptions = { force: boolean }
-/** `interrupted`: how many other bridges held the running sandbox that was replaced. */
-export type ReplaceResult = { target: ApiTarget; interrupted: number }
+/** `keystone`: a new box-wide Keystone set (connection ids), saved in the bridge home (R4-01). */
+export type ReplaceOptions = { force: boolean; keystone?: string[] }
+/** `interrupted`: how many other bridges held the running sandbox that was replaced. `keystone`: the set it runs with. */
+export type ReplaceResult = { target: ApiTarget; interrupted: number; keystone: string[] }
 
 export interface DelegateSupervisor extends Supervisor {
   status(): Promise<SupervisorStatus>
@@ -60,13 +64,16 @@ export async function statusOf(run: Run): Promise<SupervisorStatus> {
     const box = await inspectBox(deps.exec, INSPECT_ENV, run.container)
     if (!box?.running) return { state: "stopped" }
     const image = box.labels[LABEL.image]
+    const config = effectiveConfig(deps.config)
+    const front = await inspectBox(deps.exec, [], `${run.container}-front`)
     return {
       state: "running",
       target: targetOf(box, deps.config.project),
       imageTag: image ?? box.image,
       startedBy: run.state.startedHere ? "this-bridge" : "other",
       health: box.health,
-      policyVerified: box.env[MCP_ALLOW_ENV] === mcpAllowPolicy(deps.config),
+      policyVerified: box.env[MCP_ALLOW_ENV] === mcpAllowPolicy(config),
+      frontMatches: front?.labels[LABEL.frontConfig] === frontFilesFor(config).hash,
       imageMatches: image === deps.image,
       imageBuiltFrom: builtFrom(box.labels),
       bridgeAt: deps.buildSha,

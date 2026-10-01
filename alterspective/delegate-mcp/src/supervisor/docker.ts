@@ -20,6 +20,8 @@ export const LABEL = {
   profileHash: "com.alterspective.opencode-delegate.profile-hash",
   port: "com.alterspective.opencode-delegate.port",
   image: "com.alterspective.opencode-delegate.image",
+  /** On `front`: sha256 of the generated servers file it was started with (review R4-01). */
+  frontConfig: "com.alterspective.opencode-delegate.front-config",
   /** Baked into the image at build time (Dockerfile LABEL): `<version>-alterspective.<git sha>[.dirty.<hash>]`. */
   ociVersion: "org.opencontainers.image.version",
 } as const

@@ -18,6 +18,8 @@ export const L = {
   hash: "com.alterspective.opencode-delegate.profile-hash",
   port: "com.alterspective.opencode-delegate.port",
   image: "com.alterspective.opencode-delegate.image",
+  // On front (R4-01); the fake answers every sibling inspect with the box state, so the box carries it too.
+  front: "com.alterspective.opencode-delegate.front-config",
 }
 
 export type Call = { argv: string[]; env?: Record<string, string>; cwd?: string }
@@ -68,7 +70,7 @@ export function fakeDocker(state: Box, calls: Call[], over: Overrides = {}): Exe
       const failed = over.up?.(env)
       if (failed) return failed
       state.running = true
-      state.labels = { [L.hash]: env.OCD_PROFILE_HASH!, [L.port]: env.OCD_PORT!, [L.image]: env.OCD_IMAGE! }
+      state.labels = { [L.hash]: env.OCD_PROFILE_HASH!, [L.port]: env.OCD_PORT!, [L.image]: env.OCD_IMAGE!, [L.front]: env.OCD_FRONT_HASH! }
       state.env = [`OPENCODE_SERVER_PASSWORD=${env.OPENCODE_SERVER_PASSWORD}`, `OPENCODE_MCP_ALLOW=${env.OPENCODE_MCP_ALLOW}`]
     }
     if (argv.includes("down")) {

@@ -1,9 +1,11 @@
 // MOD-02 runtime guard (technical-design §3.5): before each send, GET /mcp for the session
-// directory and require every listed entry to be ks-*. The fork patch has already refused any
-// entry whose URL fails the allowlist at create/startAuth, so the names are what remains to check.
+// directory and require every listed entry to be ks-<id> for an id in the chosen Keystone set
+// (R4-01). The fork patch has already refused any entry whose URL fails the allowlist at
+// create/startAuth, so the names are what remains to check.
 // Anything the bridge cannot read or understand is policy_unverified (fails closed).
 import type { Verdict } from "../shared/contracts.ts"
 import type { OpencodeApi } from "../shared/opencode-api.ts"
+import { entryName } from "../shared/keystone.ts"
 import { KS_NAME } from "./entries.ts"
 
 const unverified = (reason: string): Verdict => ({ ok: false, code: "policy_unverified", reason })
@@ -20,13 +22,21 @@ async function readMcp(api: OpencodeApi, directory: string): Promise<{ status: n
   }
 }
 
-/** Judge a GET /mcp body: violations (non-ks names) win over malformed values. */
-export function judgeMcpStatus(data: unknown): Verdict {
+/**
+ * Judge a GET /mcp body: violations win over malformed values. A violation is a non-ks name, or,
+ * when `connections` is given, a ks-<id> whose id is not in the chosen set.
+ */
+export function judgeMcpStatus(data: unknown, connections?: readonly string[]): Verdict {
   if (!isRecord(data)) return unverified("MCP status is not a JSON object")
   const names = Object.keys(data)
   const bad = names.filter((name) => !KS_NAME.test(name))
   if (bad.length > 0) {
     return { ok: false, code: "policy_violation", reason: `non-Keystone MCP entr${bad.length === 1 ? "y" : "ies"} present: ${bad.join(", ")}` }
+  }
+  const chosen = connections ? new Set(connections.map(entryName)) : undefined
+  const unchosen = chosen ? names.filter((name) => !chosen.has(name)) : []
+  if (unchosen.length > 0) {
+    return { ok: false, code: "policy_violation", reason: `Keystone entr${unchosen.length === 1 ? "y" : "ies"} outside the chosen set: ${unchosen.join(", ")}` }
   }
   const malformed = names.filter((name) => {
     const value = data[name]
@@ -36,11 +46,12 @@ export function judgeMcpStatus(data: unknown): Verdict {
   return { ok: true }
 }
 
-export async function checkRuntime(api: OpencodeApi, directory: string): Promise<Verdict> {
+/** `connections`: the chosen Keystone set (the Guard passes it); omitted, only the ks-* names are checked. */
+export async function checkRuntime(api: OpencodeApi, directory: string, connections?: readonly string[]): Promise<Verdict> {
   // Always scope to the session directory (review M5): an unscoped read shows another instance.
   if (!directory) return unverified("no session directory to check")
   const result = await readMcp(api, directory)
   if (typeof result === "string") return unverified(result)
   if (result.status < 200 || result.status >= 300) return unverified(`GET /mcp returned HTTP ${result.status}`)
-  return judgeMcpStatus(result.data)
+  return judgeMcpStatus(result.data, connections)
 }

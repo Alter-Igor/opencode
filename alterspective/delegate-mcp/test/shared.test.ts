@@ -281,13 +281,14 @@ describe("errors", () => {
 })
 
 describe("config", () => {
-  test("allow policy only admits Keystone /mcp/dynamic and /mcp/c/<id>", () => {
+  test("allow policy only admits Keystone /mcp/c/<id> for the chosen ids, never /mcp/dynamic (R4-01)", () => {
     const policy = JSON.parse(mcpAllowPolicy(defaultConfig({})))
     const rule = policy.remote[0]
     expect(rule.origin).toBe("https://identity.alterspective.com.au")
     const re = new RegExp(rule.path)
-    expect(re.test("/mcp/dynamic")).toBe(true)
+    expect(re.test("/mcp/dynamic")).toBe(false)
     expect(re.test("/mcp/c/rag-global")).toBe(true)
+    expect(re.test("/mcp/c/m365")).toBe(false)
     expect(re.test("/api/mcp")).toBe(false)
     expect(re.test("/mcp/c/../x")).toBe(false)
   })

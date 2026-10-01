@@ -9,6 +9,7 @@ import type { Exec, ExecOptions, ExecResult } from "../src/supervisor/docker.ts"
 import { nodeLeaseFs, type LeaseFs } from "../src/supervisor/leases.ts"
 import { boxEnvOverride, composeEnv, createSupervisor, handoffOutMode, type DelegateSupervisor, type SupervisorDeps } from "../src/supervisor/lifecycle.ts"
 import type { ProcessProbe } from "../src/supervisor/process.ts"
+import { frontFilesFor } from "../src/supervisor/plan.ts"
 import { buildProfile, nodeProfileFs } from "../src/supervisor/profile.ts"
 import { IMAGE, L, deps, fail, fakeDocker, home, leaseDir, made, owner, probe, recorder, supervisor, writeOwner, type Box, type Call, type Line, useSupervisorFixture } from "./supervisor-lifecycle-fixture.ts"
 
@@ -45,8 +46,20 @@ describe("supervisor: round-2 review fixes", () => {
     await writeOwner()
     const d = deps(async () => ({ code: 0, stdout: "", stderr: "" }))
     const hash = buildProfile({ ownerConfigs: [owner], config: d.config, permission: d.permission, keyEnv: d.keyEnv }).hash
-    return { running: true, labels: { [L.hash]: hash, [L.port]: "4711", [L.image]: IMAGE }, env: ["OPENCODE_SERVER_PASSWORD=x", `OPENCODE_MCP_ALLOW=${mcpAllowPolicy(defaultConfig())}`] }
+    const front = frontFilesFor(d.config).hash
+    return { running: true, labels: { [L.hash]: hash, [L.port]: "4711", [L.image]: IMAGE, [L.front]: front }, env: ["OPENCODE_SERVER_PASSWORD=x", `OPENCODE_MCP_ALLOW=${mcpAllowPolicy(defaultConfig())}`] }
   }
+
+  test("reuse refuses a front started with another Keystone set's config (R4-01)", async () => {
+    const box = await reusable()
+    const other = frontFilesFor({ ...defaultConfig({}), keystoneConnections: ["rag-global"] }).hash
+    const front = { "opencode-delegate-front": inspectJson({ [L.image]: IMAGE, [L.front]: other }) }
+    const error = await fail(supervisor(deps(fakeDocker(box, [], { containers: front }))).ensure())
+    expect(error.code).toBe("profile_changed")
+    expect(error.message).toContain("front proxy allows a different set of Keystone services")
+    const unlabelled = { "opencode-delegate-front": inspectJson({ [L.image]: IMAGE }) }
+    expect((await fail(supervisor(deps(fakeDocker(box, [], { containers: unlabelled }))).ensure())).detail).toContain("front-config missing")
+  })
 
   test("reuse checks front (egress) and the caches came from the same checkout (N-9)", async () => {
     const box = await reusable()
@@ -64,7 +77,7 @@ describe("supervisor: round-2 review fixes", () => {
 
   test("reuse refuses a set whose inbox (or any sibling) is stopped (W2C-12)", async () => {
     const box = await reusable()
-    const stopped = { "opencode-delegate-inbox": { code: 0, stdout: JSON.stringify({ state: { Running: false }, labels: { [L.image]: IMAGE }, env: [], image: "x" }), stderr: "" } }
+    const stopped = { "opencode-delegate-inbox": { code: 0, stdout: JSON.stringify({ state: { Running: false }, labels: { [L.image]: IMAGE, [L.front]: box.labels[L.front] }, env: [], image: "x" }), stderr: "" } }
     const error = await fail(supervisor(deps(fakeDocker(box, [], { containers: stopped }))).ensure())
     expect(error.code).toBe("sandbox_unavailable")
     expect(error.message).toContain("inbox service is stopped")
@@ -119,12 +132,15 @@ describe("compose inputs", () => {
     expect(() => boxEnvOverride(["BAD NAME"])).toThrow(DelegateError)
   })
 
-  test("compose env carries the profile hash and the container name for the project", () => {
+  test("compose env carries the profile hash, the container name for the project, and front's generated folder and hash", () => {
     const d = deps(fakeDocker({ running: false, labels: {}, env: [] }, []))
     const built = buildProfile({ ownerConfigs: [owner], config: d.config, permission: d.permission, keyEnv: d.keyEnv })
-    const env = composeEnv(d, built, 1, "pw")
+    const front = { servers: "x", hash: "f".repeat(64) }
+    const env = composeEnv(d, { built, port: 1, password: "pw", front })
     expect(env.OCD_PROFILE_HASH).toBe(built.hash)
     expect(env.OCD_PROFILE_DIR).toBe(path.join(home, "profile"))
-    expect(composeEnv({ ...d, config: { ...d.config, project: "ocd-fixtest" } }, built, 1, "pw").OCD_CONTAINER).toBe("ocd-fixtest")
+    expect(env.OCD_FRONT_DIR).toBe(path.join(home, "front"))
+    expect(env.OCD_FRONT_HASH).toBe(front.hash)
+    expect(composeEnv({ ...d, config: { ...d.config, project: "ocd-fixtest" } }, { built, port: 1, password: "pw", front }).OCD_CONTAINER).toBe("ocd-fixtest")
   })
 })

@@ -126,6 +126,7 @@ export async function recordFromState(ctx: ToolContext, state: HostSessionState 
     base: state.base,
     ...(state.model ? { model: state.model } : {}),
     ...(state.agent ? { agent: state.agent } : {}),
+    ...(state.keystone ? { keystone: state.keystone } : {}),
   }
 }
 

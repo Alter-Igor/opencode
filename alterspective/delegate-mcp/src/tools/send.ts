@@ -25,7 +25,7 @@ function refused(verdict: Exclude<Verdict, { ok: true }>, what: string): Delegat
 
 /** H3 permission re-read, then the §3.5 runtime guard. `what` completes "…, so <what>." */
 export async function checkPolicy(ctx: ToolContext, box: Box, record: SessionRecord, permission: Parameters<typeof sameRules>[0], what = "nothing was sent"): Promise<void> {
-  if (!sameRules(permission, ctx.guard.permissionBaseline(record.profile)))
+  if (!sameRules(permission, ctx.guard.permissionBaseline(record.profile, record.keystone)))
     throw new DelegateError("policy_violation", `This session's permission rules no longer match the bridge's baseline, so ${what}.`, "Start a new session with oc_start_session.", "session.permission differs from permissionBaseline")
   const verdict = await ctx.guard.checkRuntime(box.api, record.boxPath)
   if (!verdict.ok) throw refused(verdict, what)

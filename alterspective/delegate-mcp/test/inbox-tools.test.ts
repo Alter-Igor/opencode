@@ -172,7 +172,7 @@ describe("in-box tools: packaging", () => {
   })
 
   test("the profile ships the tools under opencode/tool/ and the hash covers them", () => {
-    const input = { ownerConfigs: [], config: { keystoneOrigin: "https://identity.alterspective.com.au", pinnedConnections: [], boxEnv: [] }, permission: [] }
+    const input = { ownerConfigs: [], config: { keystoneOrigin: "https://identity.alterspective.com.au", keystoneConnections: [], boxEnv: [] }, permission: [] }
     const built = buildProfile(input)
     for (const name of PROFILE_TOOL_FILES) expect(built.files[`opencode/tool/${name}`]).toBe(profileTools()[name]!)
     const changed = buildProfile({ ...input, tools: { ...profileTools(), "read_inbox.ts": profileTools()["read_inbox.ts"] + "\n// changed" } })

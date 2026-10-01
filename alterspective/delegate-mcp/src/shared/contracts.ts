@@ -39,12 +39,15 @@ export type Verdict = { ok: true } | { ok: false; code: "policy_violation" | "po
 export type McpEntry = { type?: string; url?: string; headers?: Record<string, string>; oauth?: unknown; enabled?: boolean; timeout?: number }
 
 export interface Guard {
-  /** Profile-time validation of MCP entries (names must start ks-). */
+  /** Profile-time validation of MCP entries (ks-<id> → /mcp/c/<id>, id in the chosen Keystone set). */
   validateEntries(entries: Record<string, McpEntry>): Verdict
-  /** Runtime check before each send: GET /mcp for the session directory. */
+  /** Runtime check before each send: GET /mcp for the session directory (only chosen ks-<id> entries). */
   checkRuntime(api: OpencodeApi, directory: string): Promise<Verdict>
-  /** Permission ruleset applied on POST /session and in the profile. */
-  permissionBaseline(profile: "standard" | "readonly"): Array<{ permission: string; pattern: string; action: "allow" | "deny" | "ask" }>
+  /**
+   * Permission ruleset applied on POST /session and in the profile. Additive: `keystone` narrows a
+   * session's Keystone tools to those connection ids (convenience, not a wall).
+   */
+  permissionBaseline(profile: "standard" | "readonly", keystone?: readonly string[]): Array<{ permission: string; pattern: string; action: "allow" | "deny" | "ask" }>
   /** Refuse `always` replies (FM-4). */
   checkPermissionReply(reply: string): Verdict
 }

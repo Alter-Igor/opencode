@@ -1,5 +1,6 @@
 // MOD-04 oc_result, oc_collect, oc_wait, oc_events, oc_doctor, oc_login, oc_list_models, oc_server_restart.
 import { describe, expect, test } from "bun:test"
+import { z } from "zod"
 import { MAX_RESULT_CHARS } from "../src/tools/shape.ts"
 import { SAFE_BOX_GIT } from "../src/tools/core-box.ts"
 import { collectTool } from "../src/tools/collect.ts"
@@ -119,11 +120,11 @@ describe("oc_wait and oc_events", () => {
 describe("oc_doctor, oc_login, oc_list_models, oc_server_restart", () => {
   test("doctor reads a running box without starting or leasing it, and never shows the password", async () => {
     const f = fakeContext({ boxHeld: false })
-    f.api.on("GET /mcp", { status: 200, data: { "ks-delegate": { status: "connected" }, "EVIL NAME!": { status: "connected" } } })
+    f.api.on("GET /mcp", { status: 200, data: { "ks-rag-global": { status: "connected" }, "EVIL NAME!": { status: "connected" } } })
     const result = await invoke(doctorTool, {}, f.ctx)
     expect(f.started.count).toBe(0)
     expect(data(result).box).toMatchObject({ state: "running", policyVerified: true, imageMatches: true })
-    expect(data(result).mcp).toEqual({ entries: [{ name: "ks-delegate", status: "connected" }], unrecognised: 1 })
+    expect(data(result).mcp).toEqual({ entries: [{ name: "ks-rag-global", status: "connected" }], unrecognised: 1 })
     expect(data(result).guard).toMatchObject({ ok: false, code: "policy_violation" })
     expect(data(result).bridge).toMatchObject({ name: "test-bridge", version: "0.1.0-dev+abc1234" })
     expect(JSON.stringify(result)).not.toContain(TARGET.password)
@@ -139,20 +140,55 @@ describe("oc_doctor, oc_login, oc_list_models, oc_server_restart", () => {
     expect(f.started.count).toBe(1)
   })
 
-  test("login ensures the box and relays through the supervisor", async () => {
+  test("login with a server ensures the box and relays that entry through the supervisor", async () => {
     const f = fakeContext()
     const seen: string[] = []
     f.ctx.supervisorService.login = async (entry) => (seen.push(entry), "connected")
-    const result = await invoke(loginTool, {}, f.ctx)
-    expect(seen).toEqual(["ks-delegate"])
-    expect(data(result)).toEqual({ server: "ks-delegate", result: "connected" })
+    const result = await invoke(loginTool, { server: "ks-github" }, f.ctx)
+    expect(seen).toEqual(["ks-github"])
+    expect(data(result)).toEqual({ server: "ks-github", result: "connected" })
   })
 
-  test("models are listed as provider/model, filtered, and junk ids dropped", async () => {
+  test("login with no server signs in every chosen entry that needs it, in order (R4-01)", async () => {
+    const f = fakeContext()
+    const seen: string[] = []
+    f.ctx.supervisorService.login = async (entry) => (seen.push(entry), "connected")
+    f.api.on("GET /mcp", { status: 200, data: { "ks-rag-global": { status: "needs_auth" }, "ks-github": { status: "connected" }, "ks-seqlogs": { status: "needs_auth" } } })
+    const result = await invoke(loginTool, {}, f.ctx)
+    expect(seen).toEqual(["ks-rag-global", "ks-seqlogs"])
+    expect(data(result)).toMatchObject({ results: [{ server: "ks-rag-global", result: "connected" }, { server: "ks-seqlogs", result: "connected" }], skipped: [] })
+    expect(text(result).split("\n")[0]).toBe("Signed in: ks-rag-global, ks-seqlogs.")
+  })
+
+  test("login with no server stops at the first entry that does not finish (no tab after tab)", async () => {
+    const f = fakeContext()
+    const seen: string[] = []
+    f.ctx.supervisorService.login = async (entry) => (seen.push(entry), "failed")
+    f.api.on("GET /mcp", { status: 200, data: { "ks-rag-global": { status: "needs_auth" }, "ks-github": { status: "needs_auth" }, "ks-seqlogs": { status: "connected" } } })
+    const result = await invoke(loginTool, {}, f.ctx)
+    expect(seen).toEqual(["ks-rag-global"])
+    expect(data(result)).toMatchObject({ results: [{ server: "ks-rag-global", result: "failed" }], skipped: ["ks-github"] })
+  })
+
+  test("login refuses an entry outside the chosen set; nothing needing sign-in is a no-op", async () => {
+    const f = fakeContext()
+    const seen: string[] = []
+    f.ctx.supervisorService.login = async (entry) => (seen.push(entry), "connected")
+    const refused = await invoke(loginTool, { server: "ks-m365" }, f.ctx)
+    expect(data(refused)).toMatchObject({ code: "invalid_input" })
+    f.api.on("GET /mcp", { status: 200, data: { "ks-rag-global": { status: "connected" } } })
+    const none = await invoke(loginTool, {}, f.ctx)
+    expect(text(none).split("\n")[0]).toBe("No Keystone entry needs sign-in.")
+    expect(data(none)).toMatchObject({ before: { "ks-rag-global": "connected", "ks-github": "missing", "ks-seqlogs": "missing" } })
+    expect(seen).toEqual([])
+  })
+
+  test("models are listed as provider/model, filtered, and junk ids dropped; the Keystone set is shown too", async () => {
     const f = fakeContext()
     f.api.on("GET /config/providers", { status: 200, data: { providers: [{ id: "synapse", models: { auto: { id: "auto" }, bad: { id: "has space" } } }, { id: "x y", models: { m: {} } }], default: { synapse: "auto" } } })
     const all = await invoke(modelsTool, {}, f.ctx)
-    expect(data(all)).toEqual({ models: ["synapse/auto"], defaults: ["synapse/auto"] })
+    expect(data(all)).toEqual({ models: ["synapse/auto"], defaults: ["synapse/auto"], keystone: { connections: ["rag-global", "github", "seqlogs"], source: "default" } })
+    expect(text(all).split("\n")[0]).toBe("1 model. Keystone services: rag-global, github, seqlogs (default).")
     const none = await invoke(modelsTool, { provider: "openai" }, f.ctx)
     expect(data(none).models).toEqual([])
   })
@@ -178,9 +214,28 @@ describe("oc_doctor, oc_login, oc_list_models, oc_server_restart", () => {
     expect(text(result)).toContain("1 other bridge had running sessions interrupted")
   })
 
+  test("oc_server_restart keystone (R4-01): ids validated by the schema, passed on, and the new set reported", async () => {
+    const f = fakeContext()
+    const passed: Array<string[] | undefined> = []
+    const restart = f.ctx.restartBox
+    f.ctx.restartBox = async (options) => (passed.push(options?.keystone), restart(options))
+    // The MCP server validates input with the tool's schema before run() (define.ts); invoke() does not.
+    const schema = z.object(restartTool.input)
+    for (const bad of [["GitHub"], ["../x"], ["a_b"], ["-x"], Array.from({ length: 21 }, (_, i) => `c${i}`)])
+      expect({ bad, ok: schema.safeParse({ confirm: true, keystone: bad }).success }).toEqual({ bad, ok: false })
+    expect(schema.safeParse({ confirm: true, keystone: ["rag-global"] }).success).toBe(true)
+    expect(passed).toEqual([])
+    const result = await invoke(restartTool, { confirm: true, keystone: ["rag-global", "seqlogs"] }, f.ctx)
+    expect(passed).toEqual([["rag-global", "seqlogs"]])
+    expect(data(result)).toMatchObject({ restarted: true, keystone: ["rag-global", "seqlogs"] })
+    expect(text(result)).toContain("Keystone services: rag-global, seqlogs.")
+    await invoke(restartTool, { confirm: true }, f.ctx)
+    expect(passed).toEqual([["rag-global", "seqlogs"], undefined])
+  })
+
   test("oc_doctor shows the sha the image was built from and the bridge's sha", async () => {
     const f = fakeContext({ boxHeld: false })
-    f.status.value = { state: "running", target: TARGET, imageTag: "img:1", startedBy: "other", health: "healthy", policyVerified: true, imageMatches: true, imageBuiltFrom: "1111111", bridgeAt: "2222222" }
+    f.status.value = { state: "running", target: TARGET, imageTag: "img:1", startedBy: "other", health: "healthy", policyVerified: true, frontMatches: true, imageMatches: true, imageBuiltFrom: "1111111", bridgeAt: "2222222" }
     f.api.on("GET /mcp", { status: 200, data: {} })
     const result = await invoke(doctorTool, {}, f.ctx)
     expect(data(result).box).toMatchObject({ imageMatches: true, imageBuiltFrom: "1111111", bridgeAt: "2222222" })

@@ -13,7 +13,7 @@ import {
   type ProfileInput,
 } from "../src/supervisor/profile.ts"
 
-const config = { keystoneOrigin: "https://identity.alterspective.com.au", pinnedConnections: [] as string[], boxEnv: ["SYNAPSE_API_KEY"] }
+const config = { keystoneOrigin: "https://identity.alterspective.com.au", keystoneConnections: ["rag-global", "github", "seqlogs"], boxEnv: ["SYNAPSE_API_KEY"] }
 const baseline = [
   { permission: "*", pattern: "*", action: "allow" as const },
   { permission: "external_directory", pattern: "*", action: "deny" as const },
@@ -162,13 +162,16 @@ describe("profile: selection", () => {
     expect(refusal(() => buildProfile(input([text]))).code).toBe("profile_invalid")
   })
 
-  test("mcp holds ks-delegate plus pinned ks-<id> entries only", () => {
-    const built = buildProfile(input([owner({ synapse })], { config: { ...config, pinnedConnections: ["rag-global"] } }))
+  test("mcp holds one ks-<id> → /mcp/c/<id> entry per chosen connection, and no /mcp/dynamic (R4-01)", () => {
+    const built = buildProfile(input([owner({ synapse })]))
     expect(parsedConfig(built.files).mcp).toEqual({
-      "ks-delegate": { type: "remote", url: "https://identity.alterspective.com.au/mcp/dynamic" },
       "ks-rag-global": { type: "remote", url: "https://identity.alterspective.com.au/mcp/c/rag-global" },
+      "ks-github": { type: "remote", url: "https://identity.alterspective.com.au/mcp/c/github" },
+      "ks-seqlogs": { type: "remote", url: "https://identity.alterspective.com.au/mcp/c/seqlogs" },
     })
-    expect(refusal(() => buildProfile(input([owner({ synapse })], { config: { ...config, pinnedConnections: ["../x"] } }))).code).toBe("profile_invalid")
+    expect(JSON.stringify(parsedConfig(built.files))).not.toContain("dynamic")
+    for (const bad of ["../x", "Rag", "a_b", "dynamic|x"])
+      expect(refusal(() => buildProfile(input([owner({ synapse })], { config: { ...config, keystoneConnections: [bad] } }))).code).toBe("profile_invalid")
   })
 
   test("always writes the .gitignore OpenCode would otherwise crash writing", () => {
@@ -219,7 +222,7 @@ describe("profile: hash + write", () => {
     expect(a.hash).toMatch(/^[0-9a-f]{64}$/)
     const c = buildProfile(input([owner({ synapse })], { permission: baseline.slice(0, 2) }))
     expect(c.hash).not.toBe(a.hash)
-    const d = buildProfile(input([owner({ synapse })], { config: { ...config, pinnedConnections: ["x"] } }))
+    const d = buildProfile(input([owner({ synapse })], { config: { ...config, keystoneConnections: ["rag-global"] } }))
     expect(d.hash).not.toBe(a.hash)
   })
 

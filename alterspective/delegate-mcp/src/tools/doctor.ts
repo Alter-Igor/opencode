@@ -6,9 +6,11 @@ import type { SupervisorStatus } from "../supervisor/status.ts"
 import type { Verdict } from "../shared/contracts.ts"
 import type { McpStatus, OpencodeApi } from "../shared/opencode-api.ts"
 import { KS_NAME } from "../guard/entries.ts"
-import { checkEgress, type EgressCheck } from "../guard/egress-check.ts"
+import { checkEgress, egressInput, type EgressCheck } from "../guard/egress-check.ts"
+import { effectiveConfig } from "../shared/config.ts"
 import type { ToolContext } from "./context.ts"
 import { defineTool } from "./define.ts"
+import { keystoneLine, keystoneReport, type KeystoneReport } from "./keystone-report.ts"
 import { ok, untrusted } from "./shape.ts"
 
 export const PROBE_DIRECTORY = "/sessions"
@@ -49,6 +51,7 @@ function boxReport(status: SupervisorStatus): Record<string, unknown> {
     imageBuiltFrom: status.imageBuiltFrom ?? "unknown",
     bridgeAt: status.bridgeAt ?? "unknown",
     policyVerified: status.policyVerified,
+    frontMatches: status.frontMatches,
     health: status.health,
     startedBy: status.startedBy,
     baseUrl: status.target.baseUrl,
@@ -66,7 +69,7 @@ export function isVerified(status: SupervisorStatus, mcp: McpReport | undefined,
   if (status.state !== "running") return false
   // Every entry a Keystone one and signed in (or switched off): needs_auth / failed is not verified.
   const entriesOk = mcp !== undefined && "entries" in mcp && mcp.unrecognised === 0 && mcp.entries.every((e) => KS_NAME.test(e.name) && (e.status === "connected" || e.status === "disabled"))
-  return status.imageMatches && status.policyVerified && status.health === "healthy" && entriesOk && verdict.ok
+  return status.imageMatches && status.policyVerified && status.frontMatches && status.health === "healthy" && entriesOk && verdict.ok
 }
 
 function notRunning(status: Exclude<SupervisorStatus, { state: "running" }>): string {
@@ -78,7 +81,7 @@ function notRunning(status: Exclude<SupervisorStatus, { state: "running" }>): st
 function summaryOf(status: SupervisorStatus, mcp: McpReport | undefined, verdict: Verdict, verified: boolean): string {
   if (status.state !== "running") return notRunning(status)
   const built = `image built from ${status.imageBuiltFrom ?? "unknown"}, bridge at ${status.bridgeAt ?? "unknown"}`
-  const checks = `Docker health ${status.health}, image ${status.imageMatches ? "ok" : "MISMATCH"} (${built}), policy ${status.policyVerified ? "ok" : "MISMATCH"}`
+  const checks = `Docker health ${status.health}, image ${status.imageMatches ? "ok" : "MISMATCH"} (${built}), policy ${status.policyVerified ? "ok" : "MISMATCH"}, front ${status.frontMatches ? "ok" : "MISMATCH"}`
   const ks = ksEntries(mcp)
   const others = mcp && "entries" in mcp ? mcp.entries.length - ks.length + mcp.unrecognised : 0
   const entries = mcp && "entries" in mcp ? `${ks.map((e) => `${e.name} ${e.status}`).join(", ") || "no Keystone entries"}${others ? `, ${others} other entr${others === 1 ? "y" : "ies"}` : ""}` : "MCP list unavailable"
@@ -91,7 +94,19 @@ function egressReport(egress: EgressCheck): Record<string, unknown> {
 }
 
 const egressSummary = (egress: EgressCheck) =>
-  ` Egress: TLS front (fixed upstreams, no CONNECT proxy) ${egress.ok ? "configured as generated from egressHosts" : `MISMATCH (${egress.problems.length} problem${egress.problems.length === 1 ? "" : "s"})`}.`
+  ` Egress: TLS front (fixed upstreams, no CONNECT proxy) ${egress.ok ? "configured as generated from egressHosts and the chosen Keystone set" : `MISMATCH (${egress.problems.length} problem${egress.problems.length === 1 ? "" : "s"})`}.`
+
+/** The egress check for the Keystone set in force now; a damaged saved choice is a failed check, never a throw. */
+function egressFor(ctx: ToolContext, keystone: KeystoneReport): EgressCheck {
+  if ("unavailable" in keystone) {
+    const failed = checkEgress(egressInput({ ...ctx.config, keystoneConnections: [] }))
+    return { ...failed, ok: false, problems: [keystone.unavailable, ...failed.problems] }
+  }
+  return checkEgress(egressInput(effectiveConfig(ctx.config)))
+}
+
+/** Entry name → status from GET /mcp, for the Keystone report. */
+const statusMap = (mcp: McpReport | undefined) => new Map(mcp && "entries" in mcp ? mcp.entries.map((e) => [e.name, e.status]) : [])
 
 async function inspect(ctx: ToolContext, start: boolean, correlationId: string) {
   if (start && !ctx.peekBox()) await ctx.box()
@@ -107,20 +122,22 @@ export const doctorTool = defineTool({
   name: "oc_doctor",
   title: "Check the OpenCode sandbox",
   description:
-    "Health check: sandbox state and Docker health, image and MCP-policy checks, the Keystone MCP entries and their sign-in state, the policy guard verdict and this bridge's name and version, plus the configured egress allowlist, the egress control check (the TLS front generated from that allowlist, no CONNECT proxy) and isolation level (configuration, not measured). `verified` is true only when every check ran and passed. Does not start the sandbox unless start is true.",
+    "Health check: sandbox state and Docker health, image, MCP-policy and front-config checks, the chosen Keystone services (`keystone`: the box-wide set, saved or default, and each entry's sign-in state), the policy guard verdict and this bridge's name and version, plus the configured egress allowlist, the egress control check (the TLS front generated from that allowlist and the Keystone set, no CONNECT proxy) and isolation level (configuration, not measured). `verified` is true only when every check ran and passed. Does not start the sandbox unless start is true.",
   input: { start: z.boolean().optional().describe("Start (or reuse) the sandbox first. Default false.") },
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   async run(args, ctx, correlationId) {
     const { status, mcp, verdict, held } = await inspect(ctx, args.start === true, correlationId)
-    const egress = checkEgress(ctx.config.egressHosts)
-    const verified = isVerified(status, mcp, verdict) && egress.ok
-    return ok(summaryOf(status, mcp, verdict, verified) + egressSummary(egress), {
+    const keystone = keystoneReport(ctx.config, mcp && "entries" in mcp ? statusMap(mcp) : undefined)
+    const egress = egressFor(ctx, keystone)
+    const verified = isVerified(status, mcp, verdict) && egress.ok && !("unavailable" in keystone)
+    return ok(`${summaryOf(status, mcp, verdict, verified)} ${keystoneLine(keystone)}.${egressSummary(egress)}`, {
       verified,
       bridge: { name: ctx.supervisor.replace(/^supervisor:/, ""), supervisor: ctx.supervisor, bridgeId: ctx.bridgeId, version: ctx.version, holdsBox: held, sessions: ctx.sessions.size },
       isolation: { level: "S", source: "configuration" },
       box: boxReport(status),
       mcp: mcp ?? { unavailable: "the sandbox is not running" },
       guard: guardReport(verdict),
+      keystone,
       egressHostsConfigured: ctx.config.egressHosts,
       egress: egressReport(egress),
       keystoneOrigin: ctx.config.keystoneOrigin,

@@ -4,13 +4,17 @@
 // `down -v`. One probe runs the REAL box image: OCD_LIVE_BOX_IMAGE if set, else the image this
 // checkout's bridge would run (identity.ts), built first if it is missing, exactly as the bridge
 // would build it. That image is kept (it is the bridge's own); the throwaway front image is removed.
-// Only public, read-only GETs and bare TCP connects are sent; never credentials.
+// Only public, read-only GETs, unauthenticated requests and bare TCP connects are sent; never credentials.
+// R4-01 (h): front's Keystone server is generated for the default Keystone set and probed with
+// path tricks; only the chosen connections' paths may reach Keystone.
 //   OCD_LIVE_EGRESS=1 bun test test/egress-live.test.ts
 import { afterAll, beforeAll, describe, expect, test } from "bun:test"
 import { randomBytes } from "node:crypto"
-import { mkdtemp, rm } from "node:fs/promises"
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
+import { frontConfigHash, frontServersFor } from "../src/guard/egress.ts"
+import { KEYSTONE_OAUTH_PATHS } from "../src/guard/egress-identity.ts"
 import { defaultConfig } from "../src/shared/config.ts"
 import { buildIdentity } from "../src/supervisor/identity.ts"
 import { runCommand } from "../src/supervisor/workspaces.ts"
@@ -25,6 +29,7 @@ const BUILD_T = 30 * 60_000
 
 type Reply = { status?: number; body?: string; error?: string; message?: string }
 type V6 = { lookup: string[]; aaaa: string[] }
+type KsReply = { status?: number; front?: boolean; error?: string }
 type Probe = {
   frontIp: string
   dns: Record<string, string[]>
@@ -43,6 +48,7 @@ type Probe = {
   oldProxyPorts: Record<string, string>
   gateway: { ip: string; ports: Record<string, string> }
   ipv6: { addresses: string[]; direct: string; names: Record<string, V6> }
+  keystonePaths: Record<string, KsReply>
 }
 type BunFetch = { ok: boolean; status?: number; issuer?: string | null; error?: string }
 
@@ -52,6 +58,8 @@ let boxImage = ""
 let boxTitle = ""
 let gateway = ""
 let scratch = ""
+/** front's servers for the default Keystone set (rag-global, github, seqlogs), as the bridge writes them. */
+const SERVERS = frontServersFor(defaultConfig({}))
 
 // compose.yaml needs its interpolation variables even for the services this test does not start.
 const env = (extra: Record<string, string> = {}) => ({
@@ -63,6 +71,8 @@ const env = (extra: Record<string, string> = {}) => ({
   OCD_INBOX_PORT: "0",
   OCD_HANDOFF_DIR: scratch,
   OCD_PROFILE_DIR: scratch,
+  OCD_FRONT_DIR: path.join(scratch, "front"),
+  OCD_FRONT_HASH: frontConfigHash(SERVERS),
   OCD_LIVE_BOX_IMAGE: boxImage || "unset",
   ...extra,
 })
@@ -112,6 +122,8 @@ const PROBES = [
 describe.skipIf(!LIVE)("front live red/green (throwaway project)", () => {
   beforeAll(async () => {
     scratch = await mkdtemp(path.join(os.tmpdir(), "ocd-front-live-"))
+    await mkdir(path.join(scratch, "front"))
+    await writeFile(path.join(scratch, "front", "servers.conf"), SERVERS)
     boxImage = await realBoxImage()
     const up = await compose("up", "-d", "--build", "front", "probe", "probe-bun", "probe-box")
     if (up.code !== 0) throw new Error(`compose up failed: ${up.stderr.slice(-800)}`)
@@ -150,6 +162,9 @@ describe.skipIf(!LIVE)("front live red/green (throwaway project)", () => {
     test(`(a) ${label} green: an allowed host answers through front with the internal CA, and only with it`, () => {
       expect(p().discovery.status).toBe(200)
       expect(p().discovery.body).toStartWith('{"issuer":"https://identity.alterspective.com.au"')
+      // The OAuth paths front allows are still the ones Keystone's discovery names (R4-01 drift check).
+      for (const { path: allowed } of KEYSTONE_OAUTH_PATHS.filter((o) => o.path.startsWith("/api/")))
+        expect(p().discovery.body).toContain(`"https://identity.alterspective.com.au${allowed}"`)
       // Public roots alone do not verify: front, not the real host, ended the box's TLS.
       expect(p().discoveryPublicCaOnly.error).toBe("UNABLE_TO_VERIFY_LEAF_SIGNATURE")
       // The model gateway is reachable too (no key sent: 401).
@@ -191,6 +206,20 @@ describe.skipIf(!LIVE)("front live red/green (throwaway project)", () => {
       expect(Object.keys(p().gateway.ports).sort()).toEqual(["22", "2375", "2376", "443", "53", "80"])
       for (const [port, reply] of Object.entries(p().gateway.ports))
         expect({ port, reply }).toEqual({ port, reply: expect.stringMatching(/^error: (ECONNREFUSED|EHOSTUNREACH|ENETUNREACH)|^timeout$/) })
+    })
+
+    test(`(h) ${label}: on Keystone only the chosen connections' paths pass front; tricks get 403 from front (R4-01)`, () => {
+      const ks = p().keystonePaths
+      // Front's own error page (never forwarded), versus an answer that came from Keystone.
+      const refusedByFront = (reply: KsReply | undefined) => reply?.front === true && (reply.status === 403 || reply.status === 400)
+      const fromKeystone = (reply: KsReply | undefined) => reply?.front === false && reply.status !== undefined
+      expect({ discovery: ks.discovery?.status, metadata: ks.resourceMetadata?.status, mcp: ks.mcpNoAuth?.status }).toEqual({ discovery: 200, metadata: 200, mcp: 401 })
+      for (const name of ["discovery", "resourceMetadata", "mcpNoAuth", "encodedAllowed", "dotsIntoAllowed"]) expect({ name, ok: fromKeystone(ks[name]) }).toEqual({ name, ok: true })
+      // Normalised into the allowed path: Keystone answers exactly as for the plain path.
+      expect([ks.encodedAllowed?.status, ks.dotsIntoAllowed?.status]).toEqual([401, 401])
+      const refused = Object.keys(ks).filter((name) => !["discovery", "resourceMetadata", "mcpNoAuth", "encodedAllowed", "dotsIntoAllowed"].includes(name))
+      expect(refused.length).toBeGreaterThanOrEqual(19)
+      for (const name of refused) expect({ name, reply: ks[name], front: refusedByFront(ks[name]) }).toEqual({ name, reply: ks[name]!, front: true })
     })
 
     test(`(g) ${label} red: no IPv6 address or route, and no AAAA answer that could go round front`, () => {

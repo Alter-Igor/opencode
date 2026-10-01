@@ -3,9 +3,14 @@
 // baseline for its profile, and a host-only record (workspaces-state.ts) naming its session id and
 // this bridge, which is what lets a restarted bridge with the same name adopt it (W3C-01). The
 // session's metadata carries only the lookup key for that record.
+// `keystone` (R4-01) narrows a session to a subset of the box-wide Keystone set with OpenCode
+// permission rules. That is a convenience, not a wall: in-box code can still use every connection
+// of the box-wide set (oc_server_restart {keystone} sets that, and front enforces it).
 import { z } from "zod"
 import { SESSION_SUPERVISOR_KEY } from "../inbox/index.ts"
+import { currentKeystone } from "../shared/config.ts"
 import { DelegateError } from "../shared/errors.ts"
+import { CONNECTION_ID, MAX_CONNECTIONS, keystoneIds } from "../shared/keystone.ts"
 import { expectOk } from "../shared/opencode-api.ts"
 import type { OpenedWorkspace } from "../supervisor/workspaces.ts"
 import { samePath } from "../supervisor/workspaces-exec.ts"
@@ -18,12 +23,23 @@ import { ok } from "./shape.ts"
 
 export { listSessionsTool, statusTool } from "./sessions-list.ts"
 
-type StartArgs = { directory: string; title?: string; agent?: string; model?: string; profile?: "standard" | "readonly"; allowShared?: boolean }
+type StartArgs = { directory: string; title?: string; agent?: string; model?: string; profile?: "standard" | "readonly"; allowShared?: boolean; keystone?: string[] }
+
+/** The narrowing list, checked to be a subset of the box-wide set in force now; undefined = no narrowing. */
+export function sessionKeystone(ctx: ToolContext, requested: readonly string[] | undefined): string[] | undefined {
+  if (requested === undefined) return undefined
+  const ids = keystoneIds(requested)
+  const boxWide = currentKeystone(ctx.config).connections
+  const outside = ids.filter((id) => !boxWide.includes(id))
+  if (outside.length)
+    throw new DelegateError("invalid_input", `The sandbox does not offer Keystone connection${outside.length === 1 ? "" : "s"} ${outside.join(", ")}.`, `Choose from ${boxWide.join(", ") || "(none)"}, or add them to the box with oc_server_restart {keystone}.`)
+  return ids
+}
 
 async function createSession(ctx: ToolContext, box: Box, args: StartArgs, ws: OpenedWorkspace, correlationId: string): Promise<string> {
   const profile = args.profile ?? "standard"
   const metadata: SessionMetadata = { [SESSION_SUPERVISOR_KEY]: ctx.supervisor, sessionKey: ws.sessionKey }
-  const body = { title: args.title ?? `delegate ${ws.sessionKey}`, permission: ctx.guard.permissionBaseline(profile), metadata }
+  const body = { title: args.title ?? `delegate ${ws.sessionKey}`, permission: ctx.guard.permissionBaseline(profile, args.keystone), metadata }
   const created = expectOk(await box.api.call<{ id?: unknown }>({ method: "POST", path: "/session", directory: ws.boxPath, body, correlationId }), "create the session")
   if (typeof created.id !== "string" || !SESSION_ID_RE.test(created.id))
     throw new DelegateError("upstream_error", "The delegate server returned a session without a valid id.", "Retry oc_start_session; if it repeats, run oc_doctor.")
@@ -42,8 +58,9 @@ async function startIn(ctx: ToolContext, box: Box, args: StartArgs, ws: OpenedWo
   let sessionID: string | undefined
   try {
     sessionID = await createSession(ctx, box, args, ws, correlationId)
-    const state = await ctx.workspaces.bindSession(ws.sessionKey, { sessionID, profile, supervisor: ctx.supervisor, ...(args.model ? { model: args.model } : {}), ...(args.agent ? { agent: args.agent } : {}) })
-    return { sessionID, sessionKey: ws.sessionKey, hostRepo: ws.hostRepo, boxPath: ws.boxPath, branch: ws.branch, profile, createdAt: state.createdAt, base: ws.base, model: args.model, agent: args.agent }
+    const extra = { ...(args.model ? { model: args.model } : {}), ...(args.agent ? { agent: args.agent } : {}), ...(args.keystone ? { keystone: args.keystone } : {}) }
+    const state = await ctx.workspaces.bindSession(ws.sessionKey, { sessionID, profile, supervisor: ctx.supervisor, ...extra })
+    return { sessionID, sessionKey: ws.sessionKey, hostRepo: ws.hostRepo, boxPath: ws.boxPath, branch: ws.branch, profile, createdAt: state.createdAt, base: ws.base, ...extra }
   } catch (error) {
     await abandon(ctx, box, ws, sessionID, correlationId)
     throw error
@@ -63,19 +80,26 @@ export const startSessionTool = defineTool({
     model: modelSchema.optional().describe("Default model for this session's sends, as provider/model."),
     profile: z.enum(["standard", "readonly"]).optional().describe("Permission profile. readonly denies edits and asks before any shell command. Default standard."),
     allowShared: z.boolean().optional().describe("Allow this session while another one of ours is still working in the same repo (each has its own copy)."),
+    keystone: z
+      .array(z.string().regex(CONNECTION_ID, "a Keystone connection id"))
+      .max(MAX_CONNECTIONS)
+      .optional()
+      .describe("Only these Keystone connections' tools for this session (a subset of the sandbox's set; see oc_list_models). A convenience, not a security boundary. Default: all of the sandbox's set."),
   },
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   async run(args, ctx, correlationId) {
     const hostRepo = await ctx.workspaces.resolveRepo(args.directory)
+    const keystone = sessionKeystone(ctx, args.keystone)
     if (!args.allowShared) await refuseBusy(ctx, hostRepo, samePath)
     const box = await ctx.box()
     if (args.model) await requireModel(box.api, args.model, correlationId)
     const ws = await ctx.workspaces.open(hostRepo, newSessionKey())
-    const record = await startIn(ctx, box, args, ws, correlationId)
+    const record = await startIn(ctx, box, { ...args, keystone }, ws, correlationId)
     ctx.sessions.set(record.sessionID, record)
     box.hub.track(record.sessionID, ws.boxPath)
     return ok(`Session ${record.sessionID} started on ${ws.branch}. Next: oc_send, then oc_wait.`, {
       sessionID: record.sessionID, sessionKey: ws.sessionKey, branch: ws.branch, boxPath: ws.boxPath, hostRepo: ws.hostRepo, profile: record.profile, base: ws.base,
+      ...(keystone ? { keystone } : {}),
       webUrl: webUrl(box.target, ws.boxPath, record.sessionID),
     })
   },

@@ -8,6 +8,7 @@ import { mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFile
 import path from "node:path"
 import { SESSION_ID_RE } from "../shared/contracts.ts"
 import { DelegateError } from "../shared/errors.ts"
+import { CONNECTION_ID, MAX_CONNECTIONS } from "../shared/keystone.ts"
 
 export { SESSION_ID_RE }
 
@@ -35,10 +36,18 @@ export type HostSessionState = {
   supervisor?: string
   model?: string
   agent?: string
+  /** R4-01: the Keystone connections the session was narrowed to; absent = the whole box-wide set. */
+  keystone?: string[]
 }
 
 /** Written by oc_start_session right after POST /session. */
-export type SessionBinding = { sessionID: string; profile: SessionProfile; supervisor: string; model?: string; agent?: string }
+export type SessionBinding = { sessionID: string; profile: SessionProfile; supervisor: string; model?: string; agent?: string; keystone?: string[] }
+
+/** A valid narrowing list (each a connection id, bounded), or undefined. */
+function keystoneList(value: unknown): string[] | undefined {
+  if (!Array.isArray(value) || value.length > MAX_CONNECTIONS) return undefined
+  return value.every((id) => typeof id === "string" && CONNECTION_ID.test(id)) ? (value as string[]) : undefined
+}
 
 const errno = (error: unknown) => (error as NodeJS.ErrnoException | undefined)?.code ?? "unknown"
 const statePath = (dir: string, key: string) => path.join(dir, `${key}.json`)
@@ -69,7 +78,10 @@ export function parseHostState(raw: string, key: string): HostSessionState | und
   if (sessionID && supervisor) Object.assign(state, { sessionID, supervisor, profile: p.profile === "readonly" ? "readonly" : "standard" })
   const model = optional(p.model, MODEL_RE)
   const agent = optional(p.agent, AGENT_RE)
-  return { ...state, ...(model ? { model } : {}), ...(agent ? { agent } : {}) }
+  // A narrowing list that does not parse is dropped; the session's permission rules then no longer
+  // match on the next send (send.ts), which refuses it: fails closed.
+  const keystone = keystoneList(p.keystone)
+  return { ...state, ...(model ? { model } : {}), ...(agent ? { agent } : {}), ...(keystone ? { keystone } : {}) }
 }
 
 function checkState(state: HostSessionState): void {
@@ -79,7 +91,8 @@ function checkState(state: HostSessionState): void {
     (state.sessionID !== undefined && !SESSION_ID_RE.test(state.sessionID)) ||
     (state.supervisor !== undefined && !SUPERVISOR_RE.test(state.supervisor)) ||
     (state.model !== undefined && !MODEL_RE.test(state.model)) ||
-    (state.agent !== undefined && !AGENT_RE.test(state.agent))
+    (state.agent !== undefined && !AGENT_RE.test(state.agent)) ||
+    (state.keystone !== undefined && keystoneList(state.keystone) === undefined)
   if (bad) throw new DelegateError("upstream_error", "The session's host record would not be valid, so it was not saved.", "Start the session again with oc_start_session.", "invalid host state")
 }
 

@@ -5,6 +5,7 @@ import { spawn } from "node:child_process"
 import { randomUUID } from "node:crypto"
 import http from "node:http"
 import { KS_NAME } from "../guard/entries.ts"
+import { idOfEntry } from "../shared/keystone.ts"
 import { DelegateError, isDelegateError } from "../shared/errors.ts"
 import { safeLog, silentLogger, type Logger } from "../shared/log.ts"
 import { expectOk, type McpStatus, type OpencodeApi } from "../shared/opencode-api.ts"
@@ -99,6 +100,16 @@ async function openListener(port: number, logger: Logger): Promise<Listener> {
 /** The redirect_uri the box must send: this bridge's loopback listener (OpenCode's default callback). */
 export const loopbackRedirect = (port: number) => `http://127.0.0.1:${port}${CALLBACK_PATH}`
 
+/**
+ * The `resource` a ks-<id> entry's sign-in must ask for: its own connection URL. Keystone's
+ * protected-resource metadata for /mcp/c/<id> names exactly this (checked 2026-10-01), and the MCP
+ * SDK sends that value. An entry name that is not ks-<id> has no valid resource.
+ */
+export function entryResource(authOrigin: string, entry: string): string | undefined {
+  const id = idOfEntry(entry)
+  return id === undefined ? undefined : `${authOrigin}/mcp/c/${id}`
+}
+
 function parseUrl(raw: string): URL | undefined {
   try {
     return new URL(raw)
@@ -122,13 +133,18 @@ function single(q: URLSearchParams, key: string): string | undefined {
  * differently by rundll32 or the browser than by these checks. An `href` that would not re-parse to
  * itself is refused, so what is opened is exactly what was checked.
  */
-function checkAuthUrl(raw: string, authOrigin: string, port: number): string {
+function checkAuthUrl(raw: string, authOrigin: string, port: number, entry: string): string {
   const url = parseUrl(raw)
   if (url?.origin !== authOrigin || url.username || url.password) throw new DelegateError("policy_violation", "The sign-in URL from the box is not a Keystone URL; it was not opened.", "Run oc_doctor.")
   const q = url.searchParams
   const pkce = CODE_CHALLENGE_RE.test(single(q, "code_challenge") ?? "") && single(q, "code_challenge_method") === "S256"
   if (url.pathname !== AUTHORIZE_PATH || single(q, "response_type") !== "code" || !pkce || single(q, "redirect_uri") !== loopbackRedirect(port)) {
     throw new DelegateError("policy_violation", "The sign-in URL from the box is not a Keystone authorization request back to this bridge; it was not opened.", "Run oc_doctor.")
+  }
+  // R4-01: the token is audience-bound (RFC 8707) to `resource`, so the owner's consent is only
+  // given for this entry's own connection, never for /mcp/dynamic, /api/mcp or another connection.
+  if (single(q, "resource") !== entryResource(authOrigin, entry)) {
+    throw new DelegateError("policy_violation", "The sign-in URL from the box asks for access to a different Keystone resource than this entry's connection; it was not opened.", "Run oc_doctor.")
   }
   if (parseUrl(url.href)?.href !== url.href) throw new DelegateError("policy_violation", "The sign-in URL from the box does not have one stable form; it was not opened.", "Run oc_doctor.")
   return url.href
@@ -189,7 +205,7 @@ function withCorrelation(logger: Logger, correlationId: string): Logger {
 
 async function signIn(api: OpencodeApi, entry: string, opts: LoginOptions, logger: Logger): Promise<"connected" | "failed"> {
   if (!KS_NAME.test(entry) || entry.length > MAX_ENTRY_LENGTH) {
-    throw new DelegateError("invalid_input", "Only ks-* entries can be signed in.", "Pass a ks-* server name (lower-case, for example ks-delegate).")
+    throw new DelegateError("invalid_input", "Only ks-* entries can be signed in.", "Pass a ks-<id> server name (lower-case, for example ks-rag-global).")
   }
   const directory = opts.directory ?? "/sessions"
   const port = opts.port ?? LOGIN_PORT
@@ -199,7 +215,7 @@ async function signIn(api: OpencodeApi, entry: string, opts: LoginOptions, logge
     const started = expectOk(await api.call<{ authorizationUrl?: string; oauthState?: string }>({ method: "POST", path: `/mcp/${entry}/auth`, directory, body: {} }), "start the Keystone sign-in")
     if (!started.authorizationUrl) return await entryStatus(api, entry, directory) // already signed in
     if (!started.oauthState) throw new DelegateError("upstream_error", "The delegate box did not return a sign-in state.", "Retry oc_login.")
-    const checked = checkAuthUrl(started.authorizationUrl, opts.authOrigin, port)
+    const checked = checkAuthUrl(started.authorizationUrl, opts.authOrigin, port, entry)
     listener.expect(started.oauthState)
     ;(opts.opener ?? defaultOpener)(checked)
     logger.log("info", "login", "browser opened; waiting for the loopback redirect", { entry })

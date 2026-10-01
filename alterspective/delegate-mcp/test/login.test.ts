@@ -16,9 +16,13 @@ const CHALLENGE = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
 
 type UrlParts = { origin?: string; path?: string; set?: Record<string, string>; drop?: string; extra?: string }
 
-/** A well-formed Keystone authorization request back to the listener on `port`, with optional damage. */
+/**
+ * A well-formed Keystone authorization request for ks-rag-global back to the listener on `port`,
+ * with optional damage. `resource` is the entry's own connection, as the MCP SDK sends it (R4-01).
+ */
 function authUrl(port: number, o: UrlParts = {}): string {
-  const q = new URLSearchParams({ response_type: "code", client_id: "c1", code_challenge: CHALLENGE, code_challenge_method: "S256", redirect_uri: `http://127.0.0.1:${port}${CALLBACK_PATH}`, state: "s1", ...o.set })
+  const resource = `${AUTH_ORIGIN}/mcp/c/rag-global`
+  const q = new URLSearchParams({ response_type: "code", client_id: "c1", code_challenge: CHALLENGE, code_challenge_method: "S256", redirect_uri: `http://127.0.0.1:${port}${CALLBACK_PATH}`, state: "s1", resource, ...o.set })
   if (o.drop) q.delete(o.drop)
   return `${o.origin ?? AUTH_ORIGIN}${o.path ?? "/api/oauth/authorize"}?${q}${o.extra ?? ""}`
 }
@@ -50,7 +54,7 @@ function fakeApi(opts: FakeOptions = {}) {
         return { status: opts.callbackStatus ?? 200, data: { status: "connected" } as T }
       }
       await opts.beforeStatus?.()
-      return { status: 200, data: { "ks-delegate": { status: opts.finalStatus ?? "connected" } } as T }
+      return { status: 200, data: { "ks-rag-global": { status: opts.finalStatus ?? "connected" } } as T }
     },
   }
   return { api, calls }
@@ -97,13 +101,13 @@ describe("login relay", () => {
       seen.push(await hit(port, "code=abc&state=s1"))
     }
     let browser: Promise<void> | undefined
-    const result = await login(api, "ks-delegate", { port, authOrigin: AUTH_ORIGIN, opener: () => void (browser = opener()) })
+    const result = await login(api, "ks-rag-global", { port, authOrigin: AUTH_ORIGIN, opener: () => void (browser = opener()) })
     await browser
     expect(result).toBe("connected")
     expect(seen.map((s) => s.status)).toEqual([400, 400, 200, 409])
     // After login returns the listener is gone: the connection is refused.
     expect((await tryHit(port, "code=late&state=s1")).status).toBe(0)
-    const relays = calls.filter((c) => c.path === "/mcp/ks-delegate/auth/callback")
+    const relays = calls.filter((c) => c.path === "/mcp/ks-rag-global/auth/callback")
     expect(relays).toHaveLength(1)
     expect(relays[0]?.body).toEqual({ code: "abc" })
     expect(calls.every((c) => c.directory === "/sessions")).toBe(true)
@@ -113,7 +117,7 @@ describe("login relay", () => {
     const port = await freePort()
     const { api, calls } = fakeApi({ port })
     let page: Promise<Page> | undefined
-    const result = await login(api, "ks-delegate", { port, authOrigin: AUTH_ORIGIN, opener: () => void (page = hit(port, "error=access_denied&state=s1")) })
+    const result = await login(api, "ks-rag-global", { port, authOrigin: AUTH_ORIGIN, opener: () => void (page = hit(port, "error=access_denied&state=s1")) })
     expect(result).toBe("failed")
     const shown = await page!
     expect(shown.status).toBe(400)
@@ -126,7 +130,7 @@ describe("login relay", () => {
     const port = await freePort()
     const { api } = fakeApi({ port, callbackThrows: true })
     let page: Promise<Page> | undefined
-    const error = await login(api, "ks-delegate", { port, authOrigin: AUTH_ORIGIN, opener: () => void (page = hit(port, "code=abc&state=s1")) }).catch((e: unknown) => e)
+    const error = await login(api, "ks-rag-global", { port, authOrigin: AUTH_ORIGIN, opener: () => void (page = hit(port, "code=abc&state=s1")) }).catch((e: unknown) => e)
     expect(error).toBeInstanceOf(DelegateError)
     expect((error as DelegateError).code).toBe("server_down")
     expect((await page!).status).toBe(502)
@@ -139,7 +143,7 @@ describe("login relay", () => {
     const lines: string[] = []
     const logger = { log: (level: string, _component: string, msg: string, fields?: object) => void lines.push(JSON.stringify({ level, msg, fields })) }
     let page: Promise<Page> | undefined
-    const result = await login(api, "ks-delegate", { port, authOrigin: AUTH_ORIGIN, logger, opener: () => void (page = hit(port, "code=abc&state=s1")) })
+    const result = await login(api, "ks-rag-global", { port, authOrigin: AUTH_ORIGIN, logger, opener: () => void (page = hit(port, "code=abc&state=s1")) })
     expect(result).toBe("failed")
     const shown = await page!
     expect(shown.status).toBe(502)
@@ -152,7 +156,7 @@ describe("login relay", () => {
   test("returns failed when the box still reports the entry as not connected", async () => {
     const port = await freePort()
     const { api } = fakeApi({ port, finalStatus: "needs_auth" })
-    const result = await login(api, "ks-delegate", { port, authOrigin: AUTH_ORIGIN, opener: () => void hit(port, "code=abc&state=s1") })
+    const result = await login(api, "ks-rag-global", { port, authOrigin: AUTH_ORIGIN, opener: () => void hit(port, "code=abc&state=s1") })
     expect(result).toBe("failed")
   })
 
@@ -162,7 +166,7 @@ describe("login relay", () => {
     blockers.push(blocker)
     await new Promise<void>((resolve) => blocker.listen(port, "127.0.0.1", () => resolve()))
     const { api, calls } = fakeApi({ port })
-    const error = await login(api, "ks-delegate", { port, authOrigin: AUTH_ORIGIN, opener: () => {} }).catch((e: unknown) => e)
+    const error = await login(api, "ks-rag-global", { port, authOrigin: AUTH_ORIGIN, opener: () => {} }).catch((e: unknown) => e)
     expect(error).toBeInstanceOf(DelegateError)
     expect((error as DelegateError).code).toBe("port_busy")
     expect(calls).toHaveLength(0)
@@ -171,7 +175,7 @@ describe("login relay", () => {
   test("times out as failed, relays nothing, and frees the port", async () => {
     const port = await freePort()
     const { api, calls } = fakeApi({ port })
-    const result = await login(api, "ks-delegate", { port, authOrigin: AUTH_ORIGIN, timeoutMs: 150, opener: () => {} })
+    const result = await login(api, "ks-rag-global", { port, authOrigin: AUTH_ORIGIN, timeoutMs: 150, opener: () => {} })
     expect(result).toBe("failed")
     expect(calls.some((c) => c.path.endsWith("/auth/callback"))).toBe(false)
     await portIsFree(port)
@@ -181,7 +185,7 @@ describe("login relay", () => {
     const port = await freePort()
     const { api } = fakeApi({ port, authUrl: authUrl(port, { origin: "https://evil.example.test" }) })
     let opened = false
-    const error = await login(api, "ks-delegate", { port, authOrigin: AUTH_ORIGIN, opener: () => (opened = true) }).catch((e: unknown) => e)
+    const error = await login(api, "ks-rag-global", { port, authOrigin: AUTH_ORIGIN, opener: () => (opened = true) }).catch((e: unknown) => e)
     expect((error as DelegateError).code).toBe("policy_violation")
     expect(opened).toBe(false)
     await portIsFree(port)
@@ -204,10 +208,18 @@ describe("login relay", () => {
       "a redirect to localhost": authUrl(port, { set: { redirect_uri: `http://localhost:${port}${CALLBACK_PATH}` } }),
       "a second redirect_uri": authUrl(port, { extra: `&redirect_uri=${encodeURIComponent("https://evil.example.test/cb")}` }),
       "user info in the URL": authUrl(port).replace("https://", "https://owner@"),
+      // R4-01: the owner's consent is only for this entry's own connection.
+      "no resource": authUrl(port, { drop: "resource" }),
+      "the dynamic relay as resource": authUrl(port, { set: { resource: `${AUTH_ORIGIN}/mcp/dynamic` } }),
+      "the admin MCP as resource": authUrl(port, { set: { resource: `${AUTH_ORIGIN}/api/mcp` } }),
+      "another connection as resource": authUrl(port, { set: { resource: `${AUTH_ORIGIN}/mcp/c/github` } }),
+      "a resource on another origin": authUrl(port, { set: { resource: "https://evil.example.test/mcp/c/rag-global" } }),
+      "a resource with a trailing slash": authUrl(port, { set: { resource: `${AUTH_ORIGIN}/mcp/c/rag-global/` } }),
+      "a second resource": authUrl(port, { extra: `&resource=${encodeURIComponent(`${AUTH_ORIGIN}/mcp/dynamic`)}` }),
     }
     for (const [why, url] of Object.entries(bad)) {
       let opened = false
-      const error = await login(fakeApi({ authUrl: url }).api, "ks-delegate", { port, authOrigin: AUTH_ORIGIN, opener: () => (opened = true) }).catch((e: unknown) => e)
+      const error = await login(fakeApi({ authUrl: url }).api, "ks-rag-global", { port, authOrigin: AUTH_ORIGIN, opener: () => (opened = true) }).catch((e: unknown) => e)
       expect({ why, code: (error as DelegateError).code, opened }).toEqual({ why, code: "policy_violation", opened: false })
     }
     await portIsFree(port)
@@ -216,7 +228,7 @@ describe("login relay", () => {
   test("R3-06: the well-formed request is opened as given", async () => {
     const port = await freePort()
     const urls: string[] = []
-    const result = await login(fakeApi({ port }).api, "ks-delegate", { port, authOrigin: AUTH_ORIGIN, opener: (url) => void (urls.push(url), hit(port, "code=abc&state=s1")) })
+    const result = await login(fakeApi({ port }).api, "ks-rag-global", { port, authOrigin: AUTH_ORIGIN, opener: (url) => void (urls.push(url), hit(port, "code=abc&state=s1")) })
     expect(result).toBe("connected")
     expect(urls).toEqual([authUrl(port)])
   })
@@ -234,7 +246,7 @@ describe("login relay", () => {
     for (const raw of raws) {
       expect(raw).not.toBe(good)
       const urls: string[] = []
-      const result = await login(fakeApi({ authUrl: raw }).api, "ks-delegate", { port, authOrigin: AUTH_ORIGIN, opener: (url) => void (urls.push(url), hit(port, "code=abc&state=s1")) })
+      const result = await login(fakeApi({ authUrl: raw }).api, "ks-rag-global", { port, authOrigin: AUTH_ORIGIN, opener: (url) => void (urls.push(url), hit(port, "code=abc&state=s1")) })
       expect({ raw, result, urls }).toEqual({ raw, result: "connected", urls: [good] })
       expect(new URL(urls[0]!).href).toBe(urls[0]!)
     }
@@ -245,11 +257,11 @@ describe("login relay", () => {
     const custom = { ...defaultConfig({}), keystoneOrigin: AUTH_ORIGIN }
     // A URL on the default Keystone origin is refused when the bridge runs with another config...
     const onDefault = fakeApi({ port, authUrl: authUrl(port, { origin: defaultConfig({}).keystoneOrigin }) })
-    const error = await login(onDefault.api, "ks-delegate", { port, authOrigin: custom.keystoneOrigin, opener: () => {} }).catch((e: unknown) => e)
+    const error = await login(onDefault.api, "ks-rag-global", { port, authOrigin: custom.keystoneOrigin, opener: () => {} }).catch((e: unknown) => e)
     expect((error as DelegateError).code).toBe("policy_violation")
     // ...and one on that config's origin is opened.
     const onCustom = fakeApi({ port })
-    const result = await login(onCustom.api, "ks-delegate", { port, authOrigin: custom.keystoneOrigin, opener: () => void hit(port, "code=abc&state=s1") })
+    const result = await login(onCustom.api, "ks-rag-global", { port, authOrigin: custom.keystoneOrigin, opener: () => void hit(port, "code=abc&state=s1") })
     expect(result).toBe("connected")
   })
 
@@ -258,9 +270,9 @@ describe("login relay", () => {
     const lines: Array<{ level: string; msg: string; fields: Record<string, unknown> }> = []
     const logger = { log: (level: string, _c: string, msg: string, fields: Record<string, unknown> = {}) => void lines.push({ level, msg, fields }) }
     const { api } = fakeApi({ port })
-    await login(api, "ks-delegate", { port, authOrigin: AUTH_ORIGIN, logger, correlationId: "cid-1", opener: () => void hit(port, "code=abc&state=s1") })
+    await login(api, "ks-rag-global", { port, authOrigin: AUTH_ORIGIN, logger, correlationId: "cid-1", opener: () => void hit(port, "code=abc&state=s1") })
     expect(lines.map((l) => l.msg)).toContain("login called")
-    expect(lines.find((l) => l.msg === "login done")?.fields).toMatchObject({ result: "connected", entry: "ks-delegate" })
+    expect(lines.find((l) => l.msg === "login done")?.fields).toMatchObject({ result: "connected", entry: "ks-rag-global" })
     expect(lines.every((l) => l.fields.correlationId === "cid-1")).toBe(true)
     lines.length = 0
     await login(api, "evil", { authOrigin: AUTH_ORIGIN, logger }).catch(() => undefined)
@@ -274,7 +286,7 @@ describe("login relay", () => {
   test("a throwing logger never breaks the sign-in (A-11)", async () => {
     const port = await freePort()
     const logger = { log: () => { throw new Error("log sink down") } }
-    const result = await login(fakeApi({ port }).api, "ks-delegate", { port, authOrigin: AUTH_ORIGIN, logger, opener: () => void hit(port, "code=abc&state=s1") })
+    const result = await login(fakeApi({ port }).api, "ks-rag-global", { port, authOrigin: AUTH_ORIGIN, logger, opener: () => void hit(port, "code=abc&state=s1") })
     expect(result).toBe("connected")
   })
 
@@ -292,7 +304,7 @@ describe("login relay", () => {
     const { api } = fakeApi({ port, authUrl: authUrl(port, { extra: "&secretq=Q123" }) })
     const lines: string[] = []
     const logger = { log: (level: string, component: string, msg: string, fields?: object) => void lines.push(JSON.stringify({ level, component, msg, fields })) }
-    await login(api, "ks-delegate", { port, authOrigin: AUTH_ORIGIN, logger, opener: () => void hit(port, "code=CODE987&state=bad").then(() => hit(port, "code=CODE987&state=s1")) })
+    await login(api, "ks-rag-global", { port, authOrigin: AUTH_ORIGIN, logger, opener: () => void hit(port, "code=CODE987&state=bad").then(() => hit(port, "code=CODE987&state=s1")) })
     const all = lines.join("\n")
     expect(lines.length).toBeGreaterThan(0)
     expect(all).not.toContain("CODE987")

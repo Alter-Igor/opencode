@@ -1,5 +1,9 @@
 // Test helpers for the MOD-04 core tools: a fake ToolContext with a recording fake API, a fake
 // event hub and fake workspaces / command runners. No Docker, no network.
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
+import os from "node:os"
+import path from "node:path"
+import { frontServersFor } from "../src/guard/egress.ts"
 import { createGuard } from "../src/guard/index.ts"
 import { defaultConfig } from "../src/shared/config.ts"
 import type { Cursor, HubEvent, SessionView, WaitUntil } from "../src/shared/contracts.ts"
@@ -12,6 +16,15 @@ import type { Box, CommandResult, SessionRecord, ToolContext } from "../src/tool
 import type { ToolSpec } from "../src/tools/define.ts"
 import { fail, type ToolResult } from "../src/tools/shape.ts"
 import type { z } from "zod"
+
+/**
+ * A throw-away bridge home with no saved Keystone choice: the set is read from <home>/keystone.json,
+ * never the owner's real one. A test that saves a choice gives its context its own home.
+ */
+export const FIXTURE_HOME = mkdtempSync(path.join(os.tmpdir(), "ocd-tools-"))
+// As after a start: front's servers file generated for the default set (oc_doctor's egress check reads it).
+mkdirSync(path.join(FIXTURE_HOME, "front"))
+writeFileSync(path.join(FIXTURE_HOME, "front", "servers.conf"), frontServersFor(defaultConfig({})))
 
 export const SID = "ses_0123456789abcdefAB"
 export const OTHER_SID = "ses_ffffffffffffffffFF"
@@ -125,7 +138,7 @@ function fakeServices(f: Fake): Pick<ToolContext, "supervisorService" | "workspa
       ensure: async () => TARGET,
       status: async () => f.status.value,
       release: async () => {},
-      replace: async () => ({ target: TARGET, interrupted: f.restart.interrupted }),
+      replace: async () => ({ target: TARGET, interrupted: f.restart.interrupted, keystone: [] }),
       login: async () => "connected",
     },
     workspaces: {
@@ -161,7 +174,7 @@ export function fakeContext(options: { boxHeld?: boolean } = {}): Fake {
   const api = new FakeApi(order)
   const hub = new FakeHub(order)
   const box: Box = { target: TARGET, api, hub }
-  const config = { ...defaultConfig({}), roots: ["C:\\GitHub"] }
+  const config = { ...defaultConfig({}), roots: ["C:\\GitHub"], home: FIXTURE_HOME }
   let held = options.boxHeld !== false
   let host = (_argv: string[]) => ({ code: 128, stdout: "", stderr: "fatal: path not in tree" }) as CommandResult
   let inBox = (argv: string[]) => (argv.includes("rev-parse") ? okCmd(`${BASE}\n`) : okCmd(""))
@@ -169,7 +182,7 @@ export function fakeContext(options: { boxHeld?: boolean } = {}): Fake {
     api, hub, order, box, boxCmds: [], hostCmds: [], opened: [], collected: [], states: new Map(), discarded: [], started: { count: 0, restarts: 0 }, restart: { forced: [], interrupted: 0 },
     setHost: (fn) => (host = fn),
     setBox: (fn) => (inBox = fn),
-    status: { value: { state: "running", target: TARGET, imageTag: "img:1", startedBy: "other", health: "healthy", policyVerified: true, imageMatches: true } },
+    status: { value: { state: "running", target: TARGET, imageTag: "img:1", startedBy: "other", health: "healthy", policyVerified: true, frontMatches: true, imageMatches: true } },
     ctx: undefined as unknown as ToolContext,
   }
   f.ctx = {
@@ -191,7 +204,7 @@ export function fakeContext(options: { boxHeld?: boolean } = {}): Fake {
     restartBox: async (options) => {
       f.started.restarts++
       f.restart.forced.push(options?.force === true)
-      return { ...box, interrupted: f.restart.interrupted }
+      return { ...box, interrupted: f.restart.interrupted, keystone: options?.keystone ?? [] }
     },
     onBox: () => () => {},
     boxExec: async (argv) => {

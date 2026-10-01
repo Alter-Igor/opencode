@@ -7,7 +7,9 @@ import { readFileSync } from "node:fs"
 import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import path from "node:path"
 import type { BridgeConfig } from "../shared/config.ts"
-import type { Guard } from "../shared/contracts.ts"
+import type { Guard, McpEntry } from "../shared/contracts.ts"
+import { CONNECTION_ID, entryName } from "../shared/keystone.ts"
+import { validateEntries } from "../guard/entries.ts"
 import { DelegateError, isDelegateError } from "../shared/errors.ts"
 import { invalid, scanProvider, type Json, type JsonObject } from "./profile-scan.ts"
 
@@ -21,7 +23,8 @@ export const PROFILE_GITIGNORE = ["node_modules", "package.json", "package-lock.
 export type ProfileInput = {
   /** Owner config files in load order (config.json, opencode.json, opencode.jsonc); JSONC allowed. */
   ownerConfigs: string[]
-  config: Pick<BridgeConfig, "keystoneOrigin" | "pinnedConnections" | "boxEnv">
+  /** keystoneConnections must be the effective set (shared/config.ts effectiveConfig). */
+  config: Pick<BridgeConfig, "keystoneOrigin" | "keystoneConnections" | "boxEnv">
   /** Supplied by MOD-02 (Guard.permissionBaseline); the supervisor does not decide policy. */
   permission: PermissionRule[]
   /** provider id → env name to use as options.apiKey when the owner's entry has no key (must be on boxEnv). */
@@ -37,8 +40,6 @@ export type BuiltProfile = {
   providers: string[]
   dropped: Array<{ provider: string; reason: string }>
 }
-
-const CONNECTION_ID = /^[A-Za-z0-9_-]+$/
 
 /**
  * MOD-05 in-box inbox tools (profile-tools/). They are copied into opencode/tool/ so OpenCode
@@ -155,14 +156,21 @@ function withKeyEnv(id: string, entry: JsonObject, envName: string | undefined, 
   return { ...entry, options: { ...options, apiKey: `{env:${envName}}` } }
 }
 
+/**
+ * One `ks-<id>` → `/mcp/c/<id>` entry per chosen Keystone connection, and nothing else (review
+ * R4-01: never /mcp/dynamic, which reaches every service on the owner's account). The result is
+ * checked by the guard's profile-time allowlist, so a bad entry can never reach the box.
+ */
 export function mcpEntries(config: ProfileInput["config"]): JsonObject {
   const origin = new URL(config.keystoneOrigin).origin
-  const entries: JsonObject = { "ks-delegate": { type: "remote", url: `${origin}/mcp/dynamic` } }
-  for (const id of config.pinnedConnections) {
-    if (!CONNECTION_ID.test(id)) throw invalid(`The pinned connection id "${id.slice(0, 40)}" is not valid.`)
-    entries[`ks-${id}`] = { type: "remote", url: `${origin}/mcp/c/${id}` }
+  const entries: Record<string, McpEntry> = {}
+  for (const id of config.keystoneConnections) {
+    if (!CONNECTION_ID.test(id)) throw invalid(`The Keystone connection id "${id.slice(0, 40)}" is not valid.`)
+    entries[entryName(id)] = { type: "remote", url: `${origin}/mcp/c/${id}` }
   }
-  return entries
+  const verdict = validateEntries(entries, config.keystoneOrigin, config.keystoneConnections)
+  if (!verdict.ok) throw invalid(`The box's Keystone MCP entries failed the allowlist: ${verdict.reason.slice(0, 200)}`)
+  return entries as JsonObject
 }
 
 /** Rules → OpenCode config shape, preserving rule order (OpenCode evaluates last match wins). */

@@ -103,15 +103,17 @@ class Manager implements BoxManager {
   async restart(options: ReplaceOptions = { force: false }): Promise<RestartedBox> {
     const prior = this.pending
     let interrupted = 0
+    let keystone: string[] = []
     const target = (async () => {
       await prior?.catch(() => undefined)
       await this.stop().catch(() => undefined)
       const result = await this.deps.supervisor.replace(options)
       interrupted = result.interrupted
+      keystone = result.keystone
       return result.target
     })()
     const box = await this.track(target)
-    return { ...box, interrupted }
+    return { ...box, interrupted, keystone }
   }
 
   onBox(listener: (box: Box) => void): () => void {

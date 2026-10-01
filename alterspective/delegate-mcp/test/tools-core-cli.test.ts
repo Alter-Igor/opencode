@@ -90,7 +90,7 @@ describe("console redirection in mcp mode (W3A-18)", () => {
 describe("doctor exit code (W3A-09)", () => {
   function runtimeWith(verified: boolean): () => Promise<Runtime> {
     const f = fakeContext({ boxHeld: false })
-    f.api.on("GET /mcp", { status: 200, data: { "ks-delegate": { status: verified ? "connected" : "needs_auth" } } })
+    f.api.on("GET /mcp", { status: 200, data: { "ks-rag-global": { status: verified ? "connected" : "needs_auth" } } })
     return async () => ({ ctx: f.ctx, versionInfo: { version: "v", package: "0", sha: "x", dirty: false, built: null }, name: "t", shutdown: async () => {} })
   }
 
@@ -125,7 +125,7 @@ describe("restart under concurrent calls (W3A-20)", () => {
     const m = createBoxManager({
       supervisor: {
         ensure: async () => (ensures++ === 0 ? A : B),
-        replace: async () => (replaces++, await Bun.sleep(20), { target: B, interrupted: 0 }),
+        replace: async () => (replaces++, await Bun.sleep(20), { target: B, interrupted: 0, keystone: [] }),
       },
       sessions: new Map([[record().sessionID, record()]]),
       log: silentLogger,

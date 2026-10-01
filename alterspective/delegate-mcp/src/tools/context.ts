@@ -23,11 +23,13 @@ export type SessionRecord = {
   /** Additive (Wave 3): defaults for oc_send when it names no model/agent (`provider/model`). */
   model?: string
   agent?: string
+  /** Additive (R4-01): the Keystone connections this session was narrowed to (convenience, not a wall); undefined = the whole box-wide set. */
+  keystone?: string[]
 }
 
 export type Box = { target: ApiTarget; api: OpencodeApi; hub: DelegateHub }
-/** A box after oc_server_restart, with how many other bridges held the replaced sandbox. */
-export type RestartedBox = Box & { interrupted: number }
+/** A box after oc_server_restart, with how many other bridges held the replaced sandbox and the Keystone set it runs with. */
+export type RestartedBox = Box & { interrupted: number; keystone: string[] }
 
 /** Additive (Wave 3): result of one command run on the host or in the box. */
 export type CommandResult = { code: number; stdout: string; stderr: string; timedOut?: boolean }

@@ -2,10 +2,13 @@
 // the bridge's memory and in this child env (and so the container). It is never written to a
 // file or logged. Box env vars are listed in the override file by NAME only.
 import path from "node:path"
-import { mcpAllowPolicy, type BridgeConfig } from "../shared/config.ts"
+import { frontDir, mcpAllowPolicy, type BridgeConfig } from "../shared/config.ts"
 import { DelegateError } from "../shared/errors.ts"
 import { childEnv } from "./docker.ts"
 import type { BuiltProfile } from "./profile.ts"
+
+/** front's generated servers file (review R4-01) and its sha256 (the front-config label). */
+export type FrontFiles = { servers: string; hash: string }
 
 export const PASSWORD_ENV = "OPENCODE_SERVER_PASSWORD"
 export const MCP_ALLOW_ENV = "OPENCODE_MCP_ALLOW"
@@ -29,6 +32,8 @@ export function paths(config: BridgeConfig) {
     leases: path.join(config.home, "leases"),
     startLock: path.join(config.home, "start.lock"),
     boxEnvOverride: path.join(config.home, "compose.box-env.yaml"),
+    /** Generated front config, mounted read-only into front (never into the box). */
+    front: frontDir(config),
   }
 }
 
@@ -118,26 +123,36 @@ export function composeDownEnv(inputs: ComposeInputs): Record<string, string> {
     OCD_CONTAINER: containerName(inputs.config),
     OCD_PROFILE_DIR: dirs.profile,
     OCD_HANDOFF_DIR: dirs.handoff,
+    OCD_FRONT_DIR: dirs.front,
+    OCD_FRONT_HASH: "down",
     ...frontEnv(inputs.hostEnv),
   })
 }
 
-/** Env of the `docker compose up` child: CLI essentials + OCD_* + password + approved keys (+ inbox port/token). */
-export function composeEnv(inputs: ComposeInputs, built: BuiltProfile, port: number, password: string, inbox?: InboxStart): Record<string, string> {
+/** What one `up` is started with. `front` is the generated servers file for the same Keystone set as the policy. */
+export type StartValues = { built: BuiltProfile; port: number; password: string; front: FrontFiles; inbox?: InboxStart }
+
+/**
+ * Env of the `docker compose up` child: CLI essentials + OCD_* + password + approved keys (+ inbox port/token).
+ * `inputs.config.keystoneConnections` must be the effective set (effectiveConfig): it makes the MCP policy.
+ */
+export function composeEnv(inputs: ComposeInputs, start: StartValues): Record<string, string> {
   const dirs = paths(inputs.config)
-  const inboxEnv: Record<string, string> = inbox ? { OCD_INBOX_PORT: String(inbox.port), [INBOX_ADMIN_TOKEN_ENV]: inbox.token } : {}
+  const inboxEnv: Record<string, string> = start.inbox ? { OCD_INBOX_PORT: String(start.inbox.port), [INBOX_ADMIN_TOKEN_ENV]: start.inbox.token } : {}
   return childEnv(inputs.hostEnv, {
     ...approvedValues(inputs),
     OCD_IMAGE: inputs.image,
     OCD_OPENCODE_VERSION: inputs.opencodeVersion,
-    OCD_PROFILE_HASH: built.hash,
-    OCD_PORT: String(port),
+    OCD_PROFILE_HASH: start.built.hash,
+    OCD_PORT: String(start.port),
     OCD_CONTAINER: containerName(inputs.config),
     OCD_PROFILE_DIR: dirs.profile,
     OCD_HANDOFF_DIR: dirs.handoff,
+    OCD_FRONT_DIR: dirs.front,
+    OCD_FRONT_HASH: start.front.hash,
     ...frontEnv(inputs.hostEnv),
     [MCP_ALLOW_ENV]: mcpAllowPolicy(inputs.config),
-    [PASSWORD_ENV]: password,
+    [PASSWORD_ENV]: start.password,
     ...inboxEnv,
   })
 }

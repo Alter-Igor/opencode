@@ -227,7 +227,7 @@ describe("compose wiring for the inbox", () => {
   const built = buildProfile({ ownerConfigs: [], config: inputs.config, permission: [] })
 
   test("up env carries the inbox port and token; down env has a placeholder port and no token", () => {
-    const up = composeEnv(inputs, built, 40001, "pw", { port: 40002, token: TOKEN })
+    const up = composeEnv(inputs, { built, port: 40001, password: "pw", inbox: { port: 40002, token: TOKEN }, front: { servers: "", hash: "f" } })
     expect(up.OCD_INBOX_PORT).toBe("40002")
     expect(up[INBOX_ADMIN_TOKEN_ENV]).toBe(TOKEN)
     const down = composeDownEnv(inputs)
