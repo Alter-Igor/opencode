@@ -7,6 +7,7 @@
 // It can also change the box-wide Keystone set (review R4-01), saved in the bridge home.
 import { mkdir, writeFile } from "node:fs/promises"
 import path from "node:path"
+import { removeLegacyOut, sweepOutBundles } from "./handoff-hygiene.ts"
 import { mcpAllowPolicy, type BridgeConfig } from "../shared/config.ts"
 import { saveKeystoneSet } from "../shared/keystone.ts"
 import type { Supervisor } from "../shared/contracts.ts"
@@ -146,6 +147,7 @@ async function reuse(run: Run, box: BoxInspect, plan: Plan): Promise<ApiTarget> 
     await waitHealthy(run.deps, target, run.container)
     // R5-01: sign-ins of entries that left the set must not stay in the box, even on reuse.
     await pruneSignIns(run, plan)
+    await sweepOutBundles(run)
     run.note("info", "reusing running sandbox", { health: box.health })
     return target
   })
@@ -161,6 +163,7 @@ async function prepareFiles(run: Run, plan: Plan): Promise<void> {
     // The bind source must exist before `up`, or Docker creates it root-owned (review C-4).
     // There is no host out/ folder: the box's out/ is a box-only volume (G-7).
     await mkdir(path.join(dirs.handoff, "in"), { recursive: true })
+    await removeLegacyOut(run)
     await writeBoxEnvOverride(run)
     // front's servers for this Keystone set (R4-01); compose mounts the folder read-only into front.
     await mkdir(dirs.front, { recursive: true })
@@ -202,6 +205,7 @@ async function start(run: Run, plan: Plan): Promise<ApiTarget> {
     run.state.startedHere = true
     // R5-01: the data volume outlives the box, so every start (and every set change) cleans it.
     await pruneSignIns(run, plan)
+    await sweepOutBundles(run)
     return target
   })
 }

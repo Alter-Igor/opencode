@@ -5,9 +5,14 @@
 // on stdout. The bridge, not Docker, writes the host file, so the box cannot choose what lands on the
 // host or how much:
 // 1. In the box: `stat` must say "regular file" within the size cap, or nothing is copied.
-// 2. The stream: exactly one regular-file entry (a link, folder, device or second entry is refused)
-//    declaring no more than the cap. Reading stops at the cap plus a small slack, so a file the box
-//    swaps in after step 1 (bigger, a folder, a link) can never put more than the cap on the host.
+// 2. The stream: at most one small PAX header, then exactly one non-empty regular-file entry (a
+//    link, folder, device or second entry is refused) declaring no more than the cap, then the two
+//    zero end blocks and nothing but zeros. So a file the box swaps in after step 1 (bigger, a
+//    folder, a link) can never put more than the cap on the host. True bounds: at most the cap is
+//    written to the host; at most the cap + 71 KiB of tar framing (512 B header, one 4 KiB PAX
+//    header with its own 512 B header, up to 511 B padding, 1 KiB end blocks, 64 KiB trailing
+//    zeros) is consumed, plus at most one pipe chunk read ahead (64 KiB on the platforms tested).
+//    A deadline covers the whole copy, whatever the source does.
 // 3. On the host: the quarantine file (exclusive create in a host-only folder) must be a regular file
 //    of exactly the streamed size, within the cap. Only then is it fetched (workspaces.ts).
 // `docker cp` without -L copies a final-component link as a link (refused in step 2), and resolves
@@ -21,10 +26,12 @@ import { killTree } from "./spawn.ts"
 import { boxFailure, cleanEnv, type Exec } from "./workspaces-exec.ts"
 import { assertRegularFile, ensureRealDir, handoffFailure, refused, removeEntry, removeQuietly } from "./workspaces-handoff.ts"
 
-/** Bytes allowed past the file itself: PAX headers and the end-of-archive blocks. */
+/** Zero bytes allowed after the two end blocks (tar writers may pad to a record size). */
 export const TAR_SLACK_BYTES = 64 * 1024
+/** Docker writes at most one small PAX header (e.g. sub-second mtime, xattrs). */
+export const PAX_MAX_BYTES = 4 * 1024
 const BLOCK = 512
-const MAX_PAX_HEADERS = 4
+const MAX_PAX_HEADERS = 1
 const CUT_OFF = "tar stream ended early"
 
 export type TarExit = { code: number; stderr: string; timedOut: boolean }
@@ -33,10 +40,12 @@ export type TarStream = { chunks: AsyncIterable<Uint8Array>; exited: Promise<Tar
 export type TarSource = (boxPath: string, timeoutMs: number) => TarStream
 export type CopyOut = { boxPath: string; quarantinePath: string }
 
-const tooLarge = (size: number, maxBytes: number) =>
-  new DelegateError("bundle_too_large", `The session bundle is ${size} bytes, over the ${maxBytes}-byte limit; nothing was fetched.`, "Ask the delegate to drop large or generated files from its commits, then collect again.")
+const tooLarge = (size: number | string, maxBytes: number) =>
+  new DelegateError("bundle_too_large", `The session bundle is ${typeof size === "number" ? `${size} bytes` : size}, over the ${maxBytes}-byte limit; nothing was fetched.`, "Ask the delegate to drop large or generated files from its commits, then collect again.")
 const notRegular = (detail: string) => refused("The session bundle is not a regular file; it was not used.", detail)
 const badArchive = (detail: string) => refused("The session bundle did not come out of the box as one plain file; it was not used.", detail)
+const empty = (detail: string) => refused("The box wrote an empty session bundle; it was not used.", detail)
+const timedOutCopy = () => boxFailure("copy the session bundle out", "timed out", true)
 const cutOff = () => new DelegateError("upstream_error", "The session bundle was cut off while it was copied out of the box.", "Collect again; if it repeats, run oc_doctor.", CUT_OFF)
 const pad = (n: number) => (BLOCK - (n % BLOCK)) % BLOCK
 
@@ -81,7 +90,9 @@ function pullReader(chunks: AsyncIterable<Uint8Array>) {
   let buf: Buffer = Buffer.alloc(0)
   const fill = async (n: number) => {
     while (buf.length < n) {
-      const next = await it.next()
+      const next = await it.next().catch((error: unknown) => {
+        throw new DelegateError("upstream_error", "Reading the session bundle from the box failed.", "Collect again; if it repeats, run oc_doctor.", String(error).slice(0, 300))
+      })
       if (next.done) return false
       const chunk = Buffer.from(next.value.buffer, next.value.byteOffset, next.value.byteLength)
       buf = buf.length === 0 ? chunk : Buffer.concat([buf, chunk])
@@ -106,21 +117,22 @@ function pullReader(chunks: AsyncIterable<Uint8Array>) {
       }
       return true
     },
-    /** Read to the end; false when more than `limit` bytes are left. */
-    async drain(limit: number): Promise<boolean> {
+    /** Read to the end: "ok" when at most `limit` bytes are left and all are zero. */
+    async drain(limit: number): Promise<"ok" | "too many" | "not zero"> {
       for (let seen = buf.length; seen <= limit; ) {
+        if (!buf.every((b) => b === 0)) return "not zero"
         buf = Buffer.alloc(0)
-        if (!(await fill(1))) return true
+        if (!(await fill(1))) return "ok"
         seen += buf.length
       }
-      return false
+      return "too many"
     },
   }
 }
 type Reader = ReturnType<typeof pullReader>
 
 /** A ustar header: its type and size; undefined for an end-of-archive (all-zero) block. */
-function parseHeader(block: Buffer): { type: string; size: number } | undefined {
+function parseHeader(block: Buffer): { type: string; size: number | "8 GiB or more" } | undefined {
   if (block.every((b) => b === 0)) return undefined
   const octal = (from: number, to: number) => {
     const t = block.subarray(from, to).toString("latin1").replace(/[\0 ]+$/, "").trim()
@@ -129,7 +141,9 @@ function parseHeader(block: Buffer): { type: string; size: number } | undefined 
   const sum = block.reduce((acc, b, i) => acc + (i >= 148 && i < 156 ? 0x20 : b), 0)
   if (octal(148, 156) !== sum) throw badArchive("tar header checksum")
   const type = String.fromCharCode(block[156] || 0x30)
-  if (((block[124] ?? 0) & 0x80) !== 0) return { type, size: Number.POSITIVE_INFINITY } // base-256: 8 GiB or more
+  // Base-256 size (high bit set): only for 8 GiB or more; 0xff first means a negative size.
+  if (block[124] === 0xff) throw badArchive("negative tar size")
+  if (((block[124] ?? 0) & 0x80) !== 0) return { type, size: "8 GiB or more" }
   const size = octal(124, 136)
   if (!Number.isFinite(size)) throw badArchive("tar header size")
   return { type, size }
@@ -143,7 +157,7 @@ async function streamEntry(reader: Reader, maxBytes: number, write: (part: Buffe
     const header = parseHeader(block)
     if (!header) throw badArchive("empty archive")
     if (header.type === "x" || header.type === "g") {
-      if (pax >= MAX_PAX_HEADERS || header.size > TAR_SLACK_BYTES) throw badArchive("PAX headers")
+      if (pax >= MAX_PAX_HEADERS || typeof header.size !== "number" || header.size > PAX_MAX_BYTES) throw badArchive("PAX headers")
       const records = await reader.read(header.size + pad(header.size))
       if (!records) throw cutOff()
       // A size record would let the entry claim a size its header does not show (we never need one).
@@ -151,36 +165,55 @@ async function streamEntry(reader: Reader, maxBytes: number, write: (part: Buffe
       continue
     }
     if (header.type !== "0") throw notRegular(`tar entry type ${header.type}`)
-    if (header.size > maxBytes) throw tooLarge(header.size, maxBytes)
+    if (typeof header.size !== "number" || header.size > maxBytes) throw tooLarge(header.size, maxBytes)
+    if (header.size === 0) throw empty("tar entry of 0 bytes")
     if (!(await reader.pipe(header.size, write))) throw cutOff()
     if (!(await reader.read(pad(header.size)))) throw cutOff()
     return header.size
   }
 }
 
-/** After the file: end-of-archive blocks only, and no more than the slack. */
+/** After the file: exactly two zero end blocks, then only zeros, no more than the slack. */
 async function expectEnd(reader: Reader): Promise<void> {
-  const block = await reader.read(BLOCK)
-  if (block && !block.every((b) => b === 0)) throw badArchive("a second tar entry")
-  if (!(await reader.drain(TAR_SLACK_BYTES))) throw badArchive("bytes after the archive end")
-}
-
-function writeAll(fd: number, part: Buffer): void {
-  for (let done = 0; done < part.length; ) done += writeSync(fd, part, done, part.length - done)
-}
-
-/** Stream the box file into a fresh host file; a cut-off stream reports the docker cp failure if there was one. */
-async function streamToHost(source: TarSource, bundle: CopyOut, maxBytes: number, timeoutMs: number): Promise<number> {
-  let fd: number
-  try {
-    fd = openSync(bundle.quarantinePath, "wx")
-  } catch (error) {
-    throw handoffFailure("create the quarantined bundle", error, bundle.quarantinePath)
+  for (const which of ["first", "second"]) {
+    const block = await reader.read(BLOCK)
+    if (!block) throw badArchive(`no ${which} end block`)
+    if (!block.every((b) => b === 0)) throw badArchive(which === "first" ? "a second tar entry" : "an entry after one end block")
   }
-  const stream = source(bundle.boxPath, timeoutMs)
+  const rest = await reader.drain(TAR_SLACK_BYTES)
+  if (rest !== "ok") throw badArchive(rest === "too many" ? "too many bytes after the archive end" : "non-zero bytes after the archive end")
+}
+
+function writeAll(fd: number, part: Buffer, hostPath: string): void {
+  try {
+    for (let done = 0; done < part.length; ) done += writeSync(fd, part, done, part.length - done)
+  } catch (error) {
+    throw handoffFailure("write the quarantined bundle", error, hostPath)
+  }
+}
+
+/** The copy under one deadline: a source that never ends is stopped and reported as a timeout. */
+async function withDeadline<T>(work: Promise<T>, timeoutMs: number, stop: () => void): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      stop()
+      reject(timedOutCopy())
+    }, timeoutMs)
+  })
+  work.catch(() => undefined) // a rejection after the deadline won is not unhandled
+  try {
+    return await Promise.race([work, deadline])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** Parse the stream into the open host file; a cut-off stream reports the docker cp failure if there was one. */
+async function parseInto(stream: TarStream, write: (part: Buffer) => void, maxBytes: number): Promise<number> {
   try {
     const reader = pullReader(stream.chunks)
-    const size = await streamEntry(reader, maxBytes, (part) => writeAll(fd, part))
+    const size = await streamEntry(reader, maxBytes, write)
     await expectEnd(reader)
     const exit = await stream.exited
     if (exit.code !== 0) throw boxFailure("copy the session bundle out", exit.stderr, exit.timedOut)
@@ -189,8 +222,28 @@ async function streamToHost(source: TarSource, bundle: CopyOut, maxBytes: number
     if (!isDelegateError(error) || error.detail !== CUT_OFF) throw error
     const exit = await stream.exited
     throw exit.code === 0 ? error : boxFailure("copy the session bundle out", exit.stderr, exit.timedOut)
+  }
+}
+
+/** Stream the box file into a fresh host file (exclusive create), within `timeoutMs`. */
+async function streamToHost(source: TarSource, bundle: CopyOut, maxBytes: number, timeoutMs: number): Promise<number> {
+  let fd: number
+  try {
+    fd = openSync(bundle.quarantinePath, "wx")
+  } catch (error) {
+    throw handoffFailure("create the quarantined bundle", error, bundle.quarantinePath)
+  }
+  let closed = false
+  const write = (part: Buffer) => {
+    if (closed) throw timedOutCopy() // the deadline closed the file; never write to a reused fd
+    writeAll(fd, part, bundle.quarantinePath)
+  }
+  const stream = source(bundle.boxPath, timeoutMs)
+  try {
+    return await withDeadline(parseInto(stream, write, maxBytes), timeoutMs, () => stream.stop())
   } finally {
     stream.stop()
+    closed = true
     closeSync(fd)
   }
 }
@@ -203,6 +256,7 @@ async function checkInBox(box: Exec, boxPath: string, maxBytes: number, timeoutM
     throw boxFailure("check the session bundle", result.stderr, result.timedOut)
   }
   const match = /^([a-z ]+)\|(\d+)$/.exec(result.stdout.trim())
+  if (match?.[1] === "regular empty file") throw empty(boxPath)
   if (!match?.[1]?.startsWith("regular")) throw notRegular(`${match?.[1] ?? "unknown"} ${boxPath}`)
   if (Number(match[2]) > maxBytes) throw tooLarge(Number(match[2]), maxBytes)
 }
