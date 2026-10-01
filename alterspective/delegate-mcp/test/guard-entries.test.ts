@@ -12,7 +12,7 @@ import type { McpEntry } from "../src/shared/contracts.ts"
 import { saveKeystoneSet } from "../src/shared/keystone.ts"
 
 const ORIGIN = "https://identity.alterspective.com.au"
-const CHOSEN = ["rag-global", "github", "seqlogs"]
+const CHOSEN = ["rag-read", "github", "seqlogs"]
 const good = (url = `${ORIGIN}/mcp/c/github`): McpEntry => ({ type: "remote", url })
 
 // Loose on purpose: refusal rows must be able to carry shapes the typed contract forbids.
@@ -23,7 +23,7 @@ const refused: Row[] = [
   ["/mcp/dynamic (every service on the account)", "ks-delegate", good(`${ORIGIN}/mcp/dynamic`)],
   ["/mcp/dynamic under a chosen name", "ks-github", good(`${ORIGIN}/mcp/dynamic`)],
   ["a connection outside the chosen set", "ks-m365", good(`${ORIGIN}/mcp/c/m365`)],
-  ["name and path for different chosen connections", "ks-github", good(`${ORIGIN}/mcp/c/rag-global`)],
+  ["name and path for different chosen connections", "ks-github", good(`${ORIGIN}/mcp/c/rag-read`)],
   ["upper-case connection id in the path", "ks-github", good(`${ORIGIN}/mcp/c/GitHub`)],
   ["encoded connection id", "ks-github", good(`${ORIGIN}/mcp/c/git%68ub`)],
   ["direct service host", "ks-github", good("https://rag.alterspective.com.au/mcp")],
@@ -67,7 +67,7 @@ const refused: Row[] = [
 
 const accepted: Row[] = [
   ["a chosen connection", "ks-github", good()],
-  ["another chosen connection", "ks-rag-global", good(`${ORIGIN}/mcp/c/rag-global`)],
+  ["another chosen connection", "ks-rag-read", good(`${ORIGIN}/mcp/c/rag-read`)],
   ["oauth scope + clientId", "ks-github", { ...good(), oauth: { scope: "mcp:connection", clientId: "c1" } }],
   ["disabled good entry", "ks-github", { ...good(), enabled: false }],
   ["timeout", "ks-github", { ...good(), timeout: 5000 }],
@@ -118,10 +118,10 @@ describe("createGuard", () => {
     const guard = createGuard({ ...defaultConfig({}), home })
     expect(guard.validateEntries({ "ks-github": good() })).toEqual({ ok: true })
     expect(guard.validateEntries({ "ks-delegate": good(`${ORIGIN}/mcp/dynamic`) }).ok).toBe(false)
-    saveKeystoneSet(home, ["rag-global"])
+    saveKeystoneSet(home, ["rag-read"])
     // Read on every check: another bridge may have changed the set.
     expect(guard.validateEntries({ "ks-github": good() }).ok).toBe(false)
-    expect(guard.validateEntries({ "ks-rag-global": good(`${ORIGIN}/mcp/c/rag-global`) })).toEqual({ ok: true })
+    expect(guard.validateEntries({ "ks-rag-read": good(`${ORIGIN}/mcp/c/rag-read`) })).toEqual({ ok: true })
     expect(guard.checkPermissionReply("always").ok).toBe(false)
   })
 })

@@ -132,7 +132,7 @@ export type Fake = {
 
 export const LIVE_OK: LiveChecks = {
   ok: true,
-  signIns: { ok: true, names: ["ks-rag-global", "ks-github", "ks-seqlogs"], stale: [], unrecognised: 0, removedBefore: [] },
+  signIns: { ok: true, names: ["ks-rag-read", "ks-github", "ks-seqlogs"], stale: [], unrecognised: 0, removedBefore: [] },
   front: { ok: true, loadedConfigMatches: true, mountReadOnly: true, boxMountsOk: true, problems: [] },
   problems: [],
 }

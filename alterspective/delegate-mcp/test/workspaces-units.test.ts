@@ -1,6 +1,6 @@
 // Pure workspace helpers: host-executable detection (A-15, C-3), hand-off helpers (C-4), exec deadline (A-14).
 import { afterAll, beforeAll, describe, expect, test } from "bun:test"
-import { existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import {
@@ -14,7 +14,7 @@ import {
   type RawEntry,
 } from "../src/supervisor/workspaces.ts"
 import { flagChanges, packageJsonRisky } from "../src/supervisor/workspaces-detect.ts"
-import { ensureRealDir, removeEntry, takeOutBundle } from "../src/supervisor/workspaces-handoff.ts"
+import { ensureRealDir, removeEntry } from "../src/supervisor/workspaces-handoff.ts"
 import { DelegateError } from "../src/shared/errors.ts"
 
 let tmp = ""
@@ -140,7 +140,7 @@ describe("round-2 detection (N-7, N-8)", () => {
   })
 })
 
-describe("hand-off failures are DelegateErrors with the path in detail only (A-07, N-11)", () => {
+describe("hand-off failures are DelegateErrors with the path in detail only (A-07)", () => {
   test("a folder that cannot be created or checked", () => {
     const file = path.join(tmp, "not-a-folder")
     writeFileSync(file, "x")
@@ -156,44 +156,6 @@ describe("hand-off failures are DelegateErrors with the path in detail only (A-0
     expect(error!.message).not.toContain(tmp)
     expect(error!.action).not.toContain(tmp)
     expect(error!.detail).toContain(file)
-  })
-
-  const bundle = (name: string) => {
-    const out = path.join(tmp, "take", "out")
-    mkdirSync(out, { recursive: true })
-    const hostPath = path.join(out, name)
-    writeFileSync(hostPath, "bundle")
-    return { hostPath, boxPath: `/handoff/out/${name}`, quarantinePath: path.join(tmp, "take", "quarantine", name) }
-  }
-  const failWith = (code: string, times = Infinity) => {
-    let calls = 0
-    return async (from: string, to: string) => {
-      if (calls++ < times) throw Object.assign(new Error(`${code}: rename '${from}'`), { code })
-      renameSync(from, to)
-    }
-  }
-
-  test("a briefly busy bundle (EBUSY/EPERM) is retried and then moved", async () => {
-    const b = bundle("busy.bundle")
-    expect(await takeOutBundle(b, 1_000, failWith("EBUSY", 2))).toBe(b.quarantinePath)
-    expect(existsSync(b.quarantinePath)).toBe(true)
-    const c = bundle("perm.bundle")
-    expect(await takeOutBundle(c, 1_000, failWith("EPERM", 3))).toBe(c.quarantinePath)
-  })
-
-  test("errors say what to do: busy → retry, cross-device → one drive; no path in message or action", async () => {
-    const busy = (await takeOutBundle(bundle("stuck.bundle"), 1_000, failWith("EBUSY")).catch((e: unknown) => e)) as DelegateError
-    expect(busy.code).toBe("upstream_error")
-    expect(busy.message).toContain("in use")
-    expect(busy.action).toContain("Retry")
-    const exdev = (await takeOutBundle(bundle("far.bundle"), 1_000, failWith("EXDEV")).catch((e: unknown) => e)) as DelegateError
-    expect(exdev.message).toContain("different drives")
-    expect(exdev.action).toContain("one drive")
-    for (const e of [busy, exdev]) {
-      expect(e.message).not.toContain(tmp)
-      expect(e.action).not.toContain(tmp)
-      expect(e.detail).toContain(tmp)
-    }
   })
 })
 

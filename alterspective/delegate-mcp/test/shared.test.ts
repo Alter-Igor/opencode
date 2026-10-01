@@ -287,7 +287,7 @@ describe("config", () => {
     expect(rule.origin).toBe("https://identity.alterspective.com.au")
     const re = new RegExp(rule.path)
     expect(re.test("/mcp/dynamic")).toBe(false)
-    expect(re.test("/mcp/c/rag-global")).toBe(true)
+    expect(re.test("/mcp/c/rag-read")).toBe(true)
     expect(re.test("/mcp/c/m365")).toBe(false)
     expect(re.test("/api/mcp")).toBe(false)
     expect(re.test("/mcp/c/../x")).toBe(false)

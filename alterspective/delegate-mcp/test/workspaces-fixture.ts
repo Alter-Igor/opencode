@@ -1,13 +1,15 @@
 // Shared fixture for the workspace tests: real git on scratch repos under %TEMP% (never inside C:\GitHub).
 // The box is simulated: `boxExec` runs git locally with /handoff and /sessions mapped to temp folders and
 // with no global/system git config, standing in for `docker exec <box> ...`. The few coreutils the
-// bridge uses in the box (`test -e`, `mv -T`, `rm -rf`) are emulated with node:fs.
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs"
+// bridge uses in the box (`test -e`, `mv -T`, `rm -rf`, `stat -c '%F|%s'`) are emulated with node:fs.
+// `docker cp <box>:<path> -` (G-7) is the system tar writing the mapped path to stdout.
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { defaultConfig } from "../src/shared/config.ts"
 import type { DelegateError } from "../src/shared/errors.ts"
-import { cleanEnv, createWorkspaces, runCommand, type Exec, type ExecResult, type WorkspacesOptions } from "../src/supervisor/workspaces.ts"
+import { spawnStream } from "../src/supervisor/workspaces-copyout.ts"
+import { cleanEnv, createWorkspaces, runCommand, type Exec, type ExecResult, type TarSource, type WorkspacesOptions } from "../src/supervisor/workspaces.ts"
 
 export const T = 60_000
 export const OK: ExecResult = { code: 0, stdout: "", stderr: "" }
@@ -44,8 +46,24 @@ function renameWithRetry(from: string, to: string): void {
   }
 }
 
+/** GNU `stat -c '%F|%s'` without -L: a link is reported as a link. */
+function statKind(p: string): ExecResult {
+  let s: ReturnType<typeof lstatSync>
+  try {
+    s = lstatSync(p)
+  } catch {
+    return { code: 1, stdout: "", stderr: `stat: cannot statx '${p}': No such file or directory` }
+  }
+  const kind = s.isSymbolicLink() ? "symbolic link" : s.isDirectory() ? "directory" : s.isFile() ? (s.size === 0 ? "regular empty file" : "regular file") : "fifo"
+  return { ...OK, stdout: `${kind}|${s.size}
+` }
+}
+
+const TAR = process.platform === "win32" ? path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "tar.exe") : "tar"
+
 function coreutils(argv: string[]): ExecResult | undefined {
   const [cmd, flag, ...rest] = argv
+  if (cmd === "stat" && flag === "-c") return statKind(rest.at(-1) ?? "")
   if (cmd === "test" && flag === "-e") return { ...OK, code: existsSync(rest[0] ?? "") ? 0 : 1 }
   if (cmd === "mv" && flag === "-T") {
     const [from = "", to = ""] = rest
@@ -76,8 +94,16 @@ export class WorkspaceFixture {
 
   constructor(private readonly prefix: string) {}
 
+  private boxPath = (p: string) => p.replace(/^\/handoff(?=\/|$)/, posix(this.handoff)).replace(/^\/sessions(?=\/|$)/, posix(this.sessions))
+
+  /** `docker cp <box>:<path> -`: the system tar archives the mapped path (a link stays a link). */
+  readonly boxTar: TarSource = (boxPath, timeoutMs) => {
+    const local = this.boxPath(boxPath)
+    return spawnStream([TAR, "-cf", "-", "-C", path.dirname(local), path.basename(local)], timeoutMs)
+  }
+
   readonly boxExec: Exec = async (argv, options) => {
-    const args = argv.map((a) => a.replace(/^\/handoff(?=\/|$)/, posix(this.handoff)).replace(/^\/sessions(?=\/|$)/, posix(this.sessions)))
+    const args = argv.map(this.boxPath)
     const replaced = await this.boxOverride?.(args)
     if (replaced) return replaced
     return coreutils(args) ?? runCommand(args, this.boxEnv, options?.timeoutMs)
@@ -92,6 +118,7 @@ export class WorkspaceFixture {
     this.marker = path.join(this.tmp, "HOOK-RAN")
     mkdirSync(this.hostRepo, { recursive: true })
     mkdirSync(this.sessions, { recursive: true })
+    mkdirSync(path.join(this.handoff, "out"), { recursive: true }) // the box-only volume (always there in the box)
     const emptyGlobal = path.join(this.tmp, "empty.gitconfig")
     writeFileSync(emptyGlobal, "")
     this.boxEnv = { ...cleanEnv(), GIT_CONFIG_GLOBAL: emptyGlobal, GIT_CONFIG_NOSYSTEM: "1" }
@@ -110,7 +137,7 @@ export class WorkspaceFixture {
 
   workspaces(extra: Partial<WorkspacesOptions> = {}) {
     const config = { ...defaultConfig({}), home: path.join(this.tmp, "home"), roots: [this.root] }
-    const base = { config, container: "unused-in-tests", handoffDir: this.handoff, stateDir: path.join(this.tmp, "state"), boxExec: this.boxExec }
+    const base = { config, container: "unused-in-tests", handoffDir: this.handoff, stateDir: path.join(this.tmp, "state"), boxExec: this.boxExec, boxTar: this.boxTar }
     return createWorkspaces({ ...base, substMap: async () => ({}), ...extra })
   }
 

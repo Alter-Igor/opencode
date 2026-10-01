@@ -90,7 +90,7 @@ describe("console redirection in mcp mode (W3A-18)", () => {
 describe("doctor exit code (W3A-09)", () => {
   function runtimeWith(verified: boolean): () => Promise<Runtime> {
     const f = fakeContext({ boxHeld: false })
-    f.api.on("GET /mcp", { status: 200, data: { "ks-rag-global": { status: verified ? "connected" : "needs_auth" } } })
+    f.api.on("GET /mcp", { status: 200, data: { "ks-rag-read": { status: verified ? "connected" : "needs_auth" } } })
     return async () => ({ ctx: f.ctx, versionInfo: { version: "v", package: "0", sha: "x", dirty: false, built: null }, name: "t", shutdown: async () => {} })
   }
 

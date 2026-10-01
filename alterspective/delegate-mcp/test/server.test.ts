@@ -56,11 +56,11 @@ describe("MCP server", () => {
 
   test("oc_doctor over MCP returns structured, secret-free JSON without starting the box", async () => {
     const f = fakeContext({ boxHeld: false })
-    f.api.on("GET /mcp", { status: 200, data: { "ks-rag-global": { status: "needs_auth" } } })
+    f.api.on("GET /mcp", { status: 200, data: { "ks-rag-read": { status: "needs_auth" } } })
     const client = await connect(f)
     const result = await client.callTool({ name: "oc_doctor", arguments: {} })
     expect(result.isError).toBeFalsy()
-    expect(result.structuredContent).toMatchObject({ verified: false, isolation: { level: "S", source: "configuration" }, mcp: { entries: [{ name: "ks-rag-global", status: "needs_auth" }] }, guard: { ok: true } })
+    expect(result.structuredContent).toMatchObject({ verified: false, isolation: { level: "S", source: "configuration" }, mcp: { entries: [{ name: "ks-rag-read", status: "needs_auth" }] }, guard: { ok: true } })
     expect(JSON.stringify(result)).not.toContain(TARGET.password)
     expect(f.started.count).toBe(0)
   })

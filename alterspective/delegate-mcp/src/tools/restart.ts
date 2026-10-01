@@ -26,7 +26,7 @@ export const restartTool = defineTool({
   title: "Restart the sandbox",
   description:
     "Replace the OpenCode sandbox: stop it and start it again with this bridge's profile and image (fixes profile_changed). Interrupts running sessions. Refused while other bridges use the sandbox unless force is true. Requires confirm: true. " +
-    "Optional keystone: the Keystone connection ids the box may use from now on (box-wide, saved for later restarts; default rag-global, github, seqlogs). Only these services are reachable from the box; new ones may need oc_login. " +
+    "Optional keystone: the Keystone connection ids the box may use from now on (box-wide, saved for later restarts; default rag-read, github, seqlogs). Only these services are reachable from the box; new ones may need oc_login. " +
     "Ids must be in the owner's allowed list (OPENCODE_DELEGATE_KEYSTONE_ALLOWED in this MCP server's env; default: the default set); others are refused with policy_violation and only the owner can add them. One connection can relay to other services (e.g. agents that read mail, admin tools, secrets), so a chosen id may reach more than its name says.",
   input: {
     confirm: z.boolean().describe("Must be true: running sessions are interrupted."),
@@ -35,7 +35,7 @@ export const restartTool = defineTool({
       .array(z.string().regex(CONNECTION_ID, "a Keystone connection id (lower-case, digits, '-')"))
       .max(MAX_CONNECTIONS)
       .optional()
-      .describe("Keystone connection ids (/mcp/c/<id>) the box may use, e.g. [\"rag-global\", \"github\"]. Replaces the saved choice. Omit to keep it."),
+      .describe("Keystone connection ids (/mcp/c/<id>) the box may use, e.g. [\"rag-read\", \"github\"]. Replaces the saved choice. Omit to keep it."),
   },
   annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
   async run(args, ctx) {

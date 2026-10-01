@@ -34,7 +34,7 @@ describe("supervisor.replace (GAP-1)", () => {
     expect(before.action).toContain("oc_server_restart")
     expect(before.action).not.toContain("force")
     const result = await sup.replace({ force: false })
-    expect(result).toEqual({ target: { baseUrl: "http://127.0.0.1:47123", password: "generated-pw" }, interrupted: 0, keystone: ["rag-global", "github", "seqlogs"] })
+    expect(result).toEqual({ target: { baseUrl: "http://127.0.0.1:47123", password: "generated-pw" }, interrupted: 0, keystone: ["rag-read", "github", "seqlogs"] })
     const [down] = composeCalls(calls, "down")
     expect(down?.argv).toContain("--remove-orphans")
     expect(down?.argv).not.toContain("-v")
