@@ -1,6 +1,6 @@
 # Program plan — FEAT-OCD-001 follow-ups (run `20261001t0805-16a2bdad`)
 
-planRevision: 3 · Director: Claude Code (Opus 5.5), the only writer · Project writer: the task's `project-manager` subagent (receipt reused from FEAT-OCD-001)
+planRevision: 4 · Director: Claude Code (Opus 5.5), the only writer · Project writer: the task's `project-manager` subagent (receipt reused from FEAT-OCD-001)
 
 ## Outcome
 
@@ -51,11 +51,12 @@ Proportionality (R16): WS1 = one developer agent plus one independent reviewer. 
 
 ## Next actions
 
-1. WS1 developer starts in `ocd-handoff`.
-2. Research agent answers WS2 and WS3 (read-only).
-3. Director: WS4 approach.
+1. Integration-fix cycle 2 on `ocd-integ-fixes` (combined-review N1, N2, L8), then its confirmation.
+2. Merge `ocd-integ-fixes` into `ocd-followups`, run the full suite, open the integration PR to `dev`.
+3. Owner merge gate: "merge PR #N into dev".
 
 ## Checkpoint log
 
 - rev 2 (2026-10-01 ~08:50Z): WS1 built (live: no writable host bind; e2e-w3 PASS); review cycle 1 found 7 Low, fixes in progress. WS2 built (live in isolated `ocd-ws2`: no Synapse credential in the box, model call OK, refresh rotation OK, fail-closed 401). WS3 Keystone change done and bridge default switched. WS4: headless channel delivery does not work (tested twice); needs one interactive owner session after WS1 integrates. Lessons done (#1208, #1210; duplicates closed; rag-service#706).
 - rev 3 (2026-10-01 ~10:05Z): all three code workstreams integrated in order (WS1 `27513c4f93`, WS3 `e0cac70d60`, WS2 `90434eaaf5`), each post-sync suite green. Integrated: suite 851 pass / 0 fail, tsc clean; live on the main box: doctor Verified, e2e-w3 PASS, no Synapse credential in the box, rag-read wall holds, Synapse token on model routes only. WS4 #44 verified by the owner (interactive session). Stale `rag-global` and `/mcp/dynamic` box sign-ins revoked at Keystone. Residual (accepted, documented): WS2 N3 clock-skew edge; box can fill its own Docker volumes; refresh token stored on host by owner decision (D-4). Next: combined independent review, then the integration PR to `dev` (owner merge gate).
+- rev 4 (2026-10-01 ~10:50Z): combined independent review of `90434eaaf5`: 2 Medium, 1 Low/Medium, 5 Low (seams). Fixed on `ocd-integ-fixes` @ `e1df93ae5c` (suite 866/0, tsc clean, live egress 22/0, main box Verified, refresh reloads through the checked `front-reload` script). Confirmation: 7 fixed, L8 partial, 2 new Low (N1 reload/start lock gap, N2 doctor clock skew) → integration-fix cycle 2.
