@@ -12,7 +12,7 @@ import { frontServers } from "../src/guard/egress.ts"
 
 const HOSTS = ["identity.alterspective.com.au", "synapse2-api.alterspective.com.au"]
 const IDENTITY = "identity.alterspective.com.au"
-const CHOSEN = ["rag-global", "github", "seqlogs"]
+const CHOSEN = ["rag-read", "github", "seqlogs"]
 const conf = frontServers(HOSTS, { host: IDENTITY, connections: CHOSEN })
 
 /** The body of the `server { ... }` block named `host`. */
@@ -96,8 +96,8 @@ describe("generated identity server (R4-01)", () => {
       "/.well-known/openid-configuration": "GET",
       "/api/oauth/register": "POST",
       "/api/oidc/token": "POST",
-      "/.well-known/oauth-protected-resource/mcp/c/rag-global": "GET",
-      "/mcp/c/rag-global": "GET POST DELETE",
+      "/.well-known/oauth-protected-resource/mcp/c/rag-read": "GET",
+      "/mcp/c/rag-read": "GET POST DELETE",
       "/.well-known/oauth-protected-resource/mcp/c/github": "GET",
       "/mcp/c/github": "GET POST DELETE",
       "/.well-known/oauth-protected-resource/mcp/c/seqlogs": "GET",
@@ -129,10 +129,10 @@ describe("generated identity server (R4-01)", () => {
 
 describe("routing through the identity server (nginx URI semantics)", () => {
   test("allowed calls are forwarded with exactly their own path", () => {
-    expect(route("POST", "/mcp/c/rag-global")).toEqual({ status: 0, upstream: "/mcp/c/rag-global" })
+    expect(route("POST", "/mcp/c/rag-read")).toEqual({ status: 0, upstream: "/mcp/c/rag-read" })
     expect(route("GET", "/mcp/c/github")).toEqual({ status: 0, upstream: "/mcp/c/github" })
     expect(route("DELETE", "/mcp/c/seqlogs")).toEqual({ status: 0, upstream: "/mcp/c/seqlogs" })
-    expect(route("GET", "/.well-known/oauth-protected-resource/mcp/c/rag-global")).toEqual({ status: 0, upstream: "/.well-known/oauth-protected-resource/mcp/c/rag-global" })
+    expect(route("GET", "/.well-known/oauth-protected-resource/mcp/c/rag-read")).toEqual({ status: 0, upstream: "/.well-known/oauth-protected-resource/mcp/c/rag-read" })
     expect(route("GET", "/.well-known/oauth-authorization-server")).toEqual({ status: 0, upstream: "/.well-known/oauth-authorization-server" })
     expect(route("POST", "/api/oauth/register")).toEqual({ status: 0, upstream: "/api/oauth/register" })
     expect(route("POST", "/api/oidc/token")).toEqual({ status: 0, upstream: "/api/oidc/token" })

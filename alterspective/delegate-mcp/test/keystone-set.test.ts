@@ -21,15 +21,15 @@ const policyRe = (ids: string[]) => {
 }
 
 describe("connection ids", () => {
-  test("the default set is rag-global, github, seqlogs, and the config uses it unless OPENCODE_DELEGATE_KEYSTONE is set", () => {
-    expect([...DEFAULT_KEYSTONE]).toEqual(["rag-global", "github", "seqlogs"])
-    expect(defaultConfig({}).keystoneConnections).toEqual(["rag-global", "github", "seqlogs"])
-    expect(defaultConfig({ OPENCODE_DELEGATE_KEYSTONE: "rag-global, github" }).keystoneConnections).toEqual(["rag-global", "github"])
+  test("the default set is rag-read, github, seqlogs, and the config uses it unless OPENCODE_DELEGATE_KEYSTONE is set", () => {
+    expect([...DEFAULT_KEYSTONE]).toEqual(["rag-read", "github", "seqlogs"])
+    expect(defaultConfig({}).keystoneConnections).toEqual(["rag-read", "github", "seqlogs"])
+    expect(defaultConfig({ OPENCODE_DELEGATE_KEYSTONE: "rag-read, github" }).keystoneConnections).toEqual(["rag-read", "github"])
   })
 
   test("ids must match ^[a-z0-9][a-z0-9-]{0,62}$; duplicates collapse; order is kept", () => {
     expect(CONNECTION_ID.source).toBe("^[a-z0-9][a-z0-9-]{0,62}$")
-    expect(keystoneIds(["github", "rag-global", "github"])).toEqual(["github", "rag-global"])
+    expect(keystoneIds(["github", "rag-read", "github"])).toEqual(["github", "rag-read"])
     for (const bad of ["", "-x", "Rag", "rag_global", "a/b", "..", "a.b", "dynamic|x", "x".repeat(64), "a b", "a%2Fb"])
       expect(() => keystoneIds([bad])).toThrow(DelegateError)
     expect(() => keystoneIds([1])).toThrow(DelegateError)
@@ -37,19 +37,19 @@ describe("connection ids", () => {
   })
 
   test("entry names map to ids only for ks-<valid id>", () => {
-    expect(idOfEntry("ks-rag-global")).toBe("rag-global")
-    for (const bad of ["rag-global", "ks-", "ks--x", "ks-Rag", "KS-rag", "ks-a_b"]) expect(idOfEntry(bad)).toBeUndefined()
+    expect(idOfEntry("ks-rag-read")).toBe("rag-read")
+    for (const bad of ["rag-read", "ks-", "ks--x", "ks-Rag", "KS-rag", "ks-a_b"]) expect(idOfEntry(bad)).toBeUndefined()
   })
 })
 
 describe("OPENCODE_MCP_ALLOW policy (R4-01)", () => {
   test("only the chosen /mcp/c/<id> paths: no dynamic, no other id, no prefix or suffix", () => {
-    const { policy, re } = policyRe(["rag-global", "github", "seqlogs"])
+    const { policy, re } = policyRe(["rag-read", "github", "seqlogs"])
     expect(policy.remote).toHaveLength(1)
     expect(policy.remote[0]!.origin).toBe(ORIGIN)
-    expect(policy.remote[0]!.path).toBe("^/mcp/c/(rag-global|github|seqlogs)$")
-    for (const ok of ["/mcp/c/rag-global", "/mcp/c/github", "/mcp/c/seqlogs"]) expect(re!.test(ok)).toBe(true)
-    for (const bad of ["/mcp/dynamic", "/api/mcp", "/mcp/c/m365", "/mcp/c/github2", "/mcp/c/xgithub", "/mcp/c/github/", "/mcp/c/github/x", "/x/mcp/c/github", "/mcp/c/", "/mcp/c/rag-global|dynamic"])
+    expect(policy.remote[0]!.path).toBe("^/mcp/c/(rag-read|github|seqlogs)$")
+    for (const ok of ["/mcp/c/rag-read", "/mcp/c/github", "/mcp/c/seqlogs"]) expect(re!.test(ok)).toBe(true)
+    for (const bad of ["/mcp/dynamic", "/api/mcp", "/mcp/c/m365", "/mcp/c/github2", "/mcp/c/xgithub", "/mcp/c/github/", "/mcp/c/github/x", "/x/mcp/c/github", "/mcp/c/", "/mcp/c/rag-read|dynamic"])
       expect({ bad, ok: re!.test(bad) }).toEqual({ bad, ok: false })
   })
 
@@ -69,8 +69,8 @@ describe("OPENCODE_MCP_ALLOW policy (R4-01)", () => {
 
 describe("profile entries (R4-01)", () => {
   test("one ks-<id> → /mcp/c/<id> per chosen id and no ks-delegate / dynamic entry", () => {
-    expect(mcpEntries({ keystoneOrigin: ORIGIN, keystoneConnections: ["rag-global", "github", "seqlogs"], boxEnv: [] })).toEqual({
-      "ks-rag-global": { type: "remote", url: `${ORIGIN}/mcp/c/rag-global` },
+    expect(mcpEntries({ keystoneOrigin: ORIGIN, keystoneConnections: ["rag-read", "github", "seqlogs"], boxEnv: [] })).toEqual({
+      "ks-rag-read": { type: "remote", url: `${ORIGIN}/mcp/c/rag-read` },
       "ks-github": { type: "remote", url: `${ORIGIN}/mcp/c/github` },
       "ks-seqlogs": { type: "remote", url: `${ORIGIN}/mcp/c/seqlogs` },
     })
@@ -81,10 +81,10 @@ describe("profile entries (R4-01)", () => {
 describe("saved set in the bridge home", () => {
   test("missing file: the config default; saved file wins; damaged file fails closed (profile_invalid)", () => {
     const dir = tmpHome()
-    expect(readKeystoneSet(dir, ["rag-global"])).toEqual({ connections: ["rag-global"], source: "default" })
+    expect(readKeystoneSet(dir, ["rag-read"])).toEqual({ connections: ["rag-read"], source: "default" })
     expect(saveKeystoneSet(dir, ["github", "github", "seqlogs"])).toEqual(["github", "seqlogs"])
-    expect(readKeystoneSet(dir, ["rag-global"])).toEqual({ connections: ["github", "seqlogs"], source: "saved" })
-    expect(currentKeystone({ home: dir, keystoneConnections: ["rag-global"], keystoneAllowed: ["rag-global", "github", "seqlogs"] }).connections).toEqual(["github", "seqlogs"])
+    expect(readKeystoneSet(dir, ["rag-read"])).toEqual({ connections: ["github", "seqlogs"], source: "saved" })
+    expect(currentKeystone({ home: dir, keystoneConnections: ["rag-read"], keystoneAllowed: ["rag-read", "github", "seqlogs"] }).connections).toEqual(["github", "seqlogs"])
     expect(effectiveConfig({ ...defaultConfig({}), home: dir }).keystoneConnections).toEqual(["github", "seqlogs"])
     for (const text of ["not json", "{}", '{"connections":"github"}', '{"connections":["../x"]}', "null"]) {
       writeFileSync(path.join(dir, "keystone.json"), text)
@@ -114,18 +114,18 @@ describe("oc_server_restart {keystone} → supervisor.replace (R4-01)", () => {
     await writeOwner()
     const calls: Call[] = []
     const state = { running: false, labels: {}, env: [] }
-    const result = await supervisor(deps(fakeDocker(state, calls))).replace({ force: false, keystone: ["rag-global"] })
-    expect(result.keystone).toEqual(["rag-global"])
-    expect(JSON.parse(readFileSync(path.join(home, "keystone.json"), "utf8"))).toEqual({ connections: ["rag-global"] })
+    const result = await supervisor(deps(fakeDocker(state, calls))).replace({ force: false, keystone: ["rag-read"] })
+    expect(result.keystone).toEqual(["rag-read"])
+    expect(JSON.parse(readFileSync(path.join(home, "keystone.json"), "utf8"))).toEqual({ connections: ["rag-read"] })
     const up = composeCalls(calls, "up")[0]
-    expect(allowIn(up).remote[0]!.path).toBe("^/mcp/c/(rag-global)$")
+    expect(allowIn(up).remote[0]!.path).toBe("^/mcp/c/(rag-read)$")
     const servers = readFileSync(path.join(home, "front", "servers.conf"), "utf8")
-    expect(servers).toContain("location = /mcp/c/rag-global {")
+    expect(servers).toContain("location = /mcp/c/rag-read {")
     expect(servers).not.toContain("/mcp/c/github")
     expect(up?.env?.OCD_FRONT_DIR).toBe(path.join(home, "front"))
     expect(up?.env?.OCD_FRONT_HASH).toMatch(/^[0-9a-f]{64}$/)
     const profile = JSON.parse(readFileSync(path.join(home, "profile", "opencode", "opencode.json"), "utf8")) as { mcp: Record<string, unknown> }
-    expect(Object.keys(profile.mcp)).toEqual(["ks-rag-global"])
+    expect(Object.keys(profile.mcp)).toEqual(["ks-rag-read"])
     // Another bridge (same home) reads the saved set: same profile and front hash, so it reuses the box.
     const later: Call[] = []
     expect((await supervisor(deps(fakeDocker(state, later), { bridgeId: "bridge-b" })).ensure()).baseUrl).toBe(result.target.baseUrl)

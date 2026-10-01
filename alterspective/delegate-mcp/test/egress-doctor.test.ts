@@ -15,7 +15,7 @@ const scratch = mkdtempSync(path.join(os.tmpdir(), "ocd-egress-doctor-"))
 afterAll(() => rmSync(scratch, { recursive: true, force: true }))
 let n = 0
 
-const CHOSEN = { "ks-rag-global": { status: "connected" }, "ks-github": { status: "connected" }, "ks-seqlogs": { status: "connected" } }
+const CHOSEN = { "ks-rag-read": { status: "connected" }, "ks-github": { status: "connected" }, "ks-seqlogs": { status: "connected" } }
 const healthy = (f: ReturnType<typeof fakeContext>) => f.api.on("GET /mcp", { status: 200, data: CHOSEN })
 
 /** A bridge home whose front folder holds the servers file the bridge would generate (as after a start). */
@@ -38,31 +38,31 @@ describe("oc_doctor egress check", () => {
       verified: true,
       egressHostsConfigured: f.ctx.config.egressHosts,
       keystone: {
-        connections: ["rag-global", "github", "seqlogs"],
+        connections: ["rag-read", "github", "seqlogs"],
         source: "default",
         entries: [
-          { id: "rag-global", name: "ks-rag-global", status: "connected" },
+          { id: "rag-read", name: "ks-rag-read", status: "connected" },
           { id: "github", name: "ks-github", status: "connected" },
           { id: "seqlogs", name: "ks-seqlogs", status: "connected" },
         ],
       },
       egress: { ok: true, control: "tls-front", source: "configuration", frontConfigMatches: true, frontMountReadOnly: true, aliasesMatch: true, connectProxy: false, upstreamTlsVerified: true, boxSealed: true, problems: [] },
     })
-    expect(text(result)).toContain("Keystone services: rag-global, github, seqlogs (default).")
+    expect(text(result)).toContain("Keystone services: rag-read, github, seqlogs (default).")
     expect(text(result)).toContain("Egress: TLS front (fixed upstreams, no CONNECT proxy) configured as generated from egressHosts and the chosen Keystone set.")
   })
 
   test("a saved set is shown as the saved choice; a chosen entry the box does not list is `missing` and NOT verified", async () => {
     const f = fakeContext({ boxHeld: false })
-    f.ctx.config.home = startedHome(["rag-global", "m365"])
+    f.ctx.config.home = startedHome(["rag-read", "m365"])
     // m365 is outside the default ceiling; the owner allowed it at launch (R5-03).
-    f.ctx.config.keystoneAllowed = ["rag-global", "m365"]
-    f.api.on("GET /mcp", { status: 200, data: { "ks-rag-global": { status: "connected" } } })
+    f.ctx.config.keystoneAllowed = ["rag-read", "m365"]
+    f.api.on("GET /mcp", { status: 200, data: { "ks-rag-read": { status: "connected" } } })
     const result = await invoke(doctorTool, {}, f.ctx)
-    expect(data(result)).toMatchObject({ keystone: { connections: ["rag-global", "m365"], source: "saved", entries: [{ name: "ks-rag-global", status: "connected" }, { name: "ks-m365", status: "missing" }] } })
+    expect(data(result)).toMatchObject({ keystone: { connections: ["rag-read", "m365"], source: "saved", entries: [{ name: "ks-rag-read", status: "connected" }, { name: "ks-m365", status: "missing" }] } })
     // m365 is a high-risk id (R5-04): the summary and the report warn.
-    expect(text(result)).toContain("Keystone services: rag-global, m365 (saved choice; WARNING high-risk allowed or chosen: m365).")
-    expect(data(result)).toMatchObject({ keystone: { ceiling: ["rag-global", "m365"], highRisk: ["m365"], warnings: [expect.stringContaining("m365")] } })
+    expect(text(result)).toContain("Keystone services: rag-read, m365 (saved choice; WARNING high-risk allowed or chosen: m365).")
+    expect(data(result)).toMatchObject({ keystone: { ceiling: ["rag-read", "m365"], highRisk: ["m365"], warnings: [expect.stringContaining("m365")] } })
   })
 
   test("a box running an entry outside the chosen set is NOT verified (guard policy_violation)", async () => {

@@ -14,8 +14,13 @@ import { DelegateError } from "./errors.ts"
 
 /** A Keystone connection id: lower-case, digits and `-`, 1-63 characters, no leading `-`. */
 export const CONNECTION_ID = /^[a-z0-9][a-z0-9-]{0,62}$/
-/** The owner's default set: company knowledge base, GitHub, Seq logs. */
-export const DEFAULT_KEYSTONE = ["rag-global", "github", "seqlogs"] as const
+/**
+ * The owner's default set: company knowledge base (read-only), GitHub, Seq logs.
+ * `rag-read` (issue #56) is a private Keystone connection over the `rag-read` MCP service, whose
+ * tool policy is an allowlist of read tools, so ingest, delete, contribute and feedback are refused
+ * by Keystone itself, even for an admin owner and even with a token taken from the box.
+ */
+export const DEFAULT_KEYSTONE = ["rag-read", "github", "seqlogs"] as const
 /** Bounded so the generated policy regex and front config stay small. */
 export const MAX_CONNECTIONS = 20
 export const KEYSTONE_FILE = "keystone.json"
@@ -41,7 +46,7 @@ export function keystoneIds(ids: readonly unknown[]): string[] {
   const out: string[] = []
   for (const id of ids) {
     if (typeof id !== "string" || !CONNECTION_ID.test(id))
-      throw new DelegateError("invalid_input", `"${String(id).slice(0, 40)}" is not a valid Keystone connection id.`, "Use lower-case letters, digits and '-' (1-63 characters), for example rag-global.")
+      throw new DelegateError("invalid_input", `"${String(id).slice(0, 40)}" is not a valid Keystone connection id.`, "Use lower-case letters, digits and '-' (1-63 characters), for example rag-read.")
     if (!out.includes(id)) out.push(id)
   }
   if (out.length > MAX_CONNECTIONS)

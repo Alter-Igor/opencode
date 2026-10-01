@@ -20,7 +20,7 @@ Design and evidence: `docs/implementation/current/FEAT-OCD-001-opencode-delegate
 - **Drive any session in the box.** It runs as the same user as the OpenCode server in the box, so it can read the server password. With it, it can call the OpenCode API for any session in the box: wake a session, answer its own permission requests (`always` included), and change a session's details or permissions. The bridge refuses `always` and checks who owns a session. Those checks guard what the bridge does. They do not guard the inside of the box.
 - **Use the shared Synapse key.** The box holds one shared `SYNAPSE_API_KEY`. The agent can make model calls with it. Those calls are not tied to you as a person. (Follow-up: use a per-user delegated Synapse token.)
 - **Use the chosen Keystone services, as you, with everything they can do.** The box has your sign-in for each chosen connection. Any code in the box can use those tokens directly, not only through OpenCode. So it can do anything those services allow you to do, including their write tools. Keystone logs each call. The bridge denies some write tools in OpenCode's permissions (see the table below), but **that deny list is not a wall**: code in the box can call the connection with the tokens and skip OpenCode. With the default set this means:
-  - `rag-global` (company knowledge base): **not read-only for an admin owner.** It can fetch any public URL from the RAG server (`rag_ingest {url}`, a way to send data out in the URL), write straight into the shared knowledge base that every agent here reads first (`rag_ingest`, `rag_ingest_document`), and delete a collection (`rag_delete_collection`). Any member can open a draft pull request in the knowledge repo (`rag_contribute`), which is another way out. A read-only RAG connection is a follow-up (`issues.md`).
+  - `rag-read` (company knowledge base, **read-only at Keystone**): search, ask and read tools only. Keystone's `rag-read` service has an allowlist tool policy, so ingest, delete, contribute and feedback are refused by Keystone itself, even for an admin owner and even with a token taken from the box (issue #56). If you choose `rag-global` instead, it is **not** read-only for an admin owner: it can fetch any public URL from the RAG server (`rag_ingest {url}`), write into the shared knowledge base, delete a collection, and open draft pull requests (`rag_contribute`).
   - `github`: anything your GitHub access allows. **This is a way out.** It could push code to a repo, or write it into an issue or gist that someone else can read.
   - `seqlogs`: read logs, plus a few tools that change shared SeqLogs state: tenant aliases other agents use (`set_tenant_alias`) and background monitors (`start_tenant_monitor`, `stop_tenant_monitor`). `ai_analyze_window` runs a model over logs that can hold personal data.
 
@@ -36,7 +36,7 @@ Design and evidence: `docs/implementation/current/FEAT-OCD-001-opencode-delegate
 | Route | How | What limits it |
 |---|---|---|
 | GitHub writes | A push, issue, comment, gist or file through `github` | Only leaving `github` out of the set |
-| RAG URL fetch | `rag_ingest {url}`: the RAG server fetches any public URL, so data rides in the URL | Admin owners only; denied in OpenCode (not a wall); leave `rag-global` out |
+| RAG URL fetch | `rag_ingest {url}`: the RAG server fetches any public URL, so data rides in the URL | Refused by Keystone on the default `rag-read`; only reachable if you choose `rag-global` (admin owners) |
 | Knowledge-base writes | `rag_ingest`, `rag_ingest_document` (admin owners), `rag_contribute` (draft PR, any member) | Same as above |
 | Tokens copied out | Any of the routes above, carrying a refresh token | Works elsewhere until it expires or is revoked; revoke at Keystone |
 
@@ -65,11 +65,15 @@ Design and evidence: `docs/implementation/current/FEAT-OCD-001-opencode-delegate
 
 ## Keystone services
 
-The box can use only the Keystone connections you choose. The default set is `rag-global` (company knowledge base), `github` and `seqlogs`.
+The box can use only the Keystone connections you choose. The default set is `rag-read` (company knowledge base, read-only), `github` and `seqlogs`.
+
+`rag-read` is the owner's **private** connection over the Keystone service **Alterspective RAG (read-only)** (service id `rag-read`, created 2026-10-01; its tool policy allows only read tools). Connection ids are unique in Keystone, so anyone else creates their own: *Account → AI connections → New*, pick that service, give it an id such as `rag-read-<name>`. Then set that id in place of `rag-read` in `OPENCODE_DELEGATE_KEYSTONE` and `OPENCODE_DELEGATE_KEYSTONE_ALLOWED`.
+
+**Upgrading from `rag-global`:** a saved choice (`keystone.json`) that still lists `rag-global` is outside the new default ceiling, so the bridge refuses it and says so. Either pick the new set with `oc_server_restart {confirm: true, keystone: ["rag-read", "github", "seqlogs"]}`, or, if you really want `rag-global`, add it to `OPENCODE_DELEGATE_KEYSTONE_ALLOWED` yourself. Run `oc_login` once for `ks-rag-read`.
 
 - **See the set:** `oc_doctor` (`keystone`, with each entry's sign-in state) or `oc_list_models` (`keystone.connections`).
-- **Change it for the whole box:** `oc_server_restart {confirm: true, keystone: ["rag-global", "github"]}`. The choice is saved in the bridge home (`keystone.json`), so later restarts and other bridges use it. It rebuilds the profile, the MCP policy and the front proxy's Keystone paths, then restarts the box. Other bridges' sessions are interrupted, so it needs `force: true` while other bridges use the box.
-- **Narrow one session:** `oc_start_session {..., keystone: ["rag-global"]}`. It must be a subset of the box-wide set. Convenience only (see "Other known limits").
+- **Change it for the whole box:** `oc_server_restart {confirm: true, keystone: ["rag-read", "github"]}`. The choice is saved in the bridge home (`keystone.json`), so later restarts and other bridges use it. It rebuilds the profile, the MCP policy and the front proxy's Keystone paths, then restarts the box. Other bridges' sessions are interrupted, so it needs `force: true` while other bridges use the box.
+- **Narrow one session:** `oc_start_session {..., keystone: ["rag-read"]}`. It must be a subset of the box-wide set. Convenience only (see "Other known limits").
 - **New services need a sign-in:** run `oc_login` once. With no `server`, it signs in every entry that needs it, one browser tab at a time.
 - An id is not checked against Keystone. A wrong id just fails to connect, and `oc_doctor` shows that entry as `failed` or `missing`.
 - `OPENCODE_DELEGATE_KEYSTONE` (comma list) sets the default for a bridge home with no saved choice.

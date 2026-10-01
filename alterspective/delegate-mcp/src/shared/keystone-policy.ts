@@ -26,8 +26,10 @@ export const HIGH_RISK_PREFIXES = ["cas", "vault", "keystone-admin", "m365", "mo
 
 /**
  * OpenCode MCP tool ids are `<entry>_<tool>` (packages/opencode/src/mcp/catalog.ts toolName).
- * rag-global: ingest of a URL fetches any public page server-side; ingest and contribute write to
- * the shared knowledge base (or open a PR in the knowledge repo); delete_collection is irreversible.
+ * rag-global (only if the owner chooses it over the default rag-read): ingest of a URL fetches any
+ * public page server-side; ingest and contribute write to the shared knowledge base (or open a PR in
+ * the knowledge repo); delete_collection is irreversible. rag-read needs no entries here: its
+ * Keystone service policy is an allowlist of read tools (the wall, issue #56).
  * seqlogs: aliases are a lasting shared mapping other agents use; monitors are background jobs.
  */
 export const DEFAULT_TOOL_DENY = [
