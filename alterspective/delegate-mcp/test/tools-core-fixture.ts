@@ -16,6 +16,7 @@ import type { HostSessionState } from "../src/supervisor/workspaces-state.ts"
 import type { Box, CommandResult, SessionRecord, ToolContext } from "../src/tools/context.ts"
 import type { ToolSpec } from "../src/tools/define.ts"
 import { fail, type ToolResult } from "../src/tools/shape.ts"
+import { fakeSynapse } from "./synapse-fixture.ts"
 import type { z } from "zod"
 
 /**
@@ -205,6 +206,7 @@ export function fakeContext(options: { boxHeld?: boolean } = {}): Fake {
     log: silentLogger,
     guard: createGuard(config),
     ...fakeServices(f),
+    synapse: fakeSynapse(),
     inbox: { post: async () => { throw new Error("not used") }, read: async () => { throw new Error("not used") } } as unknown as ToolContext["inbox"],
     box: async () => {
       f.started.count++

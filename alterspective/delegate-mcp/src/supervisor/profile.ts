@@ -29,6 +29,12 @@ export type ProfileInput = {
   permission: PermissionRule[]
   /** provider id → env name to use as options.apiKey when the owner's entry has no key (must be on boxEnv). */
   keyEnv?: Record<string, string>
+  /**
+   * WS2 (#48): providers whose credential `front` sets (the owner's delegated Synapse token). Their
+   * own key and auth headers are removed before the scan, and options.apiKey becomes a fixed,
+   * non-secret placeholder (front drops whatever the box sends). The box holds no key for them.
+   */
+  frontAuth?: string[]
   /** OpenCode custom tools (file name → source) for opencode/tool/. Default: profileTools(). */
   tools?: Record<string, string>
 }
@@ -136,16 +142,33 @@ export function selectProviders(owner: JsonObject, input: ProfileInput): Provide
   const providers = isObject(owner.provider) ? owner.provider : {}
   for (const [id, entry] of Object.entries(providers)) {
     if (!isObject(entry)) throw invalid(`The owner config entry provider.${id} is not an object.`)
-    const scan = scanProvider(entry, `provider.${id}`)
+    const own = input.frontAuth?.includes(id) ? withoutCredentials(entry) : entry
+    const scan = scanProvider(own, `provider.${id}`)
     const missing = [...scan.envNames].filter((name) => !allowed.has(name))
     if (missing.length) {
       out.dropped.push({ provider: id, reason: `needs ${missing.sort().join(", ")} (not on the approved box env list)` })
       continue
     }
-    out.kept[id] = withKeyEnv(id, entry, input.keyEnv?.[id], allowed)
+    out.kept[id] = input.frontAuth?.includes(id) ? withPlaceholderKey(own) : withKeyEnv(id, entry, input.keyEnv?.[id], allowed)
     out.names.push(id)
   }
   return out
+}
+
+/** Not a secret: front replaces the Authorization header the box sends for these providers. */
+export const FRONT_AUTH_PLACEHOLDER = "front-sets-this-credential"
+const CREDENTIAL_HEADERS = new Set(["authorization", "x-api-key", "api-key"])
+
+/** The entry with options.apiKey and credential headers removed (front sets the credential). */
+function withoutCredentials(entry: JsonObject): JsonObject {
+  const options = isObject(entry.options) ? { ...entry.options } : {}
+  delete options.apiKey
+  if (isObject(options.headers)) options.headers = Object.fromEntries(Object.entries(options.headers).filter(([name]) => !CREDENTIAL_HEADERS.has(name.toLowerCase())))
+  return { ...entry, options }
+}
+
+function withPlaceholderKey(entry: JsonObject): JsonObject {
+  return { ...entry, options: { ...(isObject(entry.options) ? entry.options : {}), apiKey: FRONT_AUTH_PLACEHOLDER } }
 }
 
 function withKeyEnv(id: string, entry: JsonObject, envName: string | undefined, allowed: Set<string>): JsonObject {

@@ -109,10 +109,11 @@ describe("generated identity server (R4-01)", () => {
     expect(identity).not.toContain("location = /api/mcp")
   })
 
-  test("the model gateway server is unchanged (whole host, raw URI)", () => {
+  test("the model gateway server: 403 by default, exact model routes only (WS2 #48, review H1)", () => {
     const synapse = locations(serverBody(conf, "synapse2-api.alterspective.com.au"))
-    expect(synapse.map((l) => [l.exact, l.match])).toEqual([[false, "/"]])
-    expect(synapse[0]!.body).toContain("proxy_pass https://$front_upstream;")
+    expect(synapse.map((l) => [l.exact, l.match])).toEqual([[false, "/"], [true, "/v1/chat/completions"], [true, "/v1/models"]])
+    expect(synapse[0]!.body.trim()).toBe("return 403;")
+    expect(synapse[1]!.body).toContain("proxy_pass https://$front_upstream/v1/chat/completions;")
   })
 
   test("no connections: only the OAuth paths, every /mcp/c/* refused", () => {

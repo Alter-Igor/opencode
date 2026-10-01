@@ -23,6 +23,8 @@ import { createHash } from "node:crypto"
 import { writeFileSync } from "node:fs"
 import path from "node:path"
 import { defaultConfig, type BridgeConfig } from "../shared/config.ts"
+import { SYNAPSE_HOST } from "../synapse/auth-conf.ts"
+import { synapseLocations } from "../synapse/front-routes.ts"
 import { identityLocations } from "./egress-identity.ts"
 
 // Lower-case DNS name, at least two labels, no wildcard, port, scheme, quote, space or brace.
@@ -77,7 +79,7 @@ export function egressHostList(hosts: readonly string[]): string[] {
   return unique
 }
 
-/** The whole-host location of a non-Keystone server (the model gateway). */
+/** The whole-host location of a non-Keystone, non-Synapse server. */
 function wholeHost(host: string): string[] {
   return [
     "    location / {",
@@ -124,7 +126,7 @@ export function frontServers(hosts: readonly string[], keystone: FrontKeystone):
     "    return 421;",
     "}",
   ]
-  const servers = list.flatMap((host) => ["", ...server(host, host === identity ? identityLocations(host, keystone.connections) : wholeHost(host))])
+  const servers = list.flatMap((host) => ["", ...server(host, host === identity ? identityLocations(host, keystone.connections) : host === SYNAPSE_HOST ? synapseLocations(host, FRONT_GENERATED_MOUNT) : wholeHost(host))])
   return [SERVERS_HEADER, ...defaultServer, ...servers, ""].join("\n")
 }
 

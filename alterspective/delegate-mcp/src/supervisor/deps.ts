@@ -38,7 +38,8 @@ export async function defaultSupervisorDeps(config: BridgeConfig, options: Defau
     composeFile: path.join(options.repoRoot, "alterspective", "delegate-mcp", "docker", "compose.yaml"),
     ownerConfigDir: options.ownerConfigDir ?? path.join(os.homedir(), ".config", "opencode"),
     permission: options.permission,
-    keyEnv: { synapse: "SYNAPSE_API_KEY" },
+    // WS2 (#48): no Synapse key in the box; front sets the owner's delegated token.
+    frontAuth: ["synapse"],
     hostEnv: process.env,
     exec,
     profileFs: nodeProfileFs,

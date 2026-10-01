@@ -50,9 +50,9 @@ describe("frontServers", () => {
       const host = s.names[0]!
       expect(s.body).toContain(`set $front_upstream "${host}";`)
       const passes = [...s.body.matchAll(/proxy_pass (\S+);/g)].map((m) => m[1] ?? "")
-      // The model gateway: the whole host. Keystone: one literal path per allowed location (R4-01).
-      if (host === KS.host) for (const pass of passes) expect(pass).toMatch(/^https:\/\/\$front_upstream\/[a-z0-9./-]+$/)
-      else expect(passes).toEqual(["https://$front_upstream"])
+      // Keystone (R4-01) and the model gateway (WS2 #48, H1): one literal path per allowed location.
+      for (const pass of passes) expect(pass).toMatch(/^https:\/\/\$front_upstream\/[a-z0-9./-]+$/)
+      expect(passes.length).toBeGreaterThan(0)
       expect(s.body).toContain(`proxy_ssl_name ${host};`)
       expect(s.body).toContain(`proxy_set_header Host ${host};`)
       expect(s.body).toContain("include /etc/nginx/front/upstream.conf;")
