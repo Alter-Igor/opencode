@@ -140,8 +140,14 @@ async function drive() {
   const decisions: { at: string; kind: string; permission?: string; patterns?: string[]; reply: string }[] = []
   const errors: string[] = []
   const events = await client.event.subscribe()
+  // The SSE request only starts when iteration begins. The server registers its listener when the
+  // request arrives and then sends `server.connected`, so the prompt waits for that event; otherwise
+  // the terminal `session.status` could be published before anyone is listening.
+  let onConnected = () => {}
+  const connected = new Promise<void>((resolve) => (onConnected = resolve))
   const finished = (async () => {
     for await (const event of events.stream) {
+      if (event.type === "server.connected") onConnected()
       if (event.type === "permission.asked" && event.properties.sessionID === session.id) {
         // Everything in-box is already `allow`; anything that still asks is refused. Never `always`.
         await client.permission.reply({ requestID: event.properties.id, reply: "reject" }, { throwOnError: true })
@@ -175,6 +181,8 @@ async function drive() {
     return "event-loop-failed" as const
   })
 
+  const ready = await Promise.race([connected.then(() => true), Bun.sleep(15_000).then(() => false)])
+  if (!ready) throw new Error("event stream did not connect within 15s")
   await client.session.promptAsync(
     { sessionID: session.id, parts: [{ type: "text", text: args.task }] },
     { throwOnError: true },
@@ -212,12 +220,15 @@ async function drive() {
   const gitDir = path.join(runDir, "base.git")
   await run(["docker", "cp", `${taskId}:/work/repo`, after])
   await rm(path.join(after, ".git"), { recursive: true, force: true })
-  await run(["git", "clone", "--quiet", "--bare", bundle, gitDir])
+  // Host global and system git config stay out too: the agent controls `.gitattributes` in the copied
+  // tree, and could otherwise invoke any filter the host config defines (for example `filter=lfs`).
+  const emptyConfig = path.join(runDir, "empty.gitconfig")
+  await Bun.write(emptyConfig, "")
+  const isolated = { GIT_CONFIG_GLOBAL: emptyConfig, GIT_CONFIG_NOSYSTEM: "1", GIT_ATTR_NOSYSTEM: "1" }
+  await run(["git", "clone", "--quiet", "--bare", bundle, gitDir], isolated)
   await Bun.write(path.join(gitDir, "info", "exclude"), ".git\n.system_generated/\n")
   const git = (...rest: string[]) =>
-    run([
-      "git", "-c", "core.autocrlf=false", `--git-dir=${gitDir}`, `--work-tree=${after}`, ...rest,
-    ])
+    run(["git", "-c", "core.autocrlf=false", `--git-dir=${gitDir}`, `--work-tree=${after}`, ...rest], isolated)
   await git("reset", "--quiet")
   await git("add", "--all")
   const patch = await git("diff", "--cached", "--no-ext-diff", "--no-textconv", baseSha)
