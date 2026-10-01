@@ -8,7 +8,9 @@ import { createHash } from "node:crypto"
 import { FRONT_GENERATED_MOUNT, FRONT_SERVERS_NAME } from "../guard/egress.ts"
 import type { Exec } from "./docker.ts"
 
-export type Mount = { Destination?: unknown; RW?: unknown }
+export type Mount = { Destination?: unknown; RW?: unknown; Type?: unknown; Name?: unknown; Driver?: unknown }
+/** `docker volume inspect` Options per volume name; undefined when that inspect failed. */
+export type VolumeOptions = Record<string, Record<string, string> | null | undefined>
 export type FrontLive = { ok: boolean; loadedConfigMatches: boolean; mountReadOnly: boolean; boxMountsOk: boolean; problems: string[] }
 
 const SERVERS_HEADER = `# configuration file ${FRONT_GENERATED_MOUNT}/${FRONT_SERVERS_NAME}:\n`
@@ -34,7 +36,20 @@ function frontMountProblems(front: Mount[] | undefined): string[] {
   return gen.RW === false ? [] : [`front's ${FRONT_GENERATED_MOUNT} is mounted read-write`]
 }
 
-function boxMountProblems(box: Mount[] | undefined): string[] {
+/**
+ * G-7 (review L4): a writable volume must be a plain `local` volume. A local volume made with
+ * `-o o=bind,device=<host path>` (or any `device`) is a host folder in disguise.
+ */
+function volumeProblems(mount: Mount, destination: string, volumes: VolumeOptions): string[] {
+  if (mount.Driver !== "local") return [`the box's ${destination} volume uses driver ${String(mount.Driver).slice(0, 30)}, not local`]
+  const name = typeof mount.Name === "string" ? mount.Name : ""
+  const options = volumes[name]
+  if (options === undefined) return [`the box's ${destination} volume could not be inspected`]
+  if (options && (options.device !== undefined || (options.o ?? "").includes("bind"))) return [`the box's ${destination} volume is backed by a host folder (bind or device option)`]
+  return []
+}
+
+function boxMountProblems(box: Mount[] | undefined, volumes: VolumeOptions): string[] {
   if (!box) return ["the box's mounts could not be read from docker inspect"]
   const problems: string[] = []
   const seen = new Set<string>()
@@ -43,19 +58,22 @@ function boxMountProblems(box: Mount[] | undefined): string[] {
     seen.add(destination)
     if (!(destination in BOX_MOUNTS)) problems.push(`the box has an unexpected mount at ${destination}`)
     else if (BOX_MOUNTS[destination] === false && mount.RW !== false) problems.push(`the box's ${destination} is mounted read-write`)
+    // G-7: the box may write named volumes only, never a host folder.
+    else if (mount.Type !== "volume" && mount.RW !== false) problems.push(`the box's ${destination} is a writable ${typeof mount.Type === "string" ? mount.Type.slice(0, 20) : "unknown"} mount, not a box-only volume`)
+    else if (mount.RW !== false) problems.push(...volumeProblems(mount, destination, volumes))
   }
   for (const destination of Object.keys(BOX_MOUNTS)) if (!seen.has(destination)) problems.push(`the box has no mount at ${destination}`)
   return problems
 }
 
 /** Live mount modes: front's generated folder read-only; the box has exactly its own mounts. */
-export function checkMounts(front: Mount[] | undefined, box: Mount[] | undefined): { mountReadOnly: boolean; boxMountsOk: boolean; problems: string[] } {
+export function checkMounts(front: Mount[] | undefined, box: Mount[] | undefined, volumes: VolumeOptions): { mountReadOnly: boolean; boxMountsOk: boolean; problems: string[] } {
   const frontProblems = frontMountProblems(front)
-  const boxProblems = boxMountProblems(box)
+  const boxProblems = boxMountProblems(box, volumes)
   return { mountReadOnly: frontProblems.length === 0, boxMountsOk: boxProblems.length === 0, problems: [...frontProblems, ...boxProblems] }
 }
 
-export type FrontLiveInput = { dump: string | undefined; expected: string; frontMounts: Mount[] | undefined; boxMounts: Mount[] | undefined }
+export type FrontLiveInput = { dump: string | undefined; expected: string; frontMounts: Mount[] | undefined; boxMounts: Mount[] | undefined; boxVolumes: VolumeOptions }
 
 export function frontLiveFrom(input: FrontLiveInput): FrontLive {
   const problems: string[] = []
@@ -65,7 +83,7 @@ export function frontLiveFrom(input: FrontLiveInput): FrontLive {
   const loadedConfigMatches = loaded !== undefined && loaded === input.expected
   if (loaded !== undefined && !loadedConfigMatches)
     problems.push(`front's loaded servers.conf (sha256 ${sha(loaded).slice(0, 12)}) is not the one generated for the chosen Keystone set (${sha(input.expected).slice(0, 12)}); restart the sandbox with oc_server_restart`)
-  const mounts = checkMounts(input.frontMounts, input.boxMounts)
+  const mounts = checkMounts(input.frontMounts, input.boxMounts, input.boxVolumes)
   problems.push(...mounts.problems)
   return { ok: loadedConfigMatches && mounts.mountReadOnly && mounts.boxMountsOk, loadedConfigMatches, mountReadOnly: mounts.mountReadOnly, boxMountsOk: mounts.boxMountsOk, problems }
 }
@@ -81,9 +99,25 @@ async function mountsOf(exec: Exec, container: string): Promise<Mount[] | undefi
   }
 }
 
+/** Options of each writable volume the box mounts (read-only `docker volume inspect`). */
+async function volumeOptionsOf(exec: Exec, mounts: Mount[] | undefined): Promise<VolumeOptions> {
+  const names = (mounts ?? []).flatMap((m) => (m.Type === "volume" && m.RW !== false && typeof m.Name === "string" ? [m.Name] : []))
+  const inspect = async (name: string): Promise<[string, Record<string, string> | null | undefined]> => {
+    const result = await exec(["docker", "volume", "inspect", "--format", "{{json .Options}}", name], { timeoutMs: 20_000 })
+    try {
+      return [name, result.code === 0 ? (JSON.parse(result.stdout.trim()) as Record<string, string> | null) : undefined]
+    } catch {
+      return [name, undefined]
+    }
+  }
+  return Object.fromEntries(await Promise.all(names.map(inspect)))
+}
+
 /** Read front's loaded config and both containers' mounts, and compare with `expected` (the generated servers file). */
 export async function readFrontLive(exec: Exec, box: string, expected: string): Promise<FrontLive> {
   const front = `${box}-front`
   const dumped = await exec(["docker", "exec", front, "nginx", "-T"], { timeoutMs: 20_000 })
-  return frontLiveFrom({ dump: dumped.code === 0 ? dumped.stdout.replaceAll("\r\n", "\n") : undefined, expected, frontMounts: await mountsOf(exec, front), boxMounts: await mountsOf(exec, box) })
+  const boxMounts = await mountsOf(exec, box)
+  const boxVolumes = await volumeOptionsOf(exec, boxMounts)
+  return frontLiveFrom({ dump: dumped.code === 0 ? dumped.stdout.replaceAll("\r\n", "\n") : undefined, expected, frontMounts: await mountsOf(exec, front), boxMounts, boxVolumes })
 }

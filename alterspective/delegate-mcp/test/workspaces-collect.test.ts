@@ -79,8 +79,13 @@ describe("workspaces: hand-off hardening (C-4)", () => {
       expect(await code(fx.workspaces().collect(ws))).toBe("policy_violation")
       fx.boxOverride = writer(() => {})
       expect(await code(fx.workspaces().collect(ws))).toBe("upstream_error")
+      // G-7: a folder swapped in AFTER the in-box check (stat lies) is still refused from the tar stream.
+      const swapped = writer((out) => mkdirSync(out))
+      fx.boxOverride = (argv) => (argv[0] === "stat" ? { ...OK, stdout: "regular file|10\n" } : swapped(argv))
+      expect(await code(fx.workspaces().collect(ws))).toBe("policy_violation")
       expect(await fx.hostHas("delegate/odd-key")).toBe(false)
-      rmSync(path.join(fx.handoff, "out"), { recursive: true, force: true }) // the planted folder (links were removed)
+      expect(fx.handoffFiles()).toEqual([]) // the box path is cleared in the box after every collect
+      expect(fx.incoming()).toEqual([])
     },
     T,
   )
