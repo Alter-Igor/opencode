@@ -89,6 +89,12 @@ Every build and check used the work queue. The full-run command list and output 
 
 RAG returned no useful lock-specific lesson; the lessons README was checked. The correction was recorded in Synapse Coder as candidate `8c431934-027d-48b1-8255-d5096288b455`; it was not promoted. README, changelog and technical design describe the new recovery behavior. No visual check applies to this shell/proxy change.
 
+## PR #61 follow-up: fail each proof assertion
+
+[CodeRabbit comment 4157442306](https://github.com/Alter-Igor/opencode/pull/61#discussion_r4157442306) found a Low fault in the proof runner. A failed non-final command in an `&&` list does not trigger shell `set -e`. The same pattern also appeared in the older worker and timeout assertions. The observed JSON above remains evidence, but the runner could return success with a wrong early field.
+
+A fault check read the actual assertion lines and supplied a wrong value for each of their 14 fields, one at a time. Before the fix it reported **9 masked failures** (queue PID 36584, exit 1). Each assertion now has its own line. The same check reported **0 masked failures** (queue PID 54568). That queue job then reran the full real-nginx proof against `ocd-review-flock:pr61`: all five result records matched the expected values, cleanup succeeded, and bridge typecheck passed. A separate agent reviewed every changed assertion and the runner's error and cleanup paths; no blocker remained. Runtime source and the container image did not change. The fault driver is `C:\Users\IgorJericevich\AppData\Local\Temp\ocd-reload-assertions.ps1`.
+
 ## Documentation and rules
 
 README, package changelog/version, technical design, issue log and index were updated with the change (PDOC-LOC-01, VER-SRC-01, VER-LOG-01). The bridge is a single-purpose local tool; its operational guide is the package README. Existing fork-wide gaps G-1 through G-4 remain tracked under #41; this patch does not create a Project board or rewrite the fork documentation suite.

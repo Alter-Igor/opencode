@@ -87,7 +87,11 @@ while [ "$after" != new-config ] && [ "$attempt" -lt 20 ]; do
  attempt=$((attempt+1))
 done
 printf '{"reloadExit":%s,"waitedForWorker":%s,"markerStayedOldWhilePaused":%s,"before":"%s","servedWhileMasterPaused":"%s","afterSourceChangedAndResume":"%s"}\n' "$reload_exit" "$waiting" "$old_marker" "$before" "$actual" "$after"
-[ "$reload_exit" = 0 ] && [ "$waiting" = true ] && [ "$old_marker" = true ] && [ "$actual" = old-config ] && [ "$after" = new-config ]
+[ "$reload_exit" = 0 ]
+[ "$waiting" = true ]
+[ "$old_marker" = true ]
+[ "$actual" = old-config ]
+[ "$after" = new-config ]
 # A master that never acknowledges within 20 s fails, but its later read is still of checked copies.
 cp /tmp/proof/source-backup /tmp/proof/gen/servers.conf
 kill -STOP "$master"
@@ -107,7 +111,9 @@ while [ "$late" != old-config ] && [ "$attempt" -lt 100 ]; do
  attempt=$((attempt+1))
 done
 printf '{"timeoutExit":%s,"servedAfterTimeout":"%s","lateLoadAfterSourceChanged":"%s"}\n' "$timeout_exit" "$timed_out_served" "$late"
-[ "$timeout_exit" = 7 ] && [ "$timed_out_served" = new-config ] && [ "$late" = old-config ]
+[ "$timeout_exit" = 7 ]
+[ "$timed_out_served" = new-config ]
+[ "$late" = old-config ]
 # Even a reload with identical content must await a NEW worker, not match an old worker's hashes.
 cp /tmp/proof/source-backup /tmp/proof/gen/servers.conf
 kill -STOP "$master"
@@ -153,7 +159,9 @@ while [ "$retry_exit" = 8 ] && [ "$attempt" -lt 50 ]; do
  attempt=$((attempt+1))
 done
 printf '{"whileOwnerRunning":%s,"killedOwnerExit":%s,"retryAfterOwnerDeath":%s}\\n' "$contender_exit" "$killed_exit" "$retry_exit"
-[ "$contender_exit" = 8 ] && [ "$killed_exit" = 137 ] && [ "$retry_exit" = 0 ]
+[ "$contender_exit" = 8 ]
+[ "$killed_exit" = 137 ]
+[ "$retry_exit" = 0 ]
 # A staging failure also releases the descriptor, without unlinking another caller's lock file.
 cat > /tmp/proof/bin/mktemp <<'FAIL'
 #!/bin/sh
@@ -169,7 +177,8 @@ lock_kept=false
 [ -f /tmp/front/reload.lock ] && lock_kept=true
 sh /tmp/proof/reload.sh > /tmp/proof/stage-retry.log 2>&1
 printf '{"stageFailureExit":%s,"lockFileKept":%s,"retryAfterStageFailure":0}\\n' "$stage_exit" "$lock_kept"
-[ "$stage_exit" = 6 ] && [ "$lock_kept" = true ]
+[ "$stage_exit" = 6 ]
+[ "$lock_kept" = true ]
 ! grep -q rmdir /tmp/proof/stage-failure.log
 `
 
