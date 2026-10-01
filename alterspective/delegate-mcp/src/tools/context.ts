@@ -49,7 +49,7 @@ export type ToolContext = {
    * Wave 3: the contract plus `resolveRepo` (oc_start_session checks directory_busy before cloning)
    * and the host-only session records (W3C-01): adoption, "mine" and instruction reads trust only these.
    */
-  workspaces: Pick<DelegateWorkspaces, "open" | "collect" | "resolveRepo" | "bindSession" | "sessionState" | "listSessionStates" | "discard">
+  workspaces: Pick<DelegateWorkspaces, "open" | "collect" | "resolveRepo" | "bindSession" | "sessionState" | "listSessionStates" | "pruneSessionStates" | "discard">
   inbox: BridgeInbox
   /** Start or reuse the box and its event hub (idempotent, shared by concurrent calls). */
   box(): Promise<Box>

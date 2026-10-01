@@ -1,0 +1,228 @@
+{
+  "base": "f20d17082ec9da05a7e02ac3cf95571f98cdd913",
+  "worktree": "C:\\GitHub\\opencode---session-records",
+  "commandTemplate": "thisrig-work-queue.exe run --lane light -- cmd.exe //d //c \"cd /d X:\\opencode---session-records\\alterspective\\delegate-mcp && bun.exe test --timeout 30000 <files>\"",
+  "pass": 883,
+  "skip": 25,
+  "fail": 0,
+  "batches": [
+    {
+      "batch": 1,
+      "files": [
+        "test/auth-store.test.ts",
+        "test/channels.test.ts",
+        "test/doctor-live.test.ts",
+        "test/egress-allowlist.test.ts"
+      ],
+      "pid": "33028",
+      "pass": 62,
+      "skip": 0,
+      "exit": 0
+    },
+    {
+      "batch": 2,
+      "files": [
+        "test/egress-caches.test.ts",
+        "test/egress-compose.test.ts",
+        "test/egress-doctor.test.ts",
+        "test/egress-front-paths.test.ts"
+      ],
+      "pid": "97080",
+      "pass": 63,
+      "skip": 0,
+      "exit": 0
+    },
+    {
+      "batch": 3,
+      "files": [
+        "test/egress-live.test.ts",
+        "test/events-buffer.test.ts",
+        "test/events-hub.test.ts",
+        "test/events-lifecycle.test.ts"
+      ],
+      "pid": "40872",
+      "pass": 33,
+      "skip": 24,
+      "exit": 0
+    },
+    {
+      "batch": 4,
+      "files": [
+        "test/events-server.test.ts",
+        "test/events-sse.test.ts",
+        "test/events-state.test.ts",
+        "test/guard-entries.test.ts"
+      ],
+      "pid": "25972",
+      "pass": 107,
+      "skip": 0,
+      "exit": 0
+    },
+    {
+      "batch": 5,
+      "files": [
+        "test/guard-permissions.test.ts",
+        "test/guard-runtime.test.ts",
+        "test/handoff-compose.test.ts",
+        "test/handoff-hygiene.test.ts"
+      ],
+      "pid": "49964",
+      "pass": 54,
+      "skip": 0,
+      "exit": 0
+    },
+    {
+      "batch": 6,
+      "files": [
+        "test/inbox-client.test.ts",
+        "test/inbox-sidecar-limits.test.ts",
+        "test/inbox-sidecar.test.ts",
+        "test/inbox-tools.test.ts"
+      ],
+      "pid": "50164",
+      "pass": 66,
+      "skip": 0,
+      "exit": 0
+    },
+    {
+      "batch": 7,
+      "files": [
+        "test/keystone-ceiling.test.ts",
+        "test/keystone-set.test.ts",
+        "test/keystone-tool-deny.test.ts",
+        "test/login.test.ts"
+      ],
+      "pid": "99628",
+      "pass": 46,
+      "skip": 0,
+      "exit": 0
+    },
+    {
+      "batch": 8,
+      "files": [
+        "test/review-r3-directory.test.ts",
+        "test/server.test.ts",
+        "test/session-keystone.test.ts",
+        "test/shared.test.ts"
+      ],
+      "pid": "19660",
+      "pass": 53,
+      "skip": 0,
+      "exit": 0
+    },
+    {
+      "batch": 9,
+      "files": [
+        "test/spawn.test.ts",
+        "test/supervisor-compose-env.test.ts",
+        "test/supervisor-docker.test.ts",
+        "test/supervisor-front-lock.test.ts"
+      ],
+      "pid": "100012",
+      "pass": 23,
+      "skip": 0,
+      "exit": 0
+    },
+    {
+      "batch": 10,
+      "files": [
+        "test/supervisor-identity.test.ts",
+        "test/supervisor-leases.test.ts",
+        "test/supervisor-lifecycle-review.test.ts",
+        "test/supervisor-lifecycle.test.ts"
+      ],
+      "pid": "95244",
+      "pass": 57,
+      "skip": 0,
+      "exit": 0
+    },
+    {
+      "batch": 11,
+      "files": [
+        "test/supervisor-profile.test.ts",
+        "test/supervisor-replace.test.ts",
+        "test/synapse-front-reload.test.ts",
+        "test/synapse-front.test.ts"
+      ],
+      "pid": "103916",
+      "pass": 58,
+      "skip": 0,
+      "exit": 0
+    },
+    {
+      "batch": 12,
+      "files": [
+        "test/synapse-fs-retry.test.ts",
+        "test/synapse-handoff.test.ts",
+        "test/synapse-manager.test.ts",
+        "test/synapse-token.test.ts"
+      ],
+      "pid": "83320",
+      "pass": 38,
+      "skip": 0,
+      "exit": 0
+    },
+    {
+      "batch": 13,
+      "files": [
+        "test/tools-core-cli.test.ts",
+        "test/tools-core-ownership.test.ts",
+        "test/tools-core-result.test.ts",
+        "test/tools-core-review.test.ts"
+      ],
+      "pid": "27396",
+      "pass": 49,
+      "skip": 0,
+      "exit": 0
+    },
+    {
+      "batch": 14,
+      "files": [
+        "test/tools-core-runtime.test.ts",
+        "test/tools-core-send.test.ts",
+        "test/tools-core-session.test.ts",
+        "test/tools-interaction-answer.test.ts"
+      ],
+      "pid": "7240",
+      "pass": 51,
+      "skip": 0,
+      "exit": 0
+    },
+    {
+      "batch": 15,
+      "files": [
+        "test/tools-interaction-inbox.test.ts",
+        "test/tools-shape.test.ts",
+        "test/watch.test.ts",
+        "test/workspaces-collect.test.ts"
+      ],
+      "pid": "9824",
+      "pass": 56,
+      "skip": 0,
+      "exit": 0
+    },
+    {
+      "batch": 16,
+      "files": [
+        "test/workspaces-copyout.test.ts",
+        "test/workspaces-exec.test.ts",
+        "test/workspaces-prune.test.ts",
+        "test/workspaces-units.test.ts"
+      ],
+      "pid": "73868",
+      "pass": 56,
+      "skip": 1,
+      "exit": 0
+    },
+    {
+      "batch": 17,
+      "files": [
+        "test/workspaces.test.ts"
+      ],
+      "pid": "27252",
+      "pass": 11,
+      "skip": 0,
+      "exit": 0
+    }
+  ]
+}
