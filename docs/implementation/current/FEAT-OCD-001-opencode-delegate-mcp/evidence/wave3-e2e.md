@@ -49,6 +49,29 @@ Scratch script over MCP stdio: a session was asked to call `ks-delegate`'s `get-
 
 `front` log for Runs 3–4 (method and status per host; paths are not logged): `identity` POST 200 / 202 / 404, `synapse2-api` POST 200. No other SNI or `Host` appeared. The `identity` POST 404s (5–6 per run) did not break any call; they look like MCP session re-initialisation after the restart, but that is **not verified**.
 
+## Run 5 — follow-up program `20261001t0805-16a2bdad` (integration branch `ocd-followups` @ `90434eaaf5`)
+
+Box rebuilt with `oc_server_restart {confirm: true, force: true}`; image `opencode-delegate-box:1.18.31-f3f9ce5af2f0`. `oc_doctor`: **Verified**. Keystone `rag-read`, `github`, `seqlogs` connected. Synapse signed in on the host as the owner via `service:opencode`; front has the token loaded, `routesOk: true`, `matchesHost: true`.
+
+| Check | Result |
+|---|---|
+| Box env names matching `synapse`, `api_key`, `token` | none (#48) |
+| `spike/e2e-w3.ts` | exit 0: three collects through `docker cp` (#54), `PINEAPPLE`, forged session `not_found`, two repos in parallel (12 s) |
+| front log, last 15 min | 9 × `POST synapse2-api … status=200 up=200`; 0 `eyJ`/`Bearer` strings |
+| RAG write tools from inside the box with the box's own `ks-rag-read` token (raw MCP, bypassing OpenCode) | `tools/list`: 16 tools, no write tools; `rag_ingest`, `rag_contribute`, `rag_delete_collection` → `-32001 Tool not permitted by Keystone policy (not_on_allowlist)`; `rag_search` works (#56) |
+
+## T3.5 channel push — verified live (#44)
+
+2026-10-01, owner's interactive Claude Code session (2.1.281), started in a scratch folder with `.mcp.json` running the bridge with `--channels`, and `claude --dangerously-load-development-channels server:opencode-delegate`. The session started a delegated task and ended its turn without calling `oc_wait`, `oc_status` or `oc_events`. The notice arrived on its own:
+
+```
+<channel source="opencode-delegate" type="status" state="idle" sessionID="ses_f09291876ffeeWoXM53v7nKMzL">
+opencode-delegate: session ses_f09291876ffeeWoXM53v7nKMzL is idle (finished its turn): read it with oc_result
+</channel>
+```
+
+`oc_result` then showed the session idle with one box-reported commit (`hello.txt`). Note: in headless print mode (`claude -p`, stream-json) a channel notice is **not** delivered (tested twice, 2026-10-01); the proof needs an interactive session.
+
 ## Secret scan (T4.6)
 
 The live values of the box server password (32 chars) and `SYNAPSE_API_KEY` (49 chars) were read from `docker inspect opencode-delegate` into shell variables, never printed, and searched for with `grep -F` in: the bridge logs (`~/.local/share/opencode-delegate/logs/`), the Run 1 bridge stderr log, and the Run 1 + Run 2 outputs. **0 hits** (repeated after Run 3 over the bridge logs, the Run 3 stderr log and output, and the `front` container log: 0 hits). A pattern scan (JWTs, `gpaas_`/`gpapp_`/`sk-` keys, `Bearer` values, token/password JSON fields) over the same files also found 0.
@@ -57,6 +80,5 @@ Inside the box, the env holds only the secrets the design puts there: `OPENCODE_
 
 ## Not verified
 
-- T3.5 channel push inside a real Claude Code session started with `--channels`. Unit tests cover the notice text and coalescing only.
 - F6 Keystone audit row for the delegated user: `list-audit-log` returned HTTP 500 (correlation `275b3d93-390e-4b39-b023-bd8e2bfe6a13`).
 - A run of Run 2 against commit `6bf4046d75` itself. The unit suite covers the same paths at that commit (633 pass / 6 skip / 0 fail).
