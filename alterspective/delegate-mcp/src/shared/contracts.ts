@@ -2,6 +2,9 @@
 // Owned by the capability hub; modules must not change these without the hub.
 import type { ApiTarget, OpencodeApi } from "./opencode-api.ts"
 
+/** OpenCode session ids (id/id.ts). The one session-id shape the bridge accepts (W3A-19). */
+export const SESSION_ID_RE = /^ses_[A-Za-z0-9]{8,64}$/
+
 /** MOD-01: one Docker box per user. */
 export type BoxState =
   | { state: "running"; target: ApiTarget; imageTag: string; startedBy: "this-bridge" | "other" }

@@ -162,3 +162,56 @@ describe("workspaces: open is atomic and never collides", () => {
     )
   }
 })
+
+describe("workspaces: only the current branch is bundled, and the host record (W3C-11 / W3C-01)", () => {
+  test(
+    "open bundles HEAD only: another branch's commits never reach the box; base is the host HEAD",
+    async () => {
+      await git(fx.hostRepo, ["checkout", "-q", "-b", "private-branch"])
+      writeFileSync(path.join(fx.hostRepo, "secret.txt"), "not for the box\n")
+      await git(fx.hostRepo, ["add", "secret.txt"])
+      await git(fx.hostRepo, ["commit", "-q", "-m", "private"])
+      const hidden = await git(fx.hostRepo, ["rev-parse", "HEAD"])
+      await git(fx.hostRepo, ["checkout", "-q", "main"])
+      try {
+        const ws = await fx.workspaces().open(fx.hostRepo, "head-only")
+        expect(ws.base).toBe(await git(fx.hostRepo, ["rev-parse", "HEAD"]))
+        const refs = await fx.boxGit("head-only", ["for-each-ref", "--format=%(refname)"])
+        expect(refs.split(/\r?\n/)).toEqual(["refs/heads/delegate/head-only"])
+        expect(await fx.boxGit("head-only", ["cat-file", "-e", hidden]).then(() => "present", () => "absent")).toBe("absent")
+      } finally {
+        await git(fx.hostRepo, ["branch", "-q", "-D", "private-branch"])
+      }
+    },
+    T,
+  )
+
+  test(
+    "the host record: written by open, bound once to a session, listed, and removed by discard",
+    async () => {
+      const workspaces = fx.workspaces()
+      const ws = await workspaces.open(fx.hostRepo, "record-key")
+      const opened = await workspaces.sessionState("record-key")
+      expect(opened).toMatchObject({ sessionKey: "record-key", base: ws.base })
+      expect(opened?.sessionID).toBeUndefined()
+      const binding = { sessionID: "ses_0123456789abcdefAB", profile: "readonly" as const, supervisor: "supervisor:ws-test", model: "synapse/auto" }
+      expect(await workspaces.bindSession("record-key", binding)).toMatchObject(binding)
+      expect(await workspaces.sessionState("record-key")).toMatchObject({ ...binding, hostRepo: opened?.hostRepo, base: ws.base })
+      expect(await code(workspaces.bindSession("record-key", { ...binding, sessionID: "ses_ffffffffffffffffFF" }))).toBe("directory_busy")
+      expect((await workspaces.listSessionStates()).some((s) => s.sessionKey === "record-key")).toBe(true)
+      await workspaces.discard("record-key")
+      expect(await workspaces.sessionState("record-key")).toBeUndefined()
+      expect(fx.leftovers("record-key")).toEqual([])
+    },
+    T,
+  )
+
+  test("a record with a malformed session id or supervisor is not treated as bound", async () => {
+    mkdirSync(path.join(fx.tmp, "state"), { recursive: true })
+    const base = await git(fx.hostRepo, ["rev-parse", "HEAD"])
+    writeFileSync(path.join(fx.tmp, "state", "forged-key.json"), JSON.stringify({ hostRepo: fx.hostRepo, base, sessionID: "ses_../../x", supervisor: "supervisor:ws-test" }))
+    const state = await fx.workspaces().sessionState("forged-key")
+    expect(state?.sessionID).toBeUndefined()
+    expect(state?.supervisor).toBeUndefined()
+  })
+})

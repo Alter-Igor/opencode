@@ -161,9 +161,9 @@ describe("event hub over SSE", () => {
   test("trackAll tracks sessions seen on the stream (watch CLI)", async () => {
     const h = make({ trackAll: true })
     await h.start()
-    box.send(status("busy", "ses_new"), "/sessions/b")
-    await until(() => seq(h, "ses_new").length > 0)
-    expect(all(h).find((e) => e.sessionID === "ses_new")?.directory).toBe("/sessions/b")
+    box.send(status("busy", "ses_newsession"), "/sessions/b")
+    await until(() => seq(h, "ses_newsession").length > 0)
+    expect(all(h).find((e) => e.sessionID === "ses_newsession")?.directory).toBe("/sessions/b")
   })
 
   test("subscribe gets each event once; a throwing subscriber does not break the hub", async () => {
@@ -218,15 +218,15 @@ describe("wave 2 review fixes over SSE", () => {
     await h.start()
     h.track("ses_1", DIR)
     box.send(status("busy"))
-    box.send({ type: "session.created", properties: { sessionID: "ses_kid", info: { id: "ses_kid", directory: DIR, parentID: "ses_1", title: "sub" } } })
-    box.send(status("busy", "ses_kid"))
-    await until(() => seq(h, "ses_kid").includes("status:busy"))
+    box.send({ type: "session.created", properties: { sessionID: "ses_kidsession", info: { id: "ses_kidsession", directory: DIR, parentID: "ses_1", title: "sub" } } })
+    box.send(status("busy", "ses_kidsession"))
+    await until(() => seq(h, "ses_kidsession").includes("status:busy"))
     const waiting = h.wait({ sessionIDs: ["ses_1"], until: ["needs_input"], timeoutMs: 3000, cursor: h.cursor() })
-    box.send(permission("per_2", "ses_kid"))
+    box.send(permission("per_2", "ses_kidsession"))
     const result = await waiting
-    expect(result.events[0]).toMatchObject({ type: "permission", sessionID: "ses_kid", parentID: "ses_1", requestID: "per_2" })
+    expect(result.events[0]).toMatchObject({ type: "permission", sessionID: "ses_kidsession", parentID: "ses_1", requestID: "per_2" })
     await until(() => seq(h).at(-1) === "status:needs_input", 3000, "parent needs_input")
-    expect(await h.view("ses_1")).toMatchObject({ state: "needs_input", detail: "subagent ses_kid asks", pending: ["per_2"] })
+    expect(await h.view("ses_1")).toMatchObject({ state: "needs_input", detail: "subagent ses_kidsession asks", pending: ["per_2"] })
   })
 
   test("W2A-03: a reconnect finds subagents of running sessions through GET /session/:id/children", async () => {
@@ -235,13 +235,13 @@ describe("wave 2 review fixes over SSE", () => {
     h.track("ses_1", DIR)
     box.send(status("busy"))
     await until(() => seq(h).includes("status:busy"))
-    box.sessions.set("ses_kid", { id: "ses_kid", directory: DIR, parentID: "ses_1" })
-    box.status.set(DIR, { ses_1: { type: "busy" }, ses_kid: { type: "busy" } })
-    box.questions.push({ id: "que_5", sessionID: "ses_kid", directory: DIR })
+    box.sessions.set("ses_kidsession", { id: "ses_kidsession", directory: DIR, parentID: "ses_1" })
+    box.status.set(DIR, { ses_1: { type: "busy" }, ses_kidsession: { type: "busy" } })
+    box.questions.push({ id: "que_5", sessionID: "ses_kidsession", directory: DIR })
     box.dropStreams()
     await until(() => seq(h).at(-1) === "status:needs_input", 3000, "parent needs_input after rebuild")
     expect(box.requests).toContain(`GET /session/ses_1/children?${DIR}`)
-    expect(await h.view("ses_kid")).toMatchObject({ state: "needs_input", parentID: "ses_1", pending: ["que_5"] })
+    expect(await h.view("ses_kidsession")).toMatchObject({ state: "needs_input", parentID: "ses_1", pending: ["que_5"] })
   })
 
   test("W2A-10: an instance dispose makes its directory unknown, then re-reads it", async () => {

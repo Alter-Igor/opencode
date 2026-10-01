@@ -1,6 +1,7 @@
 // MOD-04 oc_result, oc_collect, oc_wait, oc_events, oc_doctor, oc_login, oc_list_models, oc_server_restart.
 import { describe, expect, test } from "bun:test"
 import { MAX_RESULT_CHARS } from "../src/tools/shape.ts"
+import { SAFE_BOX_GIT } from "../src/tools/core-box.ts"
 import { collectTool } from "../src/tools/collect.ts"
 import { doctorTool } from "../src/tools/doctor.ts"
 import { loginTool } from "../src/tools/login.ts"
@@ -30,9 +31,11 @@ describe("oc_result", () => {
     expect(replies[0]?.untrusted.text.length).toBe(8000)
     expect(text(result).split("\n")[0]).not.toContain("IGNORE")
     expect(text(result).length).toBeLessThanOrEqual(MAX_RESULT_CHARS)
-    expect(data(result).diff).toMatchObject({ base: BASE, commits: 2, stat: { text: " hello.txt | 1 +\n", truncated: false } })
+    expect(data(result).diff).toMatchObject({ base: BASE, boxReportedCommits: 2, stat: { text: " hello.txt | 1 +\n", truncated: false } })
     expect(data(result).todos).toEqual([{ status: "completed", untrusted: { text: "step 1", truncated: false } }])
-    expect(f.boxCmds.find((c) => c.includes("diff"))).toEqual(["git", "-C", "/sessions/s-0000000001", "diff", "--stat", "--no-ext-diff", "--no-textconv", "--no-color", BASE])
+    expect(f.boxCmds.find((c) => c.includes("diff"))).toEqual([...SAFE_BOX_GIT, "-C", "/sessions/s-0000000001", "diff", "--stat", "--no-ext-diff", "--no-textconv", "--no-color", BASE])
+    expect(f.boxCmds.find((c) => c.includes("rev-list"))?.slice(-2)).toEqual(["--count", `${BASE}..refs/heads/delegate/s-0000000001`])
+    expect(text(result).split("\n")[0]).toContain("2 commits (box-reported)")
   })
 
   test("control characters are stripped from untrusted text", async () => {
@@ -71,7 +74,7 @@ describe("oc_wait and oc_events", () => {
     f.ctx.sessions.set(SID, record())
     f.hub.waitResult = { events: [{ cursor: { epoch: "ep1", seq: 7 }, at: "t", type: "status", sessionID: SID, state: "idle", summary: "session idle", untrusted: INJECTION }], next: { epoch: "ep1", seq: 7 }, timedOut: false }
     const result = await invoke(waitTool, { sessionIDs: [SID], cursor: "ep1.5" }, f.ctx)
-    expect(f.hub.waits[0]).toEqual({ sessionIDs: [SID], until: ["idle", "needs_input", "error"], timeoutMs: 120_000, cursor: { epoch: "ep1", seq: 5 } })
+    expect(f.hub.waits[0]).toEqual({ sessionIDs: [SID], until: ["idle", "needs_input", "error"], timeoutMs: 100_000, cursor: { epoch: "ep1", seq: 5 } })
     expect(data(result)).toMatchObject({ still_running: false, next: "ep1.7" })
     const events = data(result).events as Array<Record<string, unknown>>
     expect(events[0]).toMatchObject({ cursor: "ep1.7", state: "idle", untrusted: { text: INJECTION, truncated: false } })

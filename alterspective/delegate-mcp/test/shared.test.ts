@@ -3,7 +3,7 @@ import { rmSync, writeFileSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { createLogger, redact, safeLog, scrub } from "../src/shared/log.ts"
-import { createApi, DEFAULT_API_TIMEOUT_MS, expectOk } from "../src/shared/opencode-api.ts"
+import { createApi, DEFAULT_API_TIMEOUT_MS, DEFAULT_MAX_RESPONSE_BYTES, expectOk } from "../src/shared/opencode-api.ts"
 import { DelegateError, ErrorCode } from "../src/shared/errors.ts"
 import { defaultConfig, mcpAllowPolicy } from "../src/shared/config.ts"
 
@@ -189,6 +189,83 @@ describe("opencode api", () => {
     } finally {
       await server.stop(true)
     }
+  })
+
+  // W3C-07: bodies are read as a stream with a byte cap. These fake bodies hold a timer of their own
+  // (like a real open socket would), so the test proves the reader stops, not that the loop drained.
+  type Stream = { pulls: number; cancelled: boolean; body: ReadableStream<Uint8Array> }
+  function endless(chunkBytes: number): Stream {
+    const state: Stream = { pulls: 0, cancelled: false, body: new ReadableStream<Uint8Array>() }
+    let keepAlive: ReturnType<typeof setInterval> | undefined
+    state.body = new ReadableStream<Uint8Array>(
+      {
+        start() {
+          keepAlive = setInterval(() => {}, 10)
+        },
+        pull(controller) {
+          state.pulls++
+          return new Promise<void>((resolve) =>
+            setTimeout(() => {
+              if (!state.cancelled) controller.enqueue(new Uint8Array(chunkBytes).fill(32))
+              resolve()
+            }, 1),
+          )
+        },
+        cancel() {
+          state.cancelled = true
+          clearInterval(keepAlive)
+        },
+      },
+      { highWaterMark: 0 },
+    )
+    return state
+  }
+  const serving = (res: () => Response) => (async () => res()) as unknown as typeof fetch
+  const api = (fetchImpl: typeof fetch, options?: { timeoutMs?: number; maxResponseBytes?: number }) => createApi({ baseUrl: "http://127.0.0.1:1", password: "pw" }, fetchImpl, options)
+
+  test("W3C-07: an endless streamed body stops at the cap as upstream_error, and the stream is cancelled", async () => {
+    const stream = endless(256)
+    const error = (await api(serving(() => new Response(stream.body, { status: 200 }))).call({ path: "/big", maxBytes: 1024 }).catch((e: unknown) => e)) as DelegateError
+    expect(error).toBeInstanceOf(DelegateError)
+    expect(error.toResult()).toEqual({ code: "upstream_error", message: "The delegate server sent a response that is too large.", action: "Retry with a smaller limit; if it repeats, run oc_doctor." })
+    expect(error.detail).toBe("body over 1024 bytes")
+    expect(stream.cancelled).toBe(true)
+    expect(stream.pulls).toBeLessThanOrEqual(6)
+  })
+
+  test("W3C-07: a declared content-length over the cap is refused before any of the body is read", async () => {
+    const stream = endless(256)
+    const res = () => new Response(stream.body, { status: 200, headers: { "content-length": String(9 * 1024 * 1024) } })
+    await expect(api(serving(res)).call({ path: "/big" })).rejects.toMatchObject({ code: "upstream_error", detail: `body over ${DEFAULT_MAX_RESPONSE_BYTES} bytes` })
+    expect(stream.pulls).toBe(0)
+    expect(stream.cancelled).toBe(true)
+  })
+
+  test("W3C-07: the cap counts bytes, not characters; exactly the cap is accepted", async () => {
+    const body = JSON.stringify({ name: "ééé" })
+    const bytes = Buffer.byteLength(body)
+    expect(bytes).toBeGreaterThan(body.length)
+    const fake = serving(() => new Response(body, { status: 200 }))
+    expect((await api(fake).call<{ name: string }>({ path: "/a", maxBytes: bytes })).data).toEqual({ name: "ééé" })
+    await expect(api(fake).call({ path: "/a", maxBytes: bytes - 1 })).rejects.toMatchObject({ code: "upstream_error", detail: `body over ${bytes - 1} bytes` })
+  })
+
+  test("W3C-07: the default cap is 8 MB and a client-wide cap applies when the call sets none", async () => {
+    expect(DEFAULT_MAX_RESPONSE_BYTES).toBe(8 * 1024 * 1024)
+    const fake = serving(() => new Response(JSON.stringify({ padding: "p".repeat(64) }), { status: 200 }))
+    await expect(api(fake, { maxResponseBytes: 32 }).call({ path: "/a" })).rejects.toMatchObject({ code: "upstream_error", detail: "body over 32 bytes" })
+    expect((await api(fake, { maxResponseBytes: 32 }).call({ path: "/a", maxBytes: 1024 })).status).toBe(200)
+  })
+
+  test("W3C-07: the deadline covers the body even when fetch ignores its signal (a trickling box)", async () => {
+    const stream = endless(8)
+    const started = Date.now()
+    const error = (await api(serving(() => new Response(stream.body, { status: 200 }))).call({ path: "/slow", timeoutMs: 80 }).catch((e: unknown) => e)) as DelegateError
+    expect(error).toBeInstanceOf(DelegateError)
+    expect(error.code).toBe("server_down")
+    expect(error.detail).toBe("timeout")
+    expect(stream.cancelled).toBe(true)
+    expect(Date.now() - started).toBeLessThan(5_000)
   })
 
   test("expectOk throws upstream_error on non-2xx", () => {

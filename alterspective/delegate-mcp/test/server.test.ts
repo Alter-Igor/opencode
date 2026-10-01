@@ -45,7 +45,12 @@ describe("MCP server", () => {
     expect(Object.keys(send?.inputSchema.properties ?? {})).toEqual(["sessionID", "message", "model", "agent", "correlationId"])
     const wait = tools.find((t) => t.name === "oc_wait")
     expect(wait?.inputSchema.properties?.timeoutSec).toMatchObject({ type: "integer", maximum: 240 })
-    expect(tools.find((t) => t.name === "oc_doctor")?.annotations).toMatchObject({ readOnlyHint: true })
+    // W3A-10: a tool that can start the sandbox is not read-only; oc_events and oc_inbox never start it.
+    for (const name of ["oc_doctor", "oc_status", "oc_list_sessions", "oc_list_models", "oc_wait", "oc_result", "oc_pending"])
+      expect(tools.find((t) => t.name === name)?.annotations).toMatchObject({ readOnlyHint: false })
+    for (const name of ["oc_events", "oc_inbox"]) expect(tools.find((t) => t.name === name)?.annotations).toMatchObject({ readOnlyHint: true })
+    expect(wait?.description).toContain("default 100 s")
+    expect(tools.find((t) => t.name === "oc_start_session")?.description).toContain("current branch")
     expect(tools.find((t) => t.name === "oc_server_restart")?.annotations).toMatchObject({ destructiveHint: true })
   })
 
@@ -55,7 +60,7 @@ describe("MCP server", () => {
     const client = await connect(f)
     const result = await client.callTool({ name: "oc_doctor", arguments: {} })
     expect(result.isError).toBeFalsy()
-    expect(result.structuredContent).toMatchObject({ isolation: "S", mcp: { entries: [{ name: "ks-delegate", status: "needs_auth" }] }, guard: { ok: true } })
+    expect(result.structuredContent).toMatchObject({ verified: false, isolation: { level: "S", source: "configuration" }, mcp: { entries: [{ name: "ks-delegate", status: "needs_auth" }] }, guard: { ok: true } })
     expect(JSON.stringify(result)).not.toContain(TARGET.password)
     expect(f.started.count).toBe(0)
   })

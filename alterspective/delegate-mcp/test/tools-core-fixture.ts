@@ -7,6 +7,7 @@ import { silentLogger } from "../src/shared/log.ts"
 import type { ApiTarget, Call, OpencodeApi } from "../src/shared/opencode-api.ts"
 import type { DelegateHub } from "../src/events/index.ts"
 import type { SupervisorStatus } from "../src/supervisor/status.ts"
+import type { HostSessionState } from "../src/supervisor/workspaces-state.ts"
 import type { Box, CommandResult, SessionRecord, ToolContext } from "../src/tools/context.ts"
 import type { ToolSpec } from "../src/tools/define.ts"
 import { fail, type ToolResult } from "../src/tools/shape.ts"
@@ -101,6 +102,9 @@ export type Fake = {
   hostCmds: string[][]
   opened: Array<[string, string]>
   collected: string[]
+  /** Host-only session records (workspaces-state.ts), by session key. */
+  states: Map<string, HostSessionState>
+  discarded: string[]
   started: { count: number; restarts: number }
   /** oc_server_restart: the force option of each restartBox call, and what the next one reports as interrupted. */
   restart: { forced: boolean[]; interrupted: number }
@@ -128,11 +132,25 @@ function fakeServices(f: Fake): Pick<ToolContext, "supervisorService" | "workspa
       resolveRepo: async (dir) => dir,
       open: async (hostRepo, key) => {
         f.opened.push([hostRepo, key])
-        return { sessionKey: key, hostRepo, boxPath: `/sessions/${key}`, branch: `delegate/${key}` }
+        f.states.set(key, { sessionKey: key, hostRepo, base: BASE, createdAt: "2026-10-01T00:00:00.000Z" })
+        return { sessionKey: key, hostRepo, boxPath: `/sessions/${key}`, branch: `delegate/${key}`, base: BASE }
       },
       collect: async (ws) => {
         f.collected.push(ws.sessionKey)
         return { branch: ws.branch, commits: 1, hostExecutableChanges: [] }
+      },
+      bindSession: async (key, binding) => {
+        const current = f.states.get(key)
+        if (!current) throw new Error(`no state for ${key}`)
+        const next = { ...current, ...binding }
+        f.states.set(key, next)
+        return next
+      },
+      sessionState: async (key) => f.states.get(key),
+      listSessionStates: async () => [...f.states.values()],
+      discard: async (key) => {
+        f.discarded.push(key)
+        f.states.delete(key)
       },
     },
   }
@@ -148,7 +166,7 @@ export function fakeContext(options: { boxHeld?: boolean } = {}): Fake {
   let host = (_argv: string[]) => ({ code: 128, stdout: "", stderr: "fatal: path not in tree" }) as CommandResult
   let inBox = (argv: string[]) => (argv.includes("rev-parse") ? okCmd(`${BASE}\n`) : okCmd(""))
   const f: Fake = {
-    api, hub, order, box, boxCmds: [], hostCmds: [], opened: [], collected: [], started: { count: 0, restarts: 0 }, restart: { forced: [], interrupted: 0 },
+    api, hub, order, box, boxCmds: [], hostCmds: [], opened: [], collected: [], states: new Map(), discarded: [], started: { count: 0, restarts: 0 }, restart: { forced: [], interrupted: 0 },
     setHost: (fn) => (host = fn),
     setBox: (fn) => (inBox = fn),
     status: { value: { state: "running", target: TARGET, imageTag: "img:1", startedBy: "other", health: "healthy", policyVerified: true, imageMatches: true } },
@@ -188,6 +206,21 @@ export function fakeContext(options: { boxHeld?: boolean } = {}): Fake {
     correlationId: () => "cid-test",
   }
   return f
+}
+
+/** The host record that makes `rec` (default: record()) a session of this bridge. */
+export function seedState(f: Fake, overrides: Partial<HostSessionState> = {}, rec: SessionRecord = record()): HostSessionState {
+  const state: HostSessionState = { sessionKey: rec.sessionKey, hostRepo: rec.hostRepo, base: rec.base ?? BASE, createdAt: rec.createdAt, sessionID: rec.sessionID, supervisor: f.ctx.supervisor, profile: rec.profile, ...overrides }
+  f.states.set(state.sessionKey, state)
+  return state
+}
+
+/** A session this process tracks AND has a host record for (the normal case after oc_start_session). */
+export function ours(f: Fake, overrides: Partial<SessionRecord> = {}): SessionRecord {
+  const rec = record(overrides)
+  f.ctx.sessions.set(rec.sessionID, rec)
+  seedState(f, {}, rec)
+  return rec
 }
 
 /** The remote session the fake API returns for GET /session/:id. */

@@ -1,14 +1,14 @@
 // MOD-01 session workspaces (technical-design §4 "Workspaces"; contracts.ts `Workspaces`).
 // The owner's repos are never mounted in the box. Code moves by git bundle only:
-//   open:    host `git bundle create <handoff>/in/<fresh>.bundle --all` -> box `git clone --no-checkout`
-//            into /sessions/.<key>.<nonce>.tmp, checks out delegate/<key> at the host HEAD, then `mv -T`
-//            to /sessions/<key> (refused with directory_busy when it already exists)
+//   open:    host `git bundle create <handoff>/in/<fresh>.bundle HEAD` (the owner's current branch
+//            only, review W3C-11) -> box `git clone --no-checkout` into /sessions/.<key>.<nonce>.tmp,
+//            checks out delegate/<key> at the host HEAD, then `mv -T` to /sessions/<key> (refused
+//            with directory_busy when it already exists). The host record is workspaces-state.ts.
 //   collect: box `git bundle create /handoff/out/<fresh>.bundle delegate/<key>` -> host moves it to a
 //            host-only folder, checks it, then `git fetch <bundle>`
 // No host-side git command ever runs inside the box clone, so hooks planted there cannot run on the host.
 // Hand-off hardening: workspaces-handoff.ts. Host-executable detection: workspaces-detect.ts.
 import { randomUUID } from "node:crypto"
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import path from "node:path"
 import type { BridgeConfig } from "../shared/config.ts"
 import type { Workspace, Workspaces } from "../shared/contracts.ts"
@@ -17,14 +17,13 @@ import { safeLog, silentLogger, type Logger } from "../shared/log.ts"
 import { flagChanges, parseRawDiff } from "./workspaces-detect.ts"
 import { canonicalPath, invalidFolder, isUnder, runCommand, samePath, systemSubst, type Exec } from "./workspaces-exec.ts"
 import { assertRegularFile, DEFAULT_MAX_BUNDLE_BYTES, planOutBundle, randomNonce, removeQuietly, reserveInBundle, takeOutBundle } from "./workspaces-handoff.ts"
+import { bindHostState, COMMIT_ID, listHostStates, readHostState, removeHostState, SESSION_KEY, writeHostState, type HostSessionState, type SessionBinding } from "./workspaces-state.ts"
 
 export { canonicalPath, cleanEnv, isUnder, parseSubst, runCommand, TIMEOUT_CODE, type Exec, type ExecOptions, type ExecResult } from "./workspaces-exec.ts"
 export { isHostExecutableMode, isHostExecutablePath, parseRawDiff, scriptsChanged, type RawEntry } from "./workspaces-detect.ts"
 export { DEFAULT_MAX_BUNDLE_BYTES, HANDOFF_IN, HANDOFF_OUT } from "./workspaces-handoff.ts"
 
-export const SESSION_KEY = /^[a-z0-9-]{4,64}$/
-/** A full commit id: SHA-1 (40 hex) or, for sha256 repositories, 64 hex. */
-export const COMMIT_ID = /^([0-9a-f]{40}|[0-9a-f]{64})$/
+export { AGENT_RE, COMMIT_ID, MODEL_RE, SESSION_ID_RE, SESSION_KEY, SUPERVISOR_RE, type HostSessionState, type SessionBinding, type SessionProfile } from "./workspaces-state.ts"
 /** bundle, clone and fetch: whole repositories. */
 export const LONG_TIMEOUT_MS = 10 * 60_000
 /** every other git / box call. */
@@ -53,7 +52,6 @@ export type WorkspacesOptions = {
   logger?: Logger
 }
 
-type SessionState = { hostRepo: string; base: string }
 type Length = "long" | "short"
 
 type Ctx = {
@@ -122,43 +120,13 @@ function checkKey(key: string) {
   if (!SESSION_KEY.test(key)) throw new DelegateError("invalid_input", "The session key is not valid.", "Use 4-64 characters: a-z, 0-9 and '-'.")
 }
 
-const statePath = (ctx: Ctx, key: string) => path.join(ctx.stateDir, `${key}.json`)
-
 const errno = (error: unknown) => (error as NodeJS.ErrnoException | undefined)?.code ?? "unknown"
 
-function writeState(ctx: Ctx, key: string, state: SessionState): void {
-  if (!COMMIT_ID.test(state.base)) throw new DelegateError("upstream_error", "The base commit read from git is not a full commit id.", "Retry oc_start_session.", "invalid base")
-  const file = statePath(ctx, key)
-  try {
-    mkdirSync(ctx.stateDir, { recursive: true })
-    writeFileSync(file, JSON.stringify(state satisfies SessionState))
-  } catch (error) {
-    // A-07: the host path and errno go to detail only.
-    throw new DelegateError("upstream_error", "The bridge could not save this session's workspace record on the host.", "Check the bridge home folder (OPENCODE_DELEGATE_HOME) is writable, then start the session again.", `${errno(error)} ${file}`)
-  }
-}
-
-function readState(ctx: Ctx, key: string): SessionState {
-  const file = statePath(ctx, key)
-  let raw: string
-  try {
-    raw = readFileSync(file, "utf8")
-  } catch (error) {
-    if (errno(error) === "ENOENT") throw new DelegateError("not_found", "This session has no workspace record on the host.", "Start a new session with oc_start_session.", `missing: ${file}`)
-    throw new DelegateError("upstream_error", "The bridge could not read this session's workspace record on the host.", "Check the bridge home folder (OPENCODE_DELEGATE_HOME) is readable, then collect again.", `${errno(error)} ${file}`)
-  }
-  try {
-    const parsed = JSON.parse(raw) as Partial<SessionState>
-    if (typeof parsed.hostRepo === "string" && typeof parsed.base === "string" && COMMIT_ID.test(parsed.base)) return { hostRepo: parsed.hostRepo, base: parsed.base }
-  } catch {
-    // reported below
-  }
-  throw new DelegateError(
-    "not_found",
-    "This session's workspace record on the host is damaged.",
-    `Delete ${key}.json from the bridge's workspaces folder (the bridge log has the full path), then start a new session with oc_start_session.`,
-    `corrupt: ${file}`,
-  )
+/** The host record collect() needs; a missing one is not_found (readHostState throws when damaged). */
+function readState(ctx: Ctx, key: string): HostSessionState {
+  const state = readHostState(ctx.stateDir, key)
+  if (state) return state
+  throw new DelegateError("not_found", "This session has no workspace record on the host.", "Start a new session with oc_start_session.", `missing: ${key}`)
 }
 
 /** The host HEAD commit the session starts from (review A-22). */
@@ -196,7 +164,10 @@ async function moveIntoPlace(ctx: Ctx, tmp: string, final: string, key: string):
 const busy = (key: string) =>
   new DelegateError("directory_busy", `The box already has a workspace for session ${key}.`, "Use a new session key, or end the old session first.")
 
-async function open(ctx: Ctx, hostRepo: string, key: string): Promise<Workspace> {
+/** A workspace plus the host HEAD it was cloned at (verified in the box before open returns). */
+export type OpenedWorkspace = Workspace & { base: string }
+
+async function open(ctx: Ctx, hostRepo: string, key: string): Promise<OpenedWorkspace> {
   checkKey(key)
   const repo = await resolveRepo(ctx, hostRepo)
   const base = await hostHead(ctx, repo)
@@ -206,26 +177,32 @@ async function open(ctx: Ctx, hostRepo: string, key: string): Promise<Workspace>
   const bundle = reserveInBundle(ctx.handoffDir, ctx.boxHandoff, key, ctx.nonce())
   let placed = false
   try {
-    await hostGit(ctx, ["-C", repo, "bundle", "create", bundle.hostPath, "--all"], "bundle the repository", "long")
+    await hostGit(ctx, ["-C", repo, "bundle", "create", bundle.hostPath, "HEAD"], "bundle the repository", "long")
     assertRegularFile(bundle.hostPath, "repository bundle")
     await cloneAt(ctx, bundle.boxPath, tmp, key, base)
     await moveIntoPlace(ctx, tmp, final, key)
     placed = true
     const boxBase = (await boxRun(ctx, ["git", "-C", final, "rev-parse", "HEAD"], "read the base commit")).trim()
     if (boxBase !== base) throw new DelegateError("upstream_error", "The session copy does not start at the repository's HEAD.", "Retry oc_start_session.", "base mismatch")
-    writeState(ctx, key, { hostRepo: repo, base })
+    writeHostState(ctx.stateDir, { sessionKey: key, hostRepo: repo, base, createdAt: new Date().toISOString() })
   } catch (error) {
     await cleanupBox(ctx, placed ? [tmp, final] : [tmp])
     throw error
   } finally {
     removeQuietly(bundle.hostPath)
   }
-  return { sessionKey: key, hostRepo: repo, boxPath: final, branch: `delegate/${key}` }
+  return { sessionKey: key, hostRepo: repo, boxPath: final, branch: `delegate/${key}`, base }
 }
 
 /** Best effort: a failed open must not leave a half-made workspace behind. Never throws. */
 async function cleanupBox(ctx: Ctx, paths: string[]): Promise<void> {
   await ctx.box(["rm", "-rf", "--", ...paths], { timeoutMs: ctx.timeouts.short }).catch(() => undefined)
+}
+
+async function discard(ctx: Ctx, key: string): Promise<void> {
+  if (!SESSION_KEY.test(key)) return
+  await cleanupBox(ctx, [`${ctx.boxSessions}/${key}`])
+  removeHostState(ctx.stateDir, key)
 }
 
 /** Fetch delegate/<key> from a bundle file; git runs no hook from the bundle. Non-fast-forward is refused. */
@@ -274,10 +251,19 @@ async function collect(ctx: Ctx, ws: Workspace) {
 /** Per-call options: the caller's correlation id ties these log lines to its own (A-17). */
 export type CallOptions = { correlationId?: string }
 
-export type DelegateWorkspaces = Workspaces & {
-  open(hostRepo: string, sessionKey: string, call?: CallOptions): Promise<Workspace>
+/** The Workspaces contract, with open() also returning the verified base commit. */
+export type DelegateWorkspaces = Omit<Workspaces, "open" | "collect"> & {
+  open(hostRepo: string, sessionKey: string, call?: CallOptions): Promise<OpenedWorkspace>
   collect(workspace: Workspace, call?: CallOptions): ReturnType<Workspaces["collect"]>
   resolveRepo(hostRepo: string, call?: CallOptions): Promise<string>
+  /** Record the OpenCode session a workspace became (W3C-01): the only source adoption trusts. */
+  bindSession(sessionKey: string, binding: SessionBinding): Promise<HostSessionState>
+  /** The host record for a session key; undefined when there is none (throws when damaged). */
+  sessionState(sessionKey: string): Promise<HostSessionState | undefined>
+  /** Every readable host record, newest first. */
+  listSessionStates(): Promise<HostSessionState[]>
+  /** Best effort (W3A-14): remove the box clone and the host record of a session that never started. Never throws. */
+  discard(sessionKey: string): Promise<void>
 }
 
 /** Anything that is not a DelegateError yet becomes one; its text goes to detail only. */
@@ -325,5 +311,9 @@ export function createWorkspaces(options: WorkspacesOptions): DelegateWorkspaces
     collect: (ws: Workspace, call?: CallOptions) =>
       traced(logger, "collect", call, { sessionKey: ws.sessionKey }, () => collect(ctx, ws), (r) => ({ branch: r.branch, commits: r.commits, hostExecutableChanges: r.hostExecutableChanges.length })),
     resolveRepo: (hostRepo: string, call?: CallOptions) => traced(logger, "resolveRepo", call, {}, () => resolveRepo(ctx, hostRepo)),
+    bindSession: async (key, binding) => bindHostState(ctx.stateDir, key, binding),
+    sessionState: async (key) => readHostState(ctx.stateDir, key),
+    listSessionStates: async () => listHostStates(ctx.stateDir),
+    discard: (key) => discard(ctx, key),
   }
 }

@@ -5,6 +5,7 @@
 // text part (and inbox text), in `untrusted`, ≤500 chars.
 import type { HubEvent, InboxMessage } from "../shared/contracts.ts"
 import { scrub } from "../shared/log.ts"
+import { stripUnsafe } from "../shared/text.ts"
 import type { HubEventInput } from "./buffer.ts"
 import type { Raw } from "./normalise.ts"
 import type { Change, Derived, Link } from "./state.ts"
@@ -106,9 +107,13 @@ export function inboxEvent(message: InboxMessage): HubEventInput {
   return { type: "inbox", summary: `inbox message ${ident(message.id)} ${sender}`, untrusted: untrusted(message.text) }
 }
 
-/** Truncated and secret-scrubbed; commit ids survive. */
+/**
+ * Hidden characters stripped first (W3C-05), so a zero-width character cannot split a secret past
+ * scrub() or count towards the cap; then truncated and secret-scrubbed; commit ids survive.
+ */
 export function untrusted(text: string): string {
-  const cut = text.length > UNTRUSTED_MAX ? text.slice(0, UNTRUSTED_MAX) + "…" : text
+  const visible = stripUnsafe(text)
+  const cut = visible.length > UNTRUSTED_MAX ? visible.slice(0, UNTRUSTED_MAX) + "…" : visible
   return scrub(cut, { keepIds: true })
 }
 

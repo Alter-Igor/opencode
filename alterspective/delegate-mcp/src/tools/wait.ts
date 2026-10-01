@@ -2,16 +2,19 @@
 // Event summaries are bridge words (contracts.ts HubEvent); anything the box supplied is only
 // ever returned under `untrusted`.
 import { z } from "zod"
-import type { HubEvent, WaitUntil } from "../shared/contracts.ts"
-import type { ToolContext } from "./context.ts"
+import type { HubEvent, SessionView, WaitUntil } from "../shared/contracts.ts"
+import type { Box, ToolContext } from "./context.ts"
 import { cursorSchema, formatCursor, ownSession, parseCursor, sessionIdSchema } from "./core-session.ts"
 import { defineTool } from "./define.ts"
 import { ok, untrusted } from "./shape.ts"
 
 export const MAX_WAIT_SEC = 240
-export const DEFAULT_WAIT_SEC = 120
+/** W3A-11: under the common 120 s client tool timeout, with room for the reply. */
+export const DEFAULT_WAIT_SEC = 100
 export const MAX_EVENTS = 200
 const DEFAULT_UNTIL: WaitUntil[] = ["idle", "needs_input", "error"]
+/** States in which a session is still working, so "call again" is the right advice (W3A-03). */
+const RUNNING = new Set(["busy", "retry", "starting"])
 
 export function shapeEvent(e: HubEvent) {
   return {
@@ -41,30 +44,51 @@ async function checkOwned(ctx: ToolContext, ids: string[], correlationId: string
   return box
 }
 
+type WaitArgs = { sessionIDs: string[]; until?: WaitUntil[]; timeoutSec?: number; cursor?: string }
+
+/** W3A-03: the hub this wait ran on was stopped or replaced (restart, reconnect, shutdown). */
+async function hubChanged(ctx: ToolContext, args: WaitArgs) {
+  const fresh = ctx.peekBox() ?? (await ctx.box().catch(() => undefined))
+  const next = fresh ? formatCursor(fresh.hub.cursor()) : undefined
+  const views = fresh ? await Promise.all(args.sessionIDs.map((id) => fresh.hub.view(id))) : []
+  const summary = "The sandbox connection was replaced or stopped during the wait (restart or reconnect), so events may have been missed. Check oc_status, then call oc_wait again with the new cursor."
+  return ok(summary, { still_running: false, hub_changed: true, ...(next ? { next } : {}), views })
+}
+
+function timedOut(timeoutSec: number, next: string, events: ReturnType<typeof shapeEvent>[], states: SessionView[]) {
+  const running = states.some((v) => RUNNING.has(v.state))
+  const list = states.map((v) => `${v.sessionID} ${v.state}`).join("; ")
+  const advice = running ? " Still running: call oc_wait again with the next cursor." : " Check oc_status or oc_pending."
+  return ok(`No matching state after ${timeoutSec} s: ${list}.${advice}`, { still_running: running, next, events, views: states })
+}
+
+async function waitOn(ctx: ToolContext, box: Box, args: WaitArgs) {
+  const timeoutSec = args.timeoutSec ?? DEFAULT_WAIT_SEC
+  const result = await box.hub.wait({ sessionIDs: args.sessionIDs, until: args.until ?? DEFAULT_UNTIL, timeoutMs: timeoutSec * 1000, cursor: parseCursor(args.cursor) })
+  if (ctx.peekBox() !== box) return hubChanged(ctx, args)
+  const page = capEvents(result.events, formatCursor(result.next), 100)
+  if (result.timedOut) return timedOut(timeoutSec, page.next, page.events, await Promise.all(args.sessionIDs.map((id) => box.hub.view(id))))
+  const views = result.views ?? []
+  const matched = [...page.events.filter((e) => e.state).map((e) => `${e.sessionID ?? "?"} ${e.state}`), ...views.map((v) => `${v.sessionID} ${v.state}`)]
+  return ok(`Done waiting: ${matched.join("; ") || "matching event"}.`, { still_running: false, next: page.next, events: page.events, views, ...(page.more ? { more: true } : {}) })
+}
+
 export const waitTool = defineTool({
   name: "oc_wait",
   title: "Wait for sessions",
   description:
-    "Wait until any of the given sessions reaches one of the `until` states (default idle, needs_input, error) or the timeout passes. Pass the cursor from oc_send so nothing that happened after the send is missed. On timeout returns still_running:true and the next cursor: call again.",
+    `Wait until any of the given sessions reaches one of the \`until\` states (default idle, needs_input, error) or the timeout passes (default ${DEFAULT_WAIT_SEC} s). Pass the cursor from oc_send so nothing that happened after the send is missed. ` +
+    "On timeout the summary names each session's state; still_running:true means call again with the next cursor. hub_changed:true means the sandbox connection was replaced during the wait: use the new cursor.",
   input: {
     sessionIDs: z.array(sessionIdSchema).min(1).max(20),
     until: z.array(z.enum(["idle", "needs_input", "error", "message"])).min(1).optional(),
     timeoutSec: z.number().int().min(1).max(MAX_WAIT_SEC).optional().describe(`Default ${DEFAULT_WAIT_SEC}, at most ${MAX_WAIT_SEC}.`),
     cursor: cursorSchema.optional(),
   },
-  annotations: { readOnlyHint: true, idempotentHint: false, openWorldHint: false },
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   async run(args, ctx, correlationId) {
     const box = await checkOwned(ctx, args.sessionIDs, correlationId)
-    const timeoutMs = (args.timeoutSec ?? DEFAULT_WAIT_SEC) * 1000
-    const result = await box.hub.wait({ sessionIDs: args.sessionIDs, until: args.until ?? DEFAULT_UNTIL, timeoutMs, cursor: parseCursor(args.cursor) })
-    const page = capEvents(result.events, formatCursor(result.next), 100)
-    const views = result.views ?? []
-    if (result.timedOut) {
-      const states = await Promise.all(args.sessionIDs.map((id) => box.hub.view(id)))
-      return ok(`Still running after ${timeoutMs / 1000} s. Call oc_wait again with the next cursor.`, { still_running: true, next: page.next, events: page.events, views: states })
-    }
-    const matched = [...page.events.filter((e) => e.state).map((e) => `${e.sessionID ?? "?"} ${e.state}`), ...views.map((v) => `${v.sessionID} ${v.state}`)]
-    return ok(`Done waiting: ${matched.join("; ") || "matching event"}.`, { still_running: false, next: page.next, events: page.events, views, ...(page.more ? { more: true } : {}) })
+    return waitOn(ctx, box, args)
   },
 })
 
@@ -79,7 +103,10 @@ export const eventsTool = defineTool({
   },
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   async run(args, ctx, correlationId) {
-    const box = args.sessionID ? await checkOwned(ctx, [args.sessionID], correlationId) : await ctx.box()
+    const held = ctx.peekBox()
+    // W3A-10: never starts the sandbox. Without a held box there is no event buffer to page.
+    if (!held) return ok("No events: this bridge holds no sandbox connection yet.", { expired: false, events: [] })
+    const box = args.sessionID ? await checkOwned(ctx, [args.sessionID], correlationId) : held
     const page = box.hub.events(parseCursor(args.cursor), args.sessionID ? { sessionID: args.sessionID } : undefined, args.limit ?? 50)
     if (page.expired)
       return ok("That cursor has expired (the sandbox restarted or the buffer moved on). Call oc_status, then page again without a cursor.", { expired: true, events: [], next: formatCursor(page.next) })

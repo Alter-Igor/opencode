@@ -12,6 +12,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { createGuard } from "../src/guard/index.ts"
 import { defaultConfig } from "../src/shared/config.ts"
 import { createLogger } from "../src/shared/log.ts"
+import { createApi, type ApiTarget } from "../src/shared/opencode-api.ts"
 import { createSupervisor, defaultSupervisorDeps } from "../src/supervisor/lifecycle.ts"
 
 type Result = { content?: Array<{ type: string; text?: string }>; structuredContent?: Record<string, unknown>; isError?: boolean }
@@ -30,12 +31,40 @@ function makeRepo(name: string): string {
   return repo
 }
 
+let boxTarget: ApiTarget | undefined
 async function holdLease(): Promise<void> {
   const config = defaultConfig()
   const guard = createGuard(config)
   const repoRoot = path.resolve(import.meta.dir, "..", "..", "..")
   const deps = await defaultSupervisorDeps(config, { bridgeId: `e2e3-holder-${process.pid}`, permission: guard.permissionBaseline("standard"), repoRoot, log: createLogger({ minLevel: "warn" }) })
-  await createSupervisor(deps).ensure()
+  boxTarget = await createSupervisor(deps).ensure()
+}
+
+/**
+ * W3C-01 live check: a session made straight through the box API (as any code in the sandbox
+ * could), whose metadata claims this bridge and points at a real session key of ours. The bridge
+ * must not list it as mine and must refuse to send to it. The forged session is deleted after.
+ */
+async function forgedCheck(victimKey: string): Promise<void> {
+  if (!boxTarget) throw new Error("no box target")
+  const api = createApi(boxTarget)
+  const guard = createGuard(defaultConfig())
+  const metadata = { supervisor: "supervisor:e2e-w3", sessionKey: victimKey, hostRepo: "C:/evil-repo", base: "e".repeat(40), profile: "standard" }
+  const made = await api.call<{ id?: string }>({ method: "POST", path: "/session", directory: `/sessions/${victimKey}`, body: { title: "forged", permission: guard.permissionBaseline("standard"), metadata } })
+  const forgedID = String(made.data?.id ?? "")
+  say(`  forged session via the box API (metadata.supervisor=supervisor:e2e-w3, sessionKey=${victimKey}): HTTP ${made.status} ${forgedID}`)
+  try {
+    const mine = (sc(await call("oc_list_sessions")).sessions as Array<Record<string, unknown>>).some((s) => s.sessionID === forgedID)
+    const all = (sc(await call("oc_list_sessions", { all: true })).sessions as Array<Record<string, unknown>>).find((s) => s.sessionID === forgedID)
+    say(`  forged in default list: ${mine}; in all:true list as mine=${String(all?.mine)} metadataSupervisor=${String(all?.metadataSupervisor)}`)
+    const sent = await call("oc_send", { sessionID: forgedID, message: "say hi" })
+    say(`  oc_send to forged -> ${String(sc(sent).code ?? "ACCEPTED (BAD)")}`)
+    const status = await call("oc_status", { sessionID: forgedID })
+    say(`  oc_status of forged -> ${String(sc(status).code ?? "returned a state (BAD)")}`)
+  } finally {
+    const del = await api.call({ method: "DELETE", path: `/session/${forgedID}`, directory: `/sessions/${victimKey}` })
+    say(`  forged session deleted: HTTP ${del.status}`)
+  }
 }
 
 function connect(logFile: string): { client: Client; transport: StdioClientTransport } {
@@ -70,13 +99,14 @@ async function waitIdle(ids: string[], cursor?: string): Promise<void> {
   if (open.size) throw new Error(`sessions still running: ${[...open].join(",")}`)
 }
 
-async function oneSession(repo: string, file: string, content: string): Promise<{ sessionID: string; cursor: string }> {
+async function oneSession(repo: string, file: string, content: string): Promise<{ sessionID: string; cursor: string; key: string }> {
   const started = await call("oc_start_session", { directory: repo, title: `e2e w3 ${file}`, model: "synapse/auto" })
   const sessionID = String(sc(started).sessionID)
+  const key = String(sc(started).sessionKey)
   const task = `Create a file ${file} containing exactly: ${content}. Then run: git add ${file} && git -c user.email=box@local -c user.name=box commit -m 'box: ${file}'. Reply DONE when finished.`
   const sent = await call("oc_send", { sessionID, message: task })
   say(`  instructions: ${JSON.stringify(sc(sent).instructions)}`)
-  return { sessionID, cursor: String(sc(sent).cursor) }
+  return { sessionID, cursor: String(sc(sent).cursor), key }
 }
 
 async function finish(repo: string, sessionID: string, file: string): Promise<void> {
@@ -116,6 +146,8 @@ async function main(): Promise<void> {
   say(`  codeword answer (untrusted): ${JSON.stringify(answer.slice(0, 80))} -> repo instructions reached the model: ${answer.includes("PINEAPPLE")}`)
   const listed = await call("oc_list_sessions")
   say(`  sessions: ${JSON.stringify((sc(listed).sessions as Array<Record<string, unknown>>).map((s) => [s.sessionID, s.state, s.mine]))}`)
+  say("--- W3C-01: forged metadata ---")
+  await forgedCheck(a.key)
 
   say("--- R6: two sessions in two repos in parallel ---")
   const repoB = makeRepo("demo-b")

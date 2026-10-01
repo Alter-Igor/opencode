@@ -45,8 +45,10 @@ function checkShape(args: Args): void {
 }
 
 async function findPending(ctx: ToolContext, box: Box, args: Args, correlationId: string): Promise<PendingItem> {
-  const { items } = await listPending(ctx, box, undefined, correlationId)
+  const { items, partial } = await listPending(ctx, box, undefined, correlationId)
   const item = items.find((candidate) => candidate.requestID === args.requestID && candidate.kind === args.kind)
+  if (!item && partial)
+    throw new DelegateError("not_found", "That request was not found, but the pending list could only be checked in part (too long or too slow).", "Call oc_pending with the session's sessionID, then answer again.", "partial pending list")
   if (!item)
     throw new DelegateError(
       "not_found",

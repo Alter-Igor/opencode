@@ -1,13 +1,14 @@
 #!/usr/bin/env bun
 // opencode-delegate CLI (bin). `mcp` (default) is the stdio MCP server: in that mode stdout carries
-// MCP frames only, so console.log is sent to stderr and logs go to stderr + <home>/logs (D-1).
+// MCP frames only, so every console method that writes to stdout is sent to stderr (W3A-18) and
+// logs go to stderr + <home>/logs (D-1).
 // Exit codes (CLI-UX-22): 0 ok, 1 error, 2 bad arguments; `watch` passes on its own codes.
 import { spawn } from "node:child_process"
 import path from "node:path"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { isDelegateError } from "./shared/errors.ts"
 import { scrub } from "./shared/log.ts"
-import { createRuntime, readVersion, shutdownSignal, type VersionInfo } from "./runtime.ts"
+import { createRuntime, readVersion, shutdownSignal, type Runtime, type VersionInfo } from "./runtime.ts"
 import { createServer } from "./server.ts"
 import { doctorTool } from "./tools/doctor.ts"
 
@@ -18,7 +19,7 @@ export const HELP = `opencode-delegate — delegate coding work to sandboxed Ope
 Usage:
   opencode-delegate [mcp] [--channels]   Run the stdio MCP server (what an AI client starts)
   opencode-delegate watch [options]      One line per session event that needs attention (see: watch --help)
-  opencode-delegate doctor               Print the oc_doctor report as JSON (read-only; never starts the sandbox)
+  opencode-delegate doctor               Print the oc_doctor report as JSON (never starts the sandbox; exit 1 unless verified)
   opencode-delegate --version [--json]   Print the version
   opencode-delegate -h | --help | help   Show this help
 
@@ -88,10 +89,23 @@ export function formatVersion(info: VersionInfo, json: boolean): string {
   return json ? JSON.stringify(info) : `opencode-delegate ${info.version}`
 }
 
+type ConsoleLike = Pick<Console, "log" | "info" | "debug" | "dir" | "table" | "trace" | "warn" | "error">
+
+/** W3A-18: anything a dependency prints must not corrupt the MCP stream on stdout. */
+export function redirectConsole(target: ConsoleLike = console, write: (text: string) => void = (text) => void process.stderr.write(text)): void {
+  const toErr = (...args: unknown[]) => write(`${args.map((a) => (typeof a === "string" ? a : Bun.inspect(a))).join(" ")}\n`)
+  target.log = toErr
+  target.info = toErr
+  target.debug = toErr
+  target.dir = (item: unknown) => toErr(item)
+  target.table = (data: unknown) => toErr(data)
+  target.trace = (...args: unknown[]) => toErr(...args, new Error("trace").stack ?? "")
+  target.warn = toErr
+  target.error = toErr
+}
+
 async function runMcp(channels: boolean): Promise<number> {
-  // Anything a dependency prints must not corrupt the MCP stream.
-  console.log = console.error
-  console.info = console.error
+  redirectConsole()
   const runtime = await createRuntime()
   const { server, close } = createServer(runtime.ctx, { channels })
   const stopped = shutdownSignal(process)
@@ -103,12 +117,13 @@ async function runMcp(channels: boolean): Promise<number> {
   return EXIT.ok
 }
 
-async function runDoctor(io: Io): Promise<number> {
-  const runtime = await createRuntime()
+/** Exit 0 only when every doctor check ran and passed (W3A-09). */
+export async function runDoctor(io: Io, make: () => Promise<Runtime> = createRuntime): Promise<number> {
+  const runtime = await make()
   try {
     const result = await doctorTool.run({}, runtime.ctx, runtime.ctx.correlationId())
     io.out(JSON.stringify(result.structuredContent ?? {}, null, 2))
-    return result.isError ? EXIT.failed : EXIT.ok
+    return !result.isError && result.structuredContent?.verified === true ? EXIT.ok : EXIT.failed
   } finally {
     await runtime.shutdown("doctor done")
   }

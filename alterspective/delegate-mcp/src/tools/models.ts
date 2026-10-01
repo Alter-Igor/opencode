@@ -33,20 +33,22 @@ export async function fetchModels(api: OpencodeApi, correlationId: string): Prom
   return { models: models.sort(), defaults }
 }
 
-/** Unknown model → refused with the list (edge case 8). */
+/**
+ * Unknown model → refused (edge case 8). The ids are box data, so they are not put in the error
+ * message (W3C-09): oc_list_models returns them as data.
+ */
 export async function requireModel(api: OpencodeApi, model: string, correlationId: string): Promise<void> {
   const { models } = await fetchModels(api, correlationId)
   if (models.includes(model)) return
-  const sample = models.slice(0, 30).join(", ")
-  throw new DelegateError("invalid_input", `The sandbox has no model ${model}. Known models: ${sample || "none"}.`, "Pick one from oc_list_models.")
+  throw new DelegateError("invalid_input", `The sandbox has no model ${model} (${models.length} model${models.length === 1 ? "" : "s"} available).`, "Call oc_list_models and pick one of its ids, for example synapse/auto.")
 }
 
 export const modelsTool = defineTool({
   name: "oc_list_models",
   title: "List sandbox models",
-  description: "List the models the sandbox can use, as provider/model ids (pass one as `model` to oc_start_session or oc_send).",
+  description: "List the models the sandbox can use, as provider/model ids (pass one as `model` to oc_start_session or oc_send). Starts the sandbox if it is not running.",
   input: { provider: z.string().regex(PROVIDER_RE).optional().describe("Only this provider, e.g. synapse.") },
-  annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   async run(args, ctx, correlationId) {
     const box = await ctx.box()
     const list = await fetchModels(box.api, correlationId)

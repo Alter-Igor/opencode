@@ -5,6 +5,7 @@ import { z } from "zod"
 import type { SupervisorStatus } from "../supervisor/status.ts"
 import type { Verdict } from "../shared/contracts.ts"
 import type { McpStatus, OpencodeApi } from "../shared/opencode-api.ts"
+import { KS_NAME } from "../guard/entries.ts"
 import type { ToolContext } from "./context.ts"
 import { defineTool } from "./define.ts"
 import { ok, untrusted } from "./shape.ts"
@@ -57,12 +58,30 @@ function guardReport(verdict: Verdict): Record<string, unknown> {
   return verdict.ok ? { ok: true } : { ok: false, code: verdict.code, reason: untrusted(verdict.reason, 500) }
 }
 
-function summaryOf(status: SupervisorStatus, mcp: McpReport | undefined, verdict: Verdict): string {
-  if (status.state !== "running") return `Sandbox ${status.state}; nothing else checked. Call oc_doctor with start:true, or any session tool, to start it.`
+const ksEntries = (mcp: McpReport | undefined) => (mcp && "entries" in mcp ? mcp.entries.filter((e) => KS_NAME.test(e.name)) : [])
+
+/** W3A-09: true only when every check ran and passed. */
+export function isVerified(status: SupervisorStatus, mcp: McpReport | undefined, verdict: Verdict): boolean {
+  if (status.state !== "running") return false
+  // Every entry a Keystone one and signed in (or switched off): needs_auth / failed is not verified.
+  const entriesOk = mcp !== undefined && "entries" in mcp && mcp.unrecognised === 0 && mcp.entries.every((e) => KS_NAME.test(e.name) && (e.status === "connected" || e.status === "disabled"))
+  return status.imageMatches && status.policyVerified && status.health === "healthy" && entriesOk && verdict.ok
+}
+
+function notRunning(status: Exclude<SupervisorStatus, { state: "running" }>): string {
+  if (status.state === "stopped") return "Sandbox stopped; nothing else checked. Call oc_doctor with start:true, or any session tool, to start it."
+  return "Sandbox unavailable (Docker or the sandbox container could not be read); nothing else checked. Start Docker Desktop, check `docker ps` works, then call oc_doctor again."
+}
+
+/** Bridge words only: MCP entries are named only when they are ks-* entries (W3C-09); others are counted. */
+function summaryOf(status: SupervisorStatus, mcp: McpReport | undefined, verdict: Verdict, verified: boolean): string {
+  if (status.state !== "running") return notRunning(status)
   const built = `image built from ${status.imageBuiltFrom ?? "unknown"}, bridge at ${status.bridgeAt ?? "unknown"}`
-  const checks = `image ${status.imageMatches ? "ok" : "MISMATCH"} (${built}), policy ${status.policyVerified ? "ok" : "MISMATCH"}`
-  const entries = mcp && "entries" in mcp ? mcp.entries.map((e) => `${e.name} ${e.status}`).join(", ") || "no MCP entries" : "MCP list unavailable"
-  return `Sandbox running (${checks}); ${entries}; guard ${verdict.ok ? "ok" : verdict.code}.`
+  const checks = `Docker health ${status.health}, image ${status.imageMatches ? "ok" : "MISMATCH"} (${built}), policy ${status.policyVerified ? "ok" : "MISMATCH"}`
+  const ks = ksEntries(mcp)
+  const others = mcp && "entries" in mcp ? mcp.entries.length - ks.length + mcp.unrecognised : 0
+  const entries = mcp && "entries" in mcp ? `${ks.map((e) => `${e.name} ${e.status}`).join(", ") || "no Keystone entries"}${others ? `, ${others} other entr${others === 1 ? "y" : "ies"}` : ""}` : "MCP list unavailable"
+  return `${verified ? "Verified" : "NOT verified"}: sandbox running (${checks}); ${entries}; guard ${verdict.ok ? "ok" : verdict.code}.`
 }
 
 async function inspect(ctx: ToolContext, start: boolean, correlationId: string) {
@@ -79,18 +98,20 @@ export const doctorTool = defineTool({
   name: "oc_doctor",
   title: "Check the OpenCode sandbox",
   description:
-    "Read-only health check: sandbox state, image and MCP-policy checks, the Keystone MCP entries and their sign-in state, the egress allowlist, the policy guard verdict and this bridge's name and version. Does not start the sandbox unless start is true.",
+    "Health check: sandbox state and Docker health, image and MCP-policy checks, the Keystone MCP entries and their sign-in state, the policy guard verdict and this bridge's name and version, plus the configured egress allowlist and isolation level (configuration, not measured). `verified` is true only when every check ran and passed. Does not start the sandbox unless start is true.",
   input: { start: z.boolean().optional().describe("Start (or reuse) the sandbox first. Default false.") },
-  annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   async run(args, ctx, correlationId) {
     const { status, mcp, verdict, held } = await inspect(ctx, args.start === true, correlationId)
-    return ok(summaryOf(status, mcp, verdict), {
+    const verified = isVerified(status, mcp, verdict)
+    return ok(summaryOf(status, mcp, verdict, verified), {
+      verified,
       bridge: { name: ctx.supervisor.replace(/^supervisor:/, ""), supervisor: ctx.supervisor, bridgeId: ctx.bridgeId, version: ctx.version, holdsBox: held, sessions: ctx.sessions.size },
-      isolation: "S",
+      isolation: { level: "S", source: "configuration" },
       box: boxReport(status),
       mcp: mcp ?? { unavailable: "the sandbox is not running" },
       guard: guardReport(verdict),
-      egressHosts: ctx.config.egressHosts,
+      egressHostsConfigured: ctx.config.egressHosts,
       keystoneOrigin: ctx.config.keystoneOrigin,
       roots: ctx.config.roots,
     })

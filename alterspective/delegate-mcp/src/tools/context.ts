@@ -1,12 +1,13 @@
 // MOD-04 tool context: the services every tool can use, created lazily so the MCP server starts
 // instantly and the box is only started by the first tool that needs it (technical-design §5).
 import type { BridgeConfig } from "../shared/config.ts"
-import type { Guard, Workspaces } from "../shared/contracts.ts"
+import type { Guard } from "../shared/contracts.ts"
 import type { Logger } from "../shared/log.ts"
 import type { ApiTarget, OpencodeApi } from "../shared/opencode-api.ts"
 import type { DelegateHub } from "../events/index.ts"
 import type { BridgeInbox } from "../inbox/index.ts"
 import type { DelegateSupervisor, ReplaceOptions } from "../supervisor/lifecycle.ts"
+import type { DelegateWorkspaces } from "../supervisor/workspaces.ts"
 
 /** A session this bridge started: where it lives on the host and in the box. */
 export type SessionRecord = {
@@ -17,7 +18,7 @@ export type SessionRecord = {
   branch: string
   profile: "standard" | "readonly"
   createdAt: string
-  /** Additive (Wave 3): the host HEAD commit the workspace started from (diff base, instructions source). */
+  /** Additive (Wave 3): the host HEAD commit the workspace started from (diff base), from the host record. */
   base?: string
   /** Additive (Wave 3): defaults for oc_send when it names no model/agent (`provider/model`). */
   model?: string
@@ -41,8 +42,11 @@ export type ToolContext = {
   log: Logger
   guard: Guard
   supervisorService: DelegateSupervisor
-  /** Wave 3: the contract plus `resolveRepo` (oc_start_session checks directory_busy before cloning). */
-  workspaces: Workspaces & { resolveRepo(hostRepo: string): Promise<string> }
+  /**
+   * Wave 3: the contract plus `resolveRepo` (oc_start_session checks directory_busy before cloning)
+   * and the host-only session records (W3C-01): adoption, "mine" and instruction reads trust only these.
+   */
+  workspaces: Pick<DelegateWorkspaces, "open" | "collect" | "resolveRepo" | "bindSession" | "sessionState" | "listSessionStates" | "discard">
   inbox: BridgeInbox
   /** Start or reuse the box and its event hub (idempotent, shared by concurrent calls). */
   box(): Promise<Box>

@@ -3,7 +3,7 @@
 // to subscribers. On every (re)connect, in-stream gap or instance dispose the affected state is
 // re-read from the server while stream events queue, and the queue is applied on top, so a gap can
 // never be papered over by a stale snapshot or a lost `idle`.
-import type { Cursor, EventHub, HubEvent, InboxMessage, SessionView } from "../shared/contracts.ts"
+import { SESSION_ID_RE, type Cursor, type EventHub, type HubEvent, type InboxMessage, type SessionView } from "../shared/contracts.ts"
 import { safeLog, silentLogger, type Logger } from "../shared/log.ts"
 import { createApi, type ApiTarget, type OpencodeApi } from "../shared/opencode-api.ts"
 import { EventBuffer, viewMatches, type Filter, type HubEventInput, type Page, type WaitInput, type WaitResult } from "./buffer.ts"
@@ -45,8 +45,6 @@ export interface DelegateHub extends EventHub {
 /** Stream events queued while a rebuild is in flight; more than this and the stream restarts. */
 const MAX_QUEUED = 10_000
 const MAX_QUEUED_CHARS = 32 * 1024 * 1024
-/** Session ids the hub adopts on its own (trackAll, subagents). */
-const SESSION_ID_RE = /^ses_[A-Za-z0-9]{1,64}$/
 
 type Scope = "all" | Set<string>
 type Queue = { items: string[]; chars: number }

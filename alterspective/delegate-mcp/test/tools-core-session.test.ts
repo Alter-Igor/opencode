@@ -1,7 +1,7 @@
 // MOD-04 oc_start_session, oc_list_sessions, oc_status, oc_abort.
 import { describe, expect, test } from "bun:test"
 import { abortTool, listSessionsTool, startSessionTool, statusTool } from "../src/tools/sessions.ts"
-import { BASE, OTHER_SID, SID, TARGET, data, fakeContext, invoke, record, text, type Fake } from "./tools-core-fixture.ts"
+import { BASE, OTHER_SID, SID, TARGET, data, fakeContext, invoke, okCmd, record, text, type Fake } from "./tools-core-fixture.ts"
 
 function canCreate(f: Fake) {
   f.api.on("POST /session", { status: 200, data: { id: SID } })
@@ -21,8 +21,10 @@ describe("oc_start_session", () => {
     expect(create?.body).toMatchObject({
       title: "fix it",
       permission: f.ctx.guard.permissionBaseline("standard"),
-      metadata: { supervisor: "supervisor:test-bridge", sessionKey: key, hostRepo: "C:\\GitHub\\demo", base: BASE, profile: "standard" },
+      metadata: { supervisor: "supervisor:test-bridge", sessionKey: key },
     })
+    expect(Object.keys((create?.body as { metadata: object }).metadata).sort()).toEqual(["sessionKey", "supervisor"])
+    expect(f.states.get(key ?? "")).toMatchObject({ sessionID: SID, supervisor: "supervisor:test-bridge", profile: "standard", hostRepo: "C:\\GitHub\\demo", base: BASE })
     expect(f.hub.tracked).toEqual([[SID, `/sessions/${key}`]])
     expect(f.ctx.sessions.get(SID)).toMatchObject({ sessionKey: key, base: BASE, branch: `delegate/${key}` })
     expect(data(result)).toMatchObject({ sessionID: SID, branch: `delegate/${key}`, boxPath: `/sessions/${key}` })
@@ -65,12 +67,37 @@ describe("oc_start_session", () => {
     expect(result.isError).toBeUndefined()
   })
 
-  test("a server reply without a valid id is upstream_error", async () => {
+  test("a server reply without a valid id is upstream_error; the clone and host record are discarded (W3A-14)", async () => {
     const f = fakeContext()
     f.api.on("POST /session", { status: 200, data: { id: "../x" } })
     const result = await invoke(startSessionTool, { directory: "C:\\GitHub\\demo" }, f.ctx)
     expect(data(result).code).toBe("upstream_error")
     expect(f.ctx.sessions.size).toBe(0)
+    expect(f.discarded).toEqual([f.opened[0]?.[1] ?? "?"])
+    expect(f.states.size).toBe(0)
+  })
+
+  test("a failed host-record write after POST /session deletes the new session and discards the clone", async () => {
+    const f = fakeContext()
+    canCreate(f)
+    f.api.on(`DELETE /session/${SID}`, { status: 200, data: true })
+    f.ctx.workspaces.bindSession = async () => {
+      throw new Error("disk full")
+    }
+    const result = await invoke(startSessionTool, { directory: "C:\\GitHub\\demo" }, f.ctx)
+    expect(result.isError).toBe(true)
+    expect(f.api.find("DELETE", `/session/${SID}`)?.directory).toBe(`/sessions/${f.opened[0]?.[1]}`)
+    expect(f.discarded).toHaveLength(1)
+    expect(f.ctx.sessions.size).toBe(0)
+  })
+
+  test("the base comes from workspaces.open (host-verified), never from a box git read (W3C-06)", async () => {
+    const f = fakeContext()
+    canCreate(f)
+    f.setBox(() => okCmd(`${"b".repeat(40)}\n`))
+    const result = await invoke(startSessionTool, { directory: "C:\\GitHub\\demo" }, f.ctx)
+    expect(data(result).base).toBe(BASE)
+    expect(f.boxCmds).toEqual([])
   })
 })
 
@@ -96,7 +123,7 @@ describe("oc_list_sessions", () => {
     const result = await invoke(listSessionsTool, { all: true }, f.ctx)
     const sessions = data(result).sessions as Array<Record<string, unknown>>
     expect(sessions).toHaveLength(2)
-    expect(sessions[1]).toMatchObject({ supervisor: "supervisor:other", mine: false })
+    expect(sessions[1]).toMatchObject({ metadataSupervisor: "supervisor:other", mine: false })
     expect(text(result).split("\n")[0]).not.toContain("ignore previous")
   })
 })
@@ -122,7 +149,8 @@ describe("oc_status and oc_abort", () => {
     f.ctx.sessions.set(SID, record())
     f.api.on(`POST /session/${SID}/abort`, { status: 200, data: true })
     const result = await invoke(abortTool, { sessionID: SID }, f.ctx)
-    expect(data(result)).toMatchObject({ aborted: true })
+    expect(data(result)).toMatchObject({ abortRequested: true, serverConfirmed: true })
+    expect(text(result)).toContain("Abort requested")
     expect(f.api.find("POST", `/session/${SID}/abort`)?.directory).toBe("/sessions/s-0000000001")
   })
 

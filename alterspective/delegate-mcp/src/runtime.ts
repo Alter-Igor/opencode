@@ -250,7 +250,11 @@ export async function createRuntime(options: RuntimeOptions = {}): Promise<Runti
   return { ctx, versionInfo, name, shutdown: shutdownOnce(manager, supervisorService, log) }
 }
 
-function shutdownOnce(manager: BoxManager, supervisor: DelegateSupervisor, log: Logger): (reason: string) => Promise<void> {
+/**
+ * One shutdown per process: stop the hub, release the lease. Capped at `capMs` so a hung Docker
+ * call cannot keep the process alive after the MCP client went away (W3A-20 covers the cap).
+ */
+export function shutdownOnce(manager: Pick<BoxManager, "stop">, supervisor: Pick<DelegateSupervisor, "release">, log: Logger, capMs = SHUTDOWN_MS): (reason: string) => Promise<void> {
   let done: Promise<void> | undefined
   return (reason) =>
     (done ??= (async () => {
@@ -260,7 +264,7 @@ function shutdownOnce(manager: BoxManager, supervisor: DelegateSupervisor, log: 
         await supervisor.release().catch((error: unknown) => safeLog(log, "warn", "runtime", "release on shutdown failed", { detail: String(error).slice(0, 200) }))
       })()
       let timer: ReturnType<typeof setTimeout> | undefined
-      const deadline = new Promise<void>((resolve) => (timer = setTimeout(resolve, SHUTDOWN_MS)))
+      const deadline = new Promise<void>((resolve) => (timer = setTimeout(resolve, capMs)))
       await Promise.race([work, deadline])
       if (timer) clearTimeout(timer)
     })())

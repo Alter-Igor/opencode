@@ -8,15 +8,14 @@
 import { z } from "zod"
 import { MAX_TEXT_BYTES } from "../../inbox-sidecar/src/rules.ts"
 import { displayText, senderTrust, wakeText } from "../inbox/index.ts"
-import type { InboxMessage, Verdict } from "../shared/contracts.ts"
+import type { InboxMessage } from "../shared/contracts.ts"
 import { DelegateError } from "../shared/errors.ts"
 import type { Box, SessionRecord, ToolContext } from "./context.ts"
-import { readInstructions } from "./core-box.ts"
-import { SESSION_ID_RE, formatCursor, ownSession, parseModel, sameRules } from "./core-session.ts"
+import { SESSION_ID_RE, ownSession } from "./core-session.ts"
 import { defineTool } from "./define.ts"
+import { checkPolicy, sendPrompt } from "./send.ts"
 import { ok, untrusted } from "./shape.ts"
 
-const enc = encodeURIComponent
 export const MAX_INBOX_PAGE = 100
 
 const TRUST_NOTE =
@@ -25,14 +24,10 @@ const TRUST_NOTE =
 
 type WakeTarget = { record: SessionRecord; box: Box }
 
-function refused(verdict: Exclude<Verdict, { ok: true }>): DelegateError {
-  return new DelegateError(verdict.code, "The session failed the bridge's policy checks, so it was not woken.", "Run oc_doctor; restart the sandbox with oc_server_restart if the profile changed.", verdict.reason)
-}
-
 /**
- * A wake is a send, so it passes the same checks as oc_send, BEFORE anything is posted: the session
- * is ours (started or adopted by this bridge), its permission rules still match the baseline (H3),
- * and the runtime guard passes (§3.5).
+ * A wake is a send, so it passes the same checks as oc_send (send.ts checkPolicy), BEFORE anything
+ * is posted: the session is ours (started or adopted through its host record), its permission
+ * rules still match the baseline (H3), and the runtime guard passes (§3.5).
  */
 async function prepareWake(ctx: ToolContext, to: string, correlationId: string): Promise<WakeTarget> {
   const sessionID = to.startsWith("session:") ? to.slice("session:".length) : ""
@@ -40,30 +35,19 @@ async function prepareWake(ctx: ToolContext, to: string, correlationId: string):
     throw new DelegateError("policy_violation", "Only a session this bridge started can be woken.", "Post without wake, or wake one of this bridge's sessions (oc_list_sessions).")
   const box = await ctx.box()
   const { record, remote } = await ownSession(ctx, box, sessionID, correlationId, true)
-  if (!sameRules(remote?.permission, ctx.guard.permissionBaseline(record.profile)))
-    throw refused({ ok: false, code: "policy_violation", reason: "session.permission differs from permissionBaseline" })
-  const verdict = await ctx.guard.checkRuntime(box.api, record.boxPath)
-  if (!verdict.ok) throw refused(verdict)
+  await checkPolicy(ctx, box, record, remote?.permission, "it was not woken")
   return { record, box }
 }
 
-/** Deliver the stored message as a prompt; returns the hub cursor taken BEFORE the send (for oc_wait). */
+/** Deliver the stored message as a prompt (send.ts sendPrompt); returns the cursor taken BEFORE the send. */
 async function wake(ctx: ToolContext, target: WakeTarget, message: InboxMessage, correlationId: string): Promise<string> {
-  const { box, record } = target
-  const instructions = await readInstructions(ctx, record)
-  const body = {
-    parts: [{ type: "text", text: wakeText(message) }],
-    ...(record.model ? { model: parseModel(record.model) } : {}),
-    ...(record.agent ? { agent: record.agent } : {}),
-    ...(instructions.system ? { system: instructions.system } : {}),
+  try {
+    return (await sendPrompt(ctx, target.box, target.record, { text: wakeText(message), correlationId })).cursor
+  } catch (error) {
+    if (!(error instanceof DelegateError)) throw error
+    const action = error.code === "not_found" ? "Use oc_list_sessions." : "Retry the wake with oc_send, or run oc_doctor."
+    throw new DelegateError(error.code, `The message was stored, but the session was not woken: ${error.message}`, action, error.detail)
   }
-  const cursor = box.hub.cursor()
-  const res = await box.api.call<unknown>({ method: "POST", path: `/session/${enc(record.sessionID)}/prompt_async`, directory: record.boxPath, body, correlationId })
-  if (res.status === 404) throw new DelegateError("not_found", "The message was stored, but the session no longer exists, so it was not woken.", "Use oc_list_sessions.", "HTTP 404")
-  if (res.status < 200 || res.status >= 300)
-    throw new DelegateError("upstream_error", "The message was stored, but the session could not be woken.", "Retry the wake with oc_send, or run oc_doctor.", `HTTP ${res.status}`)
-  box.hub.markSent(record.sessionID)
-  return formatCursor(cursor)
 }
 
 export const ocPost = defineTool({
