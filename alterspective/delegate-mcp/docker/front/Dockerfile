@@ -12,7 +12,7 @@ USER root
 # openssl makes the internal CA and the leaf certificate at start (entrypoint.sh).
 # /ca/private holds the CA key (front-only volume); /ca/public holds the CA certificate the box
 # trusts (mounted read-only in the box). The volumes copy this ownership on first use.
-RUN apk add --no-cache openssl \
+RUN apk add --no-cache openssl flock \
  && rm -f /etc/nginx/conf.d/default.conf \
  && mkdir -p /etc/nginx/front /etc/nginx/front-gen /ca/private /ca/public \
  && chown nginx:nginx /ca/private /ca/public \

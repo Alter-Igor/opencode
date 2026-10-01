@@ -10,6 +10,8 @@ The host keeps a rotated refresh token in the secret store or bridge memory befo
 
 `front-reload` copies `servers.conf` and the auth include into front-only storage, checks the copies, and gives nginx immutable paths. It tests the config, signals the master, then waits at most 20 seconds for a worker to return a unique attempt ID and the source hashes. A signal alone is not success. Timed-out copies remain available for a late reload; old copies are pruned after a new worker acknowledges. Failed loads are retried on the next bridge tick without rotating a fresh token again.
 
+Container-side calls hold a nonblocking `flock` on an open descriptor through worker acknowledgement. The lock file is never unlinked. Process exit closes the descriptor; a hard kill therefore cannot leave a stale directory lock. Short-lived child processes may retain their inherited descriptor until they exit. The pinned front image explicitly installs Alpine's `flock` package.
+
 Doctor reads the worker marker on front's loopback port 19091, checks the immutable files against those hashes, then compares the source config, auth shape, host include and allowed model routes. The listener returns no credential and is not published or reachable from the box. An unavailable marker fails verification. `nginx -T` and a file written by the reload caller do not prove what a worker loaded.
 
 ## 0. The key fact that shaped revision 2

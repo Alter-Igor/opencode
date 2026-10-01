@@ -6,6 +6,7 @@
 - Retain rotated refresh tokens before publishing proxy config, including when storage and state writes fail together.
 - Retry failed proxy loads on the next bridge tick.
 - Verify a reload through a new nginx worker reply. The proxy loads checked private copies, and doctor reports unknown state when it cannot verify the running config.
+- Release the proxy reload lock when its helper dies, so later reloads can retry.
 
 Tracks [#59](https://github.com/Alter-Igor/opencode/issues/59) and [#60](https://github.com/Alter-Igor/opencode/issues/60).
 

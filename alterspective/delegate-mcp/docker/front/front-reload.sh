@@ -80,9 +80,12 @@ esac
 
 mkdir -p "$RUN/generations" "$RUN/attempts" || exit 6
 # Host callers also hold the Synapse lock. This bounds direct or overlapping container calls.
-mkdir "$RUN/reload.lock" 2>/dev/null || { log "another reload is running"; exit 8; }
-STAGE=$(mktemp -d "$RUN/generations/.stage.XXXXXX") || { rmdir "$RUN/reload.lock"; exit 6; }
-trap 'rm -rf "$STAGE"; rmdir "$RUN/reload.lock"' EXIT
+# Keep the descriptor open through acknowledgement; the kernel releases it even on SIGKILL.
+# Never remove the lock file: a new inode could let overlapping callers acquire separate locks.
+exec 9>"$RUN/reload.lock" || exit 6
+flock -n 9 || { log "another reload is running"; exit 8; }
+STAGE=$(mktemp -d "$RUN/generations/.stage.XXXXXX") || exit 6
+trap 'rm -rf "$STAGE"' EXIT
 snapshot || exit $?
 [ "${1:-}" = --start ] && exit 0
 # nginx's own messages may quote config text: never pass them on.

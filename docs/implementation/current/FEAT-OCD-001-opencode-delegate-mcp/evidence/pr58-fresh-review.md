@@ -32,7 +32,7 @@ The accepted PR #58 residuals remain: the box can fill Docker volumes; the host 
 
 All tests and typechecking used the owner's work queue. Bridge tests ran in light-lane batches of at most four files, from the bridge package, with `bun test --timeout 30000`.
 
-- Full package run: **879 pass, 0 fail, 25 skip**, across 66 files. The skips include the opt-in live suite and the Windows symlink test. The separate live run below exercised the opt-in suite.
+- Full package run before the 0.1.1 version bump: **879 pass, 0 fail, 25 skip**, across 66 files. The skips include the opt-in live suite and the Windows symlink test. The separate live run below exercised the opt-in suite. The final focused 39-test run missed a hardcoded version expectation; the PR #61 follow-up below records its failure and repair.
 - Bridge typecheck: `bun x tsc --noEmit -p .`, exit 0.
 - Final lint: `bun x oxlint --format json alterspective/delegate-mcp`, exit 0, **0 errors and 356 warnings**. The same command on base reported 353 warnings. Four newly reported warnings concern awaiting Bun's `.rejects` assertions (typed as non-thenable); those awaits are retained so asynchronous failures are observed. Other new lint warnings were fixed. This is not a warning-free lint result.
 - After the final error-type guard, test lint cleanup and version update: **39 pass, 0 fail** across recovery, manager, filesystem retry and CLI tests; typecheck passed again.
@@ -54,6 +54,40 @@ The exact queue form was:
 On this machine it is invoked through native Git Bash from PowerShell so `cmd.exe` receives normalized switches. The runner remains the first command inside Bash. The live egress build used the heavy lane.
 
 No visual check applies to these CLI/proxy changes. No merge, production promotion or owner-box restart is included in this evidence.
+
+## PR #61 follow-up: a killed reload helper
+
+[CodeRabbit comment 4156609197](https://github.com/Alter-Igor/opencode/pull/61#discussion_r4156609197) identified a stale directory lock at `front-reload.sh:83–85` in `fd41f85fea8cead63492b4b5ccdc5dfa66b9f659`. This is a Medium availability fault. First, the source trace showed that `SIGKILL` cannot run the `EXIT` trap that removes the directory. Second, the real-nginx proof paused its own master, started one helper, rejected a competing helper, killed the exact first helper PID, and retried. Queue PID 39744 failed as expected:
+
+```json
+{"whileOwnerRunning":8,"killedOwnerExit":137,"retryAfterOwnerDeath":8}
+```
+
+The fix holds a nonblocking `flock` on descriptor 9 through the worker reply. It leaves the lock file in place so every caller locks the same inode. Both directory-removal paths were removed, including the staging-failure path in the suggested patch. The [Linux lock contract](https://man7.org/linux/man-pages/man2/flock.2.html) says the lock ends when all inherited descriptors close. A short-lived helper child may delay release until that child exits; the regression allows that bounded wait. The Dockerfile explicitly installs [Alpine's flock package](https://pkgs.alpinelinux.org/package/v3.23/main/x86_64/flock).
+
+Queue PID 102312 built the pinned Dockerfile as `ocd-review-flock:pr61`, image digest `sha256:76b384b042762d40d92017d683a508de6e7fcc22363ce600e1b56d7216c194ba`. It installed `flock 2.41.6-r1`. Queue PID 78304 passed the same real-nginx proof, including the existing delayed-load, changed-source, timeout and identical-content cases:
+
+```json
+{"whileOwnerRunning":8,"killedOwnerExit":137,"retryAfterOwnerDeath":0}
+{"stageFailureExit":6,"lockFileKept":true,"retryAfterStageFailure":0}
+```
+
+The proof uses `spike/review-reload-proof.ts` with `OCD_RELOAD_PROOF_IMAGE=ocd-review-flock:pr61`. It owns a networkless, read-only scratch container, has no host mounts or real credentials, and removes that container in `finally`. The owner box was not changed. The root agent independently reviewed the descriptor lifetime, unchanged inode, staging error path and exact-PID kill proof; it found no blocker.
+
+Final verification on the unchanged base `f20d17082ec9da05a7e02ac3cf95571f98cdd913`:
+
+- Windows initially failed five shell cases because Git Bash has no `flock`. Those cases now require both `sh` and `flock`; no fake lock was added. All **7 shell tests passed** in Linux using the existing box's Bun and real `flock`, a read-only package mount, no network and a temporary `/tmp` (queue PID 82648).
+- The first full rerun caught the old `0.1.0` expectation in `tools-core-runtime.test.ts`; the package had already moved to `0.1.1`. The expected prefix now comes from `package.json`. No runtime version code changed.
+- The final full rerun passed **874 tests, 0 failed, 30 skipped**, across all 66 files in 17 batches of at most four files (queue PID 51972). The five extra skips above were exercised separately in Linux. Bridge `bun run typecheck` also passed. Lint passed with **0 errors and 356 warnings**, unchanged from the earlier receipt.
+- The live route suite rebuilt front and passed **22 tests, 0 failed** (queue PID 76180). It used the unchanged `opencode-delegate-box:1.18.31-bc1a3343c278` box image. The scratch Compose project was removed.
+
+Every build and check used the work queue. The full-run command list and output are `C:\Users\IgorJericevich\AppData\Local\Temp\ocd-pr61-flock-checks.cmd` and `C:\Users\IgorJericevich\AppData\Local\Temp\ocd-pr61-flock-tests.log`. The live proof's exact command inside the PowerShell-to-Git-Bash wrapper was:
+
+```text
+"C:/Users/IgorJericevich/Desktop/This Rig/scripts/automation/work-queue/bin/thisrig-work-queue.exe" run --lane light -- "C:/Windows/System32/cmd.exe" //d //c "cd /d X:\opencode---delegate-hardening\alterspective\delegate-mcp && set OCD_RELOAD_PROOF_IMAGE=ocd-review-flock:pr61&& C:\Users\IgorJericevich\.bun\bin\bun.exe spike/review-reload-proof.ts"
+```
+
+RAG returned no useful lock-specific lesson; the lessons README was checked. The correction was recorded in Synapse Coder as candidate `8c431934-027d-48b1-8255-d5096288b455`; it was not promoted. README, changelog and technical design describe the new recovery behavior. No visual check applies to this shell/proxy change.
 
 ## Documentation and rules
 

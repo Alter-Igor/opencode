@@ -121,6 +121,56 @@ kill -CONT "$master"
 wait "$reload_pid"
 printf '{"identicalContentWaitedForNewWorker":%s}\n' "$same_waiting"
 [ "$same_waiting" = true ]
+# A caller killed inside the container cannot leave a lock that blocks every later reload.
+kill -STOP "$master"
+while ! grep -Eq '^State:[[:space:]]+T' /proc/$master/status; do sleep 0.01; done
+previous=$(cat /tmp/front/current.conf)
+sh /tmp/proof/reload.sh > /tmp/proof/killed.log 2>&1 &
+reload_pid=$!
+attempt=0
+while [ "$(cat /tmp/front/current.conf)" = "$previous" ] && [ "$attempt" -lt 100 ]; do
+ sleep 0.05
+ attempt=$((attempt+1))
+done
+[ "$(cat /tmp/front/current.conf)" != "$previous" ]
+set +e
+sh /tmp/proof/reload.sh > /tmp/proof/contender.log 2>&1
+contender_exit=$?
+kill -KILL "$reload_pid"
+wait "$reload_pid" 2>/dev/null
+killed_exit=$?
+set -e
+kill -CONT "$master"
+# A short-lived child may still hold the inherited descriptor until it returns.
+attempt=0
+retry_exit=8
+while [ "$retry_exit" = 8 ] && [ "$attempt" -lt 50 ]; do
+ sleep 0.1
+ set +e
+ sh /tmp/proof/reload.sh > /tmp/proof/retry.log 2>&1
+ retry_exit=$?
+ set -e
+ attempt=$((attempt+1))
+done
+printf '{"whileOwnerRunning":%s,"killedOwnerExit":%s,"retryAfterOwnerDeath":%s}\\n' "$contender_exit" "$killed_exit" "$retry_exit"
+[ "$contender_exit" = 8 ] && [ "$killed_exit" = 137 ] && [ "$retry_exit" = 0 ]
+# A staging failure also releases the descriptor, without unlinking another caller's lock file.
+cat > /tmp/proof/bin/mktemp <<'FAIL'
+#!/bin/sh
+exit 1
+FAIL
+chmod +x /tmp/proof/bin/mktemp
+set +e
+sh /tmp/proof/reload.sh --start > /tmp/proof/stage-failure.log 2>&1
+stage_exit=$?
+set -e
+rm /tmp/proof/bin/mktemp
+lock_kept=false
+[ -f /tmp/front/reload.lock ] && lock_kept=true
+sh /tmp/proof/reload.sh > /tmp/proof/stage-retry.log 2>&1
+printf '{"stageFailureExit":%s,"lockFileKept":%s,"retryAfterStageFailure":0}\\n' "$stage_exit" "$lock_kept"
+[ "$stage_exit" = 6 ] && [ "$lock_kept" = true ]
+! grep -q rmdir /tmp/proof/stage-failure.log
 `
 
 const image = process.env.OCD_RELOAD_PROOF_IMAGE

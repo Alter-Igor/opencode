@@ -2,7 +2,7 @@
 // `front-reload` script, which refuses (exit 3, no reload) when servers.conf is not the file front
 // started with (OCD_FRONT_HASH) or the Synapse include is not the strict one-variable file. The
 // entrypoint runs the same check at start (Low 4). The script is run here with `sh` and a fake
-// `nginx` on PATH when `sh` is available.
+// `nginx` on PATH when `sh` and `flock` are available (Git Bash lacks flock).
 import { describe, expect, test } from "bun:test"
 import { createHash } from "node:crypto"
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
@@ -18,6 +18,7 @@ const read = (name: string) => readFileSync(path.join(FRONT, name), "utf8")
 describe("front-reload is baked into front and is the only reload path", () => {
   test("the Dockerfile installs it executable and strips CR; the entrypoint checks before nginx starts", () => {
     const dockerfile = read("Dockerfile")
+    expect(dockerfile).toMatch(/apk add --no-cache[^\n]*\bflock\b/)
     expect(dockerfile).toContain("COPY --chmod=0755 front-reload.sh /usr/local/bin/front-reload")
     expect(dockerfile).toMatch(/sed -i 's\/\\r\$\/\/' [^\n]*\/usr\/local\/bin\/front-reload/)
     const entry = read("entrypoint.sh")
@@ -40,7 +41,7 @@ describe("front-reload is baked into front and is the only reload path", () => {
 const sh = Bun.which("sh")
 const sha = (text: string) => createHash("sha256").update(text).digest("hex")
 
-describe.skipIf(!sh)("front-reload run with sh (fake nginx)", () => {
+describe.skipIf(!sh || !Bun.which("flock"))("front-reload run with sh (fake nginx)", () => {
   const SERVERS = "server { listen 443; }\n"
   const HASH = createHash("sha256").update(SERVERS).digest("hex")
   const TOKEN = jwt({ sub: "oid-1" })

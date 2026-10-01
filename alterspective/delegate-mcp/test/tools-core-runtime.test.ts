@@ -6,6 +6,7 @@ import type { ApiTarget } from "../src/shared/opencode-api.ts"
 import { silentLogger } from "../src/shared/log.ts"
 import { FakeApi, FakeHub, record } from "./tools-core-fixture.ts"
 import { EventEmitter } from "node:events"
+import { version } from "../package.json"
 
 describe("bridge name and version", () => {
   test("OPENCODE_DELEGATE_NAME is validated; default is claude-<6 hex>", () => {
@@ -17,11 +18,11 @@ describe("bridge name and version", () => {
 
   test("version is <package>-dev+<sha>, with .dirty when the package has changes", async () => {
     const clean = await readVersion(async (argv) => ({ code: 0, stdout: argv.includes("rev-parse") ? "abc1234def\n" : "", stderr: "" }), {})
-    expect(clean).toMatchObject({ version: "0.1.0-dev+abc1234def", sha: "abc1234def", dirty: false, built: null })
+    expect(clean).toMatchObject({ version: `${version}-dev+abc1234def`, sha: "abc1234def", dirty: false, built: null })
     const dirty = await readVersion(async (argv) => ({ code: 0, stdout: argv.includes("rev-parse") ? "abc1234\n" : " M src/x.ts\n", stderr: "" }), { APP_BUILD_DATE: "2026-10-01T00:00:00Z" })
-    expect(dirty.version).toBe("0.1.0-dev+abc1234.dirty")
-    expect(JSON.parse(formatVersion(dirty, true))).toMatchObject({ version: "0.1.0-dev+abc1234.dirty", built: "2026-10-01T00:00:00Z" })
-    expect(formatVersion(dirty, false)).toBe("opencode-delegate 0.1.0-dev+abc1234.dirty")
+    expect(dirty.version).toBe(`${version}-dev+abc1234.dirty`)
+    expect(JSON.parse(formatVersion(dirty, true))).toMatchObject({ version: `${version}-dev+abc1234.dirty`, built: "2026-10-01T00:00:00Z" })
+    expect(formatVersion(dirty, false)).toBe(`opencode-delegate ${version}-dev+abc1234.dirty`)
   })
 })
 
