@@ -105,6 +105,39 @@ describe("oc_doctor live checks", () => {
     }
   })
 
+  test("review L6: every chosen Keystone entry must be listed by GET /mcp and signed in (or switched off)", async () => {
+    const all = fakeContext({ boxHeld: false })
+    all.api.on("GET /mcp", { status: 200, data: CHOSEN })
+    all.live.value = liveOk
+    expect(data(await invoke(doctorTool, {}, all.ctx))).toMatchObject({ verified: true })
+    const { ["ks-seqlogs"]: _gone, ...missing } = CHOSEN
+    for (const statuses of [missing, { ...CHOSEN, "ks-seqlogs": { status: "disabled" } }]) {
+      const f = fakeContext({ boxHeld: false })
+      f.api.on("GET /mcp", { status: 200, data: statuses })
+      f.live.value = liveOk
+      const result = await invoke(doctorTool, {}, f.ctx)
+      expect(data(result)).toMatchObject({ verified: statuses === missing ? false : true })
+      if (statuses === missing) expect(text(result)).toContain("ks-seqlogs missing")
+    }
+  })
+
+  test("review L7: a missing or failing ks-rag-read says rag-read is the owner's private id and how others set their own", async () => {
+    for (const status of [undefined, "needs_auth", "failed"]) {
+      const f = fakeContext({ boxHeld: false })
+      const { ["ks-rag-read"]: _gone, ...rest } = CHOSEN
+      f.api.on("GET /mcp", { status: 200, data: status === undefined ? rest : { ...CHOSEN, "ks-rag-read": { status } } })
+      f.live.value = liveOk
+      const result = await invoke(doctorTool, {}, f.ctx)
+      expect(data(result)).toMatchObject({ verified: false })
+      expect(text(result)).toContain("`rag-read` is the owner's private Keystone connection id")
+      expect(text(result)).toContain("OPENCODE_DELEGATE_KEYSTONE and OPENCODE_DELEGATE_KEYSTONE_ALLOWED")
+    }
+    const f = fakeContext({ boxHeld: false })
+    f.api.on("GET /mcp", { status: 200, data: CHOSEN })
+    f.live.value = liveOk
+    expect(text(await invoke(doctorTool, {}, f.ctx))).not.toContain("private Keystone connection id")
+  })
+
   test("entries removed earlier are reported by name (Keystone cannot revoke them for the bridge)", async () => {
     const f = fakeContext({ boxHeld: false })
     f.api.on("GET /mcp", { status: 200, data: CHOSEN })

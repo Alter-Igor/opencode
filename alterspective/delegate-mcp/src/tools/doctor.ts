@@ -66,6 +66,30 @@ function guardReport(verdict: Verdict): Record<string, unknown> {
 
 const ksEntries = (mcp: McpReport | undefined) => (mcp && "entries" in mcp ? mcp.entries.filter((e) => KS_NAME.test(e.name)) : [])
 
+/**
+ * Review L6: every CHOSEN Keystone connection must be listed by GET /mcp and be signed in or switched
+ * off. A chosen entry the box does not list (`missing`) is not verified.
+ */
+export const keystoneEntriesOk = (keystone: KeystoneReport) =>
+  !("unavailable" in keystone) && keystone.entries !== undefined && keystone.entries.every((e) => e.status === "connected" || e.status === "disabled")
+
+/** The id of the owner's private read-only RAG connection in the default set (issue #56, review L7). */
+const OWNER_RAG_READ = "rag-read"
+
+/**
+ * Review L7: `rag-read` is the owner's private Keystone connection id. When it is missing or not
+ * signed in, say so, and how anyone else uses their own connection over the same service.
+ */
+export function keystoneEntriesHint(keystone: KeystoneReport): string {
+  if ("unavailable" in keystone) return ""
+  const notReady = (keystone.entries ?? []).filter((e) => e.status !== "connected" && e.status !== "disabled")
+  if (notReady.length === 0) return ""
+  const list = ` Chosen Keystone entries not ready: ${notReady.map((e) => `${e.name} ${e.status}`).join(", ")}.`
+  const entry = notReady.find((e) => e.id === OWNER_RAG_READ)
+  if (!entry) return `${list} Run oc_login for them.`
+  return `${list} \`${OWNER_RAG_READ}\` is the owner's private Keystone connection id. If you are the owner, run oc_login {server: "ks-${OWNER_RAG_READ}"}. Anyone else creates their own connection over the Keystone service \`rag-read\` and sets its id in OPENCODE_DELEGATE_KEYSTONE and OPENCODE_DELEGATE_KEYSTONE_ALLOWED (README "Keystone services").`
+}
+
 /** W3A-09: true only when every check ran and passed. */
 export function isVerified(status: SupervisorStatus, mcp: McpReport | undefined, verdict: Verdict): boolean {
   if (status.state !== "running") return false
@@ -144,17 +168,21 @@ function liveWords(live: Exclude<SynapseReport["live"], { unavailable: string }>
 
 export function synapseLine(report: SynapseReport): string {
   if (report.state === "needs_sign_in") return ` Synapse: NEEDS SIGN-IN (no model calls until then; run oc_login {server: "synapse"})${report.lastError ? `; last error: ${report.lastError}` : ""}.`
+  if (report.state === "include_empty")
+    return ` Synapse: signed in${report.user ? ` as ${report.user}` : ""}, but front's include has NO token (it was re-created or emptied); no model calls until the bridge writes it again on its next renewal tick (every 15 s)${report.lastError ? `; last error: ${report.lastError}` : ""}. If it lasts, run oc_login {server: "synapse"}.`
   if (report.state === "expired")
     return ` Synapse: token EXPIRED at ${report.expiresAt ?? "unknown"}; no model calls until a renewal works. The bridge keeps retrying${report.nextRetryAt ? ` (next ${report.nextRetryAt})` : ""}${report.lastError ? `; last error: ${report.lastError}` : ""}. If it lasts, run oc_login {server: "synapse"}.`
   const live = "unavailable" in report.live ? `front: ${report.live.unavailable}` : liveWords(report.live)
-  return ` Synapse: signed in${report.user ? ` as ${report.user}` : ""}${report.actor ? ` via ${report.actor}` : ""}, token until ${report.expiresAt}, renews from ${report.refreshAt}; ${live}.`
+  // Review M3: `nginx -T` shows the files nginx WOULD load; this says whether it reloaded since the write.
+  const loaded = report.loadedSinceWrite ? "" : `; front has NOT loaded the include written last (last reload: ${report.lastReload ? `${report.lastReload.result} at ${report.lastReload.at}` : "none recorded"}; restart the sandbox if it lasts)`
+  return ` Synapse: signed in${report.user ? ` as ${report.user}` : ""}${report.actor ? ` via ${report.actor}` : ""}, token until ${report.expiresAt}, renews from ${report.refreshAt}; ${live}${loaded}.`
 }
 
 export const doctorTool = defineTool({
   name: "oc_doctor",
   title: "Check the OpenCode sandbox",
   description:
-    "Health check: sandbox state and Docker health, image, MCP-policy and front-config checks, the chosen Keystone services (`keystone`: the box-wide set, saved or default, each entry's sign-in state, the owner's allowed list `ceiling` and high-risk `warnings`), live checks (`live`: sign-ins stored in the box are only for the chosen set, front's loaded config and mount modes; entries removed earlier), the owner's Synapse token (`synapse`: signed_in / expired / needs_sign_in, expiry and renewal time, refresh token stored on the host, front's loaded auth include has the strict shape; never a value), the policy guard verdict and this bridge's name and version, plus the configured egress allowlist, the egress control check (the TLS front generated from that allowlist and the Keystone set, no CONNECT proxy) and isolation level (configuration, not measured). `verified` is true only when every check ran and passed. Does not start the sandbox unless start is true.",
+    "Health check: sandbox state and Docker health, image, MCP-policy and front-config checks, the chosen Keystone services (`keystone`: the box-wide set, saved or default, each entry's sign-in state, the owner's allowed list `ceiling` and high-risk `warnings`), live checks (`live`: sign-ins stored in the box are only for the chosen set, front's loaded config and mount modes; entries removed earlier), the owner's Synapse token (`synapse`: signed_in / include_empty / expired / needs_sign_in, expiry and renewal time, refresh token stored on the host, front's loaded auth include has the strict shape, and the last reload result and whether front loaded the include written last; never a value), the policy guard verdict and this bridge's name and version, plus the configured egress allowlist, the egress control check (the TLS front generated from that allowlist and the Keystone set, no CONNECT proxy) and isolation level (configuration, not measured). `verified` is true only when every check ran and passed. Does not start the sandbox unless start is true.",
   input: { start: z.boolean().optional().describe("Start (or reuse) the sandbox first. Default false.") },
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   async run(args, ctx, correlationId) {
@@ -162,8 +190,8 @@ export const doctorTool = defineTool({
     const keystone = keystoneReport(ctx.config, mcp && "entries" in mcp ? statusMap(mcp) : undefined)
     const egress = egressFor(ctx, keystone)
     const synapse = await ctx.synapse.status()
-    const verified = isVerified(status, mcp, verdict) && egress.ok && !("unavailable" in keystone) && live?.ok === true && synapse.ok
-    return ok(`${summaryOf(status, mcp, verdict, verified)} ${keystoneLine(keystone)}.${egressSummary(egress)}${liveSummary(live)}${synapseLine(synapse)}`, {
+    const verified = isVerified(status, mcp, verdict) && egress.ok && keystoneEntriesOk(keystone) && live?.ok === true && synapse.ok
+    return ok(`${summaryOf(status, mcp, verdict, verified)} ${keystoneLine(keystone)}.${keystoneEntriesHint(keystone)}${egressSummary(egress)}${liveSummary(live)}${synapseLine(synapse)}`, {
       verified,
       synapse,
       bridge: { name: ctx.supervisor.replace(/^supervisor:/, ""), supervisor: ctx.supervisor, bridgeId: ctx.bridgeId, version: ctx.version, holdsBox: held, sessions: ctx.sessions.size },

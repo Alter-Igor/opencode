@@ -16,6 +16,7 @@ export const SIGNED_IN: SynapseReport = {
   store: "memory",
   hostFile: { shapeOk: true, hasToken: true },
   pendingSave: false,
+  loadedSinceWrite: true,
   live: { shapeOk: true, hasToken: true, matchesHost: true, routesOk: true },
   ok: true,
 }

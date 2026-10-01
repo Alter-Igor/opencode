@@ -4,8 +4,9 @@
 // includes the file. It is NOT covered by OCD_FRONT_HASH: it changes on every refresh.
 //
 // The file can only ever set one nginx variable to "" or to "Bearer <JWT>". The writer refuses any
-// other value, and oc_doctor checks the loaded copy against the same strict shape, so the include
-// cannot be used to change anything else in front. Token values are never logged or returned.
+// other value; front's baked `front-reload` (docker/front/front-reload.sh, review M1) and its
+// entrypoint refuse any file of another shape, and oc_doctor checks the copy `nginx -T` shows against
+// the same strict shape, so the include cannot be used to change anything else in front. Token values are never logged or returned.
 import { chmod, mkdir, readFile, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { renameWithRetry } from "./fs-retry.ts"
@@ -50,9 +51,23 @@ export async function writeAuthConf(frontDir: string, token: string | undefined)
   await renameWithRetry(tmp, file)
 }
 
-/** Before `compose up`: front's include must exist. A missing or malformed file becomes the empty one. */
+/**
+ * Before `compose up`: front's include must exist. Review L5: a missing file is CREATED only (`wx`),
+ * so a sign-in that writes the token at the same moment is never overwritten; a file that cannot be
+ * read right now (a rename in flight) is left alone. Only a file read as malformed becomes the empty
+ * one (fail closed: at worst that removes a token, which the next refresh tick writes again).
+ */
 export async function ensureAuthConf(frontDir: string): Promise<void> {
+  await mkdir(frontDir, { recursive: true })
+  const created = await writeFile(authConfPath(frontDir), authConf(undefined), { encoding: "utf8", mode: 0o600, flag: "wx" }).then(
+    () => true,
+    (error: unknown) => {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") return false
+      throw error
+    },
+  )
+  if (created) return
   const text = await readFile(authConfPath(frontDir), "utf8").catch(() => undefined)
-  if (text !== undefined && isAuthConf(text)) return
+  if (text === undefined || isAuthConf(text)) return
   await writeAuthConf(frontDir, undefined)
 }

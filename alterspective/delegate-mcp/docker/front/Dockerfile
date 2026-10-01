@@ -21,8 +21,10 @@ RUN apk add --no-cache openssl \
 COPY nginx.conf /etc/nginx/nginx.conf
 COPY upstream.conf hosts.txt /etc/nginx/front/
 COPY --chmod=0755 entrypoint.sh /usr/local/bin/front-entrypoint
+# Review M1: the bridge reloads front only through this script (checks the files first).
+COPY --chmod=0755 front-reload.sh /usr/local/bin/front-reload
 # Belt and braces with .gitattributes: a Windows checkout may still hand us CRLF files.
-RUN sed -i 's/\r$//' /usr/local/bin/front-entrypoint /etc/nginx/nginx.conf /etc/nginx/front/*
+RUN sed -i 's/\r$//' /usr/local/bin/front-entrypoint /usr/local/bin/front-reload /etc/nginx/nginx.conf /etc/nginx/front/*
 USER nginx
 EXPOSE 443
 ENTRYPOINT ["/usr/local/bin/front-entrypoint"]
