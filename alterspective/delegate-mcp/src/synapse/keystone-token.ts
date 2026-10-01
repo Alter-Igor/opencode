@@ -8,7 +8,7 @@
 // - refresh: POST /api/oidc/token, grant_type=refresh_token, client_id=opencode + client secret.
 // Errors carry the HTTP status and Keystone's error code only, never a token or a key.
 import { DelegateError } from "../shared/errors.ts"
-import { JWT_RE } from "./auth-conf.ts"
+import { isTokenShape } from "./auth-conf.ts"
 
 export const HANDOFF_APP_ID = "opencode"
 export const SYNAPSE_AUDIENCE = "synapse"
@@ -18,9 +18,23 @@ export const SYNAPSE_CALLBACK_PATH = "/auth/callback"
 export const TOKEN_PATH = "/api/oidc/token"
 export const LOGIN_PATH = "/api/auth/login"
 const ERROR_CODE = /^[a-z_]{1,64}$/
+/** Keystone calls give up after this (review L5); a hung call must not hold the refresh lock. */
+export const KEYSTONE_TIMEOUT_MS = 30_000
 
 export type TokenSet = { accessToken: string; refreshToken?: string; expiresInSec: number }
 export type Fetch = (input: string, init: RequestInit) => Promise<Response>
+
+/** Decoded JWT payload (not verified: Keystone verifies it on the exchange). */
+export function jwtClaims(token: string): Record<string, unknown> | undefined {
+  const part = token.split(".")[1]
+  if (!part) return undefined
+  try {
+    const value = JSON.parse(Buffer.from(part, "base64url").toString("utf8")) as unknown
+    return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined
+  } catch {
+    return undefined
+  }
+}
 
 export const synapseRedirectUri = (port = SYNAPSE_LOGIN_PORT) => `http://127.0.0.1:${port}${SYNAPSE_CALLBACK_PATH}`
 
@@ -54,14 +68,22 @@ async function tokenCall(fetcher: Fetch, origin: string, body: URLSearchParams, 
     redirect: "error",
     headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json", "User-Agent": "opencode-delegate", ...auth },
     body,
+    signal: AbortSignal.timeout(KEYSTONE_TIMEOUT_MS),
   }).catch(() => undefined)
   if (!response) throw new DelegateError("upstream_error", `Keystone could not be reached for the Synapse token ${step}.`, "Check the network, then retry.", `${step}: fetch failed`)
   const json = (await response.json().catch(() => ({}))) as { access_token?: unknown; refresh_token?: unknown; expires_in?: unknown; error?: unknown }
   const code = typeof json.error === "string" && ERROR_CODE.test(json.error) ? json.error : "unknown"
   if (!response.ok || typeof json.access_token !== "string") throw tokenError(step, response.status, code)
-  if (!JWT_RE.test(json.access_token)) throw new DelegateError("upstream_error", "Keystone returned a Synapse token the bridge does not recognise.", "Run oc_login {server: \"synapse\"} again.", `${step}: token shape`)
-  const expires = typeof json.expires_in === "number" && json.expires_in > 0 ? json.expires_in : 3600
+  if (!isTokenShape(json.access_token)) throw new DelegateError("upstream_error", "Keystone returned a Synapse token the bridge does not recognise.", "Run oc_login {server: \"synapse\"} again.", `${step}: token shape`)
+  const expires = lifetimeSec(json.access_token, typeof json.expires_in === "number" && json.expires_in > 0 ? json.expires_in : 3600)
   return { accessToken: json.access_token, ...(typeof json.refresh_token === "string" && json.refresh_token ? { refreshToken: json.refresh_token } : {}), expiresInSec: expires }
+}
+
+/** min(expires_in, the JWT's own `exp`) (review L4): never trust the token past either. */
+export function lifetimeSec(token: string, expiresIn: number, nowMs = Date.now()): number {
+  const exp = jwtClaims(token)?.exp
+  if (typeof exp !== "number") return expiresIn
+  return Math.max(0, Math.min(expiresIn, Math.floor(exp - nowMs / 1000)))
 }
 
 function tokenError(step: string, status: number, code: string): DelegateError {

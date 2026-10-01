@@ -10,8 +10,9 @@ import { DEFAULT_PROJECT, defaultConfig, projectName } from "../src/shared/confi
 import { DelegateError } from "../src/shared/errors.ts"
 import { boxEnvOverride, composeEnv } from "../src/supervisor/compose-env.ts"
 import { FRONT_AUTH_PLACEHOLDER, buildProfile } from "../src/supervisor/profile.ts"
-import { AUTH_CONF_SHAPE, authConf, authConfPath, ensureAuthConf, isAuthConf, writeAuthConf } from "../src/synapse/auth-conf.ts"
+import { AUTH_CONF_SHAPE, MAX_TOKEN_LENGTH, authConf, authConfPath, ensureAuthConf, isAuthConf, writeAuthConf } from "../src/synapse/auth-conf.ts"
 import { liveAuth } from "../src/synapse/index.ts"
+import { SYNAPSE_ROUTES, expectedSynapseLocations, locationLines } from "../src/synapse/front-routes.ts"
 import { synapseLine } from "../src/tools/doctor.ts"
 import { SIGNED_IN, jwt } from "./synapse-fixture.ts"
 
@@ -22,6 +23,14 @@ describe("synapse-auth.conf", () => {
     expect(authConf(undefined)).toMatch(AUTH_CONF_SHAPE)
     expect(authConf(TOKEN)).toMatch(AUTH_CONF_SHAPE)
     expect(authConf(TOKEN).split("\n").filter((line) => line && !line.startsWith("#"))).toEqual([`set $synapse_auth "Bearer ${TOKEN}";`])
+  })
+
+  test("L3: a token longer than the cap is refused; one at the cap is accepted", () => {
+    const at = jwt({ sub: "x", pad: "p".repeat(4000) })
+    const capped = `${at.split(".")[0]}.${at.split(".")[1]!.slice(0, MAX_TOKEN_LENGTH - at.split(".")[0]!.length - 45)}.${"s".repeat(43)}`
+    expect(capped.length).toBe(MAX_TOKEN_LENGTH)
+    expect(isAuthConf(authConf(capped))).toBe(true)
+    expect(() => authConf(`${capped}x`)).toThrow()
   })
 
   test("refuses any value that could change other nginx config", () => {
@@ -47,15 +56,30 @@ describe("generated front servers", () => {
   const servers = frontServersFor(defaultConfig({}))
   const block = (host: string) => servers.slice(servers.indexOf(`server_name ${host};`), servers.indexOf("}\n}", servers.indexOf(`server_name ${host};`)))
 
-  test("the synapse server drops the box's Authorization and x-api-key and sets the owner's token", () => {
+  test("H1: the synapse server refuses every path (no token) except the exact model routes", () => {
     const synapse = block("synapse2-api.alterspective.com.au")
-    const lines = synapse.split("\n").map((line) => line.trim())
-    expect(lines).toContain('set $synapse_auth "";')
-    expect(lines).toContain("include /etc/nginx/front-gen/synapse-auth.conf;")
-    expect(lines).toContain("proxy_set_header Authorization $synapse_auth;")
-    expect(lines).toContain('proxy_set_header x-api-key "";')
-    // The variable starts empty BEFORE the include, so a missing token sends no credential at all.
-    expect(lines.indexOf('set $synapse_auth "";')).toBeLessThan(lines.indexOf("include /etc/nginx/front-gen/synapse-auth.conf;"))
+    expect(locationLines(synapse)).toEqual(expectedSynapseLocations())
+    expect(expectedSynapseLocations()).toEqual(["location / {", "location = /v1/chat/completions {", "location = /v1/models {"])
+    const catchAll = synapse.slice(synapse.indexOf("location / {"), synapse.indexOf("}", synapse.indexOf("location / {")))
+    expect(catchAll).toContain("return 403;")
+    expect(catchAll).not.toContain("synapse_auth")
+    expect(catchAll).not.toContain("proxy_pass")
+  })
+
+  test("each model route: its methods only, no query, fixed upstream path, box credentials dropped, owner's token set", () => {
+    const synapse = block("synapse2-api.alterspective.com.au")
+    for (const route of SYNAPSE_ROUTES) {
+      const at = synapse.indexOf(`location = ${route.path} {`)
+      const body = synapse.slice(at, synapse.indexOf("\n    }", at)).split("\n").map((line) => line.trim())
+      expect(body).toContain(`limit_except ${route.methods.join(" ")} { deny all; }`)
+      expect(body).toContain("if ($is_args) { return 403; }")
+      expect(body).toContain(`proxy_pass https://$front_upstream${route.path};`)
+      expect(body).toContain("proxy_set_header Authorization $synapse_auth;")
+      expect(body).toContain('proxy_set_header x-api-key "";')
+      // The variable starts empty BEFORE the include, so a missing token sends no credential at all.
+      expect(body.indexOf('set $synapse_auth "";')).toBeLessThan(body.indexOf("include /etc/nginx/front-gen/synapse-auth.conf;"))
+    }
+    expect(SYNAPSE_ROUTES).toEqual([{ path: "/v1/chat/completions", methods: ["POST"] }, { path: "/v1/models", methods: ["GET"] }])
   })
 
   test("the Keystone server does not get the Synapse token", () => {
@@ -69,17 +93,29 @@ describe("generated front servers", () => {
   })
 })
 
-describe("doctor: front's loaded include", () => {
-  const dump = (section: string) => `# configuration file /etc/nginx/nginx.conf:\nhttp {}\n\n# configuration file /etc/nginx/front-gen/synapse-auth.conf:\n${section}\n# configuration file /etc/nginx/front/upstream.conf:\nproxy_ssl_server_name on;\n\n`
+describe("doctor: front's loaded include and routes", () => {
+  const servers = frontServersFor(defaultConfig({}))
+  const dump = (section: string, loadedServers = servers) =>
+    `# configuration file /etc/nginx/nginx.conf:\nhttp {}\n\n# configuration file /etc/nginx/front-gen/servers.conf:\n${loadedServers}\n# configuration file /etc/nginx/front-gen/synapse-auth.conf:\n${section}\n# configuration file /etc/nginx/front/upstream.conf:\nproxy_ssl_server_name on;\n\n`
   const execWith = (stdout: string, code = 0) => async () => ({ code, stdout, stderr: "" })
+  const good = authConf(TOKEN)
 
-  test("shape and token presence are reported; the value is not", async () => {
-    const live = await liveAuth(execWith(dump(authConf(TOKEN))), "c-front")
-    expect(live).toEqual({ shapeOk: true, hasToken: true })
+  test("shape, token presence, same file as this home, model routes only; never the value", async () => {
+    const live = await liveAuth(execWith(dump(good)), "c-front", good)
+    expect(live).toEqual({ shapeOk: true, hasToken: true, matchesHost: true, routesOk: true })
     expect(JSON.stringify(live)).not.toContain(TOKEN)
-    expect(await liveAuth(execWith(dump(authConf(undefined))), "c-front")).toEqual({ shapeOk: true, hasToken: false })
-    expect(await liveAuth(execWith(dump(`${authConf(TOKEN)}return 200;\n`)), "c-front")).toEqual({ shapeOk: false, hasToken: false })
-    expect(await liveAuth(execWith("", 1), "c-front")).toHaveProperty("unavailable")
+    expect(await liveAuth(execWith(dump(authConf(undefined))), "c-front", authConf(undefined))).toMatchObject({ shapeOk: true, hasToken: false })
+    expect(await liveAuth(execWith(dump(`${good}return 200;\n`)), "c-front", good)).toMatchObject({ shapeOk: false, hasToken: false, matchesHost: false })
+    expect(await liveAuth(execWith("", 1), "c-front", good)).toHaveProperty("unavailable")
+  })
+
+  test("L6: front loaded another home's include: not matching", async () => {
+    expect(await liveAuth(execWith(dump(authConf(jwt({ sub: "someone-else" })))), "c-front", good)).toMatchObject({ matchesHost: false })
+  })
+
+  test("H1: a loaded synapse server that forwards the whole host is caught", async () => {
+    const old = servers.replace(/location = \/v1\/models \{/, "location /v1/ {")
+    expect(await liveAuth(execWith(dump(good, old)), "c-front", good)).toMatchObject({ routesOk: false })
   })
 
   test("the doctor line names states, never values", () => {

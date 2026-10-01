@@ -1,29 +1,45 @@
 // WS2 (#48): the owner's delegated Synapse token, kept and renewed on the HOST.
 // - Sign-in (oc_login {server:"synapse"} / `opencode-delegate login synapse`): handoff → exchange
-//   (offline) → refresh token into the secret store, access token into front's include, reload.
-// - Renewal: every bridge ticks; when the token is past `refreshFraction` of its lifetime (0.8), one
-//   bridge at a time (a lock in the bridge home, start-lock.ts) refreshes, writes the include and
-//   reloads front. Others see the new state file and do nothing.
-// - Fail closed: no refresh token, a refused refresh, or an expired token → the include is emptied,
-//   so front sends no credential and Synapse answers 401. oc_doctor says "needs sign-in".
+//   (offline) → access token into front's include, refresh token into the secret store, reload.
+// - Renewal (refresh.ts): every bridge ticks; past `refreshFraction` of the token's life (0.8), one
+//   bridge at a time (a lock in the bridge home) refreshes, writes the include and reloads front.
+// - Two kinds of failure (review M2):
+//   - Keystone REFUSED the refresh, or no refresh token is stored: "needs sign-in" (failClosed).
+//   - Anything passing (Keystone down, a store read error): keep retrying with backoff. The token
+//     stays in front until it expires; then the include is emptied (no credential leaves front)
+//     but the bridge keeps retrying, and front gets a token again as soon as a refresh works.
+// - A refresh token that could not be saved stays in memory and is saved on later ticks (M1).
 // State on disk (<home>/synapse/state.json) holds times and the owner's id claims, never a token.
+// Every write of the include or the state happens under the lock (review L1).
+import { randomUUID } from "node:crypto"
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises"
 import path from "node:path"
-import { DelegateError, isDelegateError } from "../shared/errors.ts"
+import { DelegateError } from "../shared/errors.ts"
 import { safeLog, type Logger } from "../shared/log.ts"
 import type { Exec } from "../supervisor/docker.ts"
-import { authConfHasToken, authConfPath, writeAuthConf } from "./auth-conf.ts"
-import { catchHandoff, jwtClaims } from "./handoff-login.ts"
-import { exchangeHandoff, refreshSynapse, type Fetch, type TokenSet } from "./keystone-token.ts"
+import { writeAuthConf } from "./auth-conf.ts"
+import { catchHandoff } from "./handoff-login.ts"
+import { exchangeHandoff, jwtClaims, type Fetch, type TokenSet } from "./keystone-token.ts"
 import type { AppSecrets } from "./secrets.ts"
 import type { SecretStore } from "./secret-store.ts"
 
 export const DEFAULT_REFRESH_FRACTION = 0.8
 export const TICK_MS = 15_000
 
-export type TokenState = { obtainedAt: number; expiresAt: number; user?: string; actor?: string; lastError?: string; needsSignIn?: boolean }
+export type TokenState = {
+  obtainedAt: number
+  expiresAt: number
+  user?: string
+  actor?: string
+  lastError?: string
+  /** Keystone refused, or nothing is stored: only a new sign-in helps. */
+  needsSignIn?: boolean
+  /** Passing failures in a row, and when the next attempt may run (backoff). */
+  failures?: number
+  retryAt?: number
+}
 export type Reload = "reloaded" | "front_not_running" | "config_invalid"
-export type Refreshed = { outcome: "fresh" | "refreshed" | "failed_closed"; reload?: Reload; error?: string }
+export type Refreshed = { outcome: "fresh" | "refreshed" | "retrying" | "expired" | "failed_closed"; reload?: Reload; error?: string }
 
 export type SynapseDeps = {
   home: string
@@ -31,6 +47,8 @@ export type SynapseDeps = {
   origin: string
   frontContainer: string
   store: SecretStore
+  /** A rotated refresh token the store could not save yet (this bridge only, never on disk unencrypted). */
+  memory: { pendingRefresh?: string }
   secrets: () => Promise<AppSecrets>
   fetch: Fetch
   exec: Exec
@@ -55,17 +73,20 @@ export async function readState(home: string): Promise<TokenState | undefined> {
   }
 }
 
-async function writeState(home: string, state: TokenState): Promise<void> {
+export async function writeState(home: string, state: TokenState): Promise<void> {
   const file = stateFile(home)
   await mkdir(path.dirname(file), { recursive: true })
-  await writeFile(`${file}.tmp`, JSON.stringify(state, null, 2), { encoding: "utf8", mode: 0o600 })
-  await rename(`${file}.tmp`, file)
+  const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`
+  await writeFile(tmp, JSON.stringify(state, null, 2), { encoding: "utf8", mode: 0o600 })
+  await rename(tmp, file)
 }
 
 /** When a refresh is due: `fraction` of the way through the token's lifetime. */
 export const refreshAt = (state: Pick<TokenState, "obtainedAt" | "expiresAt">, fraction: number) => state.obtainedAt + Math.floor((state.expiresAt - state.obtainedAt) * fraction)
 
-export const isDue = (state: TokenState | undefined, now: number, fraction: number) => state !== undefined && !state.needsSignIn && now >= refreshAt(state, fraction)
+/** Due: past the renewal point and the backoff, and not waiting for a sign-in. */
+export const isDue = (state: TokenState | undefined, now: number, fraction: number) =>
+  state !== undefined && !state.needsSignIn && now >= Math.max(refreshAt(state, fraction), state.retryAt ?? 0)
 
 /** Check, then reload. A config nginx refuses is never loaded (front keeps the last good one). */
 export async function reloadFront(exec: Exec, container: string): Promise<Reload> {
@@ -78,21 +99,45 @@ export async function reloadFront(exec: Exec, container: string): Promise<Reload
   return reload.code === 0 ? "reloaded" : "config_invalid"
 }
 
-/** Take a fresh token set: refresh token to the store, access token to front, state, reload. */
+/**
+ * Take a fresh token set (call under the lock): access token to front and state first, so a store
+ * failure can never throw the new tokens away (M1); then the refresh token to the store, or to
+ * memory when the store fails (saved on a later tick).
+ */
 export async function adopt(deps: SynapseDeps, tokens: TokenSet): Promise<Reload> {
-  if (tokens.refreshToken) await deps.store.write(tokens.refreshToken)
   await writeAuthConf(deps.frontDir, tokens.accessToken)
   const claims = jwtClaims(tokens.accessToken) ?? {}
   const act = claims.act && typeof claims.act === "object" ? (claims.act as Record<string, unknown>).sub : undefined
   const user = typeof claims.email === "string" ? claims.email : typeof claims.sub === "string" ? claims.sub : undefined
   const now = deps.now()
-  await writeState(deps.home, { obtainedAt: now, expiresAt: now + tokens.expiresInSec * 1000, ...(user ? { user } : {}), ...(typeof act === "string" ? { actor: act } : {}) })
+  const state: TokenState = { obtainedAt: now, expiresAt: now + tokens.expiresInSec * 1000, ...(user ? { user } : {}), ...(typeof act === "string" ? { actor: act } : {}) }
+  await writeState(deps.home, state)
+  if (tokens.refreshToken) {
+    deps.memory.pendingRefresh = tokens.refreshToken
+    await savePending(deps)
+  }
   return reloadFront(deps.exec, deps.frontContainer)
 }
 
-/** Empty the include and mark the state: no credential leaves front until the owner signs in again. */
+/** Save a refresh token held in memory; on failure keep it and record why (no value). */
+export async function savePending(deps: SynapseDeps): Promise<void> {
+  const pending = deps.memory.pendingRefresh
+  if (pending === undefined) return
+  const saved = await deps.store.write(pending).then(() => true, () => false)
+  const state = await readState(deps.home)
+  if (saved) {
+    deps.memory.pendingRefresh = undefined
+    if (state?.lastError?.startsWith("refresh token not saved")) await writeState(deps.home, { ...state, lastError: undefined })
+    return
+  }
+  safeLog(deps.log, "warn", "synapse", "synapse refresh token not saved; kept in memory, will retry", { store: deps.store.kind })
+  if (state) await writeState(deps.home, { ...state, lastError: `refresh token not saved (${deps.store.kind}); retrying` })
+}
+
+/** Keystone refused, or nothing is stored (call under the lock): empty the include; only a sign-in helps. */
 export async function failClosed(deps: SynapseDeps, reason: string): Promise<Refreshed> {
   await writeAuthConf(deps.frontDir, undefined)
+  deps.memory.pendingRefresh = undefined
   const state = await readState(deps.home)
   await writeState(deps.home, { obtainedAt: state?.obtainedAt ?? 0, expiresAt: state?.expiresAt ?? 0, ...(state?.user ? { user: state.user } : {}), lastError: reason.slice(0, 200), needsSignIn: true })
   safeLog(deps.log, "warn", "synapse", "synapse token failed closed", { reason: reason.slice(0, 200) })
@@ -110,50 +155,4 @@ export async function signIn(deps: SynapseDeps): Promise<{ reload: Reload; user?
   const state = await readState(deps.home)
   safeLog(deps.log, "info", "synapse", "synapse sign-in adopted", { reload, expiresAt: state?.expiresAt })
   return { reload, ...(state?.user ? { user: state.user } : {}), expiresAt: state?.expiresAt ?? 0 }
-}
-
-/** Refresh when due (or `force`), one bridge at a time. Never throws for a refused refresh: it fails closed. */
-export async function refreshIfDue(deps: SynapseDeps, force = false): Promise<Refreshed> {
-  if (!force && !isDue(await readState(deps.home), deps.now(), deps.refreshFraction)) return expireIfPast(deps)
-  return deps.lock(async () => {
-    // Another bridge may have refreshed while this one waited for the lock.
-    const state = await readState(deps.home)
-    if (!force && !isDue(state, deps.now(), deps.refreshFraction)) return { outcome: "fresh" as const }
-    const refreshToken = await deps.store.read().catch(() => undefined)
-    if (!refreshToken) return failClosed(deps, "no stored refresh token")
-    try {
-      const tokens = await refreshSynapse(deps.fetch, deps.origin, refreshToken, (await deps.secrets()).clientSecret)
-      const reload = await adopt(deps, tokens)
-      safeLog(deps.log, "info", "synapse", "synapse token refreshed", { reload, rotated: tokens.refreshToken !== undefined })
-      return { outcome: "refreshed" as const, reload }
-    } catch (error) {
-      const reason = isDelegateError(error) ? (error.detail ?? error.message) : "refresh failed"
-      if (isDelegateError(error) && error.code === "needs_auth") return failClosed(deps, reason)
-      safeLog(deps.log, "warn", "synapse", "synapse refresh failed; will retry", { reason: reason.slice(0, 200) })
-      return expireIfPast(deps, reason)
-    }
-  })
-}
-
-/** An access token past its expiry is removed from front even when the refresh only failed for now. */
-async function expireIfPast(deps: SynapseDeps, reason?: string): Promise<Refreshed> {
-  const state = await readState(deps.home)
-  const conf = await readFile(authConfPath(deps.frontDir), "utf8").catch(() => "")
-  if (state && deps.now() >= state.expiresAt && authConfHasToken(conf)) return failClosed(deps, reason ?? "access token expired")
-  return reason ? { outcome: "fresh", error: reason } : { outcome: "fresh" }
-}
-
-/** The renewal loop of one bridge. Returns a stop function. Errors are logged by code, never thrown. */
-export function startRefreshLoop(deps: SynapseDeps, tickMs = TICK_MS): () => void {
-  let running = false
-  const tick = async () => {
-    if (running) return
-    running = true
-    await refreshIfDue(deps).catch((error: unknown) => safeLog(deps.log, "warn", "synapse", "synapse refresh tick failed", { reason: isDelegateError(error) ? error.code : "error" }))
-    running = false
-  }
-  const timer = setInterval(() => void tick(), tickMs)
-  timer.unref?.()
-  void tick()
-  return () => clearInterval(timer)
 }

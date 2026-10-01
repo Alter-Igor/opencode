@@ -3,7 +3,7 @@
 import { describe, expect, test } from "bun:test"
 import { DelegateError } from "../src/shared/errors.ts"
 import { jwt } from "./synapse-fixture.ts"
-import { exchangeHandoff, handoffLoginUrl, refreshSynapse, synapseRedirectUri, type Fetch } from "../src/synapse/keystone-token.ts"
+import { exchangeHandoff, handoffLoginUrl, lifetimeSec, refreshSynapse, synapseRedirectUri, type Fetch } from "../src/synapse/keystone-token.ts"
 
 const ORIGIN = "https://identity.alterspective.com.au"
 const ACCESS = jwt({ sub: "oid-1", email: "owner@example.test", aud: "synapse", act: { sub: "service:opencode" } })
@@ -39,6 +39,8 @@ describe("exchange (RFC 8693)", () => {
     expect(call.init.method).toBe("POST")
     expect(call.init.redirect).toBe("error")
     expect((call.init.headers as Record<string, string>).Authorization).toBe("Bearer broker-key")
+    // L5: every Keystone call has a timeout, so a hung call cannot hold the refresh lock.
+    expect(call.init.signal).toBeInstanceOf(AbortSignal)
     expect(Object.fromEntries(call.form)).toEqual({
       grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
       subject_token_type: "urn:ietf:params:oauth:token-type:jwt",
@@ -90,5 +92,15 @@ describe("refresh", () => {
       throw new Error("ECONNREFUSED")
     }
     expect(((await refreshSynapse(down, ORIGIN, "rt", "s").catch((e: unknown) => e)) as DelegateError).code).toBe("upstream_error")
+  })
+})
+
+describe("L4: lifetime = min(expires_in, JWT exp)", () => {
+  test("the shorter of the two wins; no exp claim keeps expires_in", () => {
+    const now = 1_790_000_000_000
+    expect(lifetimeSec(jwt({ exp: now / 1000 + 600 }), 3600, now)).toBe(600)
+    expect(lifetimeSec(jwt({ exp: now / 1000 + 7200 }), 3600, now)).toBe(3600)
+    expect(lifetimeSec(jwt({ sub: "x" }), 3600, now)).toBe(3600)
+    expect(lifetimeSec(jwt({ exp: now / 1000 - 5 }), 3600, now)).toBe(0)
   })
 })

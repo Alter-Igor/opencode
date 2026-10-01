@@ -133,10 +133,20 @@ function liveSummary(live: LiveChecks | undefined): string {
 }
 
 /** WS2 (#48): the owner's Synapse token, by state only (never a value). */
+function liveWords(live: Exclude<SynapseReport["live"], { unavailable: string }>): string {
+  const problems = [
+    ...(live.shapeOk && live.hasToken ? [] : ["front's loaded include is NOT the expected one-variable file with a token"]),
+    ...(live.matchesHost ? [] : ["front loaded a different include than this bridge home's (another home?)"]),
+    ...(live.routesOk ? [] : ["front's synapse routes are NOT the allowed model routes"]),
+  ]
+  return problems.length === 0 ? "front has it loaded, model routes only" : problems.join("; ")
+}
+
 export function synapseLine(report: SynapseReport): string {
   if (report.state === "needs_sign_in") return ` Synapse: NEEDS SIGN-IN (no model calls until then; run oc_login {server: "synapse"})${report.lastError ? `; last error: ${report.lastError}` : ""}.`
-  if (report.state === "expired") return ` Synapse: token EXPIRED at ${report.expiresAt ?? "unknown"} (renewal failing${report.lastError ? `: ${report.lastError}` : ""}; run oc_login {server: "synapse"} if it lasts).`
-  const live = "unavailable" in report.live ? `front: ${report.live.unavailable}` : report.live.shapeOk && report.live.hasToken ? "front has it loaded" : "front's loaded copy is NOT the expected one-variable file"
+  if (report.state === "expired")
+    return ` Synapse: token EXPIRED at ${report.expiresAt ?? "unknown"}; no model calls until a renewal works. The bridge keeps retrying${report.nextRetryAt ? ` (next ${report.nextRetryAt})` : ""}${report.lastError ? `; last error: ${report.lastError}` : ""}. If it lasts, run oc_login {server: "synapse"}.`
+  const live = "unavailable" in report.live ? `front: ${report.live.unavailable}` : liveWords(report.live)
   return ` Synapse: signed in${report.user ? ` as ${report.user}` : ""}${report.actor ? ` via ${report.actor}` : ""}, token until ${report.expiresAt}, renews from ${report.refreshAt}; ${live}.`
 }
 

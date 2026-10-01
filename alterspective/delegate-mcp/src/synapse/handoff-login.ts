@@ -6,24 +6,12 @@
 import { randomBytes } from "node:crypto"
 import http from "node:http"
 import { DelegateError } from "../shared/errors.ts"
-import { SYNAPSE_CALLBACK_PATH, SYNAPSE_LOGIN_PORT, handoffLoginUrl, synapseRedirectUri } from "./keystone-token.ts"
+import { SYNAPSE_CALLBACK_PATH, SYNAPSE_LOGIN_PORT, handoffLoginUrl, jwtClaims, synapseRedirectUri } from "./keystone-token.ts"
 import { JWT_RE } from "./auth-conf.ts"
 
 export const SIGN_IN_TIMEOUT_MS = 5 * 60 * 1000
 
 export type HandoffOptions = { origin: string; opener: (url: string) => void; port?: number; timeoutMs?: number }
-
-/** Decoded JWT payload (not verified: Keystone verifies it on the exchange). */
-export function jwtClaims(token: string): Record<string, unknown> | undefined {
-  const part = token.split(".")[1]
-  if (!part) return undefined
-  try {
-    const value = JSON.parse(Buffer.from(part, "base64url").toString("utf8")) as unknown
-    return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined
-  } catch {
-    return undefined
-  }
-}
 
 /** Open the browser, wait for the callback, return the handoff JWT. */
 export async function catchHandoff(options: HandoffOptions): Promise<string> {
@@ -59,7 +47,11 @@ function listen(port: number, nonce: string): { server: http.Server; handoff: Pr
     const url = new URL(req.url ?? "/", `http://127.0.0.1:${port}`)
     if (url.pathname !== SYNAPSE_CALLBACK_PATH || done) return reply(res, 404, "Not found.")
     const token = url.searchParams.get("handoff") ?? ""
+    // Review L2: an error only ends THIS attempt when it carries this attempt's nonce (or state);
+    // any page could otherwise cancel the owner's sign-in with a crafted link.
+    const carried = url.searchParams.get("nonce") ?? url.searchParams.get("state")
     if (url.searchParams.get("error")) {
+      if (carried !== nonce) return reply(res, 400, "This sign-in link does not match. Start the sign-in again.")
       done = true
       fail(new DelegateError("needs_auth", "Keystone ended the Synapse sign-in with an error.", "Run oc_login {server: \"synapse\"} again."))
       return reply(res, 200, "Sign-in failed. You can close this tab.")
