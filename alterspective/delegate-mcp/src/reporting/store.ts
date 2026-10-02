@@ -36,7 +36,7 @@ export type ReportStoreOptions = {
   sleep?: (ms: number) => Promise<void>
   now?: () => number
   /** Called once per store, with an error code, on the first failed write. */
-  warn?: (code: string, fields?: { key: string; code: string }) => void
+  warn?: (code: string, fields?: { key: string; errno: string }) => void
   /** Test seam: the hard link used to put back a live lock moved aside. */
   link?: (existing: string, created: string) => void
   maxAgeDays?: number
@@ -103,7 +103,7 @@ export function createReportStore(options: ReportStoreOptions): ReportStore {
     if (relinkWarned) return
     relinkWarned = true
     try {
-      options.warn?.("lock_relink_failed", { key, code: errno(error) })
+      options.warn?.("lock_relink_failed", { key, errno: errno(error) })
     } catch {
       // a broken log sink must not matter
     }

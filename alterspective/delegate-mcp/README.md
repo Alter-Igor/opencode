@@ -278,6 +278,7 @@ Each result is at most 32,000 characters. When a result is too big, whole list i
 | `oc_abort` | Stops a running session. |
 | `oc_close_session` | `{sessionID, deleteBranch?, abort?, discardWork?}`. Deletes one finished session: the OpenCode session, its copy in the box and the host record. Refuses while work would be lost. See "Closing sessions and clean-up". |
 | `oc_cleanup` | `{dryRun? = true, deleteBranch?}`. Lists, then closes, this bridge's sessions idle longer than `OPENCODE_DELEGATE_SESSION_TTL_DAYS` (default 14; 0 turns it off). It never aborts and never discards work. |
+| `oc_report` | `{sinceDays? = 30, groupBy? = "model" \| "agent" \| "repo", recent? = 0}`. How delegated tasks went: counts, success rate, duration, and what happened to the work. See "Reporting". |
 | `oc_list_sessions` | This bridge's sessions. `all: true` lists every session in the box, with the bridge that owns it. |
 | `oc_post` | Posts to the agent inbox as this bridge. `wake: true` also delivers it to one of this bridge's sessions. |
 | `oc_inbox` | Reads this bridge's inbox. Text is untrusted; `truncated: true` means old unread messages were dropped. |
@@ -317,6 +318,19 @@ A finished session should not leave anything behind. The usual order is `oc_coll
 - `dryRun` is on by default and leaves the sweep position unchanged, so the real run sees the same sessions.
 - Each call checks a small page of records and continues where the last one stopped.
 - It sees only sessions with this bridge's name.
+
+## Reporting
+
+The bridge keeps one small record per task on your PC, at `<home>/workspaces/reports/<key>.json`. The box never sees this folder. A record holds metadata only: model sent, agent, repo name, times, send count, outcome, commits collected and what happened to the work. It never holds prompt or answer text, file contents or error bodies. An error is kept only as a known error code, else `other`.
+
+- **When records change:** start, send, wait, result, collect, close and the sweep. A tool never waits for a record to be saved. Saves run in the background and are flushed before `oc_report` reads and at shutdown. A failed save is logged once and never fails a tool.
+- **Several bridges** can share the home folder. Each record has its own lock file, so two processes do not lose each other's counts. In one rare race (an old lock being taken over while its owner wakes up), two writers can still overlap; the worst case is one lost count. This is logged as `lock_relink_failed`.
+- **Kept for:** 90 days. Beyond the newest 2,000, finished records are dropped too; open tasks are kept.
+- **`oc_report`** returns `notes`, `sinceDays`, `groupBy`, `since`, `totals`, `groups` (each `name` under `untrusted`), and `recent` when asked for. `totals` and each group hold `tasks`, `completed`, `error`, `aborted`, `unknown`, `notSent`, `running`, `finished`, `successRate`, `durationMs {median, p90, samples}` and `dispositions {collected, closedDiscarded, open, closedClean, swept}`.
+  - `finished` = completed + error + aborted + unknown. Tasks never sent are left out.
+  - A task nobody waited on is settled at close from the session's state: idle is `completed`, an error state is `error`, a real abort is `aborted`, anything else is `unknown`.
+  - "Model" means the model the bridge sent. **A `synapse/auto` row does not say which model Synapse picked** (follow-up #76).
+  - Token counts are a lower bound: they cover only the messages `oc_result` fetched.
 
 ## Troubleshooting
 

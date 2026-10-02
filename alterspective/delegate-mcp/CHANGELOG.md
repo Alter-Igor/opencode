@@ -18,6 +18,15 @@
 - `oc_cleanup {dryRun? = true, deleteBranch?}` sweeps sessions idle longer than `OPENCODE_DELEGATE_SESSION_TTL_DAYS` (default 14; 0 turns it off). It never aborts or discards, and a dry run leaves the sweep position unchanged.
 - New error codes: `session_active`, `uncollected_work`.
 
+**Reporting (#73).** New tool `oc_report` and per-task records.
+
+- One metadata record per task, host-side in `<home>/workspaces/reports/`, never mounted in the box. No prompt or answer text, file contents or error bodies.
+- Records are updated at start, send, wait, result, collect, close and sweep. Updates run in the background and never slow or fail a tool. They are flushed before `oc_report` and at shutdown.
+- A per-record lock file keeps two processes from losing counts. A rare takeover race can still lose one count; it is logged as `lock_relink_failed`.
+- Kept 90 days, and at most the newest 2,000 finished records.
+- `oc_report {sinceDays, groupBy, recent}` gives task counts, success rate, median and p90 duration, and collected / discarded / open work, overall and by model, agent or repo. Its `notes` say that `synapse/auto` hides the routed model (#76) and that token counts are a lower bound.
+- The server instructions now name the Synapse-only rule, close, clean-up and `oc_report`.
+
 **Fork plugin (#74).** OpenCode's own `synapse` provider (outside the box) now loads its model list from Synapse `GET /v1/models` at startup and always adds `auto`. Startup never renews a sign-in. If the saved token has expired, it uses the last good list (`synapse-models.json` in OpenCode's state folder, models only), or the configured list. The cache updates after the next chat renews the token. The plugin now remembers every refresh token it has replaced, and never cuts a renewal off halfway, so Keystone never sees a reused refresh token from one process. Two processes can still race: #75.
 
 ## 0.1.4 — 2026-10-02

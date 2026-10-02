@@ -326,10 +326,12 @@ export function shutdownOnce(manager: Pick<BoxManager, "stop">, supervisor: Pick
     (done ??= (async () => {
       safeLog(log, "info", "runtime", "shutting down", { reason })
       const work = (async () => {
-        // #73: queued task record updates first; inside the time cap like everything else here.
-        await flushReports().catch(() => undefined)
+        // #73: queued task record updates are flushed alongside the stop and release, so a slow disk
+        // never delays them; all of it stays inside the time cap.
+        const flushed = flushReports().catch(() => undefined)
         await manager.stop().catch(() => undefined)
         await supervisor.release().catch((error: unknown) => safeLog(log, "warn", "runtime", "release on shutdown failed", { detail: String(error).slice(0, 200) }))
+        await flushed
       })()
       let timer: ReturnType<typeof setTimeout> | undefined
       const deadline = new Promise<void>((resolve) => (timer = setTimeout(resolve, capMs)))

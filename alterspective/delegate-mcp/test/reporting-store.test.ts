@@ -284,7 +284,7 @@ describe("report store", () => {
     } })
     const bump = (r: TaskRecord | undefined) => (r ? { ...r, sendCount: r.sendCount + 1 } : r)
     await Promise.all([a.update("s-0000000165", bump), b.update("s-0000000165", bump)])
-    expect(warnings).toEqual([["lock_relink_failed", { key: "s-0000000165", code: "EEXIST" }]])
+    expect(warnings).toEqual([["lock_relink_failed", { key: "s-0000000165", errno: "EEXIST" }]])
   })
 
   test("flush() waits for updates that were queued without being awaited", async () => {
