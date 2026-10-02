@@ -3,8 +3,12 @@
 // addition: names must be ks-<id>, each entry must point at its own /mcp/c/<id>, the id must be
 // in the chosen Keystone set (R4-01: never /mcp/dynamic), the key set is closed, `headers` may not
 // appear at all, oauth values must be strings, and enabled:false entries are still validated.
+// #67 step 4: with host-held Keystone tokens (OCD_KEYSTONE_HOST_AUTH=1) front adds each
+// connection's credential, so the box must NOT run its own OAuth: every entry must carry exactly
+// `oauth: false` (the fork accepts it since step 2). With the flag off, `oauth: false` stays refused.
 import type { McpEntry, Verdict } from "../shared/contracts.ts"
 import { idOfEntry } from "../shared/keystone.ts"
+import { keystoneHostAuth } from "./egress-identity.ts"
 
 /** Entry names the bridge accepts, both in the profile and in GET /mcp: `ks-` + a connection id. */
 export const KS_NAME = /^ks-[a-z0-9][a-z0-9-]{0,62}$/
@@ -57,27 +61,32 @@ function checkUrl(raw: unknown, origin: string, id: string): Check {
   return undefined
 }
 
-function checkEntry(name: string, entry: unknown, origin: string, allowed: ReadonlySet<string>): Check {
+/** Host-held tokens: the box must not sign in itself, so `oauth` is exactly `false`, nothing else. */
+const checkHostOAuth = (oauth: unknown): Check =>
+  oauth === false ? undefined : "oauth must be exactly false while host-held Keystone tokens are on (OCD_KEYSTONE_HOST_AUTH=1)"
+
+function checkEntry(name: string, entry: unknown, origin: string, allowed: ReadonlySet<string>, hostAuth: boolean): Check {
   const id = KS_NAME.test(name) ? idOfEntry(name) : undefined
   if (id === undefined) return "name must be ks-<connection id> (^ks-[a-z0-9][a-z0-9-]{0,62}$)"
   if (!allowed.has(id)) return `connection ${id} is not in the chosen Keystone set`
   if (!isRecord(entry)) return "entry must be an object"
-  return checkKeys(entry) ?? checkOAuth(entry.oauth) ?? checkUrl(entry.url, origin, id)
+  return checkKeys(entry) ?? (hostAuth ? checkHostOAuth(entry.oauth) : checkOAuth(entry.oauth)) ?? checkUrl(entry.url, origin, id)
 }
 
 /**
  * Validate every MCP entry of a profile. `keystoneOrigin` is config.keystoneOrigin; it must be
  * an https origin itself, otherwise every entry is refused. `connections` is the chosen Keystone
- * set (config.currentKeystone): an entry for any other connection is refused.
+ * set (config.currentKeystone): an entry for any other connection is refused. `hostAuth`
+ * (default: OCD_KEYSTONE_HOST_AUTH=1) requires `oauth: false` on every entry.
  */
-export function validateEntries(entries: Record<string, McpEntry>, keystoneOrigin: string, connections: readonly string[]): Verdict {
+export function validateEntries(entries: Record<string, McpEntry>, keystoneOrigin: string, connections: readonly string[], hostAuth: boolean = keystoneHostAuth()): Verdict {
   if (!URL.canParse(keystoneOrigin) || new URL(keystoneOrigin).origin !== keystoneOrigin || !keystoneOrigin.startsWith("https://")) {
     return { ok: false, code: "policy_violation", reason: `configured Keystone origin ${keystoneOrigin} is not an https origin` }
   }
   if (!isRecord(entries)) return { ok: false, code: "policy_violation", reason: "MCP entries must be an object" }
   const allowed = new Set(connections)
   for (const [name, entry] of Object.entries(entries)) {
-    const problem = checkEntry(name, entry, keystoneOrigin, allowed)
+    const problem = checkEntry(name, entry, keystoneOrigin, allowed, hostAuth)
     if (problem) return violation(name, problem)
   }
   return { ok: true }

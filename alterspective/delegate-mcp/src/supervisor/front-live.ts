@@ -5,12 +5,16 @@
 import { createHash } from "node:crypto"
 import { FRONT_GENERATED_MOUNT } from "../guard/egress.ts"
 import type { Exec } from "./docker.ts"
-import { readFrontGeneration } from "./front-generation.ts"
+import { readFrontGeneration, type FrontKeystoneAuth } from "./front-generation.ts"
 
 export type Mount = { Destination?: unknown; RW?: unknown; Type?: unknown; Name?: unknown; Driver?: unknown }
 /** `docker volume inspect` Options per volume name; undefined when that inspect failed. */
 export type VolumeOptions = Record<string, Record<string, string> | null | undefined>
-export type FrontLive = { ok: boolean; loadedConfigMatches: boolean; mountReadOnly: boolean; boxMountsOk: boolean; problems: string[] }
+/**
+ * `keystone` (#67 step 4): the per-connection Keystone includes the running worker attested, as
+ * states only (front-generation.ts); absent when the loaded generation has none.
+ */
+export type FrontLive = { ok: boolean; loadedConfigMatches: boolean; mountReadOnly: boolean; boxMountsOk: boolean; problems: string[]; keystone?: FrontKeystoneAuth[] }
 
 /** The box's mounts (docker/compose.yaml) and whether each may be written. Nothing else may appear. */
 const BOX_MOUNTS: Record<string, boolean> = { "/data": true, "/sessions": true, "/handoff/in": false, "/handoff/out": true, "/profile": false, "/etc/ocd-front-ca": false }
@@ -61,7 +65,7 @@ export function checkMounts(front: Mount[] | undefined, box: Mount[] | undefined
   return { mountReadOnly: frontProblems.length === 0, boxMountsOk: boxProblems.length === 0, problems: [...frontProblems, ...boxProblems] }
 }
 
-export type FrontLiveInput = { loaded: string | undefined; expected: string; frontMounts: Mount[] | undefined; boxMounts: Mount[] | undefined; boxVolumes: VolumeOptions }
+export type FrontLiveInput = { loaded: string | undefined; expected: string; frontMounts: Mount[] | undefined; boxMounts: Mount[] | undefined; boxVolumes: VolumeOptions; keystone?: FrontKeystoneAuth[] }
 
 export function frontLiveFrom(input: FrontLiveInput): FrontLive {
   const problems: string[] = []
@@ -72,7 +76,7 @@ export function frontLiveFrom(input: FrontLiveInput): FrontLive {
     problems.push(`front's loaded servers.conf (sha256 ${sha(loaded).slice(0, 12)}) is not the one generated for the chosen Keystone set (${sha(input.expected).slice(0, 12)}); restart the sandbox with oc_server_restart`)
   const mounts = checkMounts(input.frontMounts, input.boxMounts, input.boxVolumes)
   problems.push(...mounts.problems)
-  return { ok: loadedConfigMatches && mounts.mountReadOnly && mounts.boxMountsOk, loadedConfigMatches, mountReadOnly: mounts.mountReadOnly, boxMountsOk: mounts.boxMountsOk, problems }
+  return { ok: loadedConfigMatches && mounts.mountReadOnly && mounts.boxMountsOk, loadedConfigMatches, mountReadOnly: mounts.mountReadOnly, boxMountsOk: mounts.boxMountsOk, problems, ...(input.keystone ? { keystone: input.keystone } : {}) }
 }
 
 async function mountsOf(exec: Exec, container: string): Promise<Mount[] | undefined> {
@@ -106,5 +110,5 @@ export async function readFrontLive(exec: Exec, box: string, expected: string): 
   const generation = await readFrontGeneration(exec, front)
   const boxMounts = await mountsOf(exec, box)
   const boxVolumes = await volumeOptionsOf(exec, boxMounts)
-  return frontLiveFrom({ loaded: generation?.servers, expected, frontMounts: await mountsOf(exec, front), boxMounts, boxVolumes })
+  return frontLiveFrom({ loaded: generation?.servers, expected, frontMounts: await mountsOf(exec, front), boxMounts, boxVolumes, ...(generation?.keystone ? { keystone: generation.keystone } : {}) })
 }
