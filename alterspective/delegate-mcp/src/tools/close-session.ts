@@ -173,7 +173,7 @@ export const closeSessionTool = defineTool({
   name: "oc_close_session",
   title: "Close a finished session",
   description:
-    "Delete one of this bridge's finished sessions: the OpenCode session, its copy in the sandbox and the bridge's host record. Refused while the session is running or needs input (abort: true stops it first), while its state cannot be read (retry), and while its copy has commits no host branch has, uncommitted files, or git-ignored files other than dependency/cache folders (node_modules, .cache, .turbo, __pycache__, .pytest_cache, .venv, coverage) such as dist/ or .env (run oc_collect or copy them first; discardWork: true deletes them). Commits only the reflog still holds (replaced by amend or reset) never block and are reported as discardedCommits. " +
+    "Delete one of this bridge's finished sessions: the OpenCode session, its copy in the sandbox and the bridge's host record. Refused while the session is running or needs input (abort: true stops it first), while its state cannot be read (retry), and while its copy has commits no host branch has, uncommitted files, or git-ignored files other than dependency/cache folders at any depth (node_modules, .cache, .turbo, __pycache__, .pytest_cache, .venv, coverage) such as dist/ or .env (run oc_collect or copy them first; discardWork: true deletes them). Commits only the reflog still holds (replaced by amend or reset) never block and are reported as discardedCommits. " +
     "deleteBranch: true also deletes the host branch delegate/<key>, only when another host branch contains it (discardWork: true deletes it unmerged); a branch checked out anywhere or a symbolic ref is never deleted, and no other branch is touched.",
   input: {
     sessionID: sessionIdSchema,

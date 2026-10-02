@@ -140,6 +140,16 @@ The box has no Synapse key. Model calls go out through `front`, which adds **you
   - At Keystone: remove your Synapse role, or ask a Keystone admin to run `revoke-oauth-tokens {clientId: "opencode"}`. That second one signs out **every** user of app `opencode`, not only you.
 - `OPENCODE_DELEGATE_SYNAPSE_REFRESH_FRACTION` (0.01-0.95, default 0.8) moves the renewal point. It is for tests.
 
+## Models (Synapse only)
+
+The box uses only Synapse. This is an owner rule, not a setting.
+
+- **Only one provider:** the box profile sets `enabled_providers: ["synapse"]`. Every other provider in your global OpenCode config is dropped. The bridge log names each dropped provider in a warning when the box starts.
+- **Only registered models:** when the box starts, the bridge reads Synapse `GET /v1/models` on your PC with your delegated Synapse token. It has a 4-second limit and the body is capped. The box offers that list as `synapse/<id>`. `synapse/auto` (Synapse's own routing) is always added first. Models Synapse marks as not able to chat (embed, rerank or image only) are left out.
+- **Default `synapse/auto`:** your `model` and `small_model` are kept only when they are registered Synapse models. Otherwise the box uses `synapse/auto` and says so.
+- **When the list can't be read** (no sign-in yet, Synapse down, a bad answer): the box offers `synapse/auto` only and still starts. The list is read again at the next box start. A model added to or retired from Synapse does not make a running box `profile_changed`.
+- **Every send names a model.** `oc_send` refuses a model from any other provider with `invalid_input`. With no `model`, it sends the session's saved model when the box still offers it. Otherwise it sends the box default (read from the box within 5 seconds, else `synapse/auto`). `modelFallback` in the result names the model actually sent.
+
 ## Install and run
 
 You need:
@@ -255,7 +265,7 @@ Each result is at most 32,000 characters. When a result is too big, whole list i
 |---|---|
 | `oc_doctor` | Health report: Docker, box image and version, isolation level, MCP entries, the chosen Keystone services and their sign-in state, the owner's allowed list and high-risk warnings, egress (front config for that set, read-only mount, aliases, no CONNECT proxy), live checks (`live`: sign-ins stored in the box are only for the chosen set; the config files `nginx -T` shows (what nginx would load) equal the generated file; live mount modes from `docker inspect`; sign-ins removed earlier, to revoke), guard verdict. `verified` says whether every check could be done and passed. |
 | `oc_login` | Keystone sign-in. With no `server`, every `ks-<id>` entry that needs it, one at a time; or one entry, e.g. `{server: "ks-github"}`. `{server: "synapse"}` signs you in to the model gateway on your PC (see "Synapse sign-in"). Opens your browser. |
-| `oc_list_models` | Models the box can use (`provider/model`), and the Keystone services it can use. |
+| `oc_list_models` | Models the box can use (`synapse/<id>`, default `synapse/auto`; see "Models (Synapse only)"), and the Keystone services it can use. |
 | `oc_start_session` | Copies a repo into the box and starts a session. Returns `sessionID` and a web UI link. `keystone` narrows the session to some of the box's Keystone services (not a wall). |
 | `oc_send` | Gives a session a task. Checks policy first. Returns a cursor for `oc_wait`. |
 | `oc_status` | A session's `state`, `since` when, `detail`, and `pending` request ids. (Todos are in `oc_result`.) |
@@ -266,6 +276,8 @@ Each result is at most 32,000 characters. When a result is too big, whole list i
 | `oc_pending` | Permission requests and questions waiting on an answer, for this bridge's sessions and their subagents. |
 | `oc_answer` | Answers one pending request: `once` or `reject`, or question answers. `always` is refused. |
 | `oc_abort` | Stops a running session. |
+| `oc_close_session` | `{sessionID, deleteBranch?, abort?, discardWork?}`. Deletes one finished session: the OpenCode session, its copy in the box and the host record. Refuses while work would be lost. See "Closing sessions and clean-up". |
+| `oc_cleanup` | `{dryRun? = true, deleteBranch?}`. Lists, then closes, this bridge's sessions idle longer than `OPENCODE_DELEGATE_SESSION_TTL_DAYS` (default 14; 0 turns it off). It never aborts and never discards work. |
 | `oc_list_sessions` | This bridge's sessions. `all: true` lists every session in the box, with the bridge that owns it. |
 | `oc_post` | Posts to the agent inbox as this bridge. `wake: true` also delivers it to one of this bridge's sessions. |
 | `oc_inbox` | Reads this bridge's inbox. Text is untrusted; `truncated: true` means old unread messages were dropped. |
@@ -274,6 +286,37 @@ Each result is at most 32,000 characters. When a result is too big, whole list i
 Deleted sessions: after a successful `oc_list_sessions`, the bridge checks a small page of host records. It removes a record only when the server returns 404 for that session and the box confirms its clone folder is absent. A surviving clone or link keeps the record so a session still known to this bridge can be collected. Errors keep records for a later pass. A saved cursor reaches old records over repeated list calls; one call need not clean every record. The display still shows at most the newest 200 host records.
 
 Only this box's records are pruned. When a session is bound, its record stores the box's compose project (`OPENCODE_DELEGATE_PROJECT`). A record is pruned only by a bridge with the same name and the same project, so one home shared by two projects never loses the other box's records. Records with no project (written before 0.1.3) are kept. So are records of sessions this bridge still tracks, and records from bridges with a default random name, since no later bridge has that name. Each removed record is logged at info level and listed in the result as `prunedRecords`. That is why `oc_list_sessions` is marked destructive.
+
+## Closing sessions and clean-up
+
+A finished session should not leave anything behind. The usual order is `oc_collect`, then review and merge the branch your normal way, then `oc_close_session {sessionID, deleteBranch: true}`.
+
+**What a close refuses:**
+
+- A session that is running or needs input. `abort: true` stops it first, and its work is still checked afterwards.
+- A session whose state cannot be read. Retry later.
+- A copy that holds any of these:
+  - commits no host branch has;
+  - uncommitted files;
+  - git-ignored files such as `dist/` or `.env`.
+
+  The refusal names up to 10 of them. `oc_collect` fetches commits; ask the agent to commit loose files. `oc_collect` never carries git-ignored files, so copy any you need out of the box by hand. `discardWork: true` deletes them on purpose.
+
+**What never blocks a close:**
+
+- Dependency and cache folders, at any folder depth: `node_modules`, `.cache`, `.turbo`, `__pycache__`, `.pytest_cache`, `.venv`, `coverage`.
+- Commits that only the reflog holds (replaced by an amend or a reset). These are reported as `discardedCommits`.
+
+**Branches:** `deleteBranch: true` deletes `delegate/<key>` only when another host branch contains it. `discardWork: true` deletes it unmerged. A branch that is checked out anywhere, or a symbolic ref, is never deleted. No other branch is touched.
+
+**Work that appears during a close:** if new work shows up while the session is closing, the copy and the host record are kept. `oc_collect` can still fetch it, even after a bridge restart. It fetches from this bridge's own record of a session in this box, when the box no longer knows the session.
+
+**The sweep:**
+
+- `oc_cleanup` uses the same checks, but it never aborts and never discards. A session it keeps is listed with its reason.
+- `dryRun` is on by default and leaves the sweep position unchanged, so the real run sees the same sessions.
+- Each call checks a small page of records and continues where the last one stopped.
+- It sees only sessions with this bridge's name.
 
 ## Troubleshooting
 
@@ -288,5 +331,8 @@ Only this box's records are pruned. When a session is bound, its record stores t
 | `inbox_unavailable` | The inbox did not answer. This is never "no messages". | Run `oc_doctor`; retry after a box restart. |
 | `cursor_expired` | The cursor is from before a restart or reset. | Call again without a cursor (after `oc_status`). |
 | `not_found` | The session or request is not one of this bridge's, or it is gone. | `oc_list_sessions` or `oc_pending` for fresh ids. |
+| `invalid_input` (model) | The model is not a Synapse model. | `oc_list_models`, then pick a `synapse/<id>`, for example `synapse/auto`. |
+| `session_active` | `oc_close_session` was called on a session that is running, needs input, or is already closing. | Wait for it, or pass `abort: true`. |
+| `uncollected_work` | Closing would delete commits, uncommitted files or git-ignored files the host does not have. | `oc_collect` for commits; copy git-ignored files out by hand. Then close again. Or pass `discardWork: true` on purpose. |
 
 Logs are JSON lines on stderr and in `<home>\logs` (default home `~/.local/share/opencode-delegate`, or `OPENCODE_DELEGATE_HOME`). They never contain secrets or message text.

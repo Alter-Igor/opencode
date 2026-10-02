@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.2.0 — 2026-10-03
+
+**Synapse only (#71).** The box uses only Synapse, with `synapse/auto` as the default. This is an owner rule, not a setting.
+
+- The box profile sets `enabled_providers: ["synapse"]`. Every other provider in the owner's config is dropped, with a warning.
+- The model list is read from Synapse `GET /v1/models` on the host at box start, with a 4-second limit and a 1 MB body cap. The box offers those models plus `synapse/auto`. Models that cannot chat are left out. If the read fails, the box offers `synapse/auto` only.
+- The owner's `model` / `small_model` are kept only when they are registered Synapse models. Otherwise the box uses `synapse/auto`.
+- `oc_send` refuses a non-Synapse model with `invalid_input`. Every send now names a Synapse model: the saved one when the box still offers it, else the box default (read within 5 seconds, else `synapse/auto`). `modelFallback` names the model sent.
+
+**Closing and clean-up (#72).** New tools `oc_close_session` and `oc_cleanup`.
+
+- `oc_close_session {sessionID, deleteBranch?, abort?, discardWork?}` deletes a finished session, its copy in the box and its host record.
+- A close is refused while the session runs or needs input, while its state cannot be read, or while its copy has commits no host branch has, uncommitted files, or git-ignored files outside dependency and cache folders. `discardWork: true` deletes them on purpose. Commits only the reflog holds are reported as `discardedCommits` and never block.
+- `deleteBranch: true` deletes `delegate/<key>` only when another host branch contains it. A checked-out branch or a symbolic ref is never deleted.
+- A per-session close lock stops other tools using a session while it closes. Work that appears during a close keeps the copy and the record, and `oc_collect` can fetch it from this bridge's own record after a restart.
+- `oc_cleanup {dryRun? = true, deleteBranch?}` sweeps sessions idle longer than `OPENCODE_DELEGATE_SESSION_TTL_DAYS` (default 14; 0 turns it off). It never aborts or discards, and a dry run leaves the sweep position unchanged.
+- New error codes: `session_active`, `uncollected_work`.
+
+**Fork plugin (#74).** OpenCode's own `synapse` provider (outside the box) now loads its model list from Synapse `GET /v1/models` at startup and always adds `auto`. Startup never renews a sign-in. If the saved token has expired, it uses the last good list (`synapse-models.json` in OpenCode's state folder, models only), or the configured list. The cache updates after the next chat renews the token. The plugin now remembers every refresh token it has replaced, and never cuts a renewal off halfway, so Keystone never sees a reused refresh token from one process. Two processes can still race: #75.
+
 ## 0.1.4 — 2026-10-02
 
 Host-held Keystone tokens, behind `OCD_KEYSTONE_HOST_AUTH=1`. **Off by default:** with the flag unset nothing changes.
