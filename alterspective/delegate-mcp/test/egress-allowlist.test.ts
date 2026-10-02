@@ -145,10 +145,10 @@ describe("committed front files", () => {
     expect(conf.some((l) => l.startsWith("proxy_pass") || l.includes("proxy_set_header Host"))).toBe(false)
   })
 
-  test("nginx.conf resolves upstreams with its own resolver and includes only the generated servers", async () => {
+  test("nginx.conf resolves upstreams with its own resolver and includes the checked runtime generation", async () => {
     const conf = await read("front", "nginx.conf")
     expect(conf).toContain("include /tmp/front/resolver.conf;")
-    expect(conf).toContain("include /etc/nginx/front-gen/servers.conf;")
+    expect(conf).toContain("include /tmp/front/current.conf;")
     expect(conf).not.toMatch(/^\s*(server|proxy_pass|listen)\b/m)
   })
 

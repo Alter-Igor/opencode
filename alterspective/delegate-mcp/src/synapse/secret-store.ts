@@ -52,7 +52,10 @@ export function dpapiStore(file: string, ps: PowerShell = windowsPowerShell, pla
   return {
     kind: "dpapi-file",
     async read() {
-      const cipher = await readFile(file, "utf8").catch(() => undefined)
+      const cipher = await readFile(file, "utf8").catch((error: unknown) => {
+        if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined
+        throw error
+      })
       if (cipher === undefined) return undefined
       windowsOnly()
       const plain = await ps(UNPROTECT, cipher)
