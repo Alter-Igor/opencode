@@ -25,6 +25,7 @@ import {
 import type { AuthorizationServerMetadata } from "@modelcontextprotocol/sdk/shared/auth.js"
 import { DelegateError, isDelegateError } from "../shared/errors.ts"
 import { jwtClaims } from "../synapse/keystone-token.ts"
+import { MAX_TOKEN_LENGTH, isTokenShape } from "../synapse/auth-conf.ts"
 import { assertConnectionId } from "./state.ts"
 
 /** The SDK's fetch shape (shared/transport FetchLike). */
@@ -181,6 +182,9 @@ export function readTokenReply(text: string, now: number): TokenReply {
   const access = body.access_token
   if (typeof access !== "string" || access === "") return unusable("no access token")
   if (typeof body.token_type === "string" && body.token_type.toLowerCase() !== "bearer") return unusable("not a bearer token")
+  // Combined review L1: front's include carries only a compact JWT of at most MAX_TOKEN_LENGTH; any
+  // other token would be refused by the writer on every retry, so it is unusable from the start.
+  if (!isTokenShape(access)) return unusable(`not a compact JWT of at most ${MAX_TOKEN_LENGTH} characters`)
   const expiresIn = Number(body.expires_in)
   // min(expires_in or the default, the JWT's own exp) (as for Synapse, review L4). A host clock far
   // ahead of Keystone's makes the JWT look expired: that is "unusable", never a lost refresh token.

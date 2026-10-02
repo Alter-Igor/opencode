@@ -11,7 +11,7 @@
 // any other value; front's baked `front-reload` (docker/front/front-reload.sh, review M1) and its
 // entrypoint refuse any file of another shape, and oc_doctor checks the copy `nginx -T` shows against
 // the same strict shape, so the include cannot be used to change anything else in front. Token values are never logged or returned.
-import { chmod, mkdir, readFile, writeFile } from "node:fs/promises"
+import { chmod, mkdir, readFile, readdir, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { CONNECTION_ID } from "../shared/keystone.ts"
 import { renameWithRetry } from "./fs-retry.ts"
@@ -107,6 +107,36 @@ async function ensureFile(frontDir: string, file: string, variable: AuthVar): Pr
 /** Before `compose up`: front's include must exist. */
 export async function ensureAuthConf(frontDir: string): Promise<void> {
   await ensureFile(frontDir, authConfPath(frontDir), AUTH_VAR)
+}
+
+/**
+ * #67 combined review L4: a connection that left the chosen set keeps no bearer on disk. Every
+ * ks-auth-<id>.conf whose id is not chosen is rewritten empty (call under the shared lock, before
+ * the sandbox start that loads the new set). Returns the ids emptied (ids only, never a token).
+ */
+export async function emptyUnchosenKsAuthConf(frontDir: string, chosen: readonly string[]): Promise<string[]> {
+  let names: string[]
+  try {
+    names = await readdir(frontDir)
+  } catch {
+    return []
+  }
+  const emptied: string[] = []
+  for (const name of names) {
+    const id = /^ks-auth-([a-z0-9][a-z0-9-]{0,62})\.conf$/.exec(name)?.[1]
+    if (id === undefined || chosen.includes(id)) continue
+    const file = ksAuthConfPath(frontDir, id)
+    let text: string | undefined
+    try {
+      text = await readFile(file, "utf8")
+    } catch {
+      text = undefined
+    }
+    if (text === authConf(undefined, KS_AUTH_VAR)) continue
+    await writeAtomic(frontDir, file, authConf(undefined, KS_AUTH_VAR))
+    emptied.push(id)
+  }
+  return emptied
 }
 
 /** Before `compose up` with OCD_KEYSTONE_HOST_AUTH: one include per chosen connection, same rules. */

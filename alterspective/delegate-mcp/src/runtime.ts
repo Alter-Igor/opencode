@@ -242,7 +242,8 @@ export async function createRuntime(options: RuntimeOptions = {}): Promise<Runti
   const inboxTarget = cachedTarget(() => inboxTargetFromDocker(bunExec, config))
   const container = containerName(config)
   const synapse = createSynapseAuth(config, env, log)
-  const keystone = keystoneHostAuth(env) ? hostKeystone(config, env, log, synapse, () => manager.peek()) : undefined
+  // The same source as the profile, guard, front generator and supervisor (process.env).
+  const keystone = keystoneHostAuth() ? hostKeystone(config, env, log, synapse, () => manager.peek()) : undefined
   // A renewal while this bridge held no box connected nothing: connect signed-in entries on each new box.
   if (keystone) manager.onBox((box) => void connectSignedIn((ids) => keystone.status(ids), currentKeystone(config).connections, box.api, log))
   const ctx: ToolContext = {
@@ -304,7 +305,7 @@ function startHostKeystone(keystone: KeystoneAuth, config: BridgeConfig, log: Lo
 export function hostKeystone(config: BridgeConfig, env: NodeJS.ProcessEnv, log: Logger, synapse: Pick<SynapseAuth, "deps">, heldBox: () => Box | undefined): KeystoneAuth {
   const publish = createKsPublisher({
     frontDir: frontDir(config),
-    reload: () => reloadFront(synapse.deps),
+    reload: () => reloadFront(synapse.deps, { record: false, component: "keystone-auth" }),
     connect: async (entry) => {
       const box = heldBox()
       return box ? ensureEntryConnected(box.api, entry, log) : "not_running"
