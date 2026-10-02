@@ -1,7 +1,7 @@
 # Program plan: #67 move Keystone tokens out of the delegate box
 
 - **Run id:** `20261002t0920z-5b85cd07`
-- **planRevision:** 1 (2026-10-02, program director: Claude Code session `cb058128`, sole writer)
+- **planRevision:** 2 (2026-10-02, program director: Claude Code session `cb058128`, sole writer). Rev 2: WS-A split into WS-A1 (token manager) and WS-A2 (`front` injection). They are disjoint surfaces, so they run in parallel; developers briefed for WS-A1, WS-A2 and WS-B.
 - **Owner approval:** "OK to do what needed and do it for me" (2026-10-02). Reversible code and docs changes, and ordered merges into the integration branch. **Merging into `dev` and any live-box cutover still need the owner's explicit approval.**
 
 ## Outcome
@@ -33,17 +33,18 @@ The delegate box never holds a Keystone refresh token or a long-lived access tok
 | Item | Source | Workstream | Status |
 |---|---|---|---|
 | #67 step 0 spike | #67 | — | **done** (`a7f1b3b4d5`, evidence `docs/.../evidence/keystone-host-client-spike.md`) |
-| #67 step 1 host token manager | #67 | WS-A | not started |
-| #67 step 3 `front` per-connection injection (flagged) | #67 | WS-A | not started |
-| #67 step 2 fork accepts `oauth:false` | #67 | WS-B | not started |
-| #67 step 4 cutover | #67 | WS-C | blocked by WS-A, WS-B |
-| #67 step 5 docs and evidence | #67 | WS-C | blocked by WS-A, WS-B |
+| #67 step 1 host token manager | #67 | WS-A1 | active |
+| #67 step 3 `front` per-connection injection (flagged) | #67 | WS-A2 | active |
+| #67 step 2 fork accepts `oauth:false` | #67 | WS-B | active |
+| #67 step 4 cutover | #67 | WS-C | blocked by WS-A1, WS-A2, WS-B |
+| #67 step 5 docs and evidence | #67 | WS-C | blocked by WS-A1, WS-A2, WS-B |
 
 ## Workstreams
 
 | ID | Scope (exclusive write) | Depends on | Branch / worktree | Review budget |
 |---|---|---|---|---|
-| WS-A | `alterspective/delegate-mcp/src/keystone-auth/**` (new), `src/synapse/auth-conf.ts` (generalise the variable name only), `src/guard/egress-identity.ts` (behind a flag, off by default), `docker/front/front-reload.sh`, `docker/front/entrypoint.sh`, their tests | — | `ks67-host-tokens`, `X:\opencode---ks67-host-tokens` | 4 cycles |
+| WS-A1 | `alterspective/delegate-mcp/src/keystone-auth/**` (new), `test/keystone-auth*.test.ts`; publishes through an injected `publish(id, bearer)` | — | `ks67-host-tokens`, `X:\opencode---ks67-host-tokens` | 4 cycles |
+| WS-A2 | `src/synapse/auth-conf.ts` (variable name as a parameter), `src/guard/egress-identity.ts` (flag `OCD_KEYSTONE_HOST_AUTH`, off by default), `src/supervisor/front-generation.ts`, `docker/front/front-reload.sh`, `docker/front/entrypoint.sh`, their tests | — | `ks67-front-inject`, `X:\opencode---ks67-front-inject` | 4 cycles |
 | WS-B | `packages/opencode/src/mcp/allowlist.ts`, `packages/opencode/test/mcp/allowlist*.test.ts` | — | `ks67-oauth-false`, `X:\opencode---ks67-oauth-false` | 4 cycles |
 | WS-C | `src/supervisor/profile.ts`, `src/guard/entries.ts`, `src/supervisor/login.ts`, `src/tools/login.ts`, `src/supervisor/auth-store.ts`, `src/supervisor/live.ts`, `src/tools/doctor.ts`, README, `technical-design.md`, `issues.md`, CHANGELOG | WS-A, WS-B integrated | later | 4 cycles |
 
@@ -56,9 +57,10 @@ No overlap between WS-A and WS-B. Parked #64 also touches `profile.ts` and `live
 | Order | Workstream | Branch | Base | Reviewed head | Integration state |
 |---:|---|---|---|---|---|
 | 0 | spike | `keystone-host-spike` (**integration branch for #67**) | `origin/dev` `4f38093888` | `a7f1b3b4d5` | — |
-| 1 | WS-B | `ks67-oauth-false` | `origin/dev` | — | not started |
-| 2 | WS-A | `ks67-host-tokens` | `origin/dev` | — | not started |
-| 3 | WS-C | `ks67-cutover` | integration head after 1 and 2 | — | blocked |
+| 1 | WS-B | `ks67-oauth-false` | `origin/dev` | — | active |
+| 2 | WS-A2 | `ks67-front-inject` | `origin/dev` | — | active |
+| 3 | WS-A1 | `ks67-host-tokens` | `origin/dev` | — | active |
+| 4 | WS-C | `ks67-cutover` | integration head after 1 and 2 | — | blocked |
 
 Deviation recorded: the integration branch is the existing `keystone-host-spike`, not `program/<run-id>/integration`. Worktrees can only be created through `aio repo-worktree new`, which names the branch after the worktree. One PR from `keystone-host-spike` to `dev` at the end (Gate A, owner approval).
 
