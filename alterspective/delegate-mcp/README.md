@@ -295,9 +295,9 @@ A finished session should not leave anything behind. The usual order is `oc_coll
 **What a close refuses:**
 
 - A session that is running or needs input. `abort: true` stops it first, and its work is still checked afterwards.
-- A session whose state cannot be read. Retry later.
+- A session or copy that cannot be checked. Retry later. `discardWork` never overrides a check that failed.
 - A copy that holds any of these:
-  - commits no host branch has;
+  - commits no host branch has, including every stash entry;
   - uncommitted files;
   - git-ignored files such as `dist/` or `.env`.
 

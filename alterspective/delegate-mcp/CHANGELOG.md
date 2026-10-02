@@ -12,7 +12,7 @@
 **Closing and clean-up (#72).** New tools `oc_close_session` and `oc_cleanup`.
 
 - `oc_close_session {sessionID, deleteBranch?, abort?, discardWork?}` deletes a finished session, its copy in the box and its host record.
-- A close is refused while the session runs or needs input, while its state cannot be read, or while its copy has commits no host branch has, uncommitted files, or git-ignored files outside dependency and cache folders. `discardWork: true` deletes them on purpose. Commits only the reflog holds are reported as `discardedCommits` and never block.
+- A close is refused while the session runs or needs input, while its state cannot be read, or while its copy has commits no host branch has, uncommitted files, or git-ignored files outside dependency and cache folders. `discardWork: true` deletes them on purpose, but never overrides a check that failed. Every stash entry counts, not only the newest. Commits only the reflog holds are reported as `discardedCommits` and never block.
 - `deleteBranch: true` deletes `delegate/<key>` only when another host branch contains it. A checked-out branch or a symbolic ref is never deleted.
 - A per-session close lock stops other tools using a session while it closes. `oc_send` checks it again just before the prompt is posted. Work that appears during a close keeps the copy and the record, and `oc_collect` can fetch it from this bridge's own record after a restart.
 - `oc_cleanup {dryRun? = true, deleteBranch?}` sweeps sessions idle longer than `OPENCODE_DELEGATE_SESSION_TTL_DAYS` (default 14; 0 turns it off). It never aborts or discards, and a dry run leaves the sweep position unchanged.

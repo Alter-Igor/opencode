@@ -115,13 +115,24 @@ async function boxGit(deps: CloseDeps, key: string, args: string[]) {
   return deps.box(["git", "-C", clonePath(deps, key), ...args], { timeoutMs: deps.timeoutMs })
 }
 
-/** Every commit a ref (branch, tag, stash) or HEAD of the clone points at. Undefined when unreadable. */
+/**
+ * Every commit a ref (branch, tag, every stash entry) or HEAD of the clone points at. Undefined when
+ * unreadable. PR #77 review: refs/stash names only the newest stash; older entries (stash@{1}, ...)
+ * live only in its reflog, so they are read from there too and block like any other tip.
+ */
 async function cloneTips(deps: CloseDeps, key: string): Promise<string[] | undefined> {
   const refs = await boxGit(deps, key, ["for-each-ref", "--format=%(objectname) %(*objectname)", "refs/heads", "refs/tags", "refs/stash"])
   const head = await boxGit(deps, key, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
-  if (refs.code !== 0 || (head.code !== 0 && head.code !== 1)) return undefined
+  const stash = await boxGit(deps, key, ["rev-parse", "--verify", "--quiet", "refs/stash"])
+  if (refs.code !== 0 || (head.code !== 0 && head.code !== 1) || (stash.code !== 0 && stash.code !== 1)) return undefined
+  let stashes: string[] = []
+  if (stash.code === 0) {
+    const entries = await boxGit(deps, key, ["log", "-g", "--format=%H", "refs/stash", "--"])
+    if (entries.code !== 0) return undefined
+    stashes = entries.stdout.split(/\r?\n/)
+  }
   const tips = new Set<string>()
-  for (const line of [...refs.stdout.split(/\r?\n/), head.stdout]) {
+  for (const line of [...refs.stdout.split(/\r?\n/), head.stdout, ...stashes]) {
     const [object, peeled] = line.trim().split(" ")
     const tip = peeled || object
     if (!tip) continue
@@ -321,13 +332,16 @@ function kept(o: Owned, clone: CloneState, session: CloseOutcome["session"], ref
  * the last check (after the session is deleted) returns before the clone and the host record are
  * touched, so the record stays on disk and oc_collect can still fetch the copy, even after a restart.
  */
+/** PR #77 review: discardWork consents to deleting work the checks counted, never to skipping a check that failed. */
+const blocks = (reason: CloseRefusal | undefined, discardWork: boolean | undefined) => reason === "check_failed" || (reason !== undefined && !discardWork)
+
 export async function closeSession(deps: CloseDeps, key: string, owner: CloseOwner, options: CloseOptions, hooks: CloseHooks): Promise<CloseOutcome> {
   const o = owned(deps, key, owner)
   const first = await inspectClone(deps, o.state)
-  if (reasonOf(first) && !options.discardWork) return kept(o, first, "kept", reasonOf(first))
+  if (blocks(reasonOf(first), options.discardWork)) return kept(o, first, "kept", reasonOf(first))
   await hook(hooks.stop, "stop the session")
   const stopped = await inspectClone(deps, o.state)
-  if (reasonOf(stopped) && !options.discardWork) return kept(o, stopped, "kept", reasonOf(stopped))
+  if (blocks(reasonOf(stopped), options.discardWork)) return kept(o, stopped, "kept", reasonOf(stopped))
   const branch: BranchState = options.deleteBranch ? await inspectBranch(deps, o.state) : { plan: "not_requested" }
   const session = await hook(hooks.deleteSession, "delete the session")
   let final = stopped

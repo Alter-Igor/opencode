@@ -208,6 +208,41 @@ describe("closeSession: data-loss guards", () => {
   )
 
   test(
+    "PR #77 review: an older stash entry (stash@{1}) blocks the close like the newest one",
+    async () => {
+      const s = await started()
+      await fx.boxCommit(s.key, { "a.txt": "one\n" }, "one")
+      await s.ws.collect(s.opened)
+      for (const text of ["first stash\n", "second stash\n"]) {
+        writeFileSync(path.join(fx.boxClone(s.key), "a.txt"), text)
+        await fx.boxGit(s.key, ["stash", "push", "-q"])
+      }
+      // Two stashes: refs/stash names the second; stash@{1} exists only in the refs/stash reflog.
+      const out = await s.ws.closeSession(s.key, s.owner, KEEP, s.hooks())
+      expect(out).toMatchObject({ closed: false, refused: "uncollected_work", session: "kept", clone: "kept", record: "kept" })
+      // Each stash is a work-tree commit plus an index commit (the two index commits can be one commit
+      // when made in the same second). Counting only refs/stash finds the newest stash's 2 and files
+      // the older work-tree commit under discardedCommits, which never block.
+      expect((out as { uncollectedCommits: number }).uncollectedCommits).toBeGreaterThanOrEqual(3)
+      expect(s.calls).toEqual([])
+    },
+    T,
+  )
+
+  test(
+    "PR #77 review: discardWork never skips a check that failed (check_failed keeps everything)",
+    async () => {
+      const s = await started()
+      fx.boxOverride = (argv) => (argv[0] === "sh" ? { code: 125, stdout: "", stderr: "Error response from daemon: container is not running" } : undefined)
+      const out = await s.ws.closeSession(s.key, s.owner, { discardWork: true, deleteBranch: false }, s.hooks())
+      expect(out).toMatchObject({ closed: false, refused: "check_failed", session: "kept", clone: "kept", record: "kept" })
+      expect(s.calls).toEqual([])
+      expect(existsSync(s.recordFile)).toBe(true)
+    },
+    T,
+  )
+
+  test(
     "inspectClose reports the same counts and writes nothing",
     async () => {
       const s = await started()
