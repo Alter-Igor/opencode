@@ -15,7 +15,7 @@ import { DelegateError, isDelegateError } from "../shared/errors.ts"
 import type { Logger } from "../shared/log.ts"
 import type { ApiTarget } from "../shared/opencode-api.ts"
 import { FRONT_SERVERS_NAME } from "../guard/egress.ts"
-import { ensureAuthConf, ensureKsAuthConf } from "../synapse/auth-conf.ts"
+import { emptyUnchosenKsAuthConf, ensureAuthConf, ensureKsAuthConf } from "../synapse/auth-conf.ts"
 import { KEYSTONE_HOST_AUTH_ENV, keystoneHostAuth } from "../guard/egress-identity.ts"
 import { SYNAPSE_LOCK_WAIT_MS } from "../synapse/lock.ts"
 import { INSPECT_ENV, MCP_ALLOW_ENV, approvedValues, boxEnvOverride, composeDownEnv, composeEnv, siblingContainers } from "./compose-env.ts"
@@ -193,7 +193,13 @@ async function prepareFiles(run: Run, plan: Plan): Promise<void> {
       await ensureAuthConf(dirs.front)
       // #67 step 4: with host-held Keystone tokens servers.conf includes one ks-auth-<id>.conf per
       // chosen connection, so each must exist (empty = no credential until the host publishes one).
-      if (keystoneHostAuth()) await ensureKsAuthConf(dirs.front, plan.config.keystoneConnections)
+      if (keystoneHostAuth()) {
+        await ensureKsAuthConf(dirs.front, plan.config.keystoneConnections)
+        // Combined review L4: a connection that left the set keeps no bearer on disk (front loads
+        // the new set at this start, so no reload is needed).
+        const emptied = await emptyUnchosenKsAuthConf(dirs.front, plan.config.keystoneConnections)
+        if (emptied.length) run.note("info", "emptied front includes of Keystone connections no longer chosen", { ids: emptied.join(",") })
+      }
     } catch (error) {
       throw fsFailure("write front's generated files", error, deps.config.home)
     }

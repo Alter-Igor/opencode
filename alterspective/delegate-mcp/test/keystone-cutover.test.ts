@@ -279,7 +279,16 @@ describe("runtime wiring", () => {
   test("flag on: the tool context gets the host Keystone service and the runtime a renewal loop", async () => {
     const { createRuntime } = await import("../src/runtime.ts")
     const config = { ...defaultConfig({}), home: home() }
-    const runtime = await createRuntime({ env: { OCD_KEYSTONE_HOST_AUTH: "1", OPENCODE_DELEGATE_NAME: "ks-test" }, config, log: recordingLogger(), version })
+    // The flag is read from process.env, the same source the supervisor and front generator use.
+    const before = process.env.OCD_KEYSTONE_HOST_AUTH
+    process.env.OCD_KEYSTONE_HOST_AUTH = "1"
+    let runtime
+    try {
+      runtime = await createRuntime({ env: { OPENCODE_DELEGATE_NAME: "ks-test" }, config, log: recordingLogger(), version })
+    } finally {
+      if (before === undefined) delete process.env.OCD_KEYSTONE_HOST_AUTH
+      else process.env.OCD_KEYSTONE_HOST_AUTH = before
+    }
     expect(runtime.ctx.keystone).toBeDefined()
     expect(runtime.keystone).toBeDefined()
   })

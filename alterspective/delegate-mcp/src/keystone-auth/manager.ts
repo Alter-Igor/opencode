@@ -34,7 +34,7 @@ import { TICK_MS } from "../synapse/token-manager.ts"
 import { recordGone, type ProcessProbe, type ProcessRecord } from "../supervisor/process.ts"
 import { attempt } from "./attempt.ts"
 import { loopbackListener, type Listen } from "./callback.ts"
-import { authorizationUrl, classify, discoverKeystone, exchangeCode, refreshTokens, registerHostClient, withTimeout, type FetchLike, type TokenReply } from "./oauth.ts"
+import { authorizationUrl, classify, discoverKeystone, exchangeCode, refreshTokens, registerHostClient, withTimeout, type FetchLike, type KeystoneServer, type TokenReply } from "./oauth.ts"
 import { assertConnectionId, knownConnections, ksIsDue, readKsState, writeKsState, type KsState } from "./state.ts"
 
 export type { FetchLike } from "./oauth.ts"
@@ -64,7 +64,19 @@ type Held = { accessToken: string | undefined; unusable?: string; refreshToken: 
  * Per-bridge memory: `id` names this bridge in pending markers; `held` keeps token sets that are
  * not saved or not published yet, per connection. Lives only in this process, never on disk.
  */
-export type KeystoneMemory = { id: string; held: Map<string, Held> }
+export type KeystoneMemory = {
+  id: string
+  held: Map<string, Held>
+  /** Combined review L3: discovered metadata per connection, so discovery stays outside the lock. */
+  servers?: Map<string, KeystoneServer>
+}
+
+/**
+ * Combined review L3: a locked refresh that has run this long does not publish (front's reload
+ * takes up to ~50 s); it leaves the saved set marked needsPublish and the next tick publishes it
+ * from memory under its own lock. 45 s + ~50 s stays well inside SYNAPSE_LOCK_WAIT_MS (2 min).
+ */
+export const LOCKED_PUBLISH_DEADLINE_MS = 45_000
 
 export type KeystoneAuthDeps = {
   home: string
@@ -206,8 +218,8 @@ export function savePendingRefresh(deps: KeystoneAuthDeps, connectionId: string)
 }
 
 /** The held set is saved: publish its access token, or record why it cannot be used. */
-function settleHeld(deps: KeystoneAuthDeps, id: string, held: Held, previous: KsState | undefined): Promise<KsRefreshed> {
-  return held.accessToken === undefined ? accessUnusable(deps, id, held, previous) : commitHeld(deps, id, held, previous)
+function settleHeld(deps: KeystoneAuthDeps, id: string, held: Held, previous: KsState | undefined, deadline?: number): Promise<KsRefreshed> {
+  return held.accessToken === undefined ? accessUnusable(deps, id, held, previous) : commitHeld(deps, id, held, previous, deadline)
 }
 
 /**
@@ -230,14 +242,20 @@ async function accessUnusable(deps: KeystoneAuthDeps, id: string, held: Held, pr
 }
 
 /** The held set is saved: record it as the set in force, then publish its access token. */
-async function commitHeld(deps: KeystoneAuthDeps, id: string, held: Held, previous: KsState | undefined): Promise<KsRefreshed> {
+async function commitHeld(deps: KeystoneAuthDeps, id: string, held: Held, previous: KsState | undefined, deadline?: number): Promise<KsRefreshed> {
   // Written before publishing, so peers see a fresh set (and no pending marker) at once.
   const next: KsState = { connection: id, ...held.client, obtainedAt: held.obtainedAt, expiresAt: held.expiresAt, needsPublish: true, ...(previous?.credential ? { credential: previous.credential } : {}) }
   await writeKsState(deps.home, next)
-  return publishHeld(deps, id, held, next)
+  return publishHeld(deps, id, held, next, deadline)
 }
 
-async function publishHeld(deps: KeystoneAuthDeps, id: string, held: Held, state: KsState): Promise<KsRefreshed> {
+async function publishHeld(deps: KeystoneAuthDeps, id: string, held: Held, state: KsState, deadline?: number): Promise<KsRefreshed> {
+  if (deadline !== undefined && deps.now() > deadline) {
+    // Saved already; only the publish waits. No failure is counted, so the next tick republishes.
+    await writeKsState(deps.home, { ...state, needsPublish: true, lastError: "publish deferred: the locked refresh ran long" })
+    safeLog(deps.log, "warn", COMPONENT, "keystone publish deferred to the next tick (locked refresh ran long)", { connection: id })
+    return result(id, "retrying", "publish deferred: the locked refresh ran long")
+  }
   const published = await attempt(() => deps.publish(id, held.accessToken))
   if (!published.ok) {
     const failures = (state.failures ?? 0) + 1
@@ -254,7 +272,7 @@ async function publishHeld(deps: KeystoneAuthDeps, id: string, held: Held, state
  * Take up a token reply (under the lock): save the refresh token FIRST, before anything about the
  * access token is acted on (review cycle 1, HIGH), then publish it or record it as unusable.
  */
-async function adopt(deps: KeystoneAuthDeps, id: string, reply: TokenReply, client: Client, spent?: string): Promise<KsRefreshed> {
+async function adopt(deps: KeystoneAuthDeps, id: string, reply: TokenReply, client: Client, spent?: string, deadline?: number): Promise<KsRefreshed> {
   const now = deps.now()
   // Keystone sending back the presented token means nothing new to save.
   const refreshToken = reply.refreshToken !== spent ? reply.refreshToken : undefined
@@ -270,7 +288,7 @@ async function adopt(deps: KeystoneAuthDeps, id: string, reply: TokenReply, clie
   deps.memory.held.set(id, held)
   const previous = await readKsState(deps.home, id)
   if (!(await saveHeld(deps, id, held, previous))) return result(id, "pending_save", "refresh token not saved yet")
-  return settleHeld(deps, id, held, previous)
+  return settleHeld(deps, id, held, previous, deadline)
 }
 
 /** Publish an empty credential; returns whether front took it (a throw is logged, not raised). */
@@ -312,6 +330,7 @@ async function retryLater(deps: KeystoneAuthDeps, id: string, state: KsState, re
 }
 
 async function refreshLocked(deps: KeystoneAuthDeps, id: string, force: boolean): Promise<KsRefreshed> {
+  const deadline = deps.now() + LOCKED_PUBLISH_DEADLINE_MS
   const state = await readKsState(deps.home, id)
   const held = currentHeld(deps, id, state)
   // 1. A rotated refresh token not saved yet: only retry the save, never another grant.
@@ -320,7 +339,7 @@ async function refreshLocked(deps: KeystoneAuthDeps, id: string, force: boolean)
       await expireIfPast(deps, id, await readKsState(deps.home, id))
       return result(id, "pending_save", "refresh token not saved yet")
     }
-    return settleHeld(deps, id, held, state)
+    return settleHeld(deps, id, held, state, deadline)
   }
   if (state === undefined) return result(id, "signed_out")
   if (state.needsSignIn) {
@@ -358,13 +377,16 @@ async function refreshLocked(deps: KeystoneAuthDeps, id: string, force: boolean)
   let tokens: TokenReply
   try {
     const fetchFn = withTimeout(deps.fetch)
-    const server = await discoverKeystone(fetchFn, deps.origin, id)
+    // Normally cached by prefetchServer (outside the lock); discovering here is the fallback.
+    const server = deps.memory.servers?.get(id) ?? (await discoverKeystone(fetchFn, deps.origin, id))
     tokens = await refreshTokens(fetchFn, server, client.clientId, storedToken, deps.now())
   } catch (error) {
+    // The metadata may be stale: discover again (outside the lock) before the next attempt.
+    deps.memory.servers?.delete(id)
     const failure = classify("refresh", error)
     return failure.kind === "needs_sign_in" ? failClosed(deps, id, state, failure.reason, failure.forgetClient) : retryLater(deps, id, state, failure.reason)
   }
-  const adopted = await adopt(deps, id, tokens, client, storedToken)
+  const adopted = await adopt(deps, id, tokens, client, storedToken, deadline)
   safeLog(deps.log, "info", COMPONENT, "keystone token refreshed", { connection: id, outcome: adopted.outcome })
   return adopted
 }
@@ -380,9 +402,24 @@ async function refreshLocked(deps: KeystoneAuthDeps, id: string, force: boolean)
  * @throws DelegateError invalid_input for a bad id; a lock timeout or a state-file write error
  * @example await refreshConnection(deps, "rag-read")
  */
-export function refreshConnection(deps: KeystoneAuthDeps, connectionId: string, force = false): Promise<KsRefreshed> {
+export async function refreshConnection(deps: KeystoneAuthDeps, connectionId: string, force = false): Promise<KsRefreshed> {
   const id = assertConnectionId(connectionId)
+  await prefetchServer(deps, id, force)
   return deps.lock(() => refreshLocked(deps, id, force))
+}
+
+/**
+ * Combined review L3: discover a due connection's metadata OUTSIDE the lock and cache it, so the
+ * locked section holds only the token call, the save and the publish. Reads only; never throws (a
+ * failure leaves the cache empty and the locked refresh discovers as before).
+ */
+async function prefetchServer(deps: KeystoneAuthDeps, id: string, force: boolean): Promise<void> {
+  if (deps.memory.servers?.has(id)) return
+  const state = await attempt(() => readKsState(deps.home, id))
+  if (!state.ok || state.value === undefined || state.value.needsSignIn) return
+  if (!force && !ksIsDue(state.value, deps.now(), deps.refreshFraction)) return
+  const server = await attempt(() => discoverKeystone(withTimeout(deps.fetch), deps.origin, id))
+  if (server.ok) (deps.memory.servers ??= new Map()).set(id, server.value)
 }
 
 /**
@@ -473,6 +510,7 @@ export async function signIn(deps: KeystoneAuthDeps, connectionId: string): Prom
   let client: Client
   try {
     const server = await discoverKeystone(fetchFn, deps.origin, id)
+    ;(deps.memory.servers ??= new Map()).set(id, server)
     const listener = await (deps.listen ?? loopbackListener)(deps.loginPort)
     try {
       const redirect = loopbackRedirect(listener.port)

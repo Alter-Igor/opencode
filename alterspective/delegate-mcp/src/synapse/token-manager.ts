@@ -128,13 +128,16 @@ export const isDue = (state: TokenState | undefined, now: number, fraction: numb
  * front started with and the include's strict shape, then `nginx -t`, then reloads. A refusal never
  * loads anything (front keeps the last good config). The result and its time go into the state
  * (review M3), so oc_doctor can tell whether front loaded the include written last. Call under the lock.
+ * #67 combined review L2: a reload for a Keystone publish passes `{ record: false, component }`, so
+ * it neither writes the Synapse state's lastReload nor logs as "synapse". The default is unchanged.
  */
-export async function reloadFront(deps: Pick<SynapseDeps, "exec" | "frontContainer" | "home" | "now" | "log">): Promise<Reload> {
+export async function reloadFront(deps: Pick<SynapseDeps, "exec" | "frontContainer" | "home" | "now" | "log">, options: { record?: boolean; component?: string } = {}): Promise<Reload> {
   const run = await deps.exec(["docker", "exec", deps.frontContainer, FRONT_RELOAD], { timeoutMs: 30_000 })
   const result: Reload = run.code === 0 ? "reloaded" : run.code === FILES_CHANGED ? "config_changed" : await notReloaded(deps, run.code)
   // front-reload prints fixed messages only (never the include); the last line says why.
   const reason = run.stderr.trim().split("\n").at(-1)?.slice(0, 300)
-  safeLog(deps.log, result === "reloaded" ? "info" : "warn", "synapse", result === "reloaded" ? "front reloaded" : "front NOT reloaded", { result, ...(result === "reloaded" ? {} : { exit: run.code, reason }) })
+  safeLog(deps.log, result === "reloaded" ? "info" : "warn", options.component ?? "synapse", result === "reloaded" ? "front reloaded" : "front NOT reloaded", { result, ...(result === "reloaded" ? {} : { exit: run.code, reason }) })
+  if (options.record === false) return result
   const state = await readState(deps.home)
   const transient = result !== "front_not_running" && TRANSIENT_EXITS.has(run.code)
   const failures = transient ? (state?.lastReload?.failures ?? 0) + 1 : undefined
