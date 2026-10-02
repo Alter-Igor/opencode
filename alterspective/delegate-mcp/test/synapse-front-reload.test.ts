@@ -8,6 +8,8 @@ import { createHash } from "node:crypto"
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"
+import { frontServers, frontServersFor } from "../src/guard/egress.ts"
+import { defaultConfig } from "../src/shared/config.ts"
 import { KS_AUTH_VAR, MAX_TOKEN_LENGTH, authConf, isAuthConf } from "../src/synapse/auth-conf.ts"
 import { jwt } from "./synapse-fixture.ts"
 
@@ -229,7 +231,11 @@ describe.skipIf(!sh || !Bun.which("flock"))("front-reload run with sh (fake ngin
   // #67 step 3: per-connection Keystone includes (ks-auth-<id>.conf), named by servers.conf.
   const KS_SERVERS = [
     "server { listen 443;",
-    "    location = /v1/models { set $synapse_auth \"\"; include /etc/nginx/front-gen/synapse-auth.conf; }",
+    "    location = /v1/models {",
+    '        set $synapse_auth "";',
+    "        include /etc/nginx/front-gen/synapse-auth.conf;",
+    "        include /etc/nginx/front/upstream.conf;",
+    "    }",
     "    location = /mcp/c/rag-read {",
     '        set $ks_auth "";',
     "        include /etc/nginx/front-gen/ks-auth-rag-read.conf;",
@@ -323,12 +329,54 @@ describe.skipIf(!sh || !Bun.which("flock"))("front-reload run with sh (fake ngin
     expect(run({ servers: odd, hash: sha(odd), auth: authConf(undefined) })).toMatchObject({ code: 3, nginx: [] })
     const other = KS_SERVERS.replace("ks-auth-github.conf", "evil.conf")
     expect(run({ servers: other, hash: sha(other), auth: authConf(undefined) })).toMatchObject({ code: 3, nginx: [] })
-    // Review cycle 2: non-canonical spellings of the host folder nginx would still resolve.
-    for (const spelling of ["include /etc/nginx//front-gen/evil.conf;", "include /etc/nginx/./front-gen/evil.conf;", "include front-gen/evil.conf;"]) {
-      const odd2 = KS_SERVERS.replace("}\n", `    location = /x { ${spelling} }\n}\n`)
-      expect(odd2).toContain(spelling)
+    // Review cycle 2: every include must be one the generator emits, in its exact form, on its own
+    // line. Spellings nginx would still resolve, globs, relative paths, other files, several on one
+    // line, a quoted or line-split directive, and quotes that could hide one are all refused.
+    const canonical = "        include /etc/nginx/front-gen/ks-auth-github.conf;"
+    const bad = {
+      doubleSlash: "        include /etc/nginx//front-gen/evil.conf;",
+      dotSegment: "        include /etc/nginx/./front-gen/evil.conf;",
+      dotDot: "        include /etc/nginx/front/../front-gen/evil.conf;",
+      relative: "        include front-gen/evil.conf;",
+      relativeOther: "        include evil.conf;",
+      globQuestion: "        include /etc/nginx/front-ge?/x.conf;",
+      globStar: "        include /etc/nginx/front-gen/*.conf;",
+      globClass: "        include /etc/nginx/front-ge[n]/x.conf;",
+      unknownAbsolute: "        include /etc/passwd;",
+      upstreamSibling: "        include /etc/nginx/front/evil.conf;",
+      twoOnOneLine: "        include /etc/nginx/front/upstream.conf; include /etc/nginx/front/upstream.conf;",
+      inlineAfterSet: '        set $x ""; include /tmp/evil.conf;',
+      quotedDirective: '        "include" /tmp/evil.conf;',
+      splitLine: "        include\n/tmp/evil.conf;",
+      openQuote: '        set $x "\n# "; include /tmp/evil.conf;',
+      backslash: '        set $x "a\\"; include /tmp/evil.conf; #";',
+    }
+    for (const [name, line] of Object.entries(bad)) {
+      const odd2 = KS_SERVERS.replace(canonical, `${canonical}\n${line}`)
+      expect(odd2).toContain(line)
       for (const args of [[], ["--check"], ["--start"]])
-        expect({ spelling, args, code: run({ servers: odd2, hash: sha(odd2), auth: authConf(undefined), args }).code }).toEqual({ spelling, args, code: 3 })
+        expect({ name, args, code: run({ servers: odd2, hash: sha(odd2), auth: authConf(undefined), args }).code }).toEqual({ name, args, code: 3 })
+    }
+  })
+
+  test("the generator's own servers.conf passes, flag off and on (review cycle 2 allowlist)", () => {
+    const saved = process.env.OCD_KEYSTONE_HOST_AUTH
+    try {
+      for (const flag of [undefined, "1"]) {
+        if (flag === undefined) delete process.env.OCD_KEYSTONE_HOST_AUTH
+        else process.env.OCD_KEYSTONE_HOST_AUTH = flag
+        const servers = frontServersFor(defaultConfig({}))
+        expect(servers.includes("ks-auth-")).toBe(flag === "1")
+        for (const args of [[], ["--check"], ["--start"]])
+          expect({ flag, args, code: run({ servers, hash: sha(servers), auth: authConf(TOKEN), args }).code }).toEqual({ flag, args, code: 0 })
+      }
+      // An id named like the directive is not mistaken for one.
+      process.env.OCD_KEYSTONE_HOST_AUTH = "1"
+      const servers = frontServers(["identity.alterspective.com.au", "synapse2-api.alterspective.com.au"], { host: "identity.alterspective.com.au", connections: ["include", "my-front-gen"] })
+      expect(run({ servers, hash: sha(servers), auth: authConf(undefined) }).code).toBe(0)
+    } finally {
+      if (saved === undefined) delete process.env.OCD_KEYSTONE_HOST_AUTH
+      else process.env.OCD_KEYSTONE_HOST_AUTH = saved
     }
   })
 

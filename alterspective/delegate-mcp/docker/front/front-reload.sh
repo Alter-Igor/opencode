@@ -55,6 +55,24 @@ check() {
 # servers.conf naming any other file of the host folder is refused: nginx would read it unchecked.
 check_keystone() {
   KS_SHA=
+  # Allowlist (review cycle 2): every include is one the generator emits (src/guard/egress*.ts,
+  # src/synapse/front-routes.ts), exactly, alone on its line: upstream.conf, synapse-auth.conf, or
+  # ks-auth-<id>.conf. Any other include directive (glob, relative, `..`, other file, several on a
+  # line, quoted) is refused. Whole-line comments are skipped; so that no quoted string can carry a
+  # comment line or a directive across lines, other lines must hold no backslash and an even number
+  # of each quote character. (No regex interval in awk, for older awks: the id length is held to
+  # 63 by the canonical strip below, which leaves a longer id's `front-gen/` behind.)
+  bad=$(awk -v q="'" -v dq='"' '
+    /^[ \t]*#/ { next }
+    {
+      line = $0
+      if (index(line, "\\") > 0) { bad++; next }
+      if (gsub(dq, "&", line) % 2 != 0 || gsub(q, "&", line) % 2 != 0) { bad++; next }
+      if ($0 ~ /^[ \t]*include \/etc\/nginx\/(front\/upstream|front-gen\/synapse-auth|front-gen\/ks-auth-[a-z0-9][a-z0-9-]*)\.conf;[ \t]*$/) next
+      if ($0 ~ ("(^|[;{}[:space:]" dq q "])include([[:space:]" dq q ";]|$)")) bad++
+    }
+    END { print bad + 0 }' "$SERVERS")
+  [ "$bad" = 0 ] || { log "servers.conf has an include front-reload does not allow; not reloading"; return 3; }
   # Remove exactly the allowed includes in their canonical form; any path-like `front-gen/` left
   # (another file, or a spelling nginx still resolves: `//`, `/./`, relative) is refused. A
   # connection id may contain `front-gen`, but never followed by `/`, so its location and
