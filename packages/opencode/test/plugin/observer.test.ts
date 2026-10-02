@@ -39,12 +39,12 @@ describe("session retrospective profile", () => {
     }
   })
 
-  test("disabled retrospectives do not write files or send telemetry", async () => {
+  test.each(["1", "true", "TRUE"])("disabled retrospectives (%s) do not write files or send telemetry", async (value) => {
     await using ws = await tmpdir()
     const previous = process.env.OPENCODE_DISABLE_SESSION_RETROSPECTIVES
-    process.env.OPENCODE_DISABLE_SESSION_RETROSPECTIVES = "1"
+    process.env.OPENCODE_DISABLE_SESSION_RETROSPECTIVES = value
     try {
-      const sessionId = "obs-disabled"
+      const sessionId = `obs-disabled-${value}`
       sessionObserver.onToolBefore(sessionId, "read-1", "read", {})
       sessionObserver.onToolAfter(sessionId, "read-1", "read", "ok")
       expect(await sessionObserver.finalizeSessionRetrospective(sessionId, ws.path)).toBeNull()

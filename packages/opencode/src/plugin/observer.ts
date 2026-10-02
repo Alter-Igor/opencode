@@ -1,5 +1,6 @@
 import * as fs from "node:fs/promises"
 import * as path from "node:path"
+import { truthy } from "@opencode-ai/core/flag/flag"
 import { getLatestSynapseServing } from "./synapse"
 
 export interface ToolExecutionRecord {
@@ -182,7 +183,8 @@ class SessionObserverManager {
     sessionId: string,
     workspaceDir?: string,
   ): Promise<SessionRetrospective | null> {
-    if (process.env.OPENCODE_DISABLE_SESSION_RETROSPECTIVES === "1") {
+    // #55: sandboxes hold no Keystone credential, so they skip the retrospective file and POST. Read per call.
+    if (truthy("OPENCODE_DISABLE_SESSION_RETROSPECTIVES")) {
       this.trajectories.delete(sessionId)
       this.sessionStartTimes.delete(sessionId)
       return null

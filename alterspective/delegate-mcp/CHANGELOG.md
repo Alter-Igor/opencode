@@ -3,6 +3,7 @@
 ## 0.1.2 — 2026-10-02
 
 - Stop the box from writing session retrospective JSON into task folders or sending the unauthenticated retrospective POST to Keystone. Normal OpenCode runs keep their existing behavior.
+- The flag accepts `1` or `true` (any case), like other OpenCode flags. The sandbox-worker image sets it too.
 
 Tracks [#55](https://github.com/Alter-Igor/opencode/issues/55). Other observer logs and learnings are unchanged; [#50](https://github.com/Alter-Igor/opencode/issues/50) remains open for the wider workspace-output issue.
 

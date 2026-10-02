@@ -8,7 +8,7 @@ The flag also stops retrospective files in the box, but it does not stop diagnos
 
 ## Verification
 
-Every install and test command uses the This Rig work queue. Bridge test batches contain at most four files. Validation claims follow `TST-VAL-01`.
+Every install and test command uses the local work queue. Bridge test batches contain at most four files. Validation claims follow `TST-VAL-01`.
 
 | Check | Observed result |
 | --- | --- |
@@ -63,7 +63,7 @@ No new reusable lesson was found. `AILES-032` already covers the queue's Git Bas
 
 The two Windows declaration placeholders in `packages/app/src/custom-elements.d.ts` and `packages/enterprise/src/custom-elements.d.ts` were replaced with local hardlinks to `packages/ui/src/custom-elements.d.ts` and marked skip-worktree, per `AGENTS.md`. They are not tracked changes.
 
-Local test logs: `C:\Users\IgorJericevich\AppData\Local\Temp\opencode-observer-profile-checks` (`bridge-01.log` through `bridge-16.log`, `opencode-full.log`, and `lint.log`). The install initially waited for workstation resources; two attempts failed on `queue.lock` and another reached the admission limit. The combined retry completed successfully. No queue controls were changed.
+Local test logs: `<local path>` (`bridge-01.log` through `bridge-16.log`, `opencode-full.log`, and `lint.log`). The install initially waited for workstation resources; two attempts failed on `queue.lock` and another reached the admission limit. The combined retry completed successfully. No queue controls were changed.
 
 The same local folder preserves `full-suite-process.txt`, both standalone workspace logs, `opencode-inventory.txt`, `opencode-batches.json`, and per-batch stdout, stderr, and result JSON. The process snapshot recorded the full-suite command, wrapper PID 84792, child Bun PID 43728, CPU increasing from 364.625 to 373.281 seconds, and working set increasing from 865,689,600 to 986,529,792 bytes. Only that exact Bun PID was stopped. The isolated baseline check temporarily restored the two changed OpenCode files from the base commit, then restored the exact changed file bytes in a `finally` block.
 
@@ -72,3 +72,10 @@ OpenCode batch 11 reached its 180-second external bound after the first 12 cases
 The first batch driver stopped at its 25-minute checkpoint after batch 53. The completed, incomplete, and remaining file manifests were saved before only batches 54–67 resumed. Baseline comparisons and completion checks were finite serial queue jobs with a 90-second external bound. The combined-run failure and batch-11 bound remain recorded; neither was counted as a pass.
 
 The queue reported surviving test descendants after batch 11, batch 14, and the two SIGINT checks. Exact process identities were recorded in the corresponding `*-owned-descendants.txt` files before only those owned processes were stopped. A final process check found no remaining Bun, Git, Node, or recorded console-host test process matching this worktree. The source and test bytes were restored after every base comparison; the only unstaged diff at that point was this evidence file.
+
+## Review follow-up (2026-10-02)
+
+- The guard now uses the shared `truthy()` flag helper, so `1` or `true` in any case turns retrospectives off. It is still read on each call, so tests can flip it.
+- New cases `"true"` and `"TRUE"` failed before the change (17 pass, 2 fail) and pass after it: `bun test --timeout 30000 test/plugin/observer.test.ts` gives 19 pass, 0 fail. `bun typecheck` in `packages/opencode` exits 0.
+- `alterspective/sandbox-worker/Dockerfile` now sets `OPENCODE_DISABLE_SESSION_RETROSPECTIVES=1`, so E2B sandboxes skip the unauthenticated POST too. The sandbox image was not rebuilt.
+- Bridge compose and runtime tests: 13 pass, 0 fail.
