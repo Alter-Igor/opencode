@@ -4,7 +4,7 @@ opencode-delegate is a small MCP server that runs on your PC. It lets an AI clie
 
 Design and evidence: `docs/implementation/current/FEAT-OCD-001-opencode-delegate-mcp/` (start with `technical-design.md`).
 
-The box sets `OPENCODE_DISABLE_SESSION_RETROSPECTIVES=1`. The fork's observer skips session retrospectives there: no local retrospective JSON and no POST to Keystone's audit path. Other observer logs and learnings are unchanged. Outside the box, leaving this flag unset keeps the fork's existing behavior.
+The box sets `OPENCODE_DISABLE_SESSION_RETROSPECTIVES=1`. The fork's observer skips session retrospectives there: no local retrospective JSON and no POST to Keystone's audit path. Diagnostic logs and standalone learning-store operations are unchanged; learnings a retrospective would have derived are skipped too. Outside the box, leaving this flag unset keeps the fork's existing behavior.
 
 ## Security model
 
