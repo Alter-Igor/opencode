@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.2 — 2026-10-02
+
+- Stop the box from writing session retrospective JSON into task folders or sending the unauthenticated retrospective POST to Keystone. Normal OpenCode runs keep their existing behavior.
+- The flag accepts `1` or `true` (any case), like other OpenCode flags. The sandbox-worker image sets it too.
+
+Tracks [#55](https://github.com/Alter-Igor/opencode/issues/55). Diagnostic logs and standalone learning-store operations are unchanged (retrospective-derived learnings are skipped); [#50](https://github.com/Alter-Igor/opencode/issues/50) remains open for the wider workspace-output issue.
+
 ## 0.1.1 — 2026-10-02
 
 - Keep Synapse sign-ins retryable after a temporary secret-store read error.

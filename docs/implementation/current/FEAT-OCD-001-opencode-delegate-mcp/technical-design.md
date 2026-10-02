@@ -144,6 +144,8 @@ Unchanged from revision 1: `starting`, `busy`, `retry`, `needs_input`, `idle`, `
 
 ## 8. Errors, logging, versioning
 
+The box sets `OPENCODE_DISABLE_SESSION_RETROSPECTIVES=1` to disable the fork observer's session retrospective output (#55). Finalizing a session clears its pending observer records and returns without storing a retrospective in memory, writing workspace JSON, or sending the unauthenticated Keystone audit POST. Normal fork runs keep the existing behavior when the flag is unset. Diagnostic logs and standalone learning-store operations are unchanged. The flag also skips the learnings a retrospective would have derived at finalization; #50 still covers workspace output outside this box setting.
+
 As revision 1: stable error codes (`server_down`, `profile_invalid`, `profile_changed`, `policy_violation`, `policy_unverified`, `needs_auth`, `directory_invalid`, `directory_busy`, `not_found`, `not_started`, `cursor_expired`, `inbox_unavailable`, `upstream_error`, `sandbox_unavailable`); JSON logs to stderr + file (D-1, OBS-SNK-01 deviation); audit line per tool call; `correlationId` in session metadata and `X-Correlation-ID`; version in `alterspective/delegate-mcp/package.json`, `-dev+<sha>` locally, image tag includes SHA.
 
 ## 9. Compliance design matrix

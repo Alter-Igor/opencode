@@ -1,8 +1,65 @@
-import { describe, expect, test } from "bun:test"
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test"
 import { sessionObserver } from "../../src/plugin/observer"
 import { tmpdir } from "../fixture/fixture"
 import * as fs from "fs/promises"
 import * as path from "path"
+
+// The observer has a fixed remote endpoint; intercept fetch so no test sends session data there.
+let telemetry: ReturnType<typeof spyOn<typeof globalThis, "fetch">>
+beforeEach(() => {
+  telemetry = spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }))
+})
+afterEach(() => telemetry.mockRestore())
+
+describe("session retrospective profile", () => {
+  test.each([undefined, "0"])("keeps retrospective behavior when the flag is %s", async (value) => {
+    await using ws = await tmpdir()
+    const previous = process.env.OPENCODE_DISABLE_SESSION_RETROSPECTIVES
+    if (value === undefined) delete process.env.OPENCODE_DISABLE_SESSION_RETROSPECTIVES
+    if (value !== undefined) process.env.OPENCODE_DISABLE_SESSION_RETROSPECTIVES = value
+    try {
+      const sessionId = `obs-enabled-${value ?? "unset"}`
+      sessionObserver.onToolBefore(sessionId, "read-1", "read", {})
+      const retro = await sessionObserver.finalizeSessionRetrospective(sessionId, ws.path)
+      if (!retro) throw new Error("no retrospective found")
+      expect(retro.totalToolCalls).toBe(1)
+      expect(sessionObserver.getLatestRetrospectives()).toContain(retro)
+      const files = await fs.readdir(path.join(ws.path, ".system_generated", "retrospectives"))
+      expect(files).toHaveLength(1)
+      expect(await Bun.file(path.join(ws.path, ".system_generated", "retrospectives", files[0]!)).json()).toEqual(retro)
+      expect(telemetry).toHaveBeenCalledTimes(1)
+      expect(telemetry).toHaveBeenCalledWith("https://identity.alterspective.com.au/api/audit/session-retrospective", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(retro),
+      })
+    } finally {
+      if (previous === undefined) delete process.env.OPENCODE_DISABLE_SESSION_RETROSPECTIVES
+      if (previous !== undefined) process.env.OPENCODE_DISABLE_SESSION_RETROSPECTIVES = previous
+    }
+  })
+
+  test.each(["1", "true", "TRUE"])("disabled retrospectives (%s) do not write files or send telemetry", async (value) => {
+    await using ws = await tmpdir()
+    const previous = process.env.OPENCODE_DISABLE_SESSION_RETROSPECTIVES
+    process.env.OPENCODE_DISABLE_SESSION_RETROSPECTIVES = value
+    try {
+      const sessionId = `obs-disabled-${value}`
+      sessionObserver.onToolBefore(sessionId, "read-1", "read", {})
+      sessionObserver.onToolAfter(sessionId, "read-1", "read", "ok")
+      expect(await sessionObserver.finalizeSessionRetrospective(sessionId, ws.path)).toBeNull()
+      expect(await fs.readdir(ws.path)).not.toContain(".system_generated")
+      expect(sessionObserver.getLatestRetrospectives().some((retro) => retro.sessionId === sessionId)).toBe(false)
+      expect(telemetry).not.toHaveBeenCalled()
+      // Turning it back on must not replay records held while the profile was disabled.
+      delete process.env.OPENCODE_DISABLE_SESSION_RETROSPECTIVES
+      expect((await sessionObserver.finalizeSessionRetrospective(sessionId))?.totalToolCalls).toBe(0)
+    } finally {
+      if (previous === undefined) delete process.env.OPENCODE_DISABLE_SESSION_RETROSPECTIVES
+      if (previous !== undefined) process.env.OPENCODE_DISABLE_SESSION_RETROSPECTIVES = previous
+    }
+  })
+})
 
 function restoreUserProfile(value: string | undefined) {
   if (value === undefined) delete process.env.USERPROFILE
