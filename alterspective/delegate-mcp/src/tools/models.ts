@@ -48,6 +48,16 @@ async function fetchDefault(api: OpencodeApi, correlationId: string): Promise<st
   return typeof model === "string" && MODEL_RE.test(model) && isSynapse(model) ? [model] : []
 }
 
+/**
+ * #71 cycle 2: the model to SEND when a session's saved one is not offered: the box config's model,
+ * else synapse/auto (an unreadable config never blocks the send). Sent explicitly, because OpenCode
+ * otherwise reuses the session's stored model (packages/opencode/src/session/prompt.ts).
+ */
+export async function boxDefault(api: OpencodeApi, correlationId: string): Promise<string> {
+  const found = await fetchDefault(api, correlationId).catch((): string[] => [])
+  return found[0] ?? DEFAULT_MODEL
+}
+
 export async function listModels(api: OpencodeApi, correlationId: string): Promise<ModelList> {
   const [models, defaults] = await Promise.all([fetchModels(api, correlationId), fetchDefault(api, correlationId)])
   return { models, defaults }

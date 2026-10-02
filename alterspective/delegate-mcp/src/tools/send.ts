@@ -11,7 +11,7 @@ import { readInstructions, type Instructions } from "./core-box.ts"
 import { CORRELATION_RE, agentSchema, formatCursor, modelSchema, ownSession, parseModel, requireSynapseModel, sameRules, sessionGone, sessionIdSchema } from "./core-session.ts"
 import { DEFAULT_MODEL, SYNAPSE_PROVIDER } from "../supervisor/profile.ts"
 import { defineTool } from "./define.ts"
-import { fetchModels, requireModel } from "./models.ts"
+import { boxDefault, fetchModels, requireModel } from "./models.ts"
 import { ok } from "./shape.ts"
 
 export const MAX_MESSAGE_CHARS = 100_000
@@ -36,18 +36,19 @@ export type Prompt = { text: string; model?: string; agent?: string; correlation
 /** `modelFallback`: the session's saved model was not used (#71 review cycle 1), and why. */
 export type Sent = { cursor: string; instructions: Instructions; modelFallback?: string }
 
-const SANDBOX_DEFAULT = "the sandbox default (synapse/auto unless the owner picked another)"
-
 /**
- * #71 review cycle 1: a session's SAVED model gets the same check as an explicit one. One the
+ * #71 review cycles 1-2: a session's SAVED model gets the same check as an explicit one. One the
  * sandbox no longer offers (another provider's, from before #71, or a Synapse model since retired)
- * is not sent: the sandbox default is used and the reason returned, so old sessions keep working.
+ * is replaced by the sandbox default, SENT explicitly (leaving `model` out would make OpenCode reuse
+ * the session's stored model), and the reason names the model actually sent.
  */
 async function savedModel(box: Box, saved: string | undefined, correlationId: string): Promise<{ model?: string; fallback?: string }> {
   if (!saved || saved === DEFAULT_MODEL) return saved ? { model: saved } : {}
-  if (parseModel(saved).providerID !== SYNAPSE_PROVIDER) return { fallback: `The session's saved model ${saved} is not a Synapse model; ${SANDBOX_DEFAULT} was used.` }
-  if ((await fetchModels(box.api, correlationId)).includes(saved)) return { model: saved }
-  return { fallback: `The session's saved model ${saved} is no longer offered by the sandbox; ${SANDBOX_DEFAULT} was used.` }
+  const why =
+    parseModel(saved).providerID !== SYNAPSE_PROVIDER ? "is not a Synapse model" : (await fetchModels(box.api, correlationId)).includes(saved) ? undefined : "is no longer offered by the sandbox"
+  if (!why) return { model: saved }
+  const model = await boxDefault(box.api, correlationId)
+  return { model, fallback: `The session's saved model ${saved} ${why}; the sandbox default ${model} was sent instead.` }
 }
 
 /** Instructions, cursor, prompt_async, markSent: the one way a prompt reaches a session. */

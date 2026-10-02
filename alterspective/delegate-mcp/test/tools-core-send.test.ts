@@ -192,14 +192,17 @@ describe("oc_send", () => {
   // Review cycle 1 (MEDIUM): a session's saved model gets the same registration check as an explicit
   // one; when it is no longer offered the send falls back to the sandbox default (old sessions keep
   // working) and says so.
-  test("a saved model that is not a Synapse model falls back to the sandbox default, without asking the box", async () => {
+  test("a saved model that is not a Synapse model falls back to the sandbox default, sent explicitly, without reading the model list", async () => {
     const f = fakeContext()
     ready(f)
+    // Cycle 2: the default is SENT explicitly; leaving `model` out makes OpenCode reuse the session's
+    // stored (retired) model (packages/opencode/src/session/prompt.ts).
+    f.api.on("GET /config", { status: 200, data: { model: "synapse/auto" } })
     f.ctx.sessions.set(SID, record({ model: "opencode/big-pickle" }))
     const result = await send(f)
     expect(result.isError).toBeUndefined()
-    expect(promptBody(f)).not.toHaveProperty("model")
-    expect(data(result).modelFallback).toBe("The session's saved model opencode/big-pickle is not a Synapse model; the sandbox default (synapse/auto unless the owner picked another) was used.")
+    expect(promptBody(f)?.model).toEqual({ providerID: "synapse", modelID: "auto" })
+    expect(data(result).modelFallback).toBe("The session's saved model opencode/big-pickle is not a Synapse model; the sandbox default synapse/auto was sent instead.")
     expect(text(result)).toContain("opencode/big-pickle")
     expect(f.api.find("GET", "/config/providers")).toBeUndefined()
   })
@@ -208,10 +211,16 @@ describe("oc_send", () => {
     const f = fakeContext()
     ready(f)
     f.api.on("GET /config/providers", { status: 200, data: { providers: [{ id: "synapse", models: { auto: { id: "auto" }, "qwen/qwen3.8-flash": { id: "qwen/qwen3.8-flash" } } }] } })
+    f.api.on("GET /config", { status: 200, data: { model: "synapse/qwen/qwen3.8-flash" } })
     f.ctx.sessions.set(SID, record({ model: "synapse/openai/gpt-5.6-sol" }))
     const gone = await send(f)
-    expect(promptBody(f)).not.toHaveProperty("model")
-    expect(String(data(gone).modelFallback)).toContain("is no longer offered by the sandbox")
+    expect(promptBody(f)?.model).toEqual({ providerID: "synapse", modelID: "qwen/qwen3.8-flash" })
+    expect(data(gone).modelFallback).toBe("The session's saved model synapse/openai/gpt-5.6-sol is no longer offered by the sandbox; the sandbox default synapse/qwen/qwen3.8-flash was sent instead.")
+    // The box's default cannot be read (or is not a Synapse model): synapse/auto is sent.
+    f.api.on("GET /config", { status: 500 })
+    const unread = await send(f)
+    expect(f.api.calls.filter((c) => c.path.endsWith("prompt_async")).at(-1)?.body).toMatchObject({ model: { providerID: "synapse", modelID: "auto" } })
+    expect(String(data(unread).modelFallback)).toContain("synapse/auto was sent instead")
     f.ctx.sessions.set(SID, record({ model: "synapse/qwen/qwen3.8-flash" }))
     const kept = await send(f)
     expect(data(kept)).not.toHaveProperty("modelFallback")
