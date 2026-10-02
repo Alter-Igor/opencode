@@ -16,7 +16,7 @@ import type { Logger } from "../shared/log.ts"
 import type { ApiTarget } from "../shared/opencode-api.ts"
 import { FRONT_SERVERS_NAME } from "../guard/egress.ts"
 import { ensureAuthConf, ensureKsAuthConf } from "../synapse/auth-conf.ts"
-import { keystoneHostAuth } from "../guard/egress-identity.ts"
+import { KEYSTONE_HOST_AUTH_ENV, keystoneHostAuth } from "../guard/egress-identity.ts"
 import { SYNAPSE_LOCK_WAIT_MS } from "../synapse/lock.ts"
 import { INSPECT_ENV, MCP_ALLOW_ENV, approvedValues, boxEnvOverride, composeDownEnv, composeEnv, siblingContainers } from "./compose-env.ts"
 import { LABEL, dockerArgs, imageExists, inspectBox, redactAll, requireDocker, type BoxInspect, type Exec, type ExecResult } from "./docker.ts"
@@ -96,8 +96,15 @@ async function withHolders(run: Run, error: unknown): Promise<unknown> {
  * A running box is only reused when profile, image and MCP policy all match this bridge (A-04,
  * A-05). The profile hash covers the ks-<id> entries, so another Keystone set fails here too.
  */
-export function checkReusable(deps: SupervisorDeps, box: BoxInspect, plan: Pick<Plan, "built" | "config">): void {
+export function checkReusable(deps: SupervisorDeps, box: BoxInspect, plan: Pick<Plan, "built" | "config" | "otherFlagHash">): void {
   const hash = plan.built.hash
+  if (plan.otherFlagHash !== undefined && box.labels[LABEL.profileHash] === plan.otherFlagHash) {
+    const on = keystoneHostAuth()
+    throw changed(
+      `The running sandbox was started by a bridge with ${KEYSTONE_HOST_AUTH_ENV} ${on ? "unset" : "=1"}, but this bridge has it ${on ? "=1" : "unset"}. Set ${KEYSTONE_HOST_AUTH_ENV} the same for every bridge that shares this home.`,
+      `profile hash ${hash.slice(0, 12)} differs only by ${KEYSTONE_HOST_AUTH_ENV}`,
+    )
+  }
   if (box.labels[LABEL.profileHash] !== hash)
     throw changed("The running sandbox uses an older profile (config, model list or permissions changed).", `profile hash ${box.labels[LABEL.profileHash]?.slice(0, 12) ?? "missing"} != ${hash.slice(0, 12)}`)
   if (box.labels[LABEL.image] !== deps.image)

@@ -255,6 +255,8 @@ describe("oc_login with host-held tokens", () => {
 
   test("with no server: signs in only connections the host store says need it", async () => {
     const f = fakeContext({ boxHeld: false })
+    // Review M1: a running box is now reused to connect entries; a stopped one is never started.
+    f.status.value = { state: "stopped" }
     const status = (connection: string, state: KsStatus["state"]): KsStatus => ({ connection, state, refreshTokenStored: state === "signed_in", pendingSave: false, clientRegistered: true, store: "dpapi" })
     const ks = hostKeystone([status("rag-read", "signed_in"), status("github", "needs_sign_in"), status("seqlogs", "signed_out")])
     f.ctx.keystone = ks.service

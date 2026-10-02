@@ -102,13 +102,21 @@ Today the box signs in to each chosen Keystone connection itself and keeps the t
 
 **Turn it on.**
 
-1. Set `OCD_KEYSTONE_HOST_AUTH=1` in this MCP server's `env` in your client config. Set it for every bridge that shares the same home, or they will build different profiles and `front` configs.
-2. Restart the client, then restart the sandbox: `oc_server_restart {confirm: true}`. The profile, `front`'s config and the box store all change, so a restart is needed.
+1. Set `OCD_KEYSTONE_HOST_AUTH=1` in this MCP server's `env` in your client config. Set it for every bridge that shares the same home, or they will build different profiles and `front` configs. A bridge with the other value is refused with an error that names `OCD_KEYSTONE_HOST_AUTH`.
+2. Restart **every** client that runs a bridge on this home, so each one has the flag. Only then restart the sandbox: `oc_server_restart {confirm: true}`. Add `force: true` if other bridges still hold the sandbox (their running sessions are interrupted). The profile, `front`'s config and the box store all change, so a restart is needed.
 3. Run `oc_login {server: "ks-<id>"}` for each chosen connection (or `oc_login` with no server for all of them).
 4. Run `oc_doctor`. Check `keystoneAuth.ok` is true and `verified` is true.
 5. Revoke the old box sign-ins in Keystone by client id. `oc_doctor` lists them under `live.signIns.removedBefore` (Keystone tool `revoke-oauth-tokens`). The bridge cannot revoke them for you (see "Old sign-ins are removed, not revoked").
 
-**Turn it off.** Remove the variable, restart the client and the sandbox, then run `oc_login` again: the box signs in itself, as before.
+**A box entry shows `failed`.** Run `oc_login`. A connection whose host token is still valid is only reconnected in the box, with no browser consent. `oc_login {server: "ks-<id>", force: true}` signs in again anyway. Each bridge also reconnects signed-in entries on its own box every minute, and `oc_doctor` does it before it reports.
+
+**Turn it off.**
+
+1. Remove the variable from every client that runs a bridge on this home, restart those clients, then `oc_server_restart {confirm: true}` (with `force: true` if other bridges hold the sandbox).
+2. Run `oc_login`: the box signs in itself, as before.
+3. Clean up what the host held. The access tokens in `<home>\front\ks-auth-<id>.conf` stay valid until they expire (about one hour), even after the files are no longer used. Delete those files, or wait out the hour.
+4. Revoke the host's client ids in Keystone (`revoke-oauth-tokens`). Each one is in `<home>\keystone\<id>.state.json` as `clientId` (an id, not a secret).
+5. Delete the `<home>\keystone` folder. It holds the DPAPI-encrypted refresh tokens and the state files.
 
 ## Synapse sign-in
 

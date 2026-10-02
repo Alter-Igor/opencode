@@ -48,19 +48,30 @@ export type KsPublisherDeps = {
  */
 export function createKsPublisher(deps: KsPublisherDeps): Publish {
   const write = deps.write ?? writeKsAuthConf
+  // Never throws: a connect failure is logged and must not reach the manager's locked work.
+  const connectInBackground = async (entry: string): Promise<void> => {
+    try {
+      await deps.connect(entry)
+    } catch (error) {
+      safeLog(deps.log, "warn", COMPONENT, "keystone entry connect failed", { entry, reason: error instanceof Error ? error.message.slice(0, 200) : "error" })
+    }
+  }
   return async (connectionId, bearer) => {
+    // Lock hold time: this runs under the shared lock. The write is local; reloadFront is bounded by
+    // its docker exec (30 s) plus, on failure, one docker inspect (20 s), about 50 s in all, well
+    // inside the 2-minute lock wait (SYNAPSE_LOCK_WAIT_MS) other bridges allow. Inherited from step 1.
     await write(deps.frontDir, connectionId, bearer)
     const reload = await deps.reload()
     const credential = bearer === undefined ? "empty" : "published"
     safeLog(deps.log, PUBLISHED.has(reload) ? "info" : "warn", COMPONENT, "keystone credential published", { connection: connectionId, credential, reload })
     if (!PUBLISHED.has(reload)) throw new Error(`front did not load the new Keystone credential for ${connectionId} (reload: ${reload})`)
     if (bearer === undefined) return
-    const entry = entryName(connectionId)
-    void deps.connect(entry).catch((error: unknown) =>
-      safeLog(deps.log, "warn", COMPONENT, "keystone entry connect failed", { entry, reason: error instanceof Error ? error.message.slice(0, 200) : "error" }),
-    )
+    void connectInBackground(entryName(connectionId))
   }
 }
+
+/** One connect per (box API, entry) at a time: the publisher, oc_login, a tick and oc_doctor may overlap. */
+const inFlight = new WeakMap<OpencodeApi, Map<string, Promise<string>>>()
 
 async function entryStatus(api: OpencodeApi, entry: string): Promise<string> {
   const res = await api.call<Record<string, McpStatus>>({ path: "/mcp", directory: DIRECTORY })
@@ -81,6 +92,20 @@ async function entryStatus(api: OpencodeApi, entry: string): Promise<string> {
  */
 export async function ensureEntryConnected(api: OpencodeApi, entry: string, log: Logger): Promise<string> {
   if (idOfEntry(entry) === undefined) throw new DelegateError("invalid_input", "Only ks-<id> entries can be connected.", "Pass a ks-<id> server name.")
+  const running = inFlight.get(api) ?? new Map<string, Promise<string>>()
+  inFlight.set(api, running)
+  const pending = running.get(entry)
+  if (pending) return pending
+  const attempt = connectOnce(api, entry, log)
+  running.set(entry, attempt)
+  try {
+    return await attempt
+  } finally {
+    running.delete(entry)
+  }
+}
+
+async function connectOnce(api: OpencodeApi, entry: string, log: Logger): Promise<string> {
   const before = await entryStatus(api, entry)
   if (before === "connected") return before
   const res = await api.call({ method: "POST", path: `/mcp/${entry}/connect`, directory: DIRECTORY })
@@ -111,7 +136,59 @@ export async function connectSignedIn(status: (ids: readonly string[]) => Promis
   }
   for (const state of states.filter((s) => s.state === "signed_in")) {
     const entry = entryName(state.connection)
-    out[entry] = await ensureEntryConnected(api, entry, log).catch(() => "unknown")
+    try {
+      out[entry] = await ensureEntryConnected(api, entry, log)
+    } catch {
+      out[entry] = "unknown"
+    }
   }
   return out
+}
+
+/**
+ * One reconnect pass on the box this bridge holds (nothing without one). Every bridge runs it, so a
+ * box held by several bridges is reconnected even when another bridge renewed the token.
+ *
+ * @param heldApi the held box's API, or undefined
+ * @param status the host token states
+ * @param ids the chosen connection ids, read now
+ * @param log bridge logger
+ * @returns entry name → status after the attempt; never throws
+ * @example await reconnectTick(() => manager.peek()?.api, (ids) => ks.status(ids), () => currentKeystone(config).connections, log)
+ */
+export async function reconnectTick(heldApi: () => OpencodeApi | undefined, status: (ids: readonly string[]) => Promise<KsStatus[]>, ids: () => readonly string[], log: Logger): Promise<Record<string, string>> {
+  const api = heldApi()
+  if (!api) return {}
+  let chosen: readonly string[]
+  try {
+    chosen = ids()
+  } catch (error) {
+    safeLog(log, "warn", COMPONENT, "keystone connection list failed; reconnect skipped", { reason: error instanceof Error ? error.name : "error" })
+    return {}
+  }
+  return connectSignedIn(status, chosen, api, log)
+}
+
+/** How often each bridge checks its held box's ks-* entries (one GET /mcp; a connect only when needed). */
+export const RECONNECT_TICK_MS = 60_000
+
+/**
+ * Run reconnectTick every `tickMs` (single-flight). Returns a stop function.
+ *
+ * @example const stop = startReconnectLoop(() => manager.peek()?.api, (ids) => ks.status(ids), ids, log)
+ */
+export function startReconnectLoop(heldApi: () => OpencodeApi | undefined, status: (ids: readonly string[]) => Promise<KsStatus[]>, ids: () => readonly string[], log: Logger, tickMs = RECONNECT_TICK_MS): () => void {
+  let running = false
+  const tick = async (): Promise<void> => {
+    if (running) return
+    running = true
+    try {
+      await reconnectTick(heldApi, status, ids, log)
+    } finally {
+      running = false
+    }
+  }
+  const timer = setInterval(() => void tick(), tickMs)
+  timer.unref?.()
+  return () => clearInterval(timer)
 }

@@ -26,6 +26,8 @@ export type ProfileInput = {
   ownerConfigs: string[]
   /** keystoneConnections must be the effective set (shared/config.ts effectiveConfig). */
   config: Pick<BridgeConfig, "keystoneOrigin" | "keystoneConnections" | "boxEnv">
+  /** #67: host-held Keystone tokens (entries carry oauth:false). Default: OCD_KEYSTONE_HOST_AUTH=1. */
+  hostAuth?: boolean
   /** Supplied by MOD-02 (Guard.permissionBaseline); the supervisor does not decide policy. */
   permission: PermissionRule[]
   /** provider id → env name to use as options.apiKey when the owner's entry has no key (must be on boxEnv). */
@@ -255,7 +257,7 @@ export function buildProfile(input: ProfileInput): BuiltProfile {
     $schema: "https://opencode.ai/config.json",
     ...modelFields(owner, providers),
     provider: providers.kept,
-    mcp: mcpEntries(input.config),
+    mcp: mcpEntries(input.config, input.hostAuth ?? keystoneHostAuth()),
     permission: permissionConfig(input.permission),
   }
   const files: Record<string, string> = {

@@ -21,7 +21,7 @@ import { createSynapseAuth, type SynapseAuth } from "./synapse/index.ts"
 import { reloadFront } from "./synapse/token-manager.ts"
 import { keystoneHostAuth } from "./guard/egress-identity.ts"
 import { createKeystoneAuth, type KeystoneAuth } from "./keystone-auth/index.ts"
-import { connectSignedIn, createKsPublisher, ensureEntryConnected } from "./keystone-auth/host-wiring.ts"
+import { connectSignedIn, createKsPublisher, ensureEntryConnected, startReconnectLoop } from "./keystone-auth/host-wiring.ts"
 import { cleanEnv, runCommand } from "./supervisor/workspaces-exec.ts"
 import type { Box, CommandRunner, RestartedBox, SessionRecord, ToolContext } from "./tools/context.ts"
 
@@ -277,8 +277,21 @@ export async function createRuntime(options: RuntimeOptions = {}): Promise<Runti
     name,
     synapse,
     // The renewal loop reads the chosen set on every tick (a set change needs no restart of the loop).
-    ...(keystone ? { keystone: { start: () => keystone.start(() => currentKeystone(config).connections) } } : {}),
+    // The reconnect loop: each bridge reconnects signed-in entries on the box IT holds, so a token
+    // renewed by another bridge sharing the box still gets its entries connected here.
+    ...(keystone ? { keystone: { start: () => startHostKeystone(keystone, config, log, () => manager.peek()?.api) } } : {}),
     shutdown: shutdownOnce(manager, supervisorService, log),
+  }
+}
+
+/** Start the renewal loop and the reconnect loop; the returned function stops both. */
+function startHostKeystone(keystone: KeystoneAuth, config: BridgeConfig, log: Logger, heldApi: () => OpencodeApi | undefined): () => void {
+  const ids = () => currentKeystone(config).connections
+  const stopRenewal = keystone.start(ids)
+  const stopReconnect = startReconnectLoop(heldApi, (chosen) => keystone.status(chosen), ids, log)
+  return () => {
+    stopReconnect()
+    stopRenewal()
   }
 }
 

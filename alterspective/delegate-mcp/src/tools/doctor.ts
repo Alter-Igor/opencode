@@ -8,7 +8,8 @@ import type { Verdict } from "../shared/contracts.ts"
 import type { McpStatus, OpencodeApi } from "../shared/opencode-api.ts"
 import { KS_NAME } from "../guard/entries.ts"
 import { checkEgress, egressInput, type EgressCheck } from "../guard/egress-check.ts"
-import { effectiveConfig } from "../shared/config.ts"
+import { currentKeystone, effectiveConfig } from "../shared/config.ts"
+import { reconnectTick } from "../keystone-auth/host-wiring.ts"
 import type { ToolContext } from "./context.ts"
 import { defineTool } from "./define.ts"
 import { keystoneLine, keystoneReport, type KeystoneReport } from "./keystone-report.ts"
@@ -81,13 +82,13 @@ const OWNER_RAG_READ = "rag-read"
  * Review L7: `rag-read` is the owner's private Keystone connection id. When it is missing or not
  * signed in, say so, and how anyone else uses their own connection over the same service.
  */
-export function keystoneEntriesHint(keystone: KeystoneReport): string {
+export function keystoneEntriesHint(keystone: KeystoneReport, hostAuth = false): string {
   if ("unavailable" in keystone) return ""
   const notReady = (keystone.entries ?? []).filter((e) => e.status !== "connected" && e.status !== "disabled")
   if (notReady.length === 0) return ""
   const list = ` Chosen Keystone entries not ready: ${notReady.map((e) => `${e.name} ${e.status}`).join(", ")}.`
   const entry = notReady.find((e) => e.id === OWNER_RAG_READ)
-  if (!entry) return `${list} Run oc_login for them.`
+  if (!entry) return `${list} ${hostAuth ? "Run oc_login: it reconnects entries whose host token is valid and signs in the rest." : "Run oc_login for them."}`
   return `${list} \`${OWNER_RAG_READ}\` is the owner's private Keystone connection id. If you are the owner, run oc_login {server: "ks-${OWNER_RAG_READ}"}. Anyone else creates their own connection over the Keystone service \`rag-read\` and sets its id in OPENCODE_DELEGATE_KEYSTONE and OPENCODE_DELEGATE_KEYSTONE_ALLOWED (README "Keystone services").`
 }
 
@@ -140,6 +141,10 @@ async function inspect(ctx: ToolContext, start: boolean, correlationId: string) 
   const status = await ctx.supervisorService.status()
   const held = ctx.peekBox()
   const api = held?.api ?? (status.state === "running" ? ctx.apiFor(status.target) : undefined)
+  // Review M1: with host-held tokens, reconnect signed-in entries on the box read here (held by any
+  // bridge) before reporting them: OpenCode does not reconnect an oauth:false entry by itself.
+  const keystone = ctx.keystone
+  if (api && keystone) await reconnectTick(() => api, (ids) => keystone.status(ids), () => currentKeystone(ctx.config).connections, ctx.log)
   const mcp = api ? await readMcp(api, correlationId) : undefined
   const verdict: Verdict = api ? await ctx.guard.checkRuntime(api, PROBE_DIRECTORY) : { ok: false, code: "policy_unverified", reason: "the sandbox is not running" }
   // R5-01 / R5-05: what is running, not what the labels say.
@@ -194,7 +199,7 @@ export const doctorTool = defineTool({
     const synapse = await ctx.synapse.status()
     const keystoneAuth = await keystoneAuthReport(ctx, keystone, live)
     const verified = isVerified(status, mcp, verdict) && egress.ok && keystoneEntriesOk(keystone) && live?.ok === true && synapse.ok && (!keystoneAuth.enabled || keystoneAuth.ok)
-    return ok(`${summaryOf(status, mcp, verdict, verified)} ${keystoneLine(keystone)}.${keystoneEntriesHint(keystone)}${egressSummary(egress)}${liveSummary(live, keystoneAuth.enabled)}${synapseLine(synapse)}${keystoneAuthLine(keystoneAuth)}`, {
+    return ok(`${summaryOf(status, mcp, verdict, verified)} ${keystoneLine(keystone)}.${keystoneEntriesHint(keystone, ctx.keystone !== undefined)}${egressSummary(egress)}${liveSummary(live, keystoneAuth.enabled)}${synapseLine(synapse)}${keystoneAuthLine(keystoneAuth)}`, {
       verified,
       synapse,
       keystoneAuth,
