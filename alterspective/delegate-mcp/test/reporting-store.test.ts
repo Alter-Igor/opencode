@@ -256,6 +256,37 @@ describe("report store", () => {
     expect(readdirSync(dir).sort()).toEqual(["s-0000000181.json", "s-0000000181.json.lock", "s-0000000183.json.lock"])
   })
 
+  test("a failed link-back of a moved live lock is logged once, with the key and error code only", async () => {
+    const dir = tmpDir()
+    const slow = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
+    const setup = createReportStore({ dir, now: () => NOW })
+    await setup.update("s-0000000165", () => rec("s-0000000165"))
+    const lock = path.join(dir, "s-0000000165.json.lock")
+    writeFileSync(lock, "crashed writer")
+    const old = new Date(Date.now() - 20_000)
+    utimesSync(lock, old, old)
+    let arrived = 0
+    const gate = async () => {
+      arrived++
+      while (arrived < 2) await slow(2)
+    }
+    const warnings: Array<[string, unknown]> = []
+    const a = createReportStore({ dir, now: () => NOW, onStaleLock: gate, warn: (code, fields) => warnings.push([code, fields]), link: () => {
+      throw errno("EEXIST")
+    } })
+    let failNext = true
+    const b = createReportStore({ dir, now: () => NOW, sleep: () => slow(40), onStaleLock: gate, rename: (from, to) => {
+      if (failNext) {
+        failNext = false
+        throw errno("EBUSY")
+      }
+      renameSync(from, to)
+    } })
+    const bump = (r: TaskRecord | undefined) => (r ? { ...r, sendCount: r.sendCount + 1 } : r)
+    await Promise.all([a.update("s-0000000165", bump), b.update("s-0000000165", bump)])
+    expect(warnings).toEqual([["lock_relink_failed", { key: "s-0000000165", code: "EEXIST" }]])
+  })
+
   test("flush() waits for updates that were queued without being awaited", async () => {
     const dir = tmpDir()
     const store = createReportStore({ dir, now: () => NOW })

@@ -4,7 +4,7 @@
 // agent or repo. Read-only apart from retention. Records hold metadata only, never prompt text;
 // strings a calling agent chose (agent names, repo folder names) are returned under `untrusted`.
 import { z } from "zod"
-import { reportsFor } from "../reporting/hooks.ts"
+import { flushReports, reportsFor } from "../reporting/hooks.ts"
 import type { TaskRecord } from "../reporting/record.ts"
 import { summarise, type Group, type GroupBy, type Metrics } from "../reporting/summary.ts"
 import { defineTool } from "./define.ts"
@@ -71,6 +71,8 @@ export const reportTool = defineTool({
   async run(args, ctx) {
     const sinceDays = args.sinceDays ?? DEFAULT_SINCE_DAYS
     const groupBy: GroupBy = args.groupBy ?? "model"
+    // Cycle 3: this process's own queued updates first, so the report includes its latest work.
+    await flushReports()
     const store = reportsFor(ctx)
     store.prune()
     const report = summarise(store.list(), { sinceDays, groupBy, recent: args.recent ?? 0, now: Date.now() })

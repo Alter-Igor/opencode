@@ -26,7 +26,7 @@ export function reportsFor(ctx: Pick<ToolContext, "config" | "log">): ReportStor
   let store = stores.get(dir)
   if (!store) {
     // WEBSTA-001-SECRETS-MANAGEMENT-STANDARDS: the error code only; no path, no record content.
-    store = createReportStore({ dir, warn: (code) => safeLog(ctx.log, "warn", "reporting", "task record not saved; reporting goes on without it", { code }) })
+    store = createReportStore({ dir, warn: (code, fields) => safeLog(ctx.log, "warn", "reporting", "task record not saved; reporting goes on without it", { code, ...fields }) })
     stores.set(dir, store)
   }
   return store
@@ -230,8 +230,8 @@ export function recordClose(ctx: Ctx, key: string, disposition: Exclude<Disposit
 function closedRun(record: TaskRecord, at: string, end: { aborted?: boolean; seen?: Omit<ObservedState, "sessionID"> }): TaskRecord {
   if (end.aborted) return ended(record, "aborted", at)
   const seen = end.seen
-  // Idle with an error seen is a failed run, not a completed one.
-  const state: SessionState | undefined = seen?.state === "idle" && seen.lastError ? "error" : seen?.state
-  const done = state && seen && state !== "not_found" ? finish(record, { sessionID: record.sessionID, ...seen, state }) : undefined
+  // Cycle 3: idle is completed, as in recordStates. `lastError` on an idle view can be a disarmed
+  // label left from an earlier run (events/state.ts), so it says nothing about this one.
+  const done = seen && seen.state !== "not_found" ? finish(record, { sessionID: record.sessionID, ...seen }) : undefined
   return done ?? ended(record, "unknown", at)
 }

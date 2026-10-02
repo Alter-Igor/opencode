@@ -36,7 +36,9 @@ export type ReportStoreOptions = {
   sleep?: (ms: number) => Promise<void>
   now?: () => number
   /** Called once per store, with an error code, on the first failed write. */
-  warn?: (code: string) => void
+  warn?: (code: string, fields?: { key: string; code: string }) => void
+  /** Test seam: the hard link used to put back a live lock moved aside. */
+  link?: (existing: string, created: string) => void
   maxAgeDays?: number
   maxRecords?: number
   lockAttempts?: number
@@ -70,6 +72,7 @@ const errno = (error: unknown): string => {
 export function createReportStore(options: ReportStoreOptions): ReportStore {
   const dir = options.dir
   const rename = options.rename ?? renameSync
+  const link = options.link ?? linkSync
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
   const now = options.now ?? Date.now
   const maxAgeMs = (options.maxAgeDays ?? REPORT_MAX_AGE_DAYS) * DAY_MS
@@ -89,6 +92,18 @@ export function createReportStore(options: ReportStoreOptions): ReportStore {
     warned = true
     try {
       options.warn?.(code)
+    } catch {
+      // a broken log sink must not matter
+    }
+  }
+
+  /** Cycle 3: a failed link-back, logged once per store, separately from failed writes. */
+  let relinkWarned = false
+  function warnRelinkOnce(key: string, error: unknown): void {
+    if (relinkWarned) return
+    relinkWarned = true
+    try {
+      options.warn?.("lock_relink_failed", { key, code: errno(error) })
     } catch {
       // a broken log sink must not matter
     }
@@ -212,10 +227,22 @@ export function createReportStore(options: ReportStoreOptions): ReportStore {
         } catch {
           continue // another taker moved it first
         }
+        let live = false
         try {
-          if (!isStale(aside)) linkSync(aside, file) // a live lock was moved: put it back
+          live = !isStale(aside)
         } catch {
-          // a new lock already stands there: the moved one's owner still releases only its own
+          // the moved file is gone: nothing to put back
+        }
+        if (live) {
+          try {
+            link(aside, file) // a live lock was moved: put it back, never over another lock
+          } catch (error) {
+            // Accepted limit for a metrics store: when the link-back fails (EEXIST: a new lock already
+            // stands there; or no hard links, e.g. FAT), the moved lock's owner and the next taker can
+            // both write in a rare window. The worst case is one lost count, never lost data (each
+            // write is a whole, valid file). Logged once with the key and error code only.
+            warnRelinkOnce(key, error)
+          }
         }
         try {
           unlinkSync(aside)

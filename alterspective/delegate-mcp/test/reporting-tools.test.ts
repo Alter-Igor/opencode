@@ -2,7 +2,9 @@
 // oc_start_session, oc_send, oc_wait, oc_result, oc_collect and oc_close_session keep current, and
 // oc_report summarises. A record failure never fails the tool, and no prompt text is ever stored.
 import { describe, expect, test } from "bun:test"
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { shutdownOnce } from "../src/runtime.ts"
+import { silentLogger } from "../src/shared/log.ts"
 import os from "node:os"
 import path from "node:path"
 import { z } from "zod"
@@ -160,7 +162,8 @@ describe("task records across the session lifecycle", () => {
     const cases: Array<[string, Record<string, unknown>, Record<string, unknown>]> = [
       ["idle", {}, { outcome: "completed" }],
       ["error", { lastError: "ProviderAuthError" }, { outcome: "error", errorCode: "ProviderAuthError" }],
-      ["idle", { lastError: "APIError" }, { outcome: "error", errorCode: "APIError" }],
+      // Cycle 3: idle is completed even with a label left over from an earlier run (the hub keeps it disarmed).
+      ["idle", { lastError: "APIError" }, { outcome: "completed" }],
       ["aborted", {}, { outcome: "aborted" }],
     ]
     for (const [state, extra, expected] of cases) {
@@ -174,6 +177,43 @@ describe("task records across the session lifecycle", () => {
       expect((await invoke(closeSessionTool, { sessionID: SID }, f.ctx)).isError).toBeUndefined()
       expect(stored(f, key)).toMatchObject({ ...expected, disposition: "closed_clean" })
     }
+  })
+
+  test("C2: run 1 errors, run 2 is clean and nobody waits on it: the close records completed", async () => {
+    const f = context()
+    const key = await started(f)
+    await invoke(sendTool, { sessionID: SID, message: "one" }, f.ctx)
+    settle(f, "error", key, "ProviderAuthError")
+    await invoke(waitTool, { sessionIDs: [SID] }, f.ctx)
+    expect(stored(f, key).outcome).toBe("error")
+    await invoke(sendTool, { sessionID: SID, message: "two" }, f.ctx)
+    await new Promise((resolve) => setTimeout(resolve, 2))
+    f.hub.views.set(SID, { sessionID: SID, directory: `/sessions/${key}`, state: "idle", since: new Date().toISOString(), lastError: "ProviderAuthError" })
+    f.api.on(`DELETE /session/${SID}`, { status: 200, data: true })
+    closeWith(f, {})
+    await invoke(closeSessionTool, { sessionID: SID }, f.ctx)
+    expect(stored(f, key)).toMatchObject({ outcome: "completed", sendCount: 2 })
+  })
+
+  test("oc_report includes this process's own queued updates", async () => {
+    const f = context()
+    const key = await started(f)
+    writeFileSync(path.join(dir(f), `${key}.json.lock`), "held briefly")
+    setTimeout(() => rmSync(path.join(dir(f), `${key}.json.lock`), { force: true }), 60)
+    await invokeNow(sendTool, { sessionID: SID, message: "go" }, f.ctx)
+    const report = await invokeNow(reportTool, { recent: 1 }, f.ctx)
+    expect((data(report).recent as Array<{ sendCount: number }>)[0]?.sendCount).toBe(1)
+  })
+
+  test("shutdown waits for a queued record update (inside its time cap)", async () => {
+    const f = context()
+    const key = await started(f)
+    writeFileSync(path.join(dir(f), `${key}.json.lock`), "held briefly")
+    setTimeout(() => rmSync(path.join(dir(f), `${key}.json.lock`), { force: true }), 60)
+    await invokeNow(sendTool, { sessionID: SID, message: "go" }, f.ctx)
+    expect(stored(f, key).sendCount).toBe(0)
+    await shutdownOnce({ stop: async () => {} }, { release: async () => {} }, silentLogger, 2000)("test")
+    expect(stored(f, key).sendCount).toBe(1)
   })
 
   test("a held record lock never slows a tool: oc_send returns in well under 100 ms", async () => {
