@@ -260,7 +260,10 @@ async function prepareHost(run: Run): Promise<void> {
 /** This bridge's plan (profile, policy, front config) for `keystone`, or for the saved / default set. */
 async function plan(run: Run, keystone?: readonly string[]): Promise<Plan> {
   const made = await planFor(run.deps, keystone)
-  if (made.built.dropped.length) run.note("warn", "providers left out of the box profile", { dropped: made.built.dropped.map((d) => d.provider).join(",") })
+  // #71 review cycle 1: model / small_model drops depend on the registered list, which only a start
+  // reads; withSynapseModels reports them there, once. Here the plan has `auto` only.
+  const left = made.built.dropped.filter((d) => d.provider !== "model" && d.provider !== "small_model")
+  if (left.length) run.note("warn", "providers left out of the box profile", { dropped: left.map((d) => d.provider).join(",") })
   return made
 }
 

@@ -4,6 +4,7 @@ import { DelegateError } from "../src/shared/errors.ts"
 import {
   FRONT_AUTH_PLACEHOLDER,
   MODELS_FILE,
+  MODELS_REQUEST_FILE,
   PROFILE_GITIGNORE,
   buildProfile,
   hashDirectory,
@@ -240,6 +241,30 @@ describe("profile: Synapse only (#71)", () => {
     expect(later.hash).toBe(a.hash)
     expect(later.files[MODELS_FILE]).toBe(b.files[MODELS_FILE]!)
     expect(later.offered).toEqual(["synapse/auto", "synapse/anthropic/claude-opus-5", "synapse/qwen/qwen3.8-flash"])
+  })
+
+  // Review cycle 1 (LOW): owner per-model settings cannot remap a registered name to another
+  // upstream id or SDK, and provider-level filters cannot hide `auto`.
+  test("owner per-model settings keep only name, limit and modalities", () => {
+    const settings = { auto: { name: "Auto", limit: { context: 1, output: 2 }, modalities: { input: ["text"] }, id: "openai/gpt-x", provider: { npm: "@ai-sdk/openai" }, options: { baseURL: "https://x.example" }, headers: { a: "{env:SYNAPSE_API_KEY}" } } }
+    const built = buildProfile(input([owner({ synapse: { ...synapse, models: settings } })]))
+    expect(modelsConfig(built.files).provider.synapse.models).toEqual({ auto: { name: "Auto", limit: { context: 1, output: 2 }, modalities: { input: ["text"] } } })
+  })
+
+  test("the synapse entry keeps only npm, name and options (no whitelist, blacklist, api, env or id)", () => {
+    const odd = { ...synapse, whitelist: ["x"], blacklist: ["auto"], api: "https://x.example/v1", env: ["SYNAPSE_API_KEY"], id: "other" }
+    const cfg = parsedConfig(buildProfile(input([owner({ synapse: odd })])).files)
+    expect(Object.keys(cfg.provider.synapse!).sort()).toEqual(["name", "npm", "options"])
+  })
+
+  // Review cycle 1 (LOW): what the owner asks for (defaults, per-model settings) IS in the hash, so
+  // changing it still reports profile_changed; only Synapse's own list is outside it.
+  test("an owner model change still changes the hash; a Synapse list change does not", () => {
+    const base = buildProfile(input([owner({ synapse })]))
+    expect(buildProfile(input([owner({ synapse }, { model: "synapse/qwen/qwen3.8-flash" })])).hash).not.toBe(base.hash)
+    expect(buildProfile(input([owner({ synapse: { ...synapse, models: { auto: { name: "renamed" } } } })])).hash).not.toBe(base.hash)
+    expect(buildProfile(input([owner({ synapse })], { synapseModels: registered })).hash).toBe(base.hash)
+    expect(base.files[MODELS_REQUEST_FILE]).toBeDefined()
   })
 
   test("withRegisteredModels re-checks the owner's default against the new list", () => {

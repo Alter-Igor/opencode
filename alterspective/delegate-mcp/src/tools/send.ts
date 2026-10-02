@@ -9,8 +9,9 @@ import { DelegateError } from "../shared/errors.ts"
 import type { Box, SessionRecord, ToolContext } from "./context.ts"
 import { readInstructions, type Instructions } from "./core-box.ts"
 import { CORRELATION_RE, agentSchema, formatCursor, modelSchema, ownSession, parseModel, requireSynapseModel, sameRules, sessionGone, sessionIdSchema } from "./core-session.ts"
+import { DEFAULT_MODEL, SYNAPSE_PROVIDER } from "../supervisor/profile.ts"
 import { defineTool } from "./define.ts"
-import { requireModel } from "./models.ts"
+import { fetchModels, requireModel } from "./models.ts"
 import { ok } from "./shape.ts"
 
 export const MAX_MESSAGE_CHARS = 100_000
@@ -32,13 +33,29 @@ export async function checkPolicy(ctx: ToolContext, box: Box, record: SessionRec
 }
 
 export type Prompt = { text: string; model?: string; agent?: string; correlationId: string }
-export type Sent = { cursor: string; instructions: Instructions }
+/** `modelFallback`: the session's saved model was not used (#71 review cycle 1), and why. */
+export type Sent = { cursor: string; instructions: Instructions; modelFallback?: string }
+
+const SANDBOX_DEFAULT = "the sandbox default (synapse/auto unless the owner picked another)"
+
+/**
+ * #71 review cycle 1: a session's SAVED model gets the same check as an explicit one. One the
+ * sandbox no longer offers (another provider's, from before #71, or a Synapse model since retired)
+ * is not sent: the sandbox default is used and the reason returned, so old sessions keep working.
+ */
+async function savedModel(box: Box, saved: string | undefined, correlationId: string): Promise<{ model?: string; fallback?: string }> {
+  if (!saved || saved === DEFAULT_MODEL) return saved ? { model: saved } : {}
+  if (parseModel(saved).providerID !== SYNAPSE_PROVIDER) return { fallback: `The session's saved model ${saved} is not a Synapse model; ${SANDBOX_DEFAULT} was used.` }
+  if ((await fetchModels(box.api, correlationId)).includes(saved)) return { model: saved }
+  return { fallback: `The session's saved model ${saved} is no longer offered by the sandbox; ${SANDBOX_DEFAULT} was used.` }
+}
 
 /** Instructions, cursor, prompt_async, markSent: the one way a prompt reaches a session. */
 export async function sendPrompt(ctx: ToolContext, box: Box, record: SessionRecord, prompt: Prompt): Promise<Sent> {
-  const model = prompt.model ?? record.model
-  // #71: also covers a session recorded with another provider's model before Synapse became the only one.
-  if (model) requireSynapseModel(model)
+  // #71: an explicit model was checked by the caller (requireModel); this is the last guard.
+  if (prompt.model) requireSynapseModel(prompt.model)
+  const saved = prompt.model ? {} : await savedModel(box, record.model, prompt.correlationId)
+  const model = prompt.model ?? saved.model
   const agent = prompt.agent ?? record.agent
   const instructions = await readInstructions(ctx, record)
   const body = {
@@ -52,8 +69,8 @@ export async function sendPrompt(ctx: ToolContext, box: Box, record: SessionReco
   if (res.status === 404) throw sessionGone(record.sessionID)
   if (res.status < 200 || res.status >= 300) throw new DelegateError("upstream_error", "The delegate server did not accept the message.", "Check oc_status, then retry.", `HTTP ${res.status}`)
   box.hub.markSent(record.sessionID)
-  ctx.log.log("info", "tools", "prompt sent", { sessionID: record.sessionID, correlationId: prompt.correlationId, instructions: instructions.files.join(","), instructionsTruncated: instructions.truncated, instructionsFailed: (instructions.failed ?? []).join(",") })
-  return { cursor: formatCursor(cursor), instructions }
+  ctx.log.log("info", "tools", "prompt sent", { sessionID: record.sessionID, correlationId: prompt.correlationId, instructions: instructions.files.join(","), instructionsTruncated: instructions.truncated, instructionsFailed: (instructions.failed ?? []).join(","), savedModelFallback: saved.fallback !== undefined })
+  return { cursor: formatCursor(cursor), instructions, ...(saved.fallback ? { modelFallback: saved.fallback } : {}) }
 }
 
 function instructionReport(i: Instructions): Record<string, unknown> {
@@ -80,13 +97,16 @@ export const sendTool = defineTool({
     await checkPolicy(ctx, box, record, remote?.permission)
     if (args.model) await requireModel(box.api, args.model, cid)
     const sent = await sendPrompt(ctx, box, record, { text: args.message, model: args.model, agent: args.agent, correlationId: cid })
-    const warn = sent.instructions.failed ? ` Warning: could not read ${sent.instructions.failed.join(", ")} from the repository, so it was not passed on.` : ""
+    const warn =
+      (sent.instructions.failed ? ` Warning: could not read ${sent.instructions.failed.join(", ")} from the repository, so it was not passed on.` : "") +
+      (sent.modelFallback ? ` Warning: ${sent.modelFallback}` : "")
     return ok(`Accepted by ${record.sessionID}. Call oc_wait with this cursor.${warn}`, {
       accepted: true,
       sessionID: record.sessionID,
       cursor: sent.cursor,
       correlationId: cid,
       instructions: instructionReport(sent.instructions),
+      ...(sent.modelFallback ? { modelFallback: sent.modelFallback } : {}),
     })
   },
 })

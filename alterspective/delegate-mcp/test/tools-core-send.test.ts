@@ -3,7 +3,7 @@
 import { describe, expect, test } from "bun:test"
 import { MAX_INSTRUCTIONS_CHARS } from "../src/tools/core-box.ts"
 import { sendTool } from "../src/tools/send.ts"
-import { BASE, SID, data, fakeContext, invoke, okCmd, ours, record, remoteSession, seedState, type Fake } from "./tools-core-fixture.ts"
+import { BASE, SID, data, fakeContext, invoke, okCmd, ours, record, remoteSession, seedState, text, type Fake } from "./tools-core-fixture.ts"
 import type { CommandResult } from "../src/tools/context.ts"
 
 /** Host git for instruction reads: ls-tree lists the files present, cat-file returns their text. */
@@ -189,16 +189,34 @@ describe("oc_send", () => {
     expect(f.api.find("POST", `/session/${SID}/prompt_async`)).toBeUndefined()
   })
 
-  test("a session whose recorded default model is not a Synapse model is refused (records made before #71)", async () => {
+  // Review cycle 1 (MEDIUM): a session's saved model gets the same registration check as an explicit
+  // one; when it is no longer offered the send falls back to the sandbox default (old sessions keep
+  // working) and says so.
+  test("a saved model that is not a Synapse model falls back to the sandbox default, without asking the box", async () => {
     const f = fakeContext()
     ready(f)
     f.ctx.sessions.set(SID, record({ model: "opencode/big-pickle" }))
     const result = await send(f)
-    expect(data(result)).toMatchObject({ code: "invalid_input" })
-    expect(f.api.find("POST", `/session/${SID}/prompt_async`)).toBeUndefined()
-    f.api.on("GET /config/providers", { status: 200, data: { providers: [{ id: "synapse", models: { auto: { id: "auto" } } }] } })
-    const fixed = await send(f, { model: "synapse/auto" })
-    expect(fixed.isError).toBeUndefined()
+    expect(result.isError).toBeUndefined()
+    expect(promptBody(f)).not.toHaveProperty("model")
+    expect(data(result).modelFallback).toBe("The session's saved model opencode/big-pickle is not a Synapse model; the sandbox default (synapse/auto unless the owner picked another) was used.")
+    expect(text(result)).toContain("opencode/big-pickle")
+    expect(f.api.find("GET", "/config/providers")).toBeUndefined()
+  })
+
+  test("a saved Synapse model the sandbox no longer offers falls back too; one it offers is sent", async () => {
+    const f = fakeContext()
+    ready(f)
+    f.api.on("GET /config/providers", { status: 200, data: { providers: [{ id: "synapse", models: { auto: { id: "auto" }, "qwen/qwen3.8-flash": { id: "qwen/qwen3.8-flash" } } }] } })
+    f.ctx.sessions.set(SID, record({ model: "synapse/openai/gpt-5.6-sol" }))
+    const gone = await send(f)
+    expect(promptBody(f)).not.toHaveProperty("model")
+    expect(String(data(gone).modelFallback)).toContain("is no longer offered by the sandbox")
+    f.ctx.sessions.set(SID, record({ model: "synapse/qwen/qwen3.8-flash" }))
+    const kept = await send(f)
+    expect(data(kept)).not.toHaveProperty("modelFallback")
+    const last = f.api.calls.filter((c) => c.path.endsWith("prompt_async")).at(-1)
+    expect(last?.body).toMatchObject({ model: { providerID: "synapse", modelID: "qwen/qwen3.8-flash" } })
   })
 
   test("a failed prompt_async is upstream_error and does not arm the watchdog", async () => {

@@ -7,10 +7,11 @@
 // @ai-sdk/openai-compatible with baseURL https://synapse2-api.alterspective.com.au/v1, and the fork
 // plugin (packages/opencode/src/plugin/synapse.ts) adds no fetch of its own when the box holds no
 // stored auth (its loader returns baseURL + headers only). The SDK's chat model posts to
-// `${baseURL}/chat/completions`. OpenCode does not fetch the model list in the box
-// (OPENCODE_DISABLE_MODELS_FETCH=1); GET (and so HEAD: nginx's `limit_except GET` admits HEAD) /v1/models
-// is allowed because it is a read-only list a
-// delegated user may always call (playbook §8) and lets in-box code see what `auto` can route to.
+// `${baseURL}/chat/completions`. OPENCODE_DISABLE_MODELS_FETCH=1 only stops OpenCode's models.dev
+// fetch: the fork's Synapse plugin (#74) does fetch GET /v1/models in the box, through front, and the
+// bridge reads the same list on the host at box start (models.ts, #71). GET (and so HEAD: nginx's
+// `limit_except GET` admits HEAD) /v1/models is allowed because it is a read-only list a delegated
+// user may always call (playbook §8) and lets in-box code see what `auto` can route to.
 // No embeddings, responses, usage, fleet, operator, judgment, health or MCP route is allowed.
 import { AUTH_FILE_NAME, AUTH_VAR } from "./auth-conf.ts"
 

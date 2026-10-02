@@ -251,6 +251,21 @@ describe("supervisor: Synapse model list at start (#71)", () => {
     expect(log.lines.find((l) => l.msg === "Synapse model list unavailable; the box offers synapse/auto only")?.fields.reason).toBe("reading the Synapse model list failed")
   })
 
+  // Review cycle 1 (LOW): a registered owner pick is not "left out" on every ensure (the plan is
+  // built with auto only until a start reads the list); model drops are reported once, at start.
+  test("an owner pick of a registered model logs no providers-left-out warning on start or reuse", async () => {
+    const pick = JSON.stringify({ ...JSON.parse(owner), model: "synapse/anthropic/claude-opus-5" })
+    await nodeProfileFs.writeText(path.join(home, "owner", "opencode.json"), pick)
+    const log = recorder()
+    const registeredModels = async () => ({ models: ["auto", "anthropic/claude-opus-5"], limits: {}, source: "synapse" as const })
+    const exec = fakeDocker({ running: false, labels: {}, env: [] }, [])
+    await supervisor(deps(exec, { registeredModels, log })).ensure()
+    await supervisor(deps(exec, { registeredModels, log, bridgeId: "bridge-b" })).ensure()
+    expect(log.lines.filter((l) => l.msg === "providers left out of the box profile")).toEqual([])
+    expect(log.lines.some((l) => l.msg.startsWith("owner default model not registered"))).toBe(false)
+    expect(await modelsFile()).toContain('"model": "synapse/anthropic/claude-opus-5"')
+  })
+
   test("a reuse check never reads the list", async () => {
     await writeOwner()
     let reads = 0

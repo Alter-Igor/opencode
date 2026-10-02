@@ -6,7 +6,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { authConf, authConfPath } from "../src/synapse/auth-conf.ts"
-import { FALLBACK_MODELS, MODELS_TIMEOUT_MS, SYNAPSE_MODELS_URL, registeredModels } from "../src/synapse/models.ts"
+import { FALLBACK_MODELS, MAX_BODY_BYTES, MODELS_TIMEOUT_MS, SYNAPSE_MODELS_URL, registeredModels } from "../src/synapse/models.ts"
 
 const TOKEN = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJvd25lciJ9.c2lnbmF0dXJlLXZhbHVl"
 
@@ -110,6 +110,29 @@ describe("registeredModels (#71)", () => {
       expect(got).toEqual({ models: [...FALLBACK_MODELS], limits: {}, source: "fallback", reason: "Synapse did not answer within 50 ms" })
       expect(Date.now() - started).toBeLessThan(2000)
       expect(MODELS_TIMEOUT_MS).toBeLessThanOrEqual(5000)
+    })
+  })
+
+  // Review cycle 1 (HIGH): the deadline covers the body too, so a stalled body never holds a box start.
+  test("a 200 whose body never finishes is cut off by the same deadline, and the body stream is cancelled", async () => {
+    await withFront(TOKEN, async (frontDir) => {
+      let cancelled = false
+      const stalled = () =>
+        new Response(new ReadableStream<Uint8Array>({ start: (c) => c.enqueue(new TextEncoder().encode('{"data":[')), cancel: () => void (cancelled = true) }), { status: 200 })
+      const started = Date.now()
+      const got = await registeredModels({ frontDir, fetch: fakeFetch(stalled), timeoutMs: 100 })
+      expect(got).toEqual({ models: [...FALLBACK_MODELS], limits: {}, source: "fallback", reason: "Synapse did not answer within 100 ms" })
+      expect(Date.now() - started).toBeLessThan(2000)
+      expect(cancelled).toBe(true)
+    })
+  })
+
+  test("a body larger than the cap is refused (fallback), not read to the end", async () => {
+    await withFront(TOKEN, async (frontDir) => {
+      const big = JSON.stringify({ data: [{ id: "x".repeat(MAX_BODY_BYTES) }] })
+      const got = await registeredModels({ frontDir, fetch: fakeFetch(() => new Response(big, { status: 200 })) })
+      expect(got).toEqual({ models: [...FALLBACK_MODELS], limits: {}, source: "fallback", reason: "Synapse's model list was larger than 1048576 bytes" })
+      expect(MAX_BODY_BYTES).toBe(1024 * 1024)
     })
   })
 })
