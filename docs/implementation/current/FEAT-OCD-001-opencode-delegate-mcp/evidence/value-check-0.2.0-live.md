@@ -28,6 +28,8 @@ The script's own "nothing left" check failed. It searched the session list for t
 
 The script now checks the closed ids and `mine` rows instead. It was not re-run after this fix.
 
+PR review also found that the script's wait loop read the new cursor from the wrong field and could stop on any `"error"` text. Neither changed this run: each task settled on its first `oc_wait` ("Done waiting: … idle" for both). The loop now reads `next`, ends only on a status event for its own session, and fails if the task never settles.
+
 ### #74, OpenCode outside the box (the owner's own config)
 
 `opencode models` from this checkout (`packages/opencode`, `bun run src/index.ts models`) lists 9 models, all from the `synapse` provider: `synapse/auto` and the same 8 as above. No other provider appears.
