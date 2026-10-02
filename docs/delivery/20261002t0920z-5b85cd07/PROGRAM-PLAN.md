@@ -1,7 +1,7 @@
 # Program plan: #67 move Keystone tokens out of the delegate box
 
 - **Run id:** `20261002t0920z-5b85cd07`
-- **planRevision:** 5 (2026-10-02). Rev 5: WS-C clean (2 cycles) and integrated; combined review clean, seam Lows fixed (`24b78afe3c`), integration head `8bb814f3c6`; Linux CI green; awaiting owner for the merge to `dev` (Gate A) and the live cutover. Rev 4: WS-A2 and WS-A1 clean and integrated (`e95c7be32a`); draft PR #69 opened for Linux CI; WS-C started. Rev 3: WS-B integrated; WS-A2 built, in independent review; WS-A1 building. Previously rev 2 (2026-10-02, program director: Claude Code session `cb058128`, sole writer). Rev 2: WS-A split into WS-A1 (token manager) and WS-A2 (`front` injection). They are disjoint surfaces, so they run in parallel; developers briefed for WS-A1, WS-A2 and WS-B.
+- **planRevision:** 6 (2026-10-02). Rev 6: PR #69 merged (`b8cfd8a574`, standing owner merge approval); live cutover done; **value observed**; #67 closed. Rev 5: WS-C clean (2 cycles) and integrated; combined review clean, seam Lows fixed (`24b78afe3c`), integration head `8bb814f3c6`; Linux CI green; awaiting owner for the merge to `dev` (Gate A) and the live cutover. Rev 4: WS-A2 and WS-A1 clean and integrated (`e95c7be32a`); draft PR #69 opened for Linux CI; WS-C started. Rev 3: WS-B integrated; WS-A2 built, in independent review; WS-A1 building. Previously rev 2 (2026-10-02, program director: Claude Code session `cb058128`, sole writer). Rev 2: WS-A split into WS-A1 (token manager) and WS-A2 (`front` injection). They are disjoint surfaces, so they run in parallel; developers briefed for WS-A1, WS-A2 and WS-B.
 - **Owner approval:** "OK to do what needed and do it for me" (2026-10-02). Reversible code and docs changes, and ordered merges into the integration branch. **Merging into `dev` and any live-box cutover still need the owner's explicit approval.**
 
 ## Outcome
@@ -21,7 +21,7 @@ The delegate box never holds a Keystone refresh token or a long-lived access tok
 | Guardrails | `rag-read` search works through the box; a forced refresh keeps every entry connected; the owner's sign-in effort is not higher than today; the box gets 403 on Keystone token and `/.well-known` paths. |
 | Observation method | Live check on the owner's box at cutover (WS-C): read `mcp-auth.json`, probe from the box, `oc_doctor` `keystoneAuth`, forced refresh (`…REFRESH_FRACTION=0.05`). |
 | Evidence owner / window | Program director runs it, owner confirms; at cutover, then once more after one refresh cycle. |
-| Value state | **hypothesised** (step 0 spike proved feasibility; nothing enabled yet). |
+| Value state | **observed** 2026-10-02: usable Keystone tokens in box storage went from 12 live refresh tokens to 0; all entries connected; 403 on token paths; forced refresh holds (evidence `docs/implementation/current/FEAT-OCD-001-opencode-delegate-mcp/evidence/keystone-cutover-live.md`). |
 
 ## Scope
 
@@ -124,7 +124,7 @@ WS-A2 and WS-A1 were synced with the integration branch before merge. The only i
 
 ## Value state
 
-**enabled** (code merged into the integration branch, flag off by default). It becomes **observed** only after the live cutover check: box `mcp-auth.json` is `{}`, all `ks-*` entries connected, a `rag-read` search works, a forced refresh keeps them connected, and the box gets 403 on the token paths.
+**observed** (2026-10-02). Box `mcp-auth.json` is `{}`; all `ks-*` entries connected; `rag-read` MCP initialize through front returns 200 with no token in the box; 403 on token, `.well-known`, register and authorize paths; a forced refresh rotated all three and kept them connected; 12 old in-box refresh tokens revoked. Evidence: `docs/implementation/current/FEAT-OCD-001-opencode-delegate-mcp/evidence/keystone-cutover-live.md`.
 
 ## Follow-ups filed
 
