@@ -11,6 +11,7 @@ import { Plugin } from "../plugin"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { type LanguageModelV3 } from "@ai-sdk/provider"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
+import { Flag } from "@opencode-ai/core/flag/flag"
 import { Auth } from "../auth"
 import { Env } from "../env"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
@@ -1838,6 +1839,9 @@ const layer = Layer.effect(
           s.sdk.set(key, loaded)
           return loaded as SDK
         }
+
+        // Check the resolved model too: a writable models catalogue can name a file/npm module.
+        if (Flag.OPENCODE_DISABLE_EXTERNAL_PROVIDERS) throw new Error("External provider modules are disabled")
 
         const installedPath = await (async () => {
           if (model.api.npm.startsWith("file://")) {

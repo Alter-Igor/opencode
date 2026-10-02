@@ -35,7 +35,7 @@ export type ProfileInput = {
    * non-secret placeholder (front drops whatever the box sends). The box holds no key for them.
    */
   frontAuth?: string[]
-  /** OpenCode custom tools (file name → source) for opencode/tool/. Default: profileTools(). */
+  /** Inbox helpers (file name → source) for opencode/inbox/. Default: profileTools(). */
   tools?: Record<string, string>
 }
 
@@ -48,8 +48,7 @@ export type BuiltProfile = {
 }
 
 /**
- * MOD-05 in-box inbox tools (profile-tools/). They are copied into opencode/tool/ so OpenCode
- * loads them from the read-only profile and the profile hash covers them (review M2).
+ * MOD-05 inbox helpers. A trusted profile plugin supplies its in-process client (#49).
  */
 export const PROFILE_TOOL_FILES = ["inbox-lib.ts", "message_supervisor.ts", "message_session.ts", "read_inbox.ts"] as const
 const PROFILE_TOOLS_DIR = path.join(import.meta.dir, "..", "..", "profile-tools")
@@ -259,7 +258,9 @@ export function buildProfile(input: ProfileInput): BuiltProfile {
     "opencode/.gitignore": PROFILE_GITIGNORE,
     "opencode/opencode.json": JSON.stringify(config, null, 2) + "\n",
   }
-  for (const [name, source] of Object.entries(input.tools ?? profileTools())) files[`opencode/tool/${name}`] = source
+  for (const [name, source] of Object.entries(input.tools ?? profileTools())) files[`opencode/inbox/${name}`] = source
+  // Source uses sibling profile-tools for local type checks; both folders are packed together.
+  files["opencode/plugin/inbox.ts"] = readFileSync(path.join(import.meta.dir, "..", "..", "profile-plugins", "inbox.ts"), "utf8").replaceAll("../profile-tools/", "../inbox/")
   return { files, hash: hashFiles(files), providers: providers.names, dropped: providers.dropped }
 }
 

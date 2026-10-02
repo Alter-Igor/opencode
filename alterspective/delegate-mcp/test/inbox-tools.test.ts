@@ -7,7 +7,9 @@ import * as rules from "../inbox-sidecar/src/rules.ts"
 import type { InboxStore } from "../inbox-sidecar/src/store.ts"
 import * as lib from "../profile-tools/inbox-lib.ts"
 import messageSession from "../profile-tools/message_session.ts"
-import messageSupervisor from "../profile-tools/message_supervisor.ts"
+import supervisorTool from "../profile-tools/message_supervisor.ts"
+import inboxPlugin from "../profile-plugins/inbox.ts"
+import { createOpencodeClient } from "../../../packages/sdk/js/src/client.ts"
 import readInbox from "../profile-tools/read_inbox.ts"
 import { PROFILE_TOOL_FILES, buildProfile, profileTools } from "../src/supervisor/profile.ts"
 import { startSidecar } from "./inbox-harness.ts"
@@ -30,6 +32,7 @@ const TOOLS_DIR = path.join(import.meta.dir, "..", "profile-tools")
 let dir: string
 let store: InboxStore
 let stops: Array<() => void> = []
+let messageSupervisor = supervisorTool
 const saved: Record<string, string | undefined> = {}
 const ctx = (sessionID: string) => ({ sessionID, directory: "/sessions/k1" })
 
@@ -54,10 +57,11 @@ beforeAll(async () => {
     },
   })
   stops = [inbox.stop, () => void api.stop(true)]
-  for (const name of ["OCD_INBOX_URL", "OCD_BOX_API_URL", "OPENCODE_SERVER_PASSWORD"]) saved[name] = process.env[name]
+  for (const name of ["OCD_INBOX_URL", "OPENCODE_SERVER_PASSWORD"]) saved[name] = process.env[name]
   process.env.OCD_INBOX_URL = inbox.boxUrl
-  process.env.OCD_BOX_API_URL = `http://127.0.0.1:${api.port}`
-  process.env.OPENCODE_SERVER_PASSWORD = PASSWORD
+  delete process.env.OPENCODE_SERVER_PASSWORD
+  const client = createOpencodeClient({ baseUrl: `http://127.0.0.1:${api.port}`, headers: { authorization: "Basic " + Buffer.from(`opencode:${PASSWORD}`).toString("base64") } })
+  messageSupervisor = (await inboxPlugin({ client })).tool.message_supervisor
 })
 
 afterAll(async () => {
@@ -70,6 +74,10 @@ afterAll(async () => {
 })
 
 describe("in-box tools", () => {
+  test("a shell cannot recreate supervisor lookup without the private plugin client", async () => {
+    expect(process.env.OPENCODE_SERVER_PASSWORD).toBeUndefined()
+    await expect(supervisorTool.execute({ text: "not sent" }, ctx(CHILD))).rejects.toThrow(/trusted inbox plugin/)
+  })
   test("message_supervisor sends to the supervisor in session metadata (found on a subagent's parent), unverified", async () => {
     const out = await messageSupervisor.execute({ text: "blocked on a failing test", correlationId: "" }, ctx(CHILD))
     expect(out).toContain(`to ${SUP}`)
@@ -171,10 +179,15 @@ describe("in-box tools: packaging", () => {
     expect(lib.MAX_TEXT_BYTES).toBe(rules.MAX_TEXT_BYTES)
   })
 
-  test("the profile ships the tools under opencode/tool/ and the hash covers them", () => {
+  test("the profile ships helper files outside auto-discovery and hashes the plugin and its imports", () => {
     const input = { ownerConfigs: [], config: { keystoneOrigin: "https://identity.alterspective.com.au", keystoneConnections: [], boxEnv: [] }, permission: [] }
     const built = buildProfile(input)
-    for (const name of PROFILE_TOOL_FILES) expect(built.files[`opencode/tool/${name}`]).toBe(profileTools()[name]!)
+    for (const name of PROFILE_TOOL_FILES) expect(built.files[`opencode/inbox/${name}`]).toBe(profileTools()[name]!)
+    expect(Object.keys(built.files).some((name) => name.startsWith("opencode/tool/"))).toBe(false)
+    const plugin = built.files["opencode/plugin/inbox.ts"]!
+    expect(plugin).toContain("input.client.session.get")
+    for (const match of plugin.matchAll(/^import .* from "\.\.\/inbox\/([^"]+)"/gm)) expect(built.files[`opencode/inbox/${match[1]}`]).toBeDefined()
+    expect(plugin).not.toContain("OPENCODE_SERVER_PASSWORD")
     const changed = buildProfile({ ...input, tools: { ...profileTools(), "read_inbox.ts": profileTools()["read_inbox.ts"] + "\n// changed" } })
     expect(changed.hash).not.toBe(built.hash)
   })

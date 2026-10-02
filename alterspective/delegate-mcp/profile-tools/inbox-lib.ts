@@ -1,6 +1,6 @@
 // FEAT-OCD-001 MOD-05 T5.2: shared code for the in-box inbox tools. This file is copied into the
-// box profile at opencode/tool/ next to the three tools; OpenCode imports it too but registers
-// nothing from it (no export here is shaped like a tool). It must stay dependency-free: the
+// box profile at opencode/inbox/ next to the three tools, loaded by the trusted plugin.
+// It must stay dependency-free: the
 // profile is read-only, so OpenCode cannot install @opencode-ai/plugin or zod beside it, and
 // tools therefore declare their args as plain JSON Schema (OpenCode's legacy tool-args path).
 //
@@ -22,7 +22,8 @@ export const MAX_PARENT_HOPS = 5
 // C0 controls except tab and newline, DEL, and C1 controls (W2C-17). Same as src/inbox/wake.ts.
 const CONTROL = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g
 
-export type ToolContext = { sessionID: string; directory: string }
+export type SessionInfo = { metadata?: { supervisor?: unknown }; parentID?: unknown }
+export type ToolContext = { sessionID: string; directory: string; readSession?: (id: string, directory: string) => Promise<SessionInfo> }
 export type InboxMessage = { id: string; at: string; from: string; to: string; text: string; hops: number; verified: boolean; correlationId?: string }
 type Page = { messages: InboxMessage[]; next: string; epoch?: string; oldestId?: string; lastId?: string }
 
@@ -82,33 +83,16 @@ export async function readMessages(to: string, cursor: string, limit: number): P
   return { messages: page.messages, next: page.next, epoch: optionalString(page.epoch), oldestId: optionalString(page.oldestId), lastId: optionalString(page.lastId) }
 }
 
-type SessionInfo = { metadata?: { supervisor?: unknown }; parentID?: unknown }
-
-async function sessionInfo(sessionID: string, directory: string): Promise<SessionInfo> {
-  const base = process.env.OCD_BOX_API_URL ?? "http://127.0.0.1:4096"
-  const auth = "Basic " + Buffer.from(`opencode:${process.env.OPENCODE_SERVER_PASSWORD ?? ""}`).toString("base64")
-  const url = `${base}/session/${encodeURIComponent(sessionID)}?directory=${encodeURIComponent(directory)}`
-  let res: Response
-  try {
-    res = await fetch(url, { headers: { authorization: auth }, signal: AbortSignal.timeout(TIMEOUT_MS) })
-  } catch {
-    throw new InboxToolError("This sandbox's OpenCode server could not be asked who supervises this session. Nothing was sent.")
-  }
-  if (!res.ok) throw new InboxToolError(`This session's record could not be read (HTTP ${res.status}). Nothing was sent.`)
-  const body: unknown = await res.json().catch(() => undefined)
-  if (typeof body !== "object" || body === null) throw new InboxToolError("This session's record came back unreadable, so its supervisor is unknown. Nothing was sent; try again.")
-  return body as SessionInfo
-}
-
 /**
  * The supervisor recorded by the bridge in session metadata (`metadata.supervisor`, set at
  * session creation). Subagent sessions do not carry it themselves: this walks up `parentID`
  * (at most MAX_PARENT_HOPS parents) until a session that has it. Missing → refused.
  */
 export async function supervisorOf(ctx: ToolContext): Promise<string> {
+  if (!ctx.readSession) throw new InboxToolError("The trusted inbox plugin is not available. Nothing was sent.")
   let sessionID = ctx.sessionID
   for (let hop = 0; hop <= MAX_PARENT_HOPS; hop++) {
-    const info = await sessionInfo(sessionID, ctx.directory)
+    const info = await ctx.readSession(sessionID, ctx.directory)
     const supervisor = info.metadata?.supervisor
     if (typeof supervisor === "string" && SUPERVISOR_ADDRESS.test(supervisor)) return supervisor
     if (typeof info.parentID !== "string" || info.parentID === sessionID) {

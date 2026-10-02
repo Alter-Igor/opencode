@@ -41,7 +41,11 @@ ARG OPENCODE_VERSION=0.0.0-alterspective-local
 LABEL org.opencontainers.image.title="opencode-delegate-box" \
       org.opencontainers.image.version="${OPENCODE_VERSION}" \
       com.alterspective.feature="FEAT-OCD-001"
+COPY --chmod=0555 alterspective/delegate-mcp/docker/box/entrypoint.sh /usr/local/bin/ocd-start
+COPY --chmod=0444 alterspective/delegate-mcp/docker/box/memory-probe.py /usr/local/lib/ocd-memory-probe.py
+RUN sed -i 's/\r$//' /usr/local/bin/ocd-start /usr/local/lib/ocd-memory-probe.py
 USER agent
 WORKDIR /sessions
 EXPOSE 4096
-CMD ["opencode", "serve", "--hostname", "0.0.0.0", "--port", "4096"]
+ENTRYPOINT ["/usr/local/bin/ocd-start"]
+CMD ["serve", "--hostname", "0.0.0.0", "--port", "4096"]

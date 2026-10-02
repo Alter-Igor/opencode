@@ -4,9 +4,9 @@
 // image match this bridge, and the Docker health status.
 import { effectiveConfig, mcpAllowPolicy } from "../shared/config.ts"
 import type { BoxState, Supervisor } from "../shared/contracts.ts"
-import { DelegateError } from "../shared/errors.ts"
 import type { ApiTarget } from "../shared/opencode-api.ts"
 import { INSPECT_ENV, MCP_ALLOW_ENV, PASSWORD_ENV } from "./compose-env.ts"
+import { isolationTarget, requireMemoryProtection } from "./api-isolation.ts"
 import { LABEL, builtFrom, inspectBox, requireDocker, type BoxInspect } from "./docker.ts"
 import type { LiveChecks } from "./live.ts"
 import { frontFilesFor } from "./plan.ts"
@@ -47,18 +47,7 @@ export interface DelegateSupervisor extends Supervisor {
   verifyLive(): Promise<LiveChecks>
 }
 
-export function targetOf(box: BoxInspect, project: string): ApiTarget {
-  const password = box.env[PASSWORD_ENV]
-  const port = Number(box.labels[LABEL.port])
-  if (!password || !Number.isInteger(port) || port <= 0 || port > 65535)
-    throw new DelegateError(
-      "sandbox_unavailable",
-      "The running sandbox is missing its bridge settings.",
-      `Restart the sandbox with oc_server_restart (or \`docker compose -p ${project} down\`) and retry.`,
-      `password env ${password ? "present" : "missing"}, port label ${box.labels[LABEL.port] === undefined ? "missing" : "invalid"}`,
-    )
-  return { baseUrl: `http://127.0.0.1:${port}`, password }
-}
+export const targetOf = isolationTarget
 
 export async function statusOf(run: Run): Promise<SupervisorStatus> {
   const { deps } = run
@@ -69,9 +58,12 @@ export async function statusOf(run: Run): Promise<SupervisorStatus> {
     const image = box.labels[LABEL.image]
     const config = effectiveConfig(deps.config)
     const front = await inspectBox(deps.exec, [], `${run.container}-front`)
+    const gate = await inspectBox(deps.exec, [PASSWORD_ENV], `${run.container}-gate-box`)
+    const target = targetOf(box, gate, deps.config.project, deps.image)
+    await requireMemoryProtection(deps.exec, run.container)
     return {
       state: "running",
-      target: targetOf(box, deps.config.project),
+      target,
       imageTag: image ?? box.image,
       startedBy: run.state.startedHere ? "this-bridge" : "other",
       health: box.health,

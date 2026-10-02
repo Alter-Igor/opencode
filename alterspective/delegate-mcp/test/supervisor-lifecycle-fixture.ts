@@ -12,6 +12,8 @@ import { nodeLeaseFs, type LeaseFs } from "../src/supervisor/leases.ts"
 import { boxEnvOverride, composeEnv, createSupervisor, type DelegateSupervisor, type SupervisorDeps } from "../src/supervisor/lifecycle.ts"
 import type { ProcessProbe } from "../src/supervisor/process.ts"
 import { buildProfile, nodeProfileFs } from "../src/supervisor/profile.ts"
+import { GATE_IMAGE, MEMORY_PROBE } from "../src/supervisor/api-isolation.ts"
+import { apiEnv, MEMORY_OK } from "./session-isolation-fixture.ts"
 
 export const IMAGE = "img:1.0.0-abcdef0"
 export const L = {
@@ -23,7 +25,7 @@ export const L = {
 }
 
 export type Call = { argv: string[]; env?: Record<string, string>; cwd?: string }
-export type Box = { running: boolean; labels: Record<string, string>; env: string[] }
+export type Box = { running: boolean; labels: Record<string, string>; env: string[]; password?: string }
 export type Overrides = {
   up?: (env: Record<string, string>) => ExecResult | undefined
   down?: ExecResult
@@ -33,6 +35,7 @@ export type Overrides = {
   containers?: Record<string, ExecResult>
   /** `docker exec` into the box (R5-01 sign-in store). Default: an empty store, nothing removed. */
   exec?: (argv: string[]) => ExecResult
+  memory?: ExecResult
 }
 
 export let home: string
@@ -57,7 +60,7 @@ export const owner = JSON.stringify({
 export function fakeDocker(state: Box, calls: Call[], over: Overrides = {}): Exec {
   return async (argv: string[], options?: ExecOptions) => {
     calls.push({ argv, env: options?.env, cwd: options?.cwd })
-    if (argv[1] === "exec") return over.exec?.(argv) ?? { code: 0, stdout: JSON.stringify({ names: [], removed: [] }), stderr: "" }
+    if (argv[1] === "exec") return argv.includes(MEMORY_PROBE) ? over.memory ?? { code: 0, stdout: JSON.stringify(MEMORY_OK), stderr: "" } : over.exec?.(argv) ?? { code: 0, stdout: JSON.stringify({ names: [], removed: [] }), stderr: "" }
     const sub = argv.slice(1).find((a) => ["version", "inspect", "image", "compose"].includes(a))
     if (sub === "version") return { code: 0, stdout: "29.8.0\n", stderr: "" }
     if (sub === "image") return over.imageMissing ? { code: 1, stdout: "", stderr: "No such image" } : { code: 0, stdout: "sha256:x", stderr: "" }
@@ -66,7 +69,11 @@ export function fakeDocker(state: Box, calls: Call[], over: Overrides = {}): Exe
       if (named) return named
       if (over.inspect) return over.inspect
       if (!state.running) return { code: 1, stdout: "", stderr: "Error: No such container: opencode-delegate" }
-      return { code: 0, stdout: JSON.stringify({ state: { Running: true, Health: { Status: "healthy" } }, labels: state.labels, env: state.env, image: IMAGE }), stderr: "" }
+      const gate = argv.at(-1)?.endsWith("-gate-box")
+      return { code: 0, stdout: JSON.stringify({ state: { Running: true, Health: { Status: "healthy" } }, labels: state.labels, env: gate ? [`OPENCODE_SERVER_PASSWORD=${state.password ?? "x"}`] : state.env, image: gate ? GATE_IMAGE : IMAGE,
+        networks: { "opencode-delegate_sealed": {}, ...(gate ? { "opencode-delegate_outside": {} } : {}) }, ports: gate ? { "4096/tcp": [{ HostIp: "127.0.0.1", HostPort: state.labels[L.port] }] } : {},
+        command: gate ? ["TCP-LISTEN:4096,fork,reuseaddr", "TCP:box:4096"] : ["serve", "--hostname", "0.0.0.0", "--port", "4096"], entrypoint: gate ? ["socat"] : ["/usr/local/bin/ocd-start"],
+        user: gate ? "65534:65534" : "agent", pidMode: "", privileged: false, capAdd: null, capDrop: ["ALL"], securityOpt: ["no-new-privileges:true"], readonlyRootfs: true }), stderr: "" }
     }
     if (argv.includes("up")) {
       const env = options?.env ?? {}
@@ -74,7 +81,8 @@ export function fakeDocker(state: Box, calls: Call[], over: Overrides = {}): Exe
       if (failed) return failed
       state.running = true
       state.labels = { [L.hash]: env.OCD_PROFILE_HASH!, [L.port]: env.OCD_PORT!, [L.image]: env.OCD_IMAGE!, [L.front]: env.OCD_FRONT_HASH! }
-      state.env = [`OPENCODE_SERVER_PASSWORD=${env.OPENCODE_SERVER_PASSWORD}`, `OPENCODE_MCP_ALLOW=${env.OPENCODE_MCP_ALLOW}`]
+      state.password = env.OPENCODE_SERVER_PASSWORD!
+      state.env = [...apiEnv(state.password), `OPENCODE_MCP_ALLOW=${env.OPENCODE_MCP_ALLOW}`]
     }
     if (argv.includes("down")) {
       if (over.down) return over.down
@@ -100,7 +108,7 @@ export function deps(exec: Exec, over: Partial<SupervisorDeps> = {}): Supervisor
     composeFile: "compose.yaml", ownerConfigDir: path.join(home, "owner"), permission: [{ permission: "*", pattern: "*", action: "allow" }],
     keyEnv: { synapse: "SYNAPSE_API_KEY" }, hostEnv: { PATH: "p", SYNAPSE_API_KEY: "k-value", OTHER_SECRET: "nope" },
     exec, profileFs: nodeProfileFs, leaseFs: nodeLeaseFs, probe,
-    fetch: (async () => new Response("", { status: 200 })) as unknown as typeof fetch,
+    fetch: (async (_url, init) => new Response("", { status: new Headers(init?.headers).has("authorization") ? 200 : 401 })) as typeof fetch,
     freePort: async () => 47123, randomPassword: () => "generated-pw", sleep: async () => {}, now: Date.now,
     every: () => () => {},
     ...over,

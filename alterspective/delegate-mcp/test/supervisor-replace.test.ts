@@ -5,6 +5,7 @@ import { defaultConfig, mcpAllowPolicy } from "../src/shared/config.ts"
 import type { Exec } from "../src/supervisor/docker.ts"
 import { nodeLeaseFs } from "../src/supervisor/leases.ts"
 import { IMAGE, L, deps, fail, fakeDocker, leaseDir, supervisor, writeOwner, type Box, type Call, useSupervisorFixture } from "./supervisor-lifecycle-fixture.ts"
+import { apiEnv } from "./session-isolation-fixture.ts"
 
 useSupervisorFixture()
 
@@ -12,7 +13,7 @@ useSupervisorFixture()
 const mismatched = (): Box => ({
   running: true,
   labels: { [L.hash]: "old", [L.port]: "4711", [L.image]: IMAGE },
-  env: ["OPENCODE_SERVER_PASSWORD=x", `OPENCODE_MCP_ALLOW=${mcpAllowPolicy(defaultConfig())}`],
+  env: [...apiEnv("x"), `OPENCODE_MCP_ALLOW=${mcpAllowPolicy(defaultConfig())}`],
 })
 
 /** Another bridge's live lease (this process's PID, fresh heartbeat). */

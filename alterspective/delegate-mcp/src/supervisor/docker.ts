@@ -70,7 +70,7 @@ export const dockerArgs = {
   imageExists: (tag: string) => ["docker", "image", "inspect", "--format", "{{.Id}}", tag],
   inspect: (name: string) => [
     "docker", "inspect", "--type", "container", "--format",
-    '{"state":{{json .State}},"labels":{{json .Config.Labels}},"env":{{json .Config.Env}},"image":{{json .Config.Image}}}',
+    '{"state":{{json .State}},"labels":{{json .Config.Labels}},"env":{{json .Config.Env}},"image":{{json .Config.Image}},"networks":{{json .NetworkSettings.Networks}},"ports":{{json .NetworkSettings.Ports}},"command":{{json .Config.Cmd}},"entrypoint":{{json .Config.Entrypoint}},"user":{{json .Config.User}},"pidMode":{{json .HostConfig.PidMode}},"privileged":{{json .HostConfig.Privileged}},"capAdd":{{json .HostConfig.CapAdd}},"capDrop":{{json .HostConfig.CapDrop}},"securityOpt":{{json .HostConfig.SecurityOpt}},"readonlyRootfs":{{json .HostConfig.ReadonlyRootfs}}}',
     name,
   ],
   up: (target: ComposeFiles, build: boolean) => compose(target, "up", "-d", "--remove-orphans", ...(build ? ["--build"] : [])),
@@ -101,6 +101,17 @@ export type BoxInspect = {
   image: string
   /** Only the variables asked for; the rest of the container env is discarded unread. */
   env: Record<string, string>
+  networks?: string[]
+  ports?: Record<string, Array<{ HostIp: string; HostPort: string }> | null>
+  command?: string[]
+  entrypoint?: string[]
+  user?: string
+  pidMode?: string
+  privileged?: boolean
+  capAdd?: string[]
+  capDrop?: string[]
+  securityOpt?: string[]
+  readonlyRootfs?: boolean
 }
 
 const NOT_FOUND = /No such (container|object)/i
@@ -119,7 +130,7 @@ export async function inspectBox(exec: Exec, wanted: string[], name = BOX_CONTAI
   )
 }
 
-type RawInspect = { state?: { Running?: boolean; Health?: { Status?: string } }; labels?: Record<string, string> | null; env?: string[] | null; image?: string }
+type RawInspect = Omit<Partial<BoxInspect>, "env" | "networks"> & { state?: { Running?: boolean; Health?: { Status?: string } }; env?: string[] | null; networks?: Record<string, unknown> }
 
 export function parseInspect(stdout: string, wanted: string[]): BoxInspect | undefined {
   let raw: RawInspect
@@ -136,7 +147,8 @@ export function parseInspect(stdout: string, wanted: string[]): BoxInspect | und
   }
   const status = raw.state?.Health?.Status
   const health = status === "healthy" || status === "unhealthy" || status === "starting" ? status : "none"
-  return { running: raw.state?.Running === true, health, labels: raw.labels ?? {}, image: raw.image ?? "", env }
+  return { running: raw.state?.Running === true, health, labels: raw.labels ?? {}, image: raw.image ?? "", env,
+    networks: raw.networks ? Object.keys(raw.networks) : undefined, ports: raw.ports, command: raw.command, entrypoint: raw.entrypoint, user: raw.user, pidMode: raw.pidMode, privileged: raw.privileged, capAdd: raw.capAdd ?? [], capDrop: raw.capDrop ?? [], securityOpt: raw.securityOpt, readonlyRootfs: raw.readonlyRootfs }
 }
 
 export async function imageExists(exec: Exec, tag: string): Promise<boolean> {

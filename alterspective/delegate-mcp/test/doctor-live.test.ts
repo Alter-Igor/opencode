@@ -8,6 +8,7 @@ import { frontServersFor } from "../src/guard/egress.ts"
 import { defaultConfig } from "../src/shared/config.ts"
 import { checkMounts, frontLiveFrom, serversSection } from "../src/supervisor/front-live.ts"
 import type { LiveChecks } from "../src/supervisor/live.ts"
+import { MEMORY_OK } from "./session-isolation-fixture.ts"
 import { doctorTool } from "../src/tools/doctor.ts"
 import { data, fakeContext, invoke, text } from "./tools-core-fixture.ts"
 
@@ -85,6 +86,7 @@ describe("oc_doctor live checks", () => {
   const CHOSEN = { "ks-rag-read": { status: "connected" }, "ks-github": { status: "connected" }, "ks-seqlogs": { status: "connected" } }
   const liveOk: LiveChecks = {
     ok: true,
+    apiIsolation: MEMORY_OK,
     signIns: { ok: true, names: ["ks-rag-read", "ks-github", "ks-seqlogs"], stale: [], unrecognised: 0, removedBefore: [] },
     front: { ok: true, loadedConfigMatches: true, mountReadOnly: true, boxMountsOk: true, problems: [] },
     problems: [],
@@ -103,6 +105,13 @@ describe("oc_doctor live checks", () => {
       expect(text(result)).toContain("NOT verified")
       expect(text(result)).toContain(live.problems[0]!)
     }
+  })
+
+  test("an unknown memory probe cannot inherit a successful aggregate live result", async () => {
+    const f = fakeContext({ boxHeld: false })
+    f.api.on("GET /mcp", { status: 200, data: CHOSEN })
+    f.live.value = { ...liveOk, apiIsolation: { ...MEMORY_OK, ok: false } }
+    expect(data(await invoke(doctorTool, {}, f.ctx))).toMatchObject({ verified: false })
   })
 
   test("review L6: every chosen Keystone entry must be listed by GET /mcp and signed in (or switched off)", async () => {

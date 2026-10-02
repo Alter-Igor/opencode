@@ -47,7 +47,7 @@ export async function defaultSupervisorDeps(config: BridgeConfig, options: Defau
     probe: nodeProcessProbe,
     fetch,
     freePort,
-    randomPassword: () => randomBytes(24).toString("base64url"),
+    randomPassword: () => randomBytes(32).toString("base64url"),
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     now: Date.now,
     log: options.log,

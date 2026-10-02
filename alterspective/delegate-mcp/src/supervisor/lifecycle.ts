@@ -17,7 +17,8 @@ import type { ApiTarget } from "../shared/opencode-api.ts"
 import { FRONT_SERVERS_NAME } from "../guard/egress.ts"
 import { ensureAuthConf } from "../synapse/auth-conf.ts"
 import { SYNAPSE_LOCK_WAIT_MS } from "../synapse/lock.ts"
-import { INSPECT_ENV, MCP_ALLOW_ENV, approvedValues, boxEnvOverride, composeDownEnv, composeEnv, siblingContainers } from "./compose-env.ts"
+import { INSPECT_ENV, MCP_ALLOW_ENV, PASSWORD_ENV, approvedValues, boxEnvOverride, composeDownEnv, composeEnv, siblingContainers } from "./compose-env.ts"
+import { requireMemoryProtection } from "./api-isolation.ts"
 import { LABEL, dockerArgs, imageExists, inspectBox, redactAll, requireDocker, type BoxInspect, type Exec, type ExecResult } from "./docker.ts"
 import { waitHealthy } from "./health.ts"
 import { pruneSignIns, verifyLive } from "./live.ts"
@@ -146,8 +147,10 @@ async function reuse(run: Run, box: BoxInspect, plan: Plan): Promise<ApiTarget> 
   } catch (error) {
     throw await withHolders(run, error)
   }
-  const target = targetOf(box, run.deps.config.project)
+  const gate = await inspectBox(run.deps.exec, [PASSWORD_ENV], `${run.container}-gate-box`)
+  const target = targetOf(box, gate, run.deps.config.project, run.deps.image)
   return withLease(run, async () => {
+    await requireMemoryProtection(run.deps.exec, run.container)
     await waitHealthy(run.deps, target, run.container)
     // R5-01: sign-ins of entries that left the set must not stay in the box, even on reuse.
     await pruneSignIns(run, plan)
@@ -217,6 +220,13 @@ async function start(run: Run, plan: Plan): Promise<ApiTarget> {
     const result = await deps.exec(dockerArgs.up(run.compose, build), { env, timeoutMs: 20 * 60_000 })
     if (result.code !== 0) throw upFailure(result, [password, inbox.token, ...Object.values(approvedValues(deps))])
     const target = { baseUrl: `http://127.0.0.1:${port}`, password }
+    // Wait without sending authority. Verify the live process before its first host password.
+    await waitHealthy(deps, target, run.container, true)
+    const box = await inspectBox(deps.exec, INSPECT_ENV, run.container)
+    const gate = await inspectBox(deps.exec, [PASSWORD_ENV], `${run.container}-gate-box`)
+    if (!box) throw changed("The started sandbox could not be inspected.", "box missing after compose up")
+    targetOf(box, gate, deps.config.project, deps.image)
+    await requireMemoryProtection(deps.exec, run.container)
     await waitHealthy(deps, target, run.container)
     run.state.startedHere = true
     // R5-01: the data volume outlives the box, so every start (and every set change) cleans it.

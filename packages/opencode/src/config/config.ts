@@ -327,7 +327,8 @@ const layer = Layer.effect(
 
     const loadInstanceState = Effect.fn("Config.loadInstanceState")(
       function* (ctx: InstanceContext) {
-        const auth = yield* authSvc.all().pipe(Effect.orDie)
+        // The delegate box's writable auth/account stores must never supply server code or config.
+        const auth = Flag.OPENCODE_DISABLE_REMOTE_CONFIG ? {} : yield* authSvc.all().pipe(Effect.orDie)
 
         let result: Info = {}
         const authEnv: Record<string, string> = {}
@@ -489,9 +490,9 @@ const layer = Layer.effect(
           yield* Effect.logDebug("loaded custom config from OPENCODE_CONFIG_CONTENT")
         }
 
-        const activeAccount = Option.getOrUndefined(
-          yield* accountSvc.active().pipe(Effect.catch(() => Effect.succeed(Option.none()))),
-        )
+        const activeAccount = Flag.OPENCODE_DISABLE_REMOTE_CONFIG
+          ? undefined
+          : Option.getOrUndefined(yield* accountSvc.active().pipe(Effect.catch(() => Effect.succeed(Option.none()))))
         if (activeAccount?.active_org_id) {
           const accountID = activeAccount.id
           const orgID = activeAccount.active_org_id

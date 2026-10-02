@@ -12,6 +12,7 @@ import type { ProcessProbe } from "../src/supervisor/process.ts"
 import { frontFilesFor } from "../src/supervisor/plan.ts"
 import { buildProfile, nodeProfileFs } from "../src/supervisor/profile.ts"
 import { IMAGE, L, deps, fail, fakeDocker, home, leaseDir, made, owner, probe, recorder, supervisor, writeOwner, type Box, type Call, type Line, useSupervisorFixture } from "./supervisor-lifecycle-fixture.ts"
+import { apiEnv } from "./session-isolation-fixture.ts"
 
 useSupervisorFixture()
 
@@ -47,7 +48,7 @@ describe("supervisor: round-2 review fixes", () => {
     const d = deps(async () => ({ code: 0, stdout: "", stderr: "" }))
     const hash = buildProfile({ ownerConfigs: [owner], config: d.config, permission: d.permission, keyEnv: d.keyEnv }).hash
     const front = frontFilesFor(d.config).hash
-    return { running: true, labels: { [L.hash]: hash, [L.port]: "4711", [L.image]: IMAGE, [L.front]: front }, env: ["OPENCODE_SERVER_PASSWORD=x", `OPENCODE_MCP_ALLOW=${mcpAllowPolicy(defaultConfig())}`] }
+    return { running: true, labels: { [L.hash]: hash, [L.port]: "4711", [L.image]: IMAGE, [L.front]: front }, env: [...apiEnv("x"), `OPENCODE_MCP_ALLOW=${mcpAllowPolicy(defaultConfig())}`] }
   }
 
   test("reuse refuses a front started with another Keystone set's config (R4-01)", async () => {
