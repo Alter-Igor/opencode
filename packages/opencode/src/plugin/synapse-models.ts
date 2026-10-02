@@ -12,11 +12,12 @@
 // different source, and the delegate box sets that flag while still needing the live
 // Synapse list.
 //
-// Before the fetch, a stored Keystone token that is expired, about to expire, or
-// minted for the MCP audience is refreshed for the `synapse` audience (synapse.ts,
-// resolveSynapseModelsToken). Side effect: an old MCP-audience login is upgraded at
-// startup, so chat then goes over the REST plane (native tool schemas) instead of
-// the MCP bridge.
+// Startup never refreshes a Keystone token: Keystone revokes the whole login when a
+// refresh token is reused, and the model list does not need that risk. With a stored
+// access token that is already expired, startup skips the fetch and uses the cache
+// (or the configured list). After a chat-time refresh succeeds, synapse.ts updates
+// the cache in the background with the new token (updateSynapseModelsCache). The
+// refresh single-flight guard in synapse.ts is per process.
 //
 // This runs from the Synapse plugin's `config` hook. OPENCODE_DISABLE_DEFAULT_PLUGINS
 // turns all internal plugins off, so with it set nothing here runs: no live list and
@@ -62,8 +63,8 @@ export interface SynapseStoredCredential {
 export interface SynapseModelsDeps {
   defaultBaseURL: string
   fetch?: SynapseModelsFetch
-  /** The token to send, already refreshed if needed. Defaults to the stored credential as is. */
-  resolveToken?: () => Promise<string | undefined>
+  /** The stored token, and whether it is already expired (then no fetch is made). */
+  resolveToken?: () => Promise<{ token?: string; expired: boolean }>
   log?: (event: SynapseModelsLogEvent) => void
   cache?: SynapseModelsCache
   timeoutMs?: number
@@ -71,17 +72,6 @@ export interface SynapseModelsDeps {
 }
 
 export type SynapseModelsResult = "live" | "cache" | "fallback" | "skipped"
-
-/**
- * An abort signal that fires after `ms` on an ordinary timer. Bun's
- * `AbortSignal.timeout` does not fire while nothing else holds the event loop
- * (observed on Bun 1.3.14), so a hung request would never be abandoned.
- */
-export function timeoutSignal(ms: number): { signal: AbortSignal; clear: () => void } {
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(new Error(`timed out after ${ms} ms`)), ms)
-  return { signal: controller.signal, clear: () => clearTimeout(timer) }
-}
 
 export function synapseModelsUrl(baseURL: string): string {
   return `${baseURL.replace(/\/+$/, "")}/models`
@@ -241,62 +231,113 @@ function synapseAllowed(cfg: Config): boolean {
   return true
 }
 
-async function defaultResolveToken(): Promise<string | undefined> {
-  return (await readStoredSynapseCredential())?.token
+async function defaultResolveToken(): Promise<{ token?: string; expired: boolean }> {
+  return { token: (await readStoredSynapseCredential())?.token, expired: false }
+}
+
+/** Where the model list is fetched from, for a config with an allowed `synapse` provider. */
+export interface SynapseModelsTarget {
+  baseURL: string
+  headers: Record<string, string>
+  apiKey?: string
+}
+
+export function synapseModelsTarget(cfg: Config, defaultBaseURL: string): SynapseModelsTarget | undefined {
+  const provider = cfg.provider?.[SYNAPSE_PROVIDER_ID]
+  if (!provider || !synapseAllowed(cfg)) return undefined
+  const options = provider.options ?? {}
+  return {
+    baseURL: typeof options.baseURL === "string" && options.baseURL ? options.baseURL : defaultBaseURL,
+    headers: stringHeaders(options.headers),
+    apiKey: typeof options.apiKey === "string" && options.apiKey ? options.apiKey : undefined,
+  }
+}
+
+async function fetchLiveModels(input: {
+  target: SynapseModelsTarget
+  token?: string
+  fetch?: SynapseModelsFetch
+  timeoutMs?: number
+  userAgent?: string
+}): Promise<Record<string, SynapseModelEntry>> {
+  const headers = new Headers(input.target.headers)
+  headers.set("accept", "application/json")
+  if (input.userAgent) headers.set("user-agent", input.userAgent)
+  // Same credential headers the chat path sends. With no token (the delegate box)
+  // the request still goes out, and the front proxy injects the credential.
+  if (input.token) {
+    headers.set("authorization", `Bearer ${input.token}`)
+    headers.set("x-api-key", input.token)
+  }
+  const response = await (input.fetch ?? fetch)(synapseModelsUrl(input.target.baseURL), {
+    method: "GET",
+    headers,
+    signal: AbortSignal.timeout(input.timeoutMs ?? SYNAPSE_MODELS_TIMEOUT_MS),
+  })
+  if (!response.ok) throw new Error(`HTTP ${response.status}`)
+  const live = parseSynapseModelList(await response.json())
+  if (Object.keys(live).length === 0) throw new Error("gateway returned no chat models")
+  return live
+}
+
+/**
+ * Best effort: fetch the live list with a freshly refreshed token and store it as the
+ * last good list for the next startup. Never throws; returns whether it was written.
+ */
+export async function updateSynapseModelsCache(input: {
+  target: SynapseModelsTarget
+  token: string
+  fetch?: SynapseModelsFetch
+  cache?: SynapseModelsCache
+  userAgent?: string
+}): Promise<boolean> {
+  try {
+    const live = await fetchLiveModels(input)
+    await (input.cache ?? fileSynapseModelsCache()).write(input.target.baseURL, live)
+    return true
+  } catch {
+    return false
+  }
 }
 
 /**
  * Replace `cfg.provider.synapse.models` with the gateway's live list plus `auto`.
- * On any failure it uses the cached last good list, else the configured models, adds
- * `auto`, and logs the failure. Never throws, and waits at most `timeoutMs` for the
- * gateway.
+ * With an expired stored token no request is made and the cached last good list is
+ * used, else the configured models. On a failed fetch the same fallback applies and
+ * the failure is logged. Never throws, and waits at most `timeoutMs` for the gateway.
  */
 export async function loadSynapseModels(cfg: Config, deps: SynapseModelsDeps): Promise<SynapseModelsResult> {
+  const target = synapseModelsTarget(cfg, deps.defaultBaseURL)
   const provider = cfg.provider?.[SYNAPSE_PROVIDER_ID]
-  if (!provider || !synapseAllowed(cfg)) return "skipped"
+  if (!target || !provider) return "skipped"
 
-  const options = provider.options ?? {}
-  const baseURL = typeof options.baseURL === "string" && options.baseURL ? options.baseURL : deps.defaultBaseURL
-  const url = synapseModelsUrl(baseURL)
+  const url = synapseModelsUrl(target.baseURL)
   const configured = provider.models ?? {}
   const auto = configured[SYNAPSE_AUTO_MODEL] ?? defaultAutoModel()
   const cache = deps.cache ?? fileSynapseModelsCache()
+  const useFallback = async (): Promise<SynapseModelsResult> => {
+    const cached = await cache.read(target.baseURL)
+    provider.models = { ...(cached ?? configured), [SYNAPSE_AUTO_MODEL]: auto }
+    return cached ? "cache" : "fallback"
+  }
 
   let token: string | undefined
   try {
     const stored = await (deps.resolveToken ?? defaultResolveToken)()
-    const configuredKey = typeof options.apiKey === "string" && options.apiKey ? options.apiKey : undefined
-    token = stored ?? configuredKey
-
-    const headers = new Headers(stringHeaders(options.headers))
-    headers.set("accept", "application/json")
-    if (deps.userAgent) headers.set("user-agent", deps.userAgent)
-    // Same credential headers the chat path sends. With no token (the delegate box)
-    // the request still goes out, and the front proxy injects the credential.
-    if (token) {
-      headers.set("authorization", `Bearer ${token}`)
-      headers.set("x-api-key", token)
-    }
-
-    const timeout = timeoutSignal(deps.timeoutMs ?? SYNAPSE_MODELS_TIMEOUT_MS)
-    let body: unknown
-    try {
-      const response = await (deps.fetch ?? fetch)(url, { method: "GET", headers, signal: timeout.signal })
-      if (!response.ok) throw new Error(`HTTP ${response.status}`)
-      body = await response.json()
-    } finally {
-      timeout.clear()
-    }
-    const live = parseSynapseModelList(body)
-    if (Object.keys(live).length === 0) throw new Error("gateway returned no chat models")
-
+    if (stored.expired) return await useFallback()
+    token = stored.token ?? target.apiKey
+    const live = await fetchLiveModels({
+      target,
+      token,
+      fetch: deps.fetch,
+      timeoutMs: deps.timeoutMs,
+      userAgent: deps.userAgent,
+    })
     provider.models = { ...live, [SYNAPSE_AUTO_MODEL]: auto }
-    await cache.write(baseURL, live)
+    await cache.write(target.baseURL, live)
     return "live"
   } catch (error) {
     deps.log?.({ reason: "synapse-models-fetch-failed", url, error: errorText(error, token) })
-    const cached = await cache.read(baseURL)
-    provider.models = { ...(cached ?? configured), [SYNAPSE_AUTO_MODEL]: auto }
-    return cached ? "cache" : "fallback"
+    return await useFallback()
   }
 }

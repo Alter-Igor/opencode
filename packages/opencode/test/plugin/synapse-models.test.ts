@@ -11,12 +11,13 @@ import {
   parseSynapseModelList,
   readStoredSynapseCredential,
   synapseModelsUrl,
+  updateSynapseModelsCache,
   type SynapseModelEntry,
   type SynapseModelsCache,
   type SynapseModelsFetch,
   type SynapseModelsLogEvent,
 } from "../../src/plugin/synapse-models"
-import { SynapseAuthPlugin, resolveSynapseModelsToken } from "../../src/plugin/synapse"
+import { SynapseAuthPlugin, synapseModelsToken } from "../../src/plugin/synapse"
 import * as fs from "fs/promises"
 import * as os from "os"
 import * as path from "path"
@@ -105,7 +106,7 @@ function deps(
 ) {
   return {
     fetch: fetchImpl,
-    resolveToken: async () => token,
+    resolveToken: async () => ({ token, expired: false }),
     log: (event: SynapseModelsLogEvent) => logs.push(event),
     defaultBaseURL: "https://default.example.test/v1",
     cache,
@@ -353,86 +354,125 @@ describe("readStoredSynapseCredential", () => {
   })
 })
 
-describe("resolveSynapseModelsToken", () => {
-  const future = Date.now() + 3_600_000
-  const freshSynapseJwt = jwt({ aud: "synapse", exp: Math.floor(future / 1000) })
+describe("synapseModelsToken", () => {
+  const now = Date.now()
 
-  test("an expired token is refreshed before the fetch", async () => {
-    const expired = jwt({ aud: "synapse", exp: Math.floor(Date.now() / 1000) - 60 })
-    let refreshed = 0
-    const token = await resolveSynapseModelsToken(
-      { token: expired, refreshToken: "r-1", expiresAt: Date.now() - 60_000 },
-      async () => {
-        refreshed++
-        return freshSynapseJwt
-      },
-    )
-    expect(refreshed).toBe(1)
-    expect(token).toBe(freshSynapseJwt)
+  test("no credential: no token, not expired (the request still goes out)", () => {
+    expect(synapseModelsToken(undefined, now)).toEqual({ expired: false })
   })
 
-  test("an MCP-audience token is exchanged for a Synapse-audience one", async () => {
-    const mcpJwt = jwt({ aud: "https://synapse-mcp.example.test/mcp", exp: Math.floor(future / 1000) })
-    const token = await resolveSynapseModelsToken(
-      { token: mcpJwt, refreshToken: "r-1", expiresAt: future },
-      async () => freshSynapseJwt,
-    )
-    expect(token).toBe(freshSynapseJwt)
+  test("an expired stored expiry or JWT exp marks the token expired", () => {
+    expect(synapseModelsToken({ token: "sk-1", expiresAt: now - 1_000 }, now).expired).toBe(true)
+    expect(synapseModelsToken({ token: jwt({ exp: Math.floor(now / 1000) - 60 }) }, now).expired).toBe(true)
   })
 
-  test("a fresh Synapse-audience token is used as is", async () => {
-    let refreshed = 0
-    const token = await resolveSynapseModelsToken(
-      { token: freshSynapseJwt, refreshToken: "r-1", expiresAt: future },
-      async () => {
-        refreshed++
-        return "never"
-      },
-    )
-    expect(refreshed).toBe(0)
-    expect(token).toBe(freshSynapseJwt)
-  })
-
-  test("when the refresh fails the stored token is used, so the fetch fails over as before", async () => {
-    const expired = jwt({ aud: "synapse", exp: Math.floor(Date.now() / 1000) - 60 })
-    const token = await resolveSynapseModelsToken(
-      { token: expired, refreshToken: "r-1", expiresAt: Date.now() - 60_000 },
-      async () => {
-        throw new Error("invalid_grant")
-      },
-    )
-    expect(token).toBe(expired)
-  })
-
-  test("no credential means no token", async () => {
-    expect(await resolveSynapseModelsToken(undefined, async () => "never")).toBeUndefined()
+  test("a fresh JWT or a plain API key with no expiry is used", () => {
+    const fresh = jwt({ aud: "synapse", exp: Math.floor(now / 1000) + 3600 })
+    expect(synapseModelsToken({ token: fresh, expiresAt: now + 3_600_000 }, now)).toEqual({
+      token: fresh,
+      expired: false,
+    })
+    expect(synapseModelsToken({ token: "sk-1" }, now)).toEqual({ token: "sk-1", expired: false })
   })
 })
 
-describe("SynapseAuthPlugin config hook", () => {
-  test("refreshes an expired stored token, persists it, and loads the live list", async () => {
+describe("loadSynapseModels with an expired stored token", () => {
+  const expiredDeps = (calls: Call[], cache: SynapseModelsCache) => ({
+    ...deps(okFetch(LIVE_REPLY, calls), [], TOKEN, cache),
+    resolveToken: async () => ({ token: TOKEN, expired: true }),
+  })
+
+  test("makes no request and uses the cached list", async () => {
+    const calls: Call[] = []
+    const cfg = configWithStaleModels()
+    const cache = memoryCache({ [BASE]: { "cached-model": { name: "cached-model" } } })
+    expect(await loadSynapseModels(cfg, expiredDeps(calls, cache))).toBe("cache")
+    expect(calls).toHaveLength(0)
+    expect(Object.keys(cfg.provider?.synapse?.models ?? {}).sort()).toEqual([SYNAPSE_AUTO_MODEL, "cached-model"])
+  })
+
+  test("makes no request and uses the configured list when there is no cache", async () => {
+    const calls: Call[] = []
+    const cfg = configWithStaleModels()
+    expect(await loadSynapseModels(cfg, expiredDeps(calls, memoryCache()))).toBe("fallback")
+    expect(calls).toHaveLength(0)
+    expect(Object.keys(cfg.provider?.synapse?.models ?? {})).toContain("stale-model-a")
+  })
+})
+
+describe("updateSynapseModelsCache", () => {
+  test("stores the live list fetched with the new token, and never throws", async () => {
+    const calls: Call[] = []
+    const cache = memoryCache()
+    const target = { baseURL: BASE, headers: {} }
+    expect(await updateSynapseModelsCache({ target, token: TOKEN, fetch: okFetch(LIVE_REPLY, calls), cache })).toBe(
+      true,
+    )
+    expect(calls[0].headers.get("authorization")).toBe(`Bearer ${TOKEN}`)
+    expect(Object.keys(cache.store[BASE] ?? {})).toContain("claude-opus-5")
+    expect(await updateSynapseModelsCache({ target, token: TOKEN, fetch: failingFetch([]), cache })).toBe(false)
+  })
+})
+
+describe("Synapse credential refresh (chat only; startup never refreshes)", () => {
+  type Opts = {
+    save?: (body: unknown) => Promise<unknown>
+    tokenDelayMs?: number
+    expiresIn?: number
+    refreshWaitMs?: number
+  }
+
+  function harness(opts: Opts) {
     const previousFetch = globalThis.fetch
     const previousAuth = process.env.OPENCODE_AUTH_CONTENT
-    const expired = jwt({ aud: "synapse", exp: Math.floor(Date.now() / 1000) - 60 })
-    const fresh = jwt({ aud: "synapse", exp: Math.floor(Date.now() / 1000) + 3600 })
-    process.env.OPENCODE_AUTH_CONTENT = JSON.stringify({
-      synapse: { type: "api", key: expired, metadata: { refreshToken: "r-1", expiresAt: String(Date.now() - 1000) } },
-    })
-    const calls: Call[] = []
-    const persisted: unknown[] = []
+    const nonce = Math.random().toString(36).slice(2)
+    const old = jwt({ aud: "synapse", exp: Math.floor(Date.now() / 1000) - 60, jti: `old-${nonce}` })
+    // The stored credential never changes: either every save fails, or
+    // OPENCODE_AUTH_CONTENT pins it (it always wins over auth.json).
+    const stored = {
+      type: "api",
+      key: old,
+      metadata: { refreshToken: `r-1-${nonce}`, expiresAt: String(Date.now() - 1000) },
+    }
+    process.env.OPENCODE_AUTH_CONTENT = JSON.stringify({ synapse: stored })
+    const grants: string[] = []
+    const issued: string[] = []
+    const chatAuth: (string | null)[] = []
+    const modelsAuth: (string | null)[] = []
+    const tokenCalls: string[] = []
     const stub = async (url: RequestInfo | URL, init?: RequestInit) => {
       const href = typeof url === "string" ? url : url instanceof URL ? url.href : url.url
-      calls.push({ url: href, headers: new Headers(init?.headers) })
+      const auth = new Headers(init?.headers).get("authorization")
       if (href.endsWith("/token")) {
-        return Response.json({ access_token: fresh, refresh_token: "r-2", expires_in: 3600 })
+        tokenCalls.push(href)
+        const used = (init?.body instanceof URLSearchParams ? init.body.get("refresh_token") : null) ?? ""
+        grants.push(used.replace(`-${nonce}`, ""))
+        const n = grants.length
+        await new Promise((resolve) => setTimeout(resolve, opts.tokenDelayMs ?? 5))
+        const access = jwt({ aud: "synapse", exp: Math.floor(Date.now() / 1000) + 3600, jti: `a-${n}-${nonce}` })
+        issued.push(access)
+        return Response.json({
+          access_token: access,
+          refresh_token: `r-${n + 1}-${nonce}`,
+          expires_in: opts.expiresIn ?? 3600,
+        })
       }
-      return Response.json(LIVE_REPLY)
+      if (href.endsWith("/chat/completions")) {
+        chatAuth.push(auth)
+        return Response.json({ choices: [{ message: { role: "assistant", content: "ok" } }] })
+      }
+      if (href.endsWith("/models")) {
+        modelsAuth.push(auth)
+        return Response.json(LIVE_REPLY)
+      }
+      return previousFetch(url, init)
     }
     globalThis.fetch = Object.assign(stub, { preconnect: previousFetch.preconnect })
-    try {
+
+    const start = async () => {
       const hooks = await SynapseAuthPlugin(
         {
-          client: { auth: { set: async (body: unknown) => persisted.push(body) } } as never,
+          client: { auth: { set: opts.save ?? (async () => undefined) } } as never,
           project: {} as never,
           directory: "",
           worktree: "",
@@ -440,147 +480,105 @@ describe("SynapseAuthPlugin config hook", () => {
           serverUrl: new URL("https://example.com"),
           $: {} as never,
         },
-        { tokenUrl: "https://keystone.example.test/token" },
+        { tokenUrl: "https://keystone.example.test/token", refreshWaitMs: opts.refreshWaitMs },
       )
       const cfg = configWithStaleModels()
       await hooks.config?.(cfg)
-      const modelsCall = calls.find((c) => c.url === `${BASE}/models`)
-      expect(modelsCall?.headers.get("authorization")).toBe(`Bearer ${fresh}`)
-      expect(Object.keys(cfg.provider?.synapse?.models ?? {})).toContain("claude-opus-5")
-      expect(Object.keys(cfg.provider?.synapse?.models ?? {})).toContain(SYNAPSE_AUTO_MODEL)
-      await new Promise((resolve) => setTimeout(resolve, 10))
-      expect(JSON.stringify(persisted)).toContain("r-2")
-    } finally {
+      const loaded = await hooks.auth?.loader?.(async () => stored as never, {} as never)
+      const chatFetch: unknown = loaded?.fetch
+      if (typeof chatFetch !== "function") throw new Error("auth loader returned no fetch")
+      const chat = async () => {
+        await chatFetch(`${BASE}/chat/completions`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: "auto", messages: [{ role: "user", content: "hi" }] }),
+        })
+      }
+      return { cfg, chat }
+    }
+
+    const restore = () => {
       globalThis.fetch = previousFetch
       if (previousAuth === undefined) delete process.env.OPENCODE_AUTH_CONTENT
       else process.env.OPENCODE_AUTH_CONTENT = previousAuth
     }
-  })
-})
-
-describe("Synapse credential refresh shared by startup and chat", () => {
-  type Harness = {
-    grants: string[]
-    chatAuth: (string | null)[]
-    run: () => Promise<{ config: Promise<void>; chat: () => Promise<void> }>
-    restore: () => void
+    return { old, grants, issued, chatAuth, modelsAuth, tokenCalls, start, restore }
   }
 
-  function harness(opts: { save: (body: unknown) => Promise<unknown>; tokenDelayMs?: number; hangToken?: boolean }) {
-    const previousFetch = globalThis.fetch
-    const previousAuth = process.env.OPENCODE_AUTH_CONTENT
-    const nonce = Math.random().toString(36).slice(2)
-    const expired = jwt({ aud: "synapse", exp: Math.floor(Date.now() / 1000) - 60, jti: `old-${nonce}` })
-    const fresh = jwt({ aud: "synapse", exp: Math.floor(Date.now() / 1000) + 3600, jti: `new-${nonce}` })
-    const stored = {
-      type: "api",
-      key: expired,
-      metadata: { refreshToken: `r-1-${nonce}`, expiresAt: String(Date.now() - 1000) },
-    }
-    process.env.OPENCODE_AUTH_CONTENT = JSON.stringify({ synapse: stored })
-    const h: Harness & { fresh: string } = {
-      fresh,
-      grants: [],
-      chatAuth: [],
-      restore: () => {
-        globalThis.fetch = previousFetch
-        if (previousAuth === undefined) delete process.env.OPENCODE_AUTH_CONTENT
-        else process.env.OPENCODE_AUTH_CONTENT = previousAuth
-      },
-      run: async () => {
-        const hooks = await SynapseAuthPlugin(
-          {
-            client: { auth: { set: opts.save } } as never,
-            project: {} as never,
-            directory: "",
-            worktree: "",
-            experimental_workspace: { register() {} },
-            serverUrl: new URL("https://example.com"),
-            $: {} as never,
-          },
-          { tokenUrl: "https://keystone.example.test/token" },
-        )
-        const loaded = await hooks.auth?.loader?.(async () => stored as never, {} as never)
-        const chatFetch = loaded?.fetch as (url: string, init: RequestInit) => Promise<Response>
-        return {
-          config: hooks.config?.(configWithStaleModels()) ?? Promise.resolve(),
-          chat: async () => {
-            await chatFetch(`${BASE}/chat/completions`, {
-              method: "POST",
-              headers: { "content-type": "application/json" },
-              body: JSON.stringify({ model: "auto", messages: [{ role: "user", content: "hi" }] }),
-            })
-          },
-        }
-      },
-    }
-    const stub = async (url: RequestInfo | URL, init?: RequestInit) => {
-      const href = typeof url === "string" ? url : url instanceof URL ? url.href : url.url
-      if (href.endsWith("/token")) {
-        if (opts.hangToken) {
-          return new Promise<Response>((_resolve, reject) => {
-            init?.signal?.addEventListener("abort", () => reject(new Error("token request aborted")))
-          })
-        }
-        h.grants.push(String(new URLSearchParams(String(init?.body)).get("refresh_token")))
-        await new Promise((resolve) => setTimeout(resolve, opts.tokenDelayMs ?? 30))
-        return Response.json({ access_token: fresh, refresh_token: `r-2-${nonce}`, expires_in: 3600 })
-      }
-      if (href.endsWith("/chat/completions")) {
-        h.chatAuth.push(new Headers(init?.headers).get("authorization"))
-        return Response.json({ choices: [{ message: { role: "assistant", content: "ok" } }] })
-      }
-      if (href.endsWith("/models")) {
-        const auth = new Headers(init?.headers).get("authorization")
-        return auth === `Bearer ${fresh}` ? Response.json(LIVE_REPLY) : new Response("unauthorized", { status: 401 })
-      }
-      return previousFetch(url, init)
-    }
-    globalThis.fetch = Object.assign(stub, { preconnect: previousFetch.preconnect })
-    return h
-  }
+  const settle = (ms = 30) => new Promise((resolve) => setTimeout(resolve, ms))
 
-  test("a chat request during the startup refresh joins it: exactly one refresh grant", async () => {
-    const saved: unknown[] = []
-    const h = harness({ save: async (body) => saved.push(body), tokenDelayMs: 50 })
+  test("startup with an expired token contacts neither Keystone nor /models", async () => {
+    const h = harness({})
     try {
-      const { config, chat } = await h.run()
-      await Promise.all([config, chat()])
-      await chat()
-      expect(h.grants).toHaveLength(1)
-      expect(h.chatAuth).toEqual([`Bearer ${h.fresh}`, `Bearer ${h.fresh}`])
-      expect(saved).toHaveLength(1)
+      const { cfg } = await h.start()
+      expect(h.tokenCalls).toHaveLength(0)
+      expect(h.modelsAuth).toHaveLength(0)
+      expect(Object.keys(cfg.provider?.synapse?.models ?? {})).toContain(SYNAPSE_AUTO_MODEL)
     } finally {
       h.restore()
     }
   })
 
-  test("a failed save keeps the new token in memory: no second grant with the spent refresh token", async () => {
+  test("the first chat refreshes once, then the model cache is updated in the background with the new token", async () => {
+    const h = harness({})
+    try {
+      const { chat } = await h.start()
+      await chat()
+      await settle()
+      expect(h.grants).toEqual(["r-1"])
+      expect(h.chatAuth).toEqual([`Bearer ${h.issued[0]}`])
+      expect(h.modelsAuth).toEqual([`Bearer ${h.issued[0]}`])
+    } finally {
+      h.restore()
+    }
+  })
+
+  test("with every save failing, each refresh uses the newest refresh token: r-1, r-2, r-3", async () => {
     const h = harness({
+      expiresIn: 1,
       save: async () => {
         throw new Error("server not ready")
       },
     })
     try {
-      const { config, chat } = await h.run()
-      await config
+      const { chat } = await h.start()
       await chat()
       await chat()
-      expect(h.grants).toHaveLength(1)
-      expect(h.chatAuth).toEqual([`Bearer ${h.fresh}`, `Bearer ${h.fresh}`])
+      await chat()
+      expect(h.grants).toEqual(["r-1", "r-2", "r-3"])
+      expect(h.chatAuth).toEqual(h.issued.map((token) => `Bearer ${token}`))
     } finally {
       h.restore()
     }
   })
 
-  test("an unreachable Keystone does not stall startup past the refresh timeout", async () => {
-    const h = harness({ save: async () => undefined, hangToken: true })
+  test("with OPENCODE_AUTH_CONTENT pinning the old credential (saves succeed), still r-1, r-2, r-3", async () => {
+    const saved: unknown[] = []
+    const h = harness({ expiresIn: 1, save: async (body) => saved.push(body) })
     try {
-      const { config } = await h.run()
-      const started = Date.now()
-      await config
-      expect(Date.now() - started).toBeLessThan(SYNAPSE_MODELS_TIMEOUT_MS * 2 + 1_000)
-      expect(h.grants).toHaveLength(0)
+      const { chat } = await h.start()
+      await chat()
+      await chat()
+      await chat()
+      expect(h.grants).toEqual(["r-1", "r-2", "r-3"])
+      expect(saved).toHaveLength(3)
+    } finally {
+      h.restore()
+    }
+  })
+
+  test("a slow grant that outlives the chat's wait is kept: the next refresh uses its new refresh token", async () => {
+    const h = harness({ expiresIn: 1, tokenDelayMs: 150, refreshWaitMs: 20 })
+    try {
+      const { chat } = await h.start()
+      await chat()
+      expect(h.chatAuth).toEqual([`Bearer ${h.old}`])
+      await settle(250)
+      await chat()
+      // The second wait also gives up, so that request uses the newest token held in memory.
+      expect(h.chatAuth[1]).toBe(`Bearer ${h.issued[0]}`)
+      await settle(250)
+      expect(h.grants).toEqual(["r-1", "r-2"])
     } finally {
       h.restore()
     }
