@@ -2,12 +2,15 @@ import { describe, expect, test } from "bun:test"
 import path from "node:path"
 import { DelegateError } from "../src/shared/errors.ts"
 import {
+  FRONT_AUTH_PLACEHOLDER,
+  MODELS_FILE,
   PROFILE_GITIGNORE,
   buildProfile,
   hashDirectory,
   permissionConfig,
   readOwnerConfigs,
   stripJsonc,
+  withRegisteredModels,
   writeProfile,
   type ProfileFs,
   type ProfileInput,
@@ -45,10 +48,17 @@ function refusal(fn: () => unknown): DelegateError {
   throw new Error("expected a DelegateError")
 }
 
-type ProfileJson = { provider: Record<string, { options: Record<string, unknown> }>; mcp: unknown; [key: string]: unknown }
+type ProfileJson = { provider: Record<string, { options: Record<string, unknown>; [key: string]: unknown }>; mcp: unknown; [key: string]: unknown }
 
 function parsedConfig(files: Record<string, string>): ProfileJson {
   return JSON.parse(files["opencode/opencode.json"]!) as ProfileJson
+}
+
+type ModelsJson = { model?: string; small_model?: string; provider: { synapse: { models: Record<string, unknown> } } }
+
+/** #71: the models file (JSONC: a comment header, then JSON). */
+function modelsConfig(files: Record<string, string>): ModelsJson {
+  return JSON.parse(stripJsonc(files[MODELS_FILE]!)) as ModelsJson
 }
 
 describe("profile: secret refusal", () => {
@@ -131,22 +141,134 @@ describe("profile: merge across owner files (A-21)", () => {
   test("later files merge into provider entries instead of replacing them", () => {
     const first = owner({ synapse })
     const second = JSON.stringify({ provider: { synapse: { options: { timeout: 60000 } } } })
-    const cfg = parsedConfig(buildProfile(input([first, second])).files)
+    const built = buildProfile(input([first, second]))
+    const cfg = parsedConfig(built.files)
     expect(cfg.provider.synapse!.options).toEqual({ ...synapse.options, timeout: 60000 })
-    expect((cfg.provider.synapse as unknown as { models: unknown }).models).toEqual(synapse.models)
+    // #71: the models are no longer the owner's list: they are written to the models file.
+    expect(cfg.provider.synapse).not.toHaveProperty("models")
+    expect(modelsConfig(built.files).provider.synapse.models).toEqual(synapse.models)
+  })
+})
+
+// #71: Synapse is the only provider, its models are the ones registered in Synapse, default synapse/auto.
+describe("profile: Synapse only (#71)", () => {
+  const registered = { models: ["auto", "anthropic/claude-opus-5", "qwen/qwen3.8-flash"], limits: { "anthropic/claude-opus-5": { context: 200000, output: 32000 } } }
+
+  test("enabled_providers is always [synapse], with or without an owner config", () => {
+    for (const texts of [[owner({ synapse })], [], [JSON.stringify({ provider: { opencode: {} } })]]) {
+      const built = buildProfile(input(texts))
+      expect(parsedConfig(built.files).enabled_providers).toEqual(["synapse"])
+      expect(Object.keys(parsedConfig(built.files).provider)).toEqual(["synapse"])
+      expect(built.providers).toEqual(["synapse"])
+    }
+  })
+
+  test("with no owner Synapse entry the box gets the built-in one; a front-auth box gets the placeholder key", () => {
+    const built = buildProfile(input([], { frontAuth: ["synapse"] }))
+    expect(parsedConfig(built.files).provider.synapse).toEqual({
+      npm: "@ai-sdk/openai-compatible",
+      name: "Synapse",
+      options: { baseURL: "https://synapse2-api.alterspective.com.au/v1", apiKey: FRONT_AUTH_PLACEHOLDER },
+    })
+  })
+
+  test("the Synapse SDK package and base URL are fixed, whatever the owner wrote", () => {
+    const odd = { npm: "@ai-sdk/openai", options: { baseURL: "https://x.example/v1", timeout: 1000 } }
+    const cfg = parsedConfig(buildProfile(input([owner({ synapse: odd })])).files)
+    expect(cfg.provider.synapse).toMatchObject({ npm: "@ai-sdk/openai-compatible", options: { baseURL: "https://synapse2-api.alterspective.com.au/v1", timeout: 1000 } })
+  })
+
+  test("every other owner provider is dropped and reported, whatever its env", () => {
+    const text = owner({ synapse, opencode: {}, openrouter: { options: { apiKey: "{env:SYNAPSE_API_KEY}" } } })
+    const built = buildProfile(input([text]))
+    expect(Object.keys(parsedConfig(built.files).provider)).toEqual(["synapse"])
+    expect(built.dropped).toContainEqual({ provider: "opencode", reason: "only Synapse is enabled in the box" })
+    expect(built.dropped).toContainEqual({ provider: "openrouter", reason: "only Synapse is enabled in the box" })
+  })
+
+  test("the Synapse models are the registered ones, with Synapse's limits; model and small_model default to synapse/auto", () => {
+    const stale = { ...synapse.models, "openai/gpt-5.6-sol": { name: "stale" } }
+    const built = buildProfile(input([JSON.stringify({ provider: { synapse: { ...synapse, models: stale } } })], { synapseModels: registered }))
+    const models = modelsConfig(built.files)
+    expect(models.model).toBe("synapse/auto")
+    expect(models.small_model).toBe("synapse/auto")
+    expect(models.provider.synapse.models).toEqual({
+      auto: { name: "auto", limit: { context: 200000, output: 16384 } },
+      "anthropic/claude-opus-5": { name: "anthropic/claude-opus-5", limit: { context: 200000, output: 32000 } },
+      "qwen/qwen3.8-flash": { name: "qwen/qwen3.8-flash" },
+    })
+    expect(Object.keys(models).sort()).toEqual(["model", "provider", "small_model"])
+    expect(Object.keys(models.provider)).toEqual(["synapse"])
+  })
+
+  test("without a registered list the box offers synapse/auto only (the owner's static list is never used)", () => {
+    const stale = { "openai/gpt-5.6-sol": { name: "stale" }, "z-ai/glm-5.3": { name: "stale" } }
+    const built = buildProfile(input([owner({ synapse: { ...synapse, models: stale } }, { model: "synapse/openai/gpt-5.6-sol" })]))
+    const models = modelsConfig(built.files)
+    expect(Object.keys(models.provider.synapse.models)).toEqual(["auto"])
+    expect(models.model).toBe("synapse/auto")
+    expect(built.offered).toEqual(["synapse/auto"])
+  })
+
+  test("an owner default that is a registered Synapse model is kept; any other is replaced by synapse/auto and reported", () => {
+    const kept = buildProfile(input([owner({ synapse }, { model: "synapse/anthropic/claude-opus-5", small_model: "synapse/qwen/qwen3.8-flash" })], { synapseModels: registered }))
+    expect(modelsConfig(kept.files)).toMatchObject({ model: "synapse/anthropic/claude-opus-5", small_model: "synapse/qwen/qwen3.8-flash" })
+    expect(kept.dropped).toEqual([])
+    const text = owner({ synapse, opencode: {} }, { model: "opencode/big-pickle", small_model: "synapse/openai/gpt-5.6-sol" })
+    const replaced = buildProfile(input([text], { synapseModels: registered }))
+    expect(modelsConfig(replaced.files)).toMatchObject({ model: "synapse/auto", small_model: "synapse/auto" })
+    expect(replaced.dropped).toContainEqual({ provider: "model", reason: "opencode/big-pickle is not a model registered in Synapse; synapse/auto is used" })
+    expect(replaced.dropped).toContainEqual({ provider: "small_model", reason: "synapse/openai/gpt-5.6-sol is not a model registered in Synapse; synapse/auto is used" })
+  })
+
+  test("owner agent pins (agent.<name>.model) never reach the box", () => {
+    const text = owner({ synapse }, { agent: { build: { model: "opencode/big-pickle" } } })
+    const built = buildProfile(input([text], { synapseModels: registered }))
+    expect(JSON.stringify(built.files)).not.toContain("big-pickle")
+    expect(parsedConfig(built.files)).not.toHaveProperty("agent")
+  })
+
+  test("the registered list is outside the profile hash, so a Synapse model change never makes a running box stale", async () => {
+    const a = buildProfile(input([owner({ synapse })]))
+    const b = buildProfile(input([owner({ synapse })], { synapseModels: registered }))
+    expect(b.hash).toBe(a.hash)
+    expect(b.files[MODELS_FILE]).not.toBe(a.files[MODELS_FILE])
+    const fs = memoryFs()
+    const root = path.join("home", "profile")
+    expect(await writeProfile(fs, root, b.files)).toBe(a.hash)
+    const later = withRegisteredModels(a, registered)
+    expect(later.hash).toBe(a.hash)
+    expect(later.files[MODELS_FILE]).toBe(b.files[MODELS_FILE]!)
+    expect(later.offered).toEqual(["synapse/auto", "synapse/anthropic/claude-opus-5", "synapse/qwen/qwen3.8-flash"])
+  })
+
+  test("withRegisteredModels re-checks the owner's default against the new list", () => {
+    const built = buildProfile(input([owner({ synapse }, { model: "synapse/anthropic/claude-opus-5" })]))
+    expect(modelsConfig(built.files).model).toBe("synapse/auto")
+    expect(built.dropped.map((d) => d.provider)).toEqual(["model"])
+    const later = withRegisteredModels(built, registered)
+    expect(modelsConfig(later.files).model).toBe("synapse/anthropic/claude-opus-5")
+    expect(later.dropped).toEqual([])
   })
 })
 
 describe("profile: selection", () => {
-  test("copies only provider/model/small_model and drops providers whose env is not approved", () => {
+  test("copies only the Synapse provider and the default models; nothing else of the owner's config", () => {
     const openrouter = { options: { apiKey: "{env:OPENROUTER_API_KEY}" } }
     const text = owner({ synapse, openrouter }, { small_model: "openrouter/x", mcp: { rag: { type: "remote", url: "https://rag.example" } }, instructions: ["a.md"] })
     const built = buildProfile(input([text]))
     const cfg = parsedConfig(built.files)
-    expect(Object.keys(cfg).sort()).toEqual(["$schema", "mcp", "model", "permission", "provider"])
+    expect(Object.keys(cfg).sort()).toEqual(["$schema", "enabled_providers", "mcp", "permission", "provider"])
     expect(Object.keys(cfg.provider)).toEqual(["synapse"])
-    expect(built.dropped).toContainEqual({ provider: "openrouter", reason: "needs OPENROUTER_API_KEY (not on the approved box env list)" })
+    expect(built.dropped).toContainEqual({ provider: "openrouter", reason: "only Synapse is enabled in the box" })
     expect(built.dropped.map((d) => d.provider)).toContain("small_model")
+  })
+
+  test("an owner Synapse entry that needs an unapproved env is replaced by the built-in entry and reported", () => {
+    const needs = { ...synapse, options: { ...synapse.options, apiKey: "{env:OTHER_KEY}" } }
+    const built = buildProfile(input([owner({ synapse: needs })]))
+    expect(parsedConfig(built.files).provider.synapse!.options).toEqual({ baseURL: "https://synapse2-api.alterspective.com.au/v1" })
+    expect(built.dropped).toContainEqual({ provider: "synapse", reason: "the owner's Synapse settings need OTHER_KEY (not on the approved box env list); the built-in Synapse entry is used" })
   })
 
   test("keeps a provider that needs no key and can inject an approved key env", () => {
@@ -157,9 +279,19 @@ describe("profile: selection", () => {
     expect(parsedConfig(plain.files).provider.synapse!.options.apiKey).toBeUndefined()
   })
 
-  test("refuses a default model whose provider is not in the box", () => {
+  // #71 (deliberate change): this used to be refused (profile_invalid), which stopped the box from
+  // starting for an owner whose default is e.g. opencode/big-pickle. Now it falls back to synapse/auto.
+  test("a default model whose provider is not in the box falls back to synapse/auto (no longer refused)", () => {
     const text = JSON.stringify({ model: "openrouter/x", provider: { openrouter: { options: { apiKey: "{env:OPENROUTER_API_KEY}" } } } })
-    expect(refusal(() => buildProfile(input([text]))).code).toBe("profile_invalid")
+    const built = buildProfile(input([text]))
+    expect(modelsConfig(built.files).model).toBe("synapse/auto")
+    expect(built.dropped).toContainEqual({ provider: "model", reason: "openrouter/x is not a model registered in Synapse; synapse/auto is used" })
+  })
+
+  test("a default model that is not a string is reported without echoing it", () => {
+    const built = buildProfile(input([JSON.stringify({ model: { x: 1 } })]))
+    expect(modelsConfig(built.files).model).toBe("synapse/auto")
+    expect(built.dropped).toContainEqual({ provider: "model", reason: "it is not a model registered in Synapse; synapse/auto is used" })
   })
 
   test("mcp holds one ks-<id> → /mcp/c/<id> entry per chosen connection, and no /mcp/dynamic (R4-01)", () => {

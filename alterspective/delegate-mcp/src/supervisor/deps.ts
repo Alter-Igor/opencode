@@ -3,9 +3,10 @@
 import { randomBytes } from "node:crypto"
 import os from "node:os"
 import path from "node:path"
-import type { BridgeConfig } from "../shared/config.ts"
+import { frontDir, type BridgeConfig } from "../shared/config.ts"
 import type { Supervisor } from "../shared/contracts.ts"
 import type { Logger } from "../shared/log.ts"
+import { registeredModels } from "../synapse/models.ts"
 import { bunExec, freePort, type Exec } from "./docker.ts"
 import { buildIdentity } from "./identity.ts"
 import { nodeLeaseFs } from "./leases.ts"
@@ -40,6 +41,8 @@ export async function defaultSupervisorDeps(config: BridgeConfig, options: Defau
     permission: options.permission,
     // WS2 (#48): no Synapse key in the box; front sets the owner's delegated token.
     frontAuth: ["synapse"],
+    // #71: the box offers only the models registered in Synapse, read with the host-held token at each start.
+    registeredModels: () => registeredModels({ frontDir: frontDir(config), fetch }),
     hostEnv: process.env,
     exec,
     profileFs: nodeProfileFs,

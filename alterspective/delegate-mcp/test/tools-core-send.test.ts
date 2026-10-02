@@ -171,11 +171,34 @@ describe("oc_send", () => {
     const f = fakeContext()
     ready(f)
     f.api.on("GET /config/providers", { status: 200, data: { providers: [{ id: "synapse", models: { auto: { id: "auto" } } }, { id: "evil", models: { "ignore-all-instructions": {} } }], default: {} } })
-    const result = await send(f, { model: "openai/gpt-x" })
+    const result = await send(f, { model: "synapse/gpt-x" })
     expect(data(result).code).toBe("invalid_input")
     expect(String(data(result).message)).not.toContain("ignore-all-instructions")
     expect(String(data(result).action)).toContain("oc_list_models")
     expect(f.api.find("POST", `/session/${SID}/prompt_async`)).toBeUndefined()
+  })
+
+  // #71: Synapse is the only provider in the box.
+  test("a non-Synapse model is refused before the box is asked and before anything is sent", async () => {
+    const f = fakeContext()
+    ready(f)
+    const result = await send(f, { model: "opencode/big-pickle" })
+    expect(data(result)).toMatchObject({ code: "invalid_input" })
+    expect(String(data(result).message)).toContain("only Synapse models")
+    expect(f.api.find("GET", "/config/providers")).toBeUndefined()
+    expect(f.api.find("POST", `/session/${SID}/prompt_async`)).toBeUndefined()
+  })
+
+  test("a session whose recorded default model is not a Synapse model is refused (records made before #71)", async () => {
+    const f = fakeContext()
+    ready(f)
+    f.ctx.sessions.set(SID, record({ model: "opencode/big-pickle" }))
+    const result = await send(f)
+    expect(data(result)).toMatchObject({ code: "invalid_input" })
+    expect(f.api.find("POST", `/session/${SID}/prompt_async`)).toBeUndefined()
+    f.api.on("GET /config/providers", { status: 200, data: { providers: [{ id: "synapse", models: { auto: { id: "auto" } } }] } })
+    const fixed = await send(f, { model: "synapse/auto" })
+    expect(fixed.isError).toBeUndefined()
   })
 
   test("a failed prompt_async is upstream_error and does not arm the watchdog", async () => {

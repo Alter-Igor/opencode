@@ -8,7 +8,7 @@ import type { Verdict } from "../shared/contracts.ts"
 import { DelegateError } from "../shared/errors.ts"
 import type { Box, SessionRecord, ToolContext } from "./context.ts"
 import { readInstructions, type Instructions } from "./core-box.ts"
-import { CORRELATION_RE, agentSchema, formatCursor, modelSchema, ownSession, parseModel, sameRules, sessionGone, sessionIdSchema } from "./core-session.ts"
+import { CORRELATION_RE, agentSchema, formatCursor, modelSchema, ownSession, parseModel, requireSynapseModel, sameRules, sessionGone, sessionIdSchema } from "./core-session.ts"
 import { defineTool } from "./define.ts"
 import { requireModel } from "./models.ts"
 import { ok } from "./shape.ts"
@@ -37,6 +37,8 @@ export type Sent = { cursor: string; instructions: Instructions }
 /** Instructions, cursor, prompt_async, markSent: the one way a prompt reaches a session. */
 export async function sendPrompt(ctx: ToolContext, box: Box, record: SessionRecord, prompt: Prompt): Promise<Sent> {
   const model = prompt.model ?? record.model
+  // #71: also covers a session recorded with another provider's model before Synapse became the only one.
+  if (model) requireSynapseModel(model)
   const agent = prompt.agent ?? record.agent
   const instructions = await readInstructions(ctx, record)
   const body = {
@@ -66,7 +68,7 @@ export const sendTool = defineTool({
   input: {
     sessionID: sessionIdSchema,
     message: z.string().min(1).max(MAX_MESSAGE_CHARS),
-    model: modelSchema.optional().describe("provider/model for this send; default the session's model."),
+    model: modelSchema.optional().describe("synapse/<id> for this send (see oc_list_models); default the session's model, else synapse/auto."),
     agent: agentSchema.optional(),
     correlationId: z.string().regex(CORRELATION_RE).optional().describe("Your id for this task; sent as X-Correlation-ID and logged."),
   },

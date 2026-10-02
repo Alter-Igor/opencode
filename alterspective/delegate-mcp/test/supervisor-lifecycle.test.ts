@@ -217,3 +217,47 @@ describe("supervisor: logging (A-17) and login wrapper", () => {
   })
 })
 
+// #71: the box's models are read from Synapse at each start; the hash never depends on them.
+describe("supervisor: Synapse model list at start (#71)", () => {
+  const modelsFile = () => readFile(path.join(home, "profile", "opencode", "opencode.jsonc"), "utf8")
+  const expectedHash = () => {
+    const d = deps(async () => ({ code: 0, stdout: "", stderr: "" }))
+    return buildProfile({ ownerConfigs: [owner], config: d.config, permission: d.permission, keyEnv: d.keyEnv }).hash
+  }
+
+  test("the registered models are written to the profile and the profile hash is the same as without them", async () => {
+    await writeOwner()
+    const calls: Call[] = []
+    const log = recorder()
+    const registeredModels = async () => ({ models: ["auto", "anthropic/claude-opus-5"], limits: {}, source: "synapse" as const })
+    await supervisor(deps(fakeDocker({ running: false, labels: {}, env: [] }, calls), { registeredModels, log })).ensure()
+    const text = await modelsFile()
+    expect(text).toContain('"anthropic/claude-opus-5"')
+    expect(text).toContain('"model": "synapse/auto"')
+    expect(calls.find((c) => c.argv.includes("up"))!.env!.OCD_PROFILE_HASH).toBe(expectedHash())
+    expect(log.lines.some((l) => l.msg === "box models from Synapse" && l.fields.count === 2)).toBe(true)
+  })
+
+  test("an unreadable list (or a failing reader) still starts the box, with synapse/auto only, and says so", async () => {
+    await writeOwner()
+    const calls: Call[] = []
+    const log = recorder()
+    const registeredModels = () => Promise.reject(new Error("boom"))
+    await supervisor(deps(fakeDocker({ running: false, labels: {}, env: [] }, calls), { registeredModels, log })).ensure()
+    expect(calls.some((c) => c.argv.includes("up"))).toBe(true)
+    const text = await modelsFile()
+    expect(text).toContain('"auto"')
+    expect(text).not.toContain("claude")
+    expect(log.lines.find((l) => l.msg === "Synapse model list unavailable; the box offers synapse/auto only")?.fields.reason).toBe("reading the Synapse model list failed")
+  })
+
+  test("a reuse check never reads the list", async () => {
+    await writeOwner()
+    let reads = 0
+    const registeredModels = async () => (reads++, { models: ["auto"], limits: {}, source: "synapse" as const })
+    const exec = fakeDocker({ running: false, labels: {}, env: [] }, [])
+    await supervisor(deps(exec, { registeredModels })).ensure()
+    await supervisor(deps(exec, { registeredModels, bridgeId: "bridge-b" })).ensure()
+    expect(reads).toBe(1)
+  })
+})

@@ -1,0 +1,116 @@
+// #71: the models registered in Synapse, read on the HOST when the box starts. The box offers only
+// these (profile.ts writes them as the `synapse` provider's models), so OpenCode in the box never
+// fetches a model list itself (OPENCODE_DISABLE_MODELS_FETCH=1).
+//
+// The credential is the owner's delegated Synapse token the bridge already keeps for front
+// (<home>/front/synapse-auth.conf, auth-conf.ts). It is sent to Synapse's read-only GET /v1/models
+// only, the same route front allows the box (front-routes.ts). The token is never returned, logged
+// or put in a reason.
+//
+// `auto` is Synapse's routing alias: Synapse does not list it, so it is always added, first.
+// Entries Synapse marks as not chat-capable (embed, rerank or image only) are left out: an
+// OpenCode session cannot use them. contextWindow / maxOutput become the model's limit.
+//
+// Any failure (no token yet, HTTP error, bad body, timeout) gives `auto` only and a reason: the box
+// still starts, with Synapse's own routing. The owner's static model list is never a fallback (it
+// goes stale). The list is read again at the next box start.
+import { readFile } from "node:fs/promises"
+import { SYNAPSE_HOST, authConfPath, isAuthConf } from "./auth-conf.ts"
+
+export const SYNAPSE_MODELS_URL = `https://${SYNAPSE_HOST}/v1/models`
+/** The bridge's own deadline for the call (AILES-059: never rely on a caller's signal). */
+export const MODELS_TIMEOUT_MS = 4000
+/** Synapse's routing alias and the box's default model (#71). */
+export const AUTO_MODEL = "auto"
+/** What the box offers when the list cannot be read: Synapse's own routing. */
+export const FALLBACK_MODELS = [AUTO_MODEL] as const
+/** A model id within MODEL_RE's model part (workspaces-state.ts): slash-separated segments, none starting with a dot. */
+const MODEL_ID_SHAPE = /^[A-Za-z0-9][A-Za-z0-9._:@-]*(\/[A-Za-z0-9][A-Za-z0-9._:@-]*)*$/
+export const isModelId = (id: string) => id.length <= 128 && MODEL_ID_SHAPE.test(id)
+const MAX_MODELS = 300
+const BEARER_RE = /set \$synapse_auth "Bearer ([A-Za-z0-9._-]+)";/
+
+export type ModelLimit = { context: number; output: number }
+
+export type RegisteredModels =
+  | { models: string[]; limits: Record<string, ModelLimit>; source: "synapse" }
+  | { models: string[]; limits: Record<string, ModelLimit>; source: "fallback"; reason: string }
+
+export type ModelsDeps = { frontDir: string; fetch: typeof fetch; timeoutMs?: number }
+
+type Entry = { id: string; chat: boolean; limit?: ModelLimit }
+
+const fallback = (reason: string): RegisteredModels => ({ models: [...FALLBACK_MODELS], limits: {}, source: "fallback", reason })
+
+/** Never throws: a box start must not fail because the list cannot be read. */
+export async function registeredModels(deps: ModelsDeps): Promise<RegisteredModels> {
+  const token = await hostToken(deps.frontDir)
+  if (!token) return fallback('no host-held Synapse token (run oc_login {server:"synapse"})')
+  const timeoutMs = deps.timeoutMs ?? MODELS_TIMEOUT_MS
+  const reply = await fetchWithin(deps.fetch, token, timeoutMs)
+  if (reply === "timeout") return fallback(`Synapse did not answer within ${timeoutMs} ms`)
+  if (reply === "unreachable") return fallback("Synapse could not be reached")
+  if (!reply.ok) return fallback(`Synapse answered HTTP ${reply.status}`)
+  const entries = await readEntries(reply)
+  if (!entries) return fallback("Synapse's model list was not readable")
+  const usable = entries.filter((entry) => entry.chat && isModelId(entry.id) && entry.id !== AUTO_MODEL)
+  const ids = [...new Set(usable.map((entry) => entry.id))].sort().slice(0, MAX_MODELS - 1)
+  if (!ids.length && !entries.some((entry) => entry.id === AUTO_MODEL)) return fallback("Synapse listed no usable model ids")
+  const limits: Record<string, ModelLimit> = {}
+  for (const entry of usable) if (entry.limit && ids.includes(entry.id)) limits[entry.id] = entry.limit
+  return { models: [AUTO_MODEL, ...ids], limits, source: "synapse" }
+}
+
+/** The call, cut off by the bridge's own timer whether or not `fetch` honours the signal. */
+async function fetchWithin(fetchFn: typeof fetch, token: string, timeoutMs: number): Promise<Response | "timeout" | "unreachable"> {
+  const controller = new AbortController()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const deadline = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => {
+      controller.abort()
+      resolve("timeout")
+    }, timeoutMs)
+  })
+  const call = fetchFn(SYNAPSE_MODELS_URL, { headers: { authorization: `Bearer ${token}`, accept: "application/json" }, signal: controller.signal }).catch(() => "unreachable" as const)
+  try {
+    return await Promise.race([call, deadline])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** The bearer token in front's include, or undefined (missing, malformed or empty include). */
+async function hostToken(frontDir: string): Promise<string | undefined> {
+  const text = await readFile(authConfPath(frontDir), "utf8").catch(() => undefined)
+  if (text === undefined || !isAuthConf(text)) return undefined
+  return BEARER_RE.exec(text)?.[1]
+}
+
+/** OpenAI's list shape, { data: [{ id, ... }] }, with Synapse's catalogue fields. Anything else is undefined. */
+async function readEntries(res: Response): Promise<Entry[] | undefined> {
+  let body: unknown
+  try {
+    body = await res.json()
+  } catch {
+    return undefined
+  }
+  const data = isRecord(body) ? body.data : undefined
+  if (!Array.isArray(data)) return undefined
+  return data.flatMap((item: unknown): Entry[] => {
+    if (!isRecord(item) || typeof item.id !== "string") return []
+    const limit = positiveInt(item.contextWindow) && positiveInt(item.maxOutput) ? { context: item.contextWindow, output: item.maxOutput } : undefined
+    return [{ id: item.id, chat: chatCapable(item.capabilities), ...(limit ? { limit } : {}) }]
+  })
+}
+
+/** Synapse's capabilities.ops: an entry that declares ops without "chat" is not a chat model. No ops declared: kept. */
+function chatCapable(capabilities: unknown): boolean {
+  const ops = isRecord(capabilities) ? capabilities.ops : undefined
+  return !Array.isArray(ops) || ops.length === 0 || ops.includes("chat")
+}
+
+const positiveInt = (value: unknown): value is number => typeof value === "number" && Number.isInteger(value) && value > 0
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
