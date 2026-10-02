@@ -185,7 +185,7 @@ function fakeServices(f: Fake): Pick<ToolContext, "supervisorService" | "workspa
       closeSession: async () => {
         throw new Error("not used: tools-close.test.ts uses real workspaces")
       },
-      closeCandidates: async () => ({ states: [], legacy: 0, otherBox: 0 }),
+      closeCandidates: async () => ({ states: [], legacy: 0, otherBox: 0, otherBridge: 0 }),
     },
   }
 }

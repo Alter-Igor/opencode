@@ -3,8 +3,10 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test"
 import { existsSync, readFileSync } from "node:fs"
 import path from "node:path"
+import type { SessionState, SessionView } from "../src/shared/contracts.ts"
 import { writeHostState, type HostSessionState } from "../src/supervisor/workspaces-state.ts"
 import { cleanupTool, closeSessionTool } from "../src/tools/close-session.ts"
+import { collectTool } from "../src/tools/collect.ts"
 import { allTools } from "../src/tools/index.ts"
 import { data, fakeContext, invoke, text, type Fake } from "./tools-core-fixture.ts"
 import { T, WorkspaceFixture } from "./workspaces-fixture.ts"
@@ -58,15 +60,28 @@ async function start(f: Fake, options: { supervisor?: string; ageDays?: number; 
   return { key, sessionID, state }
 }
 
+const view = (s: Started, state: SessionState): SessionView => ({ sessionID: s.sessionID, directory: `/sessions/${s.key}`, state, since: new Date().toISOString() })
 const deleted = (f: Fake, sessionID: string) => f.api.find("DELETE", `/session/${sessionID}`) !== undefined
+const aborted = (f: Fake, sessionID: string) => f.api.find("POST", `/session/${sessionID}/abort`) !== undefined
+
+/** The session reports `before` until an abort was posted, then `after` (once `onAbort` has run). */
+function busyUntilAbort(f: Fake, s: Started, before: SessionState, onAbort?: () => Promise<void>) {
+  let ran = false
+  f.hub.view = async (id: string) => {
+    if (id !== s.sessionID || !aborted(f, id)) return view(s, before)
+    if (!ran) {
+      ran = true
+      await onAbort?.()
+    }
+    return view(s, "idle")
+  }
+}
 
 describe("oc_close_session", () => {
-  test("is registered with honest destructive annotations", () => {
+  test("is registered with honest destructive annotations and the split flags", () => {
     const tools = allTools()
-    for (const name of ["oc_close_session", "oc_cleanup"]) {
-      const tool = tools.find((t) => t.name === name)
-      expect(tool?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true })
-    }
+    for (const name of ["oc_close_session", "oc_cleanup"]) expect(tools.find((t) => t.name === name)?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true })
+    expect(Object.keys(closeSessionTool.input).sort()).toEqual(["abort", "deleteBranch", "discardWork", "sessionID"])
   })
 
   test(
@@ -76,7 +91,7 @@ describe("oc_close_session", () => {
       const s = await start(f)
       const result = await invoke(closeSessionTool, { sessionID: s.sessionID }, f.ctx)
       expect(result.isError).toBeUndefined()
-      expect(data(result)).toMatchObject({ sessionID: s.sessionID, sessionKey: s.key, closed: true, session: "deleted", clone: "removed", record: "removed", branch: "not_requested", uncollectedCommits: 0 })
+      expect(data(result)).toMatchObject({ sessionID: s.sessionID, sessionKey: s.key, closed: true, session: "deleted", clone: "removed", record: "removed", branch: "not_requested", uncollectedCommits: 0, aborted: false })
       expect(deleted(f, s.sessionID)).toBe(true)
       expect(fx.leftovers(s.key)).toEqual([])
       expect(existsSync(recordFile(s.key))).toBe(false)
@@ -87,39 +102,107 @@ describe("oc_close_session", () => {
   )
 
   test(
-    "a busy session is refused without force; force aborts first and then closes",
+    "a busy session is session_active without abort; abort: true stops it first, then closes",
     async () => {
       const f = context()
       const s = await start(f)
-      f.hub.views.set(s.sessionID, { sessionID: s.sessionID, directory: `/sessions/${s.key}`, state: "busy", since: new Date().toISOString() })
+      busyUntilAbort(f, s, "busy")
       const refused = await invoke(closeSessionTool, { sessionID: s.sessionID }, f.ctx)
-      expect(refused.isError).toBe(true)
-      expect(data(refused).code).toBe("directory_busy")
-      expect(deleted(f, s.sessionID)).toBe(false)
+      expect(data(refused).code).toBe("session_active")
+      expect(aborted(f, s.sessionID) || deleted(f, s.sessionID)).toBe(false)
       expect(existsSync(recordFile(s.key))).toBe(true)
-      const forced = await invoke(closeSessionTool, { sessionID: s.sessionID, force: true }, f.ctx)
-      expect(data(forced)).toMatchObject({ closed: true, aborted: true })
-      const abortAt = f.order.indexOf(`POST /session/${s.sessionID}/abort`)
-      expect(abortAt).toBeGreaterThan(-1)
-      expect(abortAt).toBeLessThan(f.order.indexOf(`DELETE /session/${s.sessionID}`))
+      const stopped = await invoke(closeSessionTool, { sessionID: s.sessionID, abort: true }, f.ctx)
+      expect(data(stopped)).toMatchObject({ closed: true, aborted: true })
+      expect(f.order.indexOf(`POST /session/${s.sessionID}/abort`)).toBeLessThan(f.order.indexOf(`DELETE /session/${s.sessionID}`))
     },
     T,
   )
 
   test(
-    "uncollected commits are refused with the count; force deletes them",
+    "HIGH 2: work the aborted turn leaves is refused before DELETE, and oc_collect still works",
+    async () => {
+      const f = context()
+      const s = await start(f)
+      busyUntilAbort(f, s, "busy", () => fx.boxCommit(s.key, { "late.txt": "late\n" }, "late"))
+      const refused = await invoke(closeSessionTool, { sessionID: s.sessionID, abort: true }, f.ctx)
+      expect(data(refused).code).toBe("uncollected_work")
+      expect(text(refused)).toContain("1 uncollected commit")
+      expect(deleted(f, s.sessionID)).toBe(false)
+      expect(f.ctx.sessions.has(s.sessionID)).toBe(true)
+      expect(existsSync(recordFile(s.key))).toBe(true)
+      const collected = await invoke(collectTool, { sessionID: s.sessionID }, f.ctx)
+      expect(data(collected)).toMatchObject({ commits: 1 })
+      const closed = await invoke(closeSessionTool, { sessionID: s.sessionID }, f.ctx)
+      expect(data(closed)).toMatchObject({ closed: true })
+    },
+    T,
+  )
+
+  test(
+    "uncollected commits are uncollected_work with the count; discardWork deletes them",
     async () => {
       const f = context()
       const s = await start(f)
       await fx.boxCommit(s.key, { "w.txt": "work\n" }, "work")
       const refused = await invoke(closeSessionTool, { sessionID: s.sessionID }, f.ctx)
-      expect(refused.isError).toBe(true)
+      expect(data(refused).code).toBe("uncollected_work")
       expect(text(refused)).toContain("1 uncollected commit")
+      expect(text(refused)).toContain("oc_collect")
       expect(deleted(f, s.sessionID)).toBe(false)
       expect(fx.leftovers(s.key)).toEqual([s.key])
-      const forced = await invoke(closeSessionTool, { sessionID: s.sessionID, force: true }, f.ctx)
-      expect(data(forced)).toMatchObject({ closed: true, uncollectedCommits: 1 })
+      const discarded = await invoke(closeSessionTool, { sessionID: s.sessionID, discardWork: true }, f.ctx)
+      expect(data(discarded)).toMatchObject({ closed: true, uncollectedCommits: 1 })
       expect(fx.leftovers(s.key)).toEqual([])
+    },
+    T,
+  )
+
+  test(
+    "when the sandbox already lost the session, the refusal does not suggest oc_collect",
+    async () => {
+      const f = context()
+      const s = await start(f, { track: false })
+      await fx.boxCommit(s.key, { "w.txt": "work\n" }, "work")
+      f.api.on(`GET /session/${s.sessionID}`, { status: 404 })
+      const refused = await invoke(closeSessionTool, { sessionID: s.sessionID }, f.ctx)
+      expect(data(refused).code).toBe("uncollected_work")
+      expect(text(refused)).not.toContain("oc_collect")
+    },
+    T,
+  )
+
+  test(
+    "MEDIUM 4: a state that cannot be verified is refused with a retry hint, never a force hint",
+    async () => {
+      const f = context()
+      const s = await start(f)
+      f.hub.views.set(s.sessionID, view(s, "unknown"))
+      const refused = await invoke(closeSessionTool, { sessionID: s.sessionID, abort: true }, f.ctx)
+      expect(refused.isError).toBe(true)
+      expect(text(refused)).toMatch(/retry/i)
+      expect(text(refused)).not.toMatch(/force|discardWork/)
+      expect(aborted(f, s.sessionID) || deleted(f, s.sessionID)).toBe(false)
+      f.hub.views.delete(s.sessionID)
+      fx.boxOverride = (argv) => (argv[0] === "sh" ? { code: 125, stdout: "", stderr: "daemon down" } : undefined)
+      const unchecked = await invoke(closeSessionTool, { sessionID: s.sessionID }, f.ctx)
+      expect(text(unchecked)).not.toMatch(/force|discardWork/)
+      expect(deleted(f, s.sessionID)).toBe(false)
+    },
+    T,
+  )
+
+  test(
+    "MEDIUM 5: while a close runs, other tools refuse the session (session_active)",
+    async () => {
+      const f = context()
+      const s = await start(f)
+      const during: string[] = []
+      busyUntilAbort(f, s, "busy", async () => {
+        during.push(String(data(await invoke(collectTool, { sessionID: s.sessionID }, f.ctx)).code))
+        during.push(String(data(await invoke(closeSessionTool, { sessionID: s.sessionID }, f.ctx)).code))
+      })
+      expect(data(await invoke(closeSessionTool, { sessionID: s.sessionID, abort: true }, f.ctx))).toMatchObject({ closed: true })
+      expect(during).toEqual(["session_active", "session_active"])
     },
     T,
   )
@@ -130,9 +213,9 @@ describe("oc_close_session", () => {
       const f = context()
       const s = await start(f, { supervisor: "supervisor:other-bridge" })
       const before = readFileSync(recordFile(s.key), "utf8")
-      const result = await invoke(closeSessionTool, { sessionID: s.sessionID, force: true, deleteBranch: true }, f.ctx)
+      const result = await invoke(closeSessionTool, { sessionID: s.sessionID, abort: true, discardWork: true, deleteBranch: true }, f.ctx)
       expect(data(result).code).toBe("not_found")
-      expect(deleted(f, s.sessionID)).toBe(false)
+      expect(aborted(f, s.sessionID) || deleted(f, s.sessionID)).toBe(false)
       expect(readFileSync(recordFile(s.key), "utf8")).toBe(before)
       expect(fx.leftovers(s.key)).toEqual([s.key])
     },
@@ -160,7 +243,7 @@ describe("oc_cleanup", () => {
     await fx.boxCommit(uncollected.key, { "u.txt": "keep\n" }, "keep")
     const young = await start(f, { track: false })
     const busy = await start(f, { ageDays: 30, track: false })
-    f.hub.views.set(busy.sessionID, { sessionID: busy.sessionID, directory: `/sessions/${busy.key}`, state: "needs_input", since: new Date().toISOString() })
+    f.hub.views.set(busy.sessionID, view(busy, "needs_input"))
     const recent = await start(f, { ageDays: 30, updatedDaysAgo: 1, track: false })
     const other = await start(f, { ageDays: 30, supervisor: "supervisor:other-bridge" })
     const legacy = await start(f, { ageDays: 30, track: false })
@@ -183,14 +266,17 @@ describe("oc_cleanup", () => {
       expect(d.kept).toEqual([{ sessionKey: s.uncollected.key, reason: "uncollected_work", uncollectedCommits: 1, uncommittedPaths: 0 }])
       expect(d.skipped).toMatchObject({ active: 1, recent: 1 })
       expect(d.legacyRecords).toBe(1)
+      expect(Number(d.otherBridgeRecords)).toBeGreaterThanOrEqual(1)
+      expect(text(dry)).toContain("OPENCODE_DELEGATE_NAME")
       expect(snapshot()).toEqual(before)
-      expect(f.api.calls.some((c) => c.method === "DELETE")).toBe(false)
+      expect(f.api.calls.some((c) => c.method === "DELETE" || c.path.endsWith("/abort"))).toBe(false)
 
       const real = await invoke(cleanupTool, { dryRun: false }, f.ctx)
       expect(data(real)).toMatchObject({ dryRun: false, closed: [s.stale.key], wouldClose: [] })
       expect(existsSync(recordFile(s.stale.key))).toBe(false)
       expect(fx.leftovers(s.stale.key)).toEqual([])
       expect(f.api.calls.filter((c) => c.method === "DELETE").map((c) => c.path)).toEqual([`/session/${s.stale.sessionID}`])
+      expect(f.api.calls.some((c) => c.path.endsWith("/abort"))).toBe(false)
       for (const kept of [s.uncollected, s.young, s.busy, s.recent, s.other, s.legacy]) {
         expect(existsSync(recordFile(kept.key))).toBe(true)
         expect(fx.leftovers(kept.key)).toEqual([kept.key])

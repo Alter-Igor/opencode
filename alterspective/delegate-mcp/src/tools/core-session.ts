@@ -12,6 +12,7 @@ import { DelegateError } from "../shared/errors.ts"
 import type { ApiTarget } from "../shared/opencode-api.ts"
 import { AGENT_RE, MODEL_RE, SESSION_ID_RE, SESSION_KEY, type HostSessionState, type SessionProfile } from "../supervisor/workspaces-state.ts"
 import type { Box, SessionRecord, ToolContext } from "./context.ts"
+import { closingError, isClosing } from "./closing.ts"
 
 export { AGENT_RE, MODEL_RE, SESSION_ID_RE, type SessionProfile }
 export const CORRELATION_RE = /^[A-Za-z0-9_.:-]{1,64}$/
@@ -147,6 +148,8 @@ export type OwnedSession = { record: SessionRecord; remote?: RemoteSession }
  */
 export async function ownSession(ctx: ToolContext, box: Box, sessionID: string, correlationId: string, read = false): Promise<OwnedSession> {
   checkSessionId(sessionID)
+  // #72: a session being closed is not handed to send, collect or any other tool meanwhile.
+  if (isClosing(ctx, sessionID)) throw closingError(sessionID)
   const known = ctx.sessions.get(sessionID)
   if (known && !read) return { record: known }
   const remote = await readSession(ctx, box, sessionID, correlationId, known?.boxPath, known !== undefined)

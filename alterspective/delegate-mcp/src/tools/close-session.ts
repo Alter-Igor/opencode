@@ -1,26 +1,33 @@
 // #72: oc_close_session and oc_cleanup. Nothing else removes finished delegated work: the box clone
 // (/sessions/<key>), the OpenCode session, the host record and the fetched delegate/<key> branch.
-// Both tools close only sessions whose host record names this bridge and this box
-// (workspaces-close.ts re-checks that). Commits only the box has, and uncommitted files, are never
-// deleted unless `force`; oc_cleanup never forces. The host branch goes only when merged (or forced
-// on oc_close_session). Results carry session ids, keys and counts only.
+// Both close only sessions whose host record names this bridge and this box (workspaces-close.ts
+// re-checks that before anything is sent). Two separate opt-ins (review cycle 1): `abort` stops a
+// running session first; `discardWork` allows deleting commits no host branch has, uncommitted
+// files and an unmerged delegate branch. oc_cleanup uses neither. Every close holds the close lock
+// (closing.ts), so oc_send / oc_collect refuse the session meanwhile. Results carry ids, keys, counts.
 import { z } from "zod"
 import { DelegateError } from "../shared/errors.ts"
 import type { SessionState } from "../shared/contracts.ts"
-import type { CloseOutcome, ClosePlan, SessionRemoval } from "../supervisor/workspaces.ts"
+import type { CloseOutcome, SessionRemoval } from "../supervisor/workspaces.ts"
 import type { Box, ToolContext } from "./context.ts"
-import { boxPathOf, checkSessionId, ownedStates, sessionIdSchema, type RemoteSession } from "./core-session.ts"
+import { whileClosing } from "./closing.ts"
+import { boxPathOf, checkSessionId, hostState, ownedStates, recordFromState, sessionIdSchema, type RemoteSession } from "./core-session.ts"
 import { defineTool } from "./define.ts"
 import { ok } from "./shape.ts"
 
 export const TTL_ENV = "OPENCODE_DELEGATE_SESSION_TTL_DAYS"
 export const DEFAULT_TTL_DAYS = 14
 const DAY_MS = 24 * 60 * 60 * 1000
-/** Records looked at per oc_cleanup call (oldest first), and sessions closed per call. */
+/** Records looked at per oc_cleanup call, and sessions closed (or listed) per call. */
 const MAX_EXAMINED = 20
 const MAX_CLOSED = 10
-/** States in which a session may still change its clone: never closed without force, never swept. */
-const ACTIVE: ReadonlySet<SessionState> = new Set<SessionState>(["starting", "busy", "retry", "needs_input", "unknown", "server_down"])
+/** After an abort: how often, and how long apart, the state is read until the run has stopped. */
+const STOP_POLLS = 10
+const STOP_POLL_MS = 300
+/** A running session may still change its copy. */
+const ACTIVE: ReadonlySet<SessionState> = new Set<SessionState>(["starting", "busy", "retry", "needs_input"])
+/** States that say nothing about the copy: the close is refused, to be retried (never forced). */
+const UNVERIFIED: ReadonlySet<SessionState> = new Set<SessionState>(["unknown", "server_down"])
 
 /** OPENCODE_DELEGATE_SESSION_TTL_DAYS: whole days, 0 disables; unset is 14. */
 export function ttlDays(raw: string | undefined): number {
@@ -30,6 +37,9 @@ export function ttlDays(raw: string | undefined): number {
 }
 
 type Located = { sessionKey: string; remote?: RemoteSession }
+
+const notOurs = (sessionID: string) =>
+  new DelegateError("not_found", `Session ${sessionID} is not one of this bridge's sessions.`, "Use oc_list_sessions to see this bridge's sessions.")
 
 /** The key of one of our sessions: tracked, named by the box's metadata, or (box lost it) by a host record. */
 async function locate(ctx: ToolContext, box: Box, sessionID: string, correlationId: string): Promise<Located> {
@@ -47,9 +57,6 @@ async function locate(ctx: ToolContext, box: Box, sessionID: string, correlation
   return { sessionKey: key }
 }
 
-const notOurs = (sessionID: string) =>
-  new DelegateError("not_found", `Session ${sessionID} is not one of this bridge's sessions.`, "Use oc_list_sessions to see this bridge's sessions.")
-
 /** DELETE /session/:id; 404 means the sandbox no longer has it. Anything else throws (nothing else is removed). */
 function sessionDeleter(box: Box, sessionID: string, sessionKey: string, correlationId: string): () => Promise<SessionRemoval> {
   return async () => {
@@ -61,62 +68,108 @@ function sessionDeleter(box: Box, sessionID: string, sessionKey: string, correla
 }
 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`
+const unverified = (sessionID: string, state: SessionState) =>
+  new DelegateError("upstream_error", `Could not verify the state of session ${sessionID} (${state}), so nothing was deleted.`, "Retry in a moment; if it repeats, run oc_doctor.")
+const active = (sessionID: string, state: SessionState, aborted: boolean) =>
+  aborted
+    ? new DelegateError("session_active", `Session ${sessionID} was asked to abort but is still ${state}, so nothing was deleted.`, "Retry in a moment; check oc_status.")
+    : new DelegateError("session_active", `Session ${sessionID} is ${state}, so nothing was deleted.`, "Wait for it with oc_wait, or pass abort: true to stop it first.")
 
-function uncollectedError(sessionID: string, outcome: Pick<CloseOutcome, "refused" | "uncollectedCommits" | "uncommittedPaths">): DelegateError {
-  if (outcome.refused === "check_failed")
-    return new DelegateError("upstream_error", `Could not check session ${sessionID}'s copy for uncollected work, so nothing was deleted.`, "Retry; run oc_doctor if the sandbox is down. force: true deletes without the check.")
+function refusalError(sessionID: string, outcome: Pick<CloseOutcome, "refused" | "uncollectedCommits" | "uncommittedPaths">, canCollect: boolean): DelegateError {
+  if (outcome.refused === "check_failed") return new DelegateError("upstream_error", `Could not check session ${sessionID}'s copy for uncollected work, so nothing was deleted.`, "Retry; if it repeats, run oc_doctor.")
   const lost = [outcome.uncollectedCommits ? plural(outcome.uncollectedCommits, "uncollected commit") : "", outcome.uncommittedPaths ? plural(outcome.uncommittedPaths, "uncommitted file") : ""].filter(Boolean).join(" and ")
-  return new DelegateError("directory_busy", `Session ${sessionID} still has ${lost} in the sandbox, so nothing was deleted.`, "Collect them first with oc_collect (ask the agent to commit loose files), or pass force: true to delete them.")
+  const action = canCollect
+    ? "Fetch them with oc_collect first (ask the agent to commit loose files), or pass discardWork: true to delete them."
+    : "The sandbox no longer has this session, so the bridge cannot fetch them; pass discardWork: true to delete them, or copy them out of the sandbox by hand."
+  return new DelegateError("uncollected_work", `Session ${sessionID} still has ${lost} in the sandbox, so nothing was deleted.`, action)
 }
 
-/** The session's state when the sandbox still has it (undefined when it is gone). */
-async function liveState(box: Box, located: Located, sessionID: string): Promise<SessionState | undefined> {
-  return located.remote ? (await box.hub.view(sessionID)).state : undefined
+/** The state now; refuses an unverifiable one. */
+async function stateOf(box: Box, sessionID: string): Promise<SessionState> {
+  const state = (await box.hub.view(sessionID)).state
+  if (UNVERIFIED.has(state)) throw unverified(sessionID, state)
+  return state
 }
 
-function busyError(sessionID: string, state: SessionState): DelegateError {
-  return new DelegateError("directory_busy", `Session ${sessionID} is ${state}, so it was not closed.`, "Wait for it with oc_wait (or stop it with oc_abort), then close it; force: true aborts it first.")
-}
-
-async function abortFirst(ctx: ToolContext, box: Box, located: Located, sessionID: string, correlationId: string): Promise<void> {
+/** The stop hook: nothing to do for a session the sandbox lost; an active one is refused, or aborted and awaited. */
+async function stopSession(ctx: ToolContext, box: Box, located: Located, sessionID: string, abort: boolean, correlationId: string): Promise<boolean> {
+  if (!located.remote) return false
+  let state = await stateOf(box, sessionID)
+  if (!ACTIVE.has(state)) return false
+  if (!abort) throw active(sessionID, state, false)
   const res = await box.api.call<unknown>({ method: "POST", path: `/session/${sessionID}/abort`, directory: boxPathOf(located.sessionKey), correlationId })
-  ctx.log.log("info", "tools", "aborted a session before closing it", { sessionID, correlationId, status: res.status })
+  ctx.log.log("info", "tools", "abort sent before closing a session", { sessionID, correlationId, status: res.status })
+  if (res.status < 200 || res.status >= 300) throw new DelegateError("upstream_error", `The sandbox did not accept the abort of session ${sessionID}, so nothing was deleted.`, "Retry; check oc_status.", `HTTP ${res.status}`)
+  for (let poll = 0; poll < STOP_POLLS; poll++) {
+    state = await stateOf(box, sessionID)
+    if (!ACTIVE.has(state)) return true
+    await new Promise((resolve) => setTimeout(resolve, STOP_POLL_MS))
+  }
+  throw active(sessionID, state, true)
+}
+
+/** After a late refusal (session deleted, copy kept): keep the session tracked so oc_collect still works in this run. */
+async function keepTracked(ctx: ToolContext, sessionID: string, sessionKey: string): Promise<void> {
+  if (ctx.sessions.has(sessionID)) return
+  const state = await hostState(ctx, sessionKey)
+  if (state?.sessionID !== sessionID) return
+  try {
+    ctx.sessions.set(sessionID, await recordFromState(ctx, { ...state, sessionID }))
+  } catch {
+    ctx.log.log("warn", "tools", "a kept session copy could not be tracked", { sessionKey })
+  }
 }
 
 function closeSummary(o: CloseOutcome): string {
-  const lost = o.uncollectedCommits || o.uncommittedPaths ? ` Deleted (force) ${plural(o.uncollectedCommits, "uncollected commit")} and ${plural(o.uncommittedPaths, "uncommitted file")}.` : ""
-  if (o.closed) return `Session ${o.sessionID} closed: session ${o.session}, copy ${o.clone}, record removed, branch ${o.branch}.${lost}`
-  return `Session ${o.sessionID} only partly closed (session ${o.session}, copy ${o.clone}, branch ${o.branch}, record ${o.record}); the host record was kept, so oc_close_session can be retried.${lost}`
+  const lost = o.uncollectedCommits || o.uncommittedPaths ? ` Deleted (discardWork) ${plural(o.uncollectedCommits, "uncollected commit")} and ${plural(o.uncommittedPaths, "uncommitted file")}.` : ""
+  const ignored = o.ignoredPaths ? ` ${plural(o.ignoredPaths, "git-ignored path")} went with the copy.` : ""
+  if (o.closed) return `Session ${o.sessionID} closed: session ${o.session}, copy ${o.clone}, record removed, branch ${o.branch}.${lost}${ignored}`
+  const why = o.refused ? ` Refused (${o.refused}): ${plural(o.uncollectedCommits, "uncollected commit")} and ${plural(o.uncommittedPaths, "uncommitted file")} appeared while closing, so the copy was kept; oc_collect can still fetch it while this bridge runs.` : ""
+  return `Session ${o.sessionID} only partly closed (session ${o.session}, copy ${o.clone}, branch ${o.branch}, record ${o.record}); the host record was kept, so oc_close_session can be retried.${why}`
+}
+
+type CloseArgs = { sessionID: string; deleteBranch?: boolean; abort?: boolean; discardWork?: boolean }
+
+async function closeOne(ctx: ToolContext, box: Box, located: Located, args: CloseArgs, correlationId: string) {
+  let aborted = false
+  const owner = { supervisor: ctx.supervisor, sessionID: args.sessionID }
+  const outcome = await ctx.workspaces.closeSession(located.sessionKey, owner, { discardWork: args.discardWork === true, deleteBranch: args.deleteBranch === true }, {
+    stop: async () => {
+      aborted = await stopSession(ctx, box, located, args.sessionID, args.abort === true, correlationId)
+    },
+    deleteSession: sessionDeleter(box, args.sessionID, located.sessionKey, correlationId),
+  })
+  const canCollect = located.remote !== undefined || ctx.sessions.has(args.sessionID)
+  if (outcome.refused && outcome.session === "kept") {
+    // Refused before stopping: a running session is the more useful answer (its work is not done yet).
+    if (!aborted && located.remote && args.abort !== true) {
+      const state = await stateOf(box, args.sessionID)
+      if (ACTIVE.has(state)) throw active(args.sessionID, state, false)
+    }
+    throw refusalError(args.sessionID, outcome, canCollect)
+  }
+  if (outcome.closed) ctx.sessions.delete(args.sessionID)
+  else if (outcome.session !== "kept") await keepTracked(ctx, args.sessionID, located.sessionKey)
+  return ok(closeSummary(outcome), { ...outcome, aborted })
 }
 
 export const closeSessionTool = defineTool({
   name: "oc_close_session",
   title: "Close a finished session",
   description:
-    "Delete one of this bridge's finished sessions: the OpenCode session, its copy in the sandbox and the bridge's host record. Refuses while the session is busy or needs input, and while its copy has commits no host branch has (run oc_collect first) or uncommitted files, unless force: true (which aborts a running session and deletes that work). " +
-    "deleteBranch: true also deletes the host branch delegate/<key>, only if it is merged into the repository's HEAD or the session's base (force: true deletes it unmerged); a branch checked out anywhere is never deleted, and no other branch is touched.",
+    "Delete one of this bridge's finished sessions: the OpenCode session, its copy in the sandbox and the bridge's host record. Refused while the session is running or needs input (abort: true stops it first), while its state cannot be read (retry), and while its copy has commits no host branch has or uncommitted files (run oc_collect first, or discardWork: true deletes them). " +
+    "deleteBranch: true also deletes the host branch delegate/<key>, only when another host branch contains it (discardWork: true deletes it unmerged); a branch checked out anywhere or a symbolic ref is never deleted, and no other branch is touched.",
   input: {
     sessionID: sessionIdSchema,
-    deleteBranch: z.boolean().optional().describe("Also delete the host branch delegate/<key> when it is merged. Default false."),
-    force: z.boolean().optional().describe("Abort a running session and delete uncollected work and an unmerged branch. Default false."),
+    deleteBranch: z.boolean().optional().describe("Also delete the host branch delegate/<key> when another branch contains it. Default false."),
+    abort: z.boolean().optional().describe("Stop a running session before closing it. Its work is still checked afterwards. Default false."),
+    discardWork: z.boolean().optional().describe("Allow deleting commits no host branch has, uncommitted files and an unmerged delegate/<key>. Default false."),
   },
   annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
   async run(args, ctx, correlationId) {
-    const force = args.force === true
     const box = await ctx.box()
     const located = await locate(ctx, box, args.sessionID, correlationId)
-    const owner = { supervisor: ctx.supervisor, sessionID: args.sessionID }
-    // Ownership and the loss check first (reads only): nothing is sent for a session that is not ours.
-    const plan: ClosePlan = await ctx.workspaces.inspectClose(located.sessionKey, owner, { deleteBranch: false })
-    const state = await liveState(box, located, args.sessionID)
-    const aborted = state !== undefined && ACTIVE.has(state)
-    if (aborted && !force) throw busyError(args.sessionID, state)
-    if (!plan.safe && !force) throw uncollectedError(args.sessionID, { refused: plan.reason, uncollectedCommits: plan.uncollectedCommits, uncommittedPaths: plan.uncommittedPaths })
-    if (aborted) await abortFirst(ctx, box, located, args.sessionID, correlationId)
-    const outcome = await ctx.workspaces.closeSession(located.sessionKey, owner, { force, deleteBranch: args.deleteBranch === true }, sessionDeleter(box, args.sessionID, located.sessionKey, correlationId))
-    if (outcome.refused && outcome.session === "kept") throw uncollectedError(args.sessionID, outcome)
-    if (outcome.session !== "kept") ctx.sessions.delete(args.sessionID)
-    return ok(closeSummary(outcome), { ...outcome, aborted })
+    return whileClosing(ctx, args.sessionID, () => closeOne(ctx, box, located, args, correlationId))
   },
 })
 
@@ -135,25 +188,26 @@ async function lastActive(run: SweepRun, state: Candidate): Promise<{ at: number
   return { at: typeof updated === "number" && Number.isFinite(updated) ? Math.max(created, updated) : created, present: true }
 }
 
-/** Why a candidate is not swept now, or undefined when it is stale and idle. */
-async function notStale(run: SweepRun, state: Candidate): Promise<keyof Sweep["skipped"] | undefined> {
-  const active = await lastActive(run, state)
-  if (!active) return "unknown"
-  if (active.at >= run.cutoff) return "recent"
-  if (active.present && ACTIVE.has((await run.box.hub.view(state.sessionID)).state)) return "active"
-  return undefined
+/** Why a candidate is not swept now, or whether the sandbox still has it when it is stale and idle. */
+async function staleness(run: SweepRun, state: Candidate): Promise<{ skip: keyof Sweep["skipped"] } | { present: boolean }> {
+  const last = await lastActive(run, state)
+  if (!last) return { skip: "unknown" }
+  if (last.at >= run.cutoff) return { skip: "recent" }
+  if (!last.present) return { present: false }
+  const now = (await run.box.hub.view(state.sessionID)).state
+  return UNVERIFIED.has(now) ? { skip: "unknown" } : ACTIVE.has(now) ? { skip: "active" } : { present: true }
 }
 
 function keep(out: Sweep, sessionKey: string, reason: string, o: { uncollectedCommits: number; uncommittedPaths: number }): void {
   out.kept.push({ sessionKey, reason, uncollectedCommits: o.uncollectedCommits, uncommittedPaths: o.uncommittedPaths })
 }
 
-/** One stale candidate: listed (dry run) or closed with every guard and never forced. */
+/** One stale candidate: listed (dry run) or closed with every guard, never aborted, never discarding work. */
 async function sweepOne(run: SweepRun, state: Candidate): Promise<void> {
   const { ctx, out } = run
-  const skip = await notStale(run, state)
-  if (skip) {
-    out.skipped[skip]++
+  const stale = await staleness(run, state)
+  if ("skip" in stale) {
+    out.skipped[stale.skip]++
     return
   }
   const owner = { supervisor: ctx.supervisor, sessionID: state.sessionID }
@@ -163,22 +217,37 @@ async function sweepOne(run: SweepRun, state: Candidate): Promise<void> {
     else keep(out, state.sessionKey, plan.reason ?? "check_failed", plan)
     return
   }
-  const o = await ctx.workspaces.closeSession(state.sessionKey, owner, { force: false, deleteBranch: run.deleteBranch }, sessionDeleter(run.box, state.sessionID, state.sessionKey, run.correlationId))
-  if (o.session !== "kept") ctx.sessions.delete(state.sessionID)
-  if (o.closed) out.closed.push(state.sessionKey)
-  else if (o.refused && o.session === "kept") keep(out, state.sessionKey, o.refused, o)
+  const located: Located = { sessionKey: state.sessionKey, ...(stale.present ? { remote: { id: state.sessionID } } : {}) }
+  const o = await whileClosing(ctx, state.sessionID, () =>
+    ctx.workspaces.closeSession(state.sessionKey, owner, { discardWork: false, deleteBranch: run.deleteBranch }, {
+      stop: async () => {
+        await stopSession(ctx, run.box, located, state.sessionID, false, run.correlationId)
+      },
+      deleteSession: sessionDeleter(run.box, state.sessionID, state.sessionKey, run.correlationId),
+    }),
+  )
+  if (o.closed) {
+    ctx.sessions.delete(state.sessionID)
+    out.closed.push(state.sessionKey)
+  } else if (o.refused && o.session === "kept") keep(out, state.sessionKey, o.refused, o)
   else out.partial.push(state.sessionKey)
+}
+
+function sweepSummary(out: Sweep, dryRun: boolean, days: number, examined: number, otherBridge: number): string {
+  const done = dryRun ? `${plural(out.wouldClose.length, "session")} would be closed` : `${plural(out.closed.length, "session")} closed`
+  const others = otherBridge ? ` ${plural(otherBridge, "record")} name another bridge and were not touched: a bridge only sweeps its own sessions, so set OPENCODE_DELEGATE_NAME to a fixed name to sweep later runs' sessions.` : ""
+  return `${done}; ${out.kept.length} kept for uncollected work or failed checks (older than ${days} days, ${plural(examined, "record")} looked at; each call continues where the last one stopped).${others}`
 }
 
 export const cleanupTool = defineTool({
   name: "oc_cleanup",
   title: "Sweep stale sessions",
   description:
-    `Find this bridge's sessions idle longer than ${TTL_ENV} days (default ${DEFAULT_TTL_DAYS}; 0 disables) and close them with oc_close_session's guards, never forced: a session with uncollected commits or uncommitted files, or one that is busy or needs input, is kept. ` +
-    `dryRun (default true) only lists what would be removed. At most ${MAX_EXAMINED} records are looked at and ${MAX_CLOSED} sessions closed per call, oldest first. deleteBranch: true also deletes merged delegate/<key> branches.`,
+    `Find this bridge's sessions idle longer than ${TTL_ENV} days (default ${DEFAULT_TTL_DAYS}; 0 disables) and close them with oc_close_session's guards, never aborting and never discarding work: a session with uncollected commits or uncommitted files, or one that is running, needs input or cannot be checked, is kept. ` +
+    `dryRun (default true) only lists what would be removed. Each call looks at up to ${MAX_EXAMINED} records and closes up to ${MAX_CLOSED}, continuing where the last call stopped. Only sessions of this bridge's name are seen. deleteBranch: true also deletes delegate/<key> branches another host branch contains.`,
   input: {
     dryRun: z.boolean().optional().describe("Only report what would be removed. Default true."),
-    deleteBranch: z.boolean().optional().describe("Also delete each closed session's host branch when it is merged. Default false."),
+    deleteBranch: z.boolean().optional().describe("Also delete each closed session's host branch when another branch contains it. Default false."),
   },
   annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
   async run(args, ctx, correlationId) {
@@ -198,8 +267,7 @@ export const cleanupTool = defineTool({
         ctx.log.log("warn", "tools", "session sweep skipped a session", { sessionKey: state.sessionKey, correlationId, code: error instanceof DelegateError ? error.code : "unexpected" })
       }
     }
-    const done = dryRun ? `${plural(out.wouldClose.length, "session")} would be closed` : `${plural(out.closed.length, "session")} closed`
-    const summary = `${done}; ${out.kept.length} kept for uncollected work or failed checks (older than ${days} days, ${plural(candidates.states.length, "record")} looked at).`
-    return ok(summary, { dryRun, ttlDays: days, examined: candidates.states.length, ...out, legacyRecords: candidates.legacy, otherBoxRecords: candidates.otherBox })
+    const summary = sweepSummary(out, dryRun, days, candidates.states.length, candidates.otherBridge)
+    return ok(summary, { dryRun, ttlDays: days, examined: candidates.states.length, ...out, legacyRecords: candidates.legacy, otherBoxRecords: candidates.otherBox, otherBridgeRecords: candidates.otherBridge })
   },
 })
