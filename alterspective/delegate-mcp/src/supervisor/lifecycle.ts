@@ -98,7 +98,7 @@ async function withHolders(run: Run, error: unknown): Promise<unknown> {
  */
 export function checkReusable(deps: SupervisorDeps, box: BoxInspect, plan: Pick<Plan, "built" | "config" | "otherFlagHash">): void {
   const hash = plan.built.hash
-  if (plan.otherFlagHash !== undefined && box.labels[LABEL.profileHash] === plan.otherFlagHash) {
+  if (plan.otherFlagHash !== undefined && plan.otherFlagHash !== hash && box.labels[LABEL.profileHash] === plan.otherFlagHash) {
     const on = keystoneHostAuth()
     throw changed(
       `The running sandbox was started by a bridge with ${KEYSTONE_HOST_AUTH_ENV} ${on ? "unset" : "=1"}, but this bridge has it ${on ? "=1" : "unset"}. Set ${KEYSTONE_HOST_AUTH_ENV} the same for every bridge that shares this home.`,

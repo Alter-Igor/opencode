@@ -14,7 +14,7 @@ import { currentKeystone } from "../shared/config.ts"
 import { DelegateError, isDelegateError } from "../shared/errors.ts"
 import { entryName, idOfEntry } from "../shared/keystone.ts"
 import type { McpStatus, OpencodeApi } from "../shared/opencode-api.ts"
-import type { Box, ToolContext } from "./context.ts"
+import type { ToolContext } from "./context.ts"
 import { defineTool } from "./define.ts"
 import { ok } from "./shape.ts"
 
@@ -80,24 +80,34 @@ const NEEDS_HOST_SIGN_IN: ReadonlySet<KsStatus["state"]> = new Set<KsStatus["sta
 type HostOutcome = { server: string; result: "connected" | "failed"; outcome: string; expiresAt?: string; box?: string }
 
 /**
- * Review M1: the box to connect entries on: the one this bridge holds, else a RUNNING one (another
- * bridge's; box() reuses it, as the old flow did). A stopped sandbox is never started for this.
+ * Review M1 + cycle 2: the box API to connect entries on: the box this bridge holds, else the
+ * RUNNING box's target read from status() (another bridge's). It only attaches, never box() or
+ * ensure(), so it can never start a sandbox; a box that stops meanwhile just fails the call.
  */
-async function runningBox(ctx: ToolContext): Promise<Box | undefined> {
+async function runningApi(ctx: ToolContext): Promise<OpencodeApi | undefined> {
   const held = ctx.peekBox()
-  if (held) return held
+  if (held) return held.api
   const status = await ctx.supervisorService.status()
-  return status.state === "running" ? ctx.box() : undefined
+  return status.state === "running" ? ctx.apiFor(status.target) : undefined
 }
 
-/** Connect one box entry; "not_running" without a running box, "unknown" when the attempt failed. */
+/** Connect one box entry; "not_running" without a running box, "unknown" when anything failed. */
 async function connectEntry(ctx: ToolContext, server: string): Promise<string> {
-  const box = await runningBox(ctx)
-  if (!box) return "not_running"
   try {
-    return await ensureEntryConnected(box.api, server, ctx.log)
+    const api = await runningApi(ctx)
+    return api ? await ensureEntryConnected(api, server, ctx.log) : "not_running"
   } catch {
     return "unknown"
+  }
+}
+
+/** Reconnect every signed-in entry; never throws (a failure leaves the sign-in results standing). */
+async function reconnectAll(ctx: ToolContext, ks: HostKeystone, connections: string[]): Promise<{ running: boolean | undefined; reconnected: Record<string, string> }> {
+  try {
+    const api = await runningApi(ctx)
+    return { running: api !== undefined, reconnected: api ? await connectSignedIn((ids) => ks.status(ids), connections, api, ctx.log) : {} }
+  } catch {
+    return { running: undefined, reconnected: {} }
   }
 }
 
@@ -158,11 +168,10 @@ async function hostSignInAll(ctx: ToolContext, ks: HostKeystone, connections: st
     if (results.at(-1)?.result === "failed") break
   }
   const skipped = pending.slice(results.length).map(entryName)
-  const box = await runningBox(ctx)
-  const reconnected = box ? await connectSignedIn((ids) => ks.status(ids), connections, box.api, ctx.log) : {}
+  const { running, reconnected } = await reconnectAll(ctx, ks, connections)
   const notConnected = Object.entries(reconnected).filter(([, status]) => status !== "connected").map(([name, status]) => `${name} ${status}`)
   const signIns = pending.length === 0 ? "No Keystone connection needs sign-in on the host." : `${results.map(hostWords).join(" ")}${skipped.length ? ` Not tried: ${skipped.join(", ")}.` : ""}`
-  const boxLine = !box ? " The sandbox is not running; front loads the tokens when it starts." : notConnected.length ? ` Box entries still not connected: ${notConnected.join(", ")} (see oc_doctor).` : " Box entries with a valid host token are connected."
+  const boxLine = running === undefined ? " The sandbox could not be checked; box entries were not reconnected (see oc_doctor)." : !running ? " The sandbox is not running; front loads the tokens when it starts." : notConnected.length ? ` Box entries still not connected: ${notConnected.join(", ")} (see oc_doctor).` : " Box entries with a valid host token are connected."
   return ok(`${signIns}${boxLine}`, { host: true, results, skipped, reconnected, before: Object.fromEntries(before.map((s) => [entryName(s.connection), s.state])) })
 }
 

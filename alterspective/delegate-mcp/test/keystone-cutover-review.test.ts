@@ -41,9 +41,20 @@ describe("M1: a box this bridge does not hold yet", () => {
     f.ctx.keystone = ks.service
     f.api.on("GET /mcp", { status: 200, data: { "ks-github": { status: "failed" } } }).on("POST /mcp/ks-github/connect", { status: 200, data: true })
     const result = await invoke(loginTool, { server: "ks-github" }, f.ctx)
-    expect(f.started.count).toBe(1)
+    // Cycle 2: attach to the running target only; box()/ensure() could START a box that stopped meanwhile.
+    expect(f.started.count).toBe(0)
     expect(f.api.find("POST", "/mcp/ks-github/connect")).toBeDefined()
     expect(text(result)).not.toContain("not running")
+  })
+
+  test("cycle 2: a connect that throws after a good sign-in reports box unknown, not a failed tool", async () => {
+    const f = fakeContext({ boxHeld: false })
+    f.ctx.keystone = hostKs([state("github", "needs_sign_in"), state("rag-read", "signed_in")]).service
+    f.ctx.supervisorService = { ...f.ctx.supervisorService, status: async () => { throw new Error("docker gone") } }
+    const one = await invoke(loginTool, { server: "ks-github" }, f.ctx)
+    expect(data(one)).toMatchObject({ result: "connected", outcome: "signed_in", box: "unknown" })
+    const all = await invoke(loginTool, {}, f.ctx)
+    expect(data(all)).toMatchObject({ results: [{ server: "ks-github", result: "connected" }] })
   })
 
   test("oc_login does not start a stopped sandbox just to connect", async () => {
@@ -149,6 +160,20 @@ describe("LOW: supervisor with the flag on", () => {
     expect(seenAtUp).toEqual([true, true, true])
     expect(readFileSync(path.join(home, "front", "ks-auth-github.conf"), "utf8")).toContain('set $ks_auth "";')
   })
+
+  for (const flag of [undefined, "1"]) {
+    test(`cycle 2: no Keystone service chosen, flag ${flag ?? "off"}: the running box is reused (no false flag mismatch)`, async () => {
+      await writeOwner()
+      const box: Box = { running: false, labels: {}, env: [] }
+      const calls: Call[] = []
+      const exec = fakeDocker(box, calls)
+      const none = (b: string) => deps(exec, { bridgeId: b, config: { ...deps(exec).config, keystoneConnections: [] } })
+      await withFlag(flag, () => supervisor(none("bridge-a")).ensure())
+      const ups = calls.filter((c) => c.argv.includes("up")).length
+      await withFlag(flag, () => supervisor(none("bridge-b")).ensure())
+      expect(calls.filter((c) => c.argv.includes("up")).length).toBe(ups)
+    })
+  }
 
   test("a box started with the other flag value is refused with an error that names OCD_KEYSTONE_HOST_AUTH", async () => {
     await writeOwner()

@@ -44,6 +44,8 @@ export async function planFor(deps: PlanDeps, keystone?: readonly string[]): Pro
   const input = { ownerConfigs, config, permission: deps.permission, keyEnv: deps.keyEnv, frontAuth: deps.frontAuth }
   const hostAuth = keystoneHostAuth()
   const built = buildProfile({ ...input, hostAuth })
-  const otherFlagHash = buildProfile({ ...input, hostAuth: !hostAuth }).hash
-  return { config, built, front: frontFilesFor(config), otherFlagHash }
+  // With no Keystone entry chosen the flag changes nothing in the profile: both hashes are equal,
+  // and a matching box must never be read as a flag mismatch (review cycle 2, High).
+  const other = buildProfile({ ...input, hostAuth: !hostAuth }).hash
+  return { config, built, front: frontFilesFor(config), ...(other !== built.hash ? { otherFlagHash: other } : {}) }
 }
