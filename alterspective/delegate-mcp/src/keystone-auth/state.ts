@@ -27,6 +27,9 @@ export type KsState = {
   retryAt?: number
   /** A bridge holds a rotated refresh token it could not save yet (no value here). Peers wait. */
   pendingBy?: string
+  /** The holder process (pid + start time): the marker counts while that process lives. */
+  pendingPid?: number
+  pendingStartedAt?: number
   pendingAt?: number
   /** What front was last given: a bearer, or an empty credential. */
   credential?: "published" | "empty"
@@ -113,6 +116,13 @@ export const ksRefreshAt = (state: Pick<KsState, "obtainedAt" | "expiresAt">, fr
 /**
  * Due: past the renewal point (or the token is saved but not yet in front) and past the backoff,
  * and not waiting for a sign-in.
+ *
+ * @param state the connection's state (undefined: never due)
+ * @param now host clock, epoch ms
+ * @param fraction share of the token's life after which it is renewed (0.8 by default)
+ * @returns whether a refresh (or republish) should run now
+ * @throws never
+ * @example ksIsDue(state, Date.now(), 0.8)
  */
 export const ksIsDue = (state: KsState | undefined, now: number, fraction: number) =>
   state !== undefined && !state.needsSignIn && now >= Math.max(state.needsPublish ? 0 : ksRefreshAt(state, fraction), state.retryAt ?? 0)

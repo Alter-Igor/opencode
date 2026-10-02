@@ -11,7 +11,11 @@
 //   is published. If the save fails, the new set stays in this bridge's memory, nothing new is
 //   published (front keeps the old access token until it expires), the state carries a marker
 //   (`pendingBy`, no value) so peers do not refresh with the spent stored token, and the save is
-//   retried on every tick without another grant. A bridge exit loses an unsaved token: the next
+//   retried on every tick without another grant. The marker names the holder's pid and start
+//   time; it counts while that process lives (judged like synapse/lock.ts), not for a fixed time.
+//   An access token that cannot be used (too short a life, a malformed reply) never costs the
+//   rotated refresh token: it is saved first, nothing is published, and the refresh is retried
+//   with backoff using the NEW token. A bridge exit loses an unsaved token: the next
 //   refresh then gets invalid_grant and the connection needs a sign-in.
 // - Two kinds of failure, as for Synapse (review M2): Keystone refused (invalid_grant, revoked
 //   client, ...) or nothing is stored → needs sign-in and an EMPTY credential is published. A passing
@@ -26,10 +30,11 @@ import { safeLog, type Logger } from "../shared/log.ts"
 import { loopbackRedirect } from "../supervisor/login.ts"
 import { backoffMs } from "../synapse/refresh.ts"
 import type { SecretStore } from "../synapse/secret-store.ts"
-import { PENDING_STALE_MS, TICK_MS } from "../synapse/token-manager.ts"
+import { TICK_MS } from "../synapse/token-manager.ts"
+import { recordGone, type ProcessProbe, type ProcessRecord } from "../supervisor/process.ts"
 import { attempt } from "./attempt.ts"
 import { loopbackListener, type Listen } from "./callback.ts"
-import { authorizationUrl, classify, discoverKeystone, exchangeCode, refreshTokens, registerHostClient, withTimeout, type FetchLike, type HostTokens } from "./oauth.ts"
+import { authorizationUrl, classify, discoverKeystone, exchangeCode, refreshTokens, registerHostClient, withTimeout, type FetchLike, type TokenReply } from "./oauth.ts"
 import { assertConnectionId, knownConnections, ksIsDue, readKsState, writeKsState, type KsState } from "./state.ts"
 
 export type { FetchLike } from "./oauth.ts"
@@ -40,6 +45,9 @@ const COMPONENT = "keystone-auth"
  * Hand front one connection's credential: a bearer, or undefined for an EMPTY credential (no
  * Authorization header leaves front). WS-A2 provides the writer of `ks-auth-<id>.conf`; WS-C wires
  * it. Called under the shared lock. A throw means front did not get it; the manager retries.
+ * It MUST NOT take the shared lock itself: withStartLock (supervisor/start-lock.ts) is not
+ * re-entrant, so a nested acquire from the same process waits on itself until the lock wait
+ * (2 min) runs out and then throws.
  */
 export type Publish = (connectionId: string, bearer: string | undefined) => Promise<void>
 
@@ -47,10 +55,15 @@ type Client = { clientId: string; clientRedirect?: string; clientScope?: string 
 
 /**
  * A token set this bridge holds in memory. `refreshToken` is set only while it is NOT yet saved;
- * the access token is kept so a failed publish can be retried without another grant.
+ * the access token is kept so a failed publish can be retried without another grant. No access
+ * token (`unusable` says why) means: save the refresh token, publish nothing, retry later.
  */
-type Held = { accessToken: string; refreshToken: string | undefined; obtainedAt: number; expiresAt: number; client: Client }
+type Held = { accessToken: string | undefined; unusable?: string; refreshToken: string | undefined; obtainedAt: number; expiresAt: number; client: Client }
 
+/**
+ * Per-bridge memory: `id` names this bridge in pending markers; `held` keeps token sets that are
+ * not saved or not published yet, per connection. Lives only in this process, never on disk.
+ */
 export type KeystoneMemory = { id: string; held: Map<string, Held> }
 
 export type KeystoneAuthDeps = {
@@ -74,11 +87,25 @@ export type KeystoneAuthDeps = {
   log: Logger
   /** The sign-in listener (default: a real loopback HTTP listener). */
   listen?: Listen
+  /** Judges whether another bridge's pending marker is still held by a live process. */
+  probe: ProcessProbe
+  /** This process (pid and start time), written into the pending marker. */
+  self: () => Promise<ProcessRecord>
 }
 
+/**
+ * What one refresh attempt did. fresh: nothing due. refreshed: a new bearer is in front.
+ * retrying: a passing failure (or a saved token whose access token was unusable / not taken by
+ * front), backing off. expired: past expiry, credential emptied, still retrying. pending_save: a
+ * rotated refresh token is held in memory, unsaved; nothing new published. waiting: another live
+ * bridge holds an unsaved token. needs_sign_in: refused or nothing stored. signed_out: no state.
+ */
 export type KsOutcome = "fresh" | "refreshed" | "retrying" | "expired" | "pending_save" | "waiting" | "needs_sign_in" | "signed_out"
 export type KsRefreshed = { connection: string; outcome: KsOutcome; error?: string }
-export type KsSignIn = { connection: string; outcome: "signed_in" | "pending_save" | "publish_failed"; expiresAt: number }
+export type KsSignIn = { connection: string; outcome: "signed_in" | "pending_save" | "publish_failed" | "access_unusable"; expiresAt: number }
+
+/** Prefix of the error of an "access token unusable" outcome (the refresh token was saved). */
+const UNUSABLE = "access token unusable"
 
 const result = (connection: string, outcome: KsOutcome, error?: string): KsRefreshed => ({ connection, outcome, ...(error ? { error } : {}) })
 const clientOf = (state: KsState | undefined): Client | undefined =>
@@ -95,31 +122,75 @@ function currentHeld(deps: KeystoneAuthDeps, id: string, state: KsState | undefi
   const unsaved = held.refreshToken !== undefined
   const superseded = state !== undefined && state.obtainedAt > held.obtainedAt
   // A saved set is only kept to republish the current access token.
-  const stale = !unsaved && (state === undefined || state.obtainedAt !== held.obtainedAt || state.needsSignIn === true || deps.now() >= held.expiresAt)
+  const stale = !unsaved && (held.accessToken === undefined || state === undefined || state.obtainedAt !== held.obtainedAt || state.needsSignIn === true || deps.now() >= held.expiresAt)
   if (!superseded && !stale) return held
   deps.memory.held.delete(id)
   if (unsaved) safeLog(deps.log, "info", COMPONENT, "dropped an unsaved refresh token: a newer sign-in or refresh replaced it", { connection: id })
   return undefined
 }
 
-/** Another bridge holds an unsaved refresh token for the current set (and is still trying). */
-const pendingElsewhere = (deps: KeystoneAuthDeps, state: KsState) =>
-  state.pendingBy !== undefined && state.pendingBy !== deps.memory.id && deps.now() - (state.pendingAt ?? 0) < PENDING_STALE_MS
+/**
+ * Another bridge holds an unsaved refresh token for the current set and its process still lives.
+ * Judged by pid + start time like the lock holder (synapse/lock.ts via start-lock): a live holder
+ * waiting on the lock is never taken for gone, however long it waits, and a reused pid is.
+ *
+ * @param deps manager dependencies (memory id, probe)
+ * @param state the connection's state
+ * @returns true while the marker must be honoured
+ * @throws never (an unreadable start time keeps the marker: waiting is the safe side)
+ * @example if (await pendingMarkerLive(deps, state)) return "waiting"
+ */
+export async function pendingMarkerLive(deps: Pick<KeystoneAuthDeps, "memory" | "probe">, state: KsState): Promise<boolean> {
+  if (state.pendingBy === undefined || state.pendingBy === deps.memory.id) return false
+  // A marker without a holder record cannot be judged; nothing in this module writes one.
+  if (state.pendingPid === undefined) return false
+  const gone = await attempt(() => recordGone({ pid: state.pendingPid ?? 0, ...(state.pendingStartedAt !== undefined ? { startedAt: state.pendingStartedAt } : {}) }, deps.probe))
+  return !gone.ok || !gone.value
+}
 
 /** Save a held refresh token (under the lock). On failure keep it in memory and mark the state. */
 async function saveHeld(deps: KeystoneAuthDeps, id: string, held: Held, state: KsState | undefined): Promise<boolean> {
   const store = deps.store(id)
   const token = held.refreshToken
   if (token === undefined) return true
+  // The marker goes down BEFORE the store write (review cycle 1, M2): if both fail on one bad disk,
+  // the marker attempt came first; if only the store fails, peers already know to wait. It keeps
+  // the PREVIOUS set's times, so a newer sign-in still supersedes this held set.
+  const me = await deps.self()
+  const marker: KsState = { ...(state ?? { connection: id, obtainedAt: 0, expiresAt: 0 }), pendingBy: deps.memory.id, pendingPid: me.pid, ...(me.startedAt !== undefined ? { pendingStartedAt: me.startedAt } : {}), pendingAt: deps.now() }
+  const marked = await attempt(() => writeKsState(deps.home, marker))
   const saved = await attempt(() => store.write(token))
   if (saved.ok) {
     held.refreshToken = undefined
     return true
   }
-  safeLog(deps.log, "warn", COMPONENT, "keystone refresh token not saved; kept in memory, not published, will retry", { connection: id, store: store.kind })
-  // The marker keeps the PREVIOUS set's times, so a newer sign-in still supersedes this one.
-  await writeKsState(deps.home, { ...(state ?? { connection: id, obtainedAt: 0, expiresAt: 0 }), pendingBy: deps.memory.id, pendingAt: deps.now(), lastError: `refresh token not saved (${store.kind}); retrying` })
+  safeLog(deps.log, marked.ok ? "warn" : "error", COMPONENT, "keystone refresh token not saved; kept in memory, not published, will retry", { connection: id, store: store.kind, marked: marked.ok })
+  if (marked.ok) await attempt(() => writeKsState(deps.home, { ...marker, lastError: `refresh token not saved (${store.kind}); retrying` }))
   return false
+}
+
+/** The held set is saved: publish its access token, or record why it cannot be used. */
+function settleHeld(deps: KeystoneAuthDeps, id: string, held: Held, previous: KsState | undefined): Promise<KsRefreshed> {
+  return held.accessToken === undefined ? accessUnusable(deps, id, held, previous) : commitHeld(deps, id, held, previous)
+}
+
+/**
+ * The refresh token is saved but the access token cannot be used: publish nothing, keep the
+ * current set's times (front keeps the old bearer until it expires; a sign-in with no prior set
+ * starts expired) and retry with backoff, which will present the NEWLY saved refresh token.
+ */
+async function accessUnusable(deps: KeystoneAuthDeps, id: string, held: Held, previous: KsState | undefined): Promise<KsRefreshed> {
+  deps.memory.held.delete(id)
+  const now = deps.now()
+  const base: KsState = previous && !previous.needsSignIn ? previous : { connection: id, obtainedAt: now, expiresAt: now, ...(previous?.credential ? { credential: previous.credential } : {}) }
+  const { pendingBy: _b, pendingPid: _p, pendingStartedAt: _s, pendingAt: _a, needsSignIn: _n, ...rest } = base
+  const failures = (base.failures ?? 0) + 1
+  const reason = `${UNUSABLE} (${held.unusable ?? "unknown"}); refresh token saved`
+  const next: KsState = { ...rest, ...held.client, failures, retryAt: now + backoffMs(failures), lastError: reason }
+  await writeKsState(deps.home, next)
+  safeLog(deps.log, "warn", COMPONENT, "keystone access token unusable; refresh token saved, nothing published, will retry", { connection: id, reason, failures })
+  const expired = await expireIfPast(deps, id, next)
+  return result(id, expired.outcome === "expired" ? "expired" : "retrying", reason)
 }
 
 /** The held set is saved: record it as the set in force, then publish its access token. */
@@ -138,21 +209,32 @@ async function publishHeld(deps: KeystoneAuthDeps, id: string, held: Held, state
     safeLog(deps.log, "warn", COMPONENT, "keystone token saved but not published to front; will retry", { connection: id, failures })
     return result(id, "retrying", "publish to front failed")
   }
-  const { needsPublish: _n, failures: _f, retryAt: _r, lastError: _e, pendingBy: _b, pendingAt: _a, ...rest } = state
+  const { needsPublish: _n, failures: _f, retryAt: _r, lastError: _e, pendingBy: _b, pendingPid: _p, pendingStartedAt: _s, pendingAt: _a, ...rest } = state
   await writeKsState(deps.home, { ...rest, credential: "published", publishedAt: deps.now() })
   return result(id, "refreshed")
 }
 
-/** Take up a new token set (under the lock): save the refresh token first, then publish. */
-async function adopt(deps: KeystoneAuthDeps, id: string, tokens: HostTokens, client: Client, spent?: string): Promise<KsRefreshed> {
+/**
+ * Take up a token reply (under the lock): save the refresh token FIRST, before anything about the
+ * access token is acted on (review cycle 1, HIGH), then publish it or record it as unusable.
+ */
+async function adopt(deps: KeystoneAuthDeps, id: string, reply: TokenReply, client: Client, spent?: string): Promise<KsRefreshed> {
   const now = deps.now()
-  // The SDK hands back the presented token when Keystone sends none; nothing new to save then.
-  const refreshToken = tokens.refreshToken !== undefined && tokens.refreshToken !== spent ? tokens.refreshToken : undefined
-  const held: Held = { accessToken: tokens.accessToken, refreshToken, obtainedAt: now, expiresAt: now + tokens.expiresInSec * 1000, client }
+  // Keystone sending back the presented token means nothing new to save.
+  const refreshToken = reply.refreshToken !== spent ? reply.refreshToken : undefined
+  const usable = "accessToken" in reply.access ? reply.access : undefined
+  const held: Held = {
+    accessToken: usable?.accessToken,
+    ...("unusable" in reply.access ? { unusable: reply.access.unusable } : {}),
+    refreshToken,
+    obtainedAt: now,
+    expiresAt: now + (usable?.expiresInSec ?? 0) * 1000,
+    client,
+  }
   deps.memory.held.set(id, held)
   const previous = await readKsState(deps.home, id)
   if (!(await saveHeld(deps, id, held, previous))) return result(id, "pending_save", "refresh token not saved yet")
-  return commitHeld(deps, id, held, previous)
+  return settleHeld(deps, id, held, previous)
 }
 
 /** Publish an empty credential; returns whether front took it (a throw is logged, not raised). */
@@ -202,7 +284,7 @@ async function refreshLocked(deps: KeystoneAuthDeps, id: string, force: boolean)
       await expireIfPast(deps, id, await readKsState(deps.home, id))
       return result(id, "pending_save", "refresh token not saved yet")
     }
-    return commitHeld(deps, id, held, state)
+    return settleHeld(deps, id, held, state)
   }
   if (state === undefined) return result(id, "signed_out")
   if (state.needsSignIn) {
@@ -212,11 +294,11 @@ async function refreshLocked(deps: KeystoneAuthDeps, id: string, force: boolean)
   }
   const now = deps.now()
   // 2. Saved but not in front: republish from memory when this bridge still holds the access token.
-  if (state.needsPublish && now >= (state.retryAt ?? 0) && held !== undefined) return publishHeld(deps, id, held, state)
+  if (state.needsPublish && now >= (state.retryAt ?? 0) && held?.accessToken !== undefined) return publishHeld(deps, id, held, state)
   if (!force && !ksIsDue(state, now, deps.refreshFraction)) return expireIfPast(deps, id, state)
   // 3. Another bridge holds the rotated token in memory; the stored one is spent. Wait for it, even
   // when forced: refreshing with the spent token would get invalid_grant and lose the sign-in.
-  if (pendingElsewhere(deps, state)) {
+  if (await pendingMarkerLive(deps, state)) {
     const expired = await expireIfPast(deps, id, state)
     return result(id, expired.outcome === "expired" ? "expired" : "waiting", "another bridge holds an unsaved refresh token")
   }
@@ -228,7 +310,7 @@ async function refreshLocked(deps: KeystoneAuthDeps, id: string, force: boolean)
   if (!stored.ok) return retryLater(deps, id, state, `refresh token store (${store.kind}) could not be read`)
   const storedToken = stored.value
   if (storedToken === undefined) return failClosed(deps, id, state, "no stored refresh token", false)
-  let tokens: HostTokens
+  let tokens: TokenReply
   try {
     const fetchFn = withTimeout(deps.fetch)
     const server = await discoverKeystone(fetchFn, deps.origin, id)
@@ -300,8 +382,19 @@ export function startKeystoneRefreshLoop(deps: KeystoneAuthDeps, connectionIds?:
   const tick = async () => {
     if (running) return
     running = true
-    await refreshDue(deps, connectionIds?.())
-    running = false
+    try {
+      let ids: readonly string[] | undefined
+      try {
+        ids = connectionIds?.()
+      } catch (error) {
+        // A failing list must not stop renewal for good: log, skip this tick, try again next one.
+        safeLog(deps.log, "warn", COMPONENT, "keystone connection list failed; skipping this tick", { reason: error instanceof Error ? error.name : "error" })
+        return
+      }
+      await refreshDue(deps, ids)
+    } finally {
+      running = false
+    }
   }
   const timer = setInterval(() => void tick(), tickMs)
   timer.unref?.()
@@ -331,7 +424,7 @@ async function forgetClient(deps: KeystoneAuthDeps, id: string): Promise<void> {
 export async function signIn(deps: KeystoneAuthDeps, connectionId: string): Promise<KsSignIn> {
   const id = assertConnectionId(connectionId)
   const fetchFn = withTimeout(deps.fetch)
-  let tokens: HostTokens
+  let tokens: TokenReply
   let client: Client
   try {
     const server = await discoverKeystone(fetchFn, deps.origin, id)
@@ -366,7 +459,7 @@ export async function signIn(deps: KeystoneAuthDeps, connectionId: string): Prom
   if (tokens.refreshToken === undefined)
     throw new DelegateError("upstream_error", "Keystone gave no refresh token for this connection.", "Check the connection allows refresh, then sign in again.", "exchange: no refresh_token")
   const adopted = await deps.lock(() => adopt(deps, id, tokens, client))
-  const outcome = adopted.outcome === "refreshed" ? "signed_in" : adopted.outcome === "pending_save" ? "pending_save" : "publish_failed"
+  const outcome = adopted.outcome === "refreshed" ? "signed_in" : adopted.outcome === "pending_save" ? "pending_save" : adopted.error?.startsWith(UNUSABLE) ? "access_unusable" : "publish_failed"
   const state = await readKsState(deps.home, id)
   safeLog(deps.log, "info", COMPONENT, "keystone sign-in adopted", { connection: id, outcome })
   return { connection: id, outcome, expiresAt: state?.needsSignIn ? 0 : (state?.expiresAt ?? 0) }

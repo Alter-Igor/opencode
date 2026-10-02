@@ -10,8 +10,7 @@
 import {
   discoverAuthorizationServerMetadata,
   discoverOAuthProtectedResourceMetadata,
-  exchangeAuthorization,
-  refreshAuthorization,
+  parseErrorResponse,
   registerClient,
   startAuthorization,
 } from "@modelcontextprotocol/sdk/client/auth.js"
@@ -23,7 +22,7 @@ import {
   OAuthError,
   UnauthorizedClientError,
 } from "@modelcontextprotocol/sdk/server/auth/errors.js"
-import type { AuthorizationServerMetadata, OAuthTokens } from "@modelcontextprotocol/sdk/shared/auth.js"
+import type { AuthorizationServerMetadata } from "@modelcontextprotocol/sdk/shared/auth.js"
 import { DelegateError, isDelegateError } from "../shared/errors.ts"
 import { jwtClaims } from "../synapse/keystone-token.ts"
 import { assertConnectionId } from "./state.ts"
@@ -44,8 +43,6 @@ export type KeystoneServer = {
   /** Space-separated `scopes_supported` of the protected resource, or undefined when it names none. */
   scope: string | undefined
 }
-
-export type HostTokens = { accessToken: string; refreshToken: string | undefined; expiresInSec: number }
 
 /** Every call gets a timeout, so a hung Keystone is a passing failure, not a stuck tick. */
 export const withTimeout = (fetchFn: FetchLike, ms = KEYSTONE_TIMEOUT_MS): FetchLike => (url, init) => fetchFn(url, { ...init, signal: init?.signal ?? AbortSignal.timeout(ms) })
@@ -84,7 +81,10 @@ export async function discoverKeystone(fetchFn: FetchLike, origin: string, conne
   sameOrigin(base, issuer, "authorization server")
   const metadata = await discoverAuthorizationServerMetadata(issuer, { fetchFn })
   if (!metadata) throw new DelegateError("upstream_error", "Keystone published no authorization server metadata.", "Retry later; run oc_doctor.", "no AS metadata")
-  sameOrigin(base, metadata.issuer, "issuer")
+  // RFC 8414 section 3.3: the issuer in the metadata must be the one it was discovered from. Only a
+  // trailing slash is ignored (new URL() adds one to a bare origin).
+  if (metadata.issuer.replace(/\/$/, "") !== issuer.href.replace(/\/$/, ""))
+    throw new DelegateError("policy_violation", "Keystone's metadata names another issuer; nothing was sent there.", "Check keystoneOrigin and Keystone's discovery metadata.", "issuer mismatch")
   sameOrigin(base, metadata.authorization_endpoint, "authorization endpoint")
   sameOrigin(base, metadata.token_endpoint, "token endpoint")
   sameOrigin(base, metadata.registration_endpoint, "registration endpoint")
@@ -141,39 +141,110 @@ export async function authorizationUrl(server: KeystoneServer, clientId: string,
   return { url, codeVerifier }
 }
 
-function hostTokens(tokens: OAuthTokens, now: number): HostTokens {
-  // min(expires_in, the JWT's own exp) when both exist (as for Synapse, review L4); either alone
-  // when only one exists; neither means the lifetime is unknown, which is refused.
-  const exp = jwtClaims(tokens.access_token)?.exp
-  const bounds = [tokens.expires_in, typeof exp === "number" ? exp - now / 1000 : undefined].filter((v): v is number => typeof v === "number" && Number.isFinite(v))
-  const life = bounds.length > 0 ? Math.floor(Math.min(...bounds)) : 0
-  if (life < MIN_LIFETIME_SEC) throw new DelegateError("upstream_error", "Keystone returned a token with no usable lifetime.", "Retry later; run oc_doctor.", "token: lifetime too short")
-  return { accessToken: tokens.access_token, refreshToken: tokens.refresh_token, expiresInSec: life }
+/**
+ * What one token reply gave the host. The refresh token is read from the RAW JSON before anything
+ * else is checked, so a rotated token is never lost to a later check (review cycle 1, HIGH and M3):
+ * the caller saves it first, and an unusable access token only means "saved, not published".
+ */
+export type TokenReply = {
+  /** The refresh token in the reply, or undefined when it holds none. */
+  refreshToken: string | undefined
+  /** The access token and its lifetime, or why it cannot be used (it is then never published). */
+  access: { accessToken: string; expiresInSec: number } | { unusable: string }
+}
+
+/**
+ * Lifetime assumed when a reply has no usable `expires_in`: one hour, the Synapse default and the
+ * lifetime the step 0 spike observed. A JWT's own `exp` still caps it.
+ */
+export const DEFAULT_LIFETIME_SEC = 3600
+
+/**
+ * Read a successful token reply without a schema that could reject it as a whole.
+ *
+ * @param text the raw response body
+ * @param now host clock, epoch ms
+ * @returns the refresh token (if any) and the access token or why it is unusable
+ * @throws never
+ * @example readTokenReply('{"access_token":"...","refresh_token":"..."}', Date.now())
+ */
+export function readTokenReply(text: string, now: number): TokenReply {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    parsed = undefined
+  }
+  const body = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {}
+  const refreshToken = typeof body.refresh_token === "string" && body.refresh_token !== "" ? body.refresh_token : undefined
+  const unusable = (why: string): TokenReply => ({ refreshToken, access: { unusable: why } })
+  const access = body.access_token
+  if (typeof access !== "string" || access === "") return unusable("no access token")
+  if (typeof body.token_type === "string" && body.token_type.toLowerCase() !== "bearer") return unusable("not a bearer token")
+  const expiresIn = Number(body.expires_in)
+  // min(expires_in or the default, the JWT's own exp) (as for Synapse, review L4). A host clock far
+  // ahead of Keystone's makes the JWT look expired: that is "unusable", never a lost refresh token.
+  const exp = jwtClaims(access)?.exp
+  const life = Math.floor(Math.min(Number.isFinite(expiresIn) && expiresIn > 0 ? expiresIn : DEFAULT_LIFETIME_SEC, typeof exp === "number" ? exp - now / 1000 : Number.POSITIVE_INFINITY))
+  if (life < MIN_LIFETIME_SEC) return unusable("lifetime too short")
+  return { refreshToken, access: { accessToken: access, expiresInSec: life } }
+}
+
+/**
+ * POST to the token endpoint ourselves instead of the SDK's exchange/refresh helpers: those parse
+ * the reply with a strict schema, and a reply failing it would throw away a refresh token Keystone
+ * has already rotated. Public client: client_id in the body, no secret (as the SDK does for "none").
+ * Residual risk (cannot be fixed on the client): if the connection drops while the body is read,
+ * or a 200 reply is not JSON at all, a rotated token cannot be read and is lost; the next refresh
+ * then gets invalid_grant and the connection needs a sign-in.
+ */
+async function tokenRequest(fetchFn: FetchLike, server: KeystoneServer, params: URLSearchParams, now: number): Promise<TokenReply> {
+  params.set("resource", server.resource.href)
+  const response = await fetchFn(server.metadata.token_endpoint, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
+    body: params,
+  })
+  const text = await response.text()
+  // An error reply carries no token. parseErrorResponse maps it to the SDK's OAuthError classes;
+  // its message can hold the raw body, so classify() only ever reads the error code.
+  if (!response.ok) throw await parseErrorResponse(text)
+  return readTokenReply(text, now)
 }
 
 /**
  * Exchange the authorization code (public client: no secret, PKCE verifier instead).
  *
- * @returns the token set
- * @throws the SDK's OAuthError, or DelegateError for an unusable lifetime
- * @example const tokens = await exchangeCode(fetch, server, clientId, code, verifier, redirect, Date.now())
+ * @param fetchFn fetch
+ * @param server result of discoverKeystone
+ * @param clientId registered public client id
+ * @param code authorization code from the callback
+ * @param codeVerifier PKCE verifier from authorizationUrl
+ * @param redirect the redirect URI used in the authorization request
+ * @param now host clock, epoch ms
+ * @returns the token reply (save its refresh token before using its access token)
+ * @throws the SDK's OAuthError for an error reply, or a network/timeout error
+ * @example const reply = await exchangeCode(fetch, server, clientId, code, verifier, redirect, Date.now())
  */
-export async function exchangeCode(fetchFn: FetchLike, server: KeystoneServer, clientId: string, code: string, codeVerifier: string, redirect: string, now: number): Promise<HostTokens> {
-  const tokens = await exchangeAuthorization(server.issuer, { metadata: server.metadata, clientInformation: { client_id: clientId }, authorizationCode: code, codeVerifier, redirectUri: redirect, resource: server.resource, fetchFn })
-  return hostTokens(tokens, now)
+export function exchangeCode(fetchFn: FetchLike, server: KeystoneServer, clientId: string, code: string, codeVerifier: string, redirect: string, now: number): Promise<TokenReply> {
+  return tokenRequest(fetchFn, server, new URLSearchParams({ grant_type: "authorization_code", code, code_verifier: codeVerifier, redirect_uri: redirect, client_id: clientId }), now)
 }
 
 /**
- * Refresh. Keystone rotates strictly: once this call reaches Keystone, `refreshToken` is spent,
- * so the caller must keep the returned one before anything else can fail.
+ * Refresh. Keystone rotates strictly: once this call reaches Keystone, `refreshToken` is spent, so
+ * the caller must save the returned one before anything else can fail.
  *
- * @returns the new token set; `refreshToken` is the rotated one (or the old one if none was sent back)
- * @throws the SDK's OAuthError, a network/timeout error, or DelegateError for an unusable lifetime
- * @example const tokens = await refreshTokens(fetch, server, clientId, stored, Date.now())
+ * @param fetchFn fetch
+ * @param server result of discoverKeystone
+ * @param clientId registered public client id
+ * @param refreshToken the stored refresh token (spent by this call)
+ * @param now host clock, epoch ms
+ * @returns the token reply; its refreshToken is the rotated one, or undefined if none came back
+ * @throws the SDK's OAuthError for an error reply (e.g. InvalidGrantError), or a network/timeout error
+ * @example const reply = await refreshTokens(fetch, server, clientId, stored, Date.now())
  */
-export async function refreshTokens(fetchFn: FetchLike, server: KeystoneServer, clientId: string, refreshToken: string, now: number): Promise<HostTokens> {
-  const tokens = await refreshAuthorization(server.issuer, { metadata: server.metadata, clientInformation: { client_id: clientId }, refreshToken, resource: server.resource, fetchFn })
-  return hostTokens(tokens, now)
+export function refreshTokens(fetchFn: FetchLike, server: KeystoneServer, clientId: string, refreshToken: string, now: number): Promise<TokenReply> {
+  return tokenRequest(fetchFn, server, new URLSearchParams({ grant_type: "refresh_token", refresh_token: refreshToken, client_id: clientId }), now)
 }
 
 /** OAuth answers after which retrying cannot help: the grant or the client is gone. */

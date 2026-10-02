@@ -73,6 +73,8 @@ export function createKeystoneAuth(config: Pick<BridgeConfig, "home" | "keystone
     loginPort: LOGIN_PORT,
     loginTimeoutMs: LOGIN_TIMEOUT_MS,
     log,
+    probe: nodeProcessProbe,
+    self: async () => ({ pid: process.pid, startedAt: await (startedAt ??= ownStartTime(nodeProcessProbe)) }),
   }
   return {
     deps,

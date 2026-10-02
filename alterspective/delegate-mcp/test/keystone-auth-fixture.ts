@@ -12,6 +12,7 @@ import { nodeProcessProbe } from "../src/supervisor/process.ts"
 import { withStartLock } from "../src/supervisor/start-lock.ts"
 import { synapseLockFile } from "../src/synapse/lock.ts"
 import type { Logger } from "../src/shared/log.ts"
+import type { ProcessProbe } from "../src/supervisor/process.ts"
 import { jwt } from "./synapse-fixture.ts"
 
 export const ORIGIN = "https://identity.example.test"
@@ -33,6 +34,8 @@ export type FakeKeystone = {
   metadata: Record<string, unknown>
   /** Overrides for the protected-resource metadata. */
   resource: Record<string, unknown>
+  /** Overrides merged into every successful token reply (e.g. a short expires_in, a bad field). */
+  reply: Record<string, unknown>
   issue(): { access: string; refresh: string }
 }
 
@@ -47,6 +50,7 @@ export function fakeKeystone(): FakeKeystone {
     fail: {},
     metadata: {},
     resource: {},
+    reply: {},
     issue() {
       counter++
       const access = jwt({ sub: "test-owner", aud: `${ORIGIN}/mcp/c/rag-read`, n: counter })
@@ -98,7 +102,7 @@ export function fakeKeystone(): FakeKeystone {
           if (!k.valid.delete(presented)) return Response.json({ error: "invalid_grant" }, { status: 400 })
         }
         const t = k.issue()
-        return Response.json({ access_token: t.access, refresh_token: t.refresh, token_type: "Bearer", expires_in: 3600, scope: SCOPE })
+        return Response.json({ access_token: t.access, refresh_token: t.refresh, token_type: "Bearer", expires_in: 3600, scope: SCOPE, ...k.reply })
       }
       return new Response("unexpected", { status: 500 })
     },
@@ -129,6 +133,8 @@ export type Harness = {
   deps: KeystoneAuthDeps
   /** A second bridge on the same home: own memory, same stores, clock, publish sink and lock file. */
   peer(id: string): KeystoneAuthDeps
+  /** Other "processes" the fake probe knows: pid -> start time (absent = dead). This process is always alive. */
+  processes: Map<number, number>
 }
 
 /**
@@ -152,6 +158,11 @@ export async function harness(options: { realLock?: boolean } = {}): Promise<Har
   const lock: KeystoneAuthDeps["lock"] = options.realLock
     ? (fn) => withStartLock(nodeLeaseFs, lockFile, fn, { now: Date.now, sleep: (ms) => new Promise((r) => setTimeout(r, ms)), probe: nodeProcessProbe, self: { pid: process.pid, startedAt: 1 }, waitMs: 10_000 })
     : (fn) => fn()
+  const processes = new Map<number, number>()
+  const probe: ProcessProbe = {
+    alive: (pid) => pid === process.pid || processes.has(pid),
+    startTime: async (pid) => (pid === process.pid ? 1 : processes.get(pid)),
+  }
   const make = (id: string): KeystoneAuthDeps => ({
     home,
     origin: ORIGIN,
@@ -166,6 +177,8 @@ export async function harness(options: { realLock?: boolean } = {}): Promise<Har
     loginPort: 0,
     loginTimeoutMs: 5_000,
     log,
+    probe,
+    self: async () => ({ pid: process.pid, startedAt: 1 }),
   })
-  return { home, keystone, stores, published, clock, log, deps: make("test-bridge-a"), peer: make }
+  return { home, keystone, stores, published, clock, log, deps: make("test-bridge-a"), peer: make, processes }
 }

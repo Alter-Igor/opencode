@@ -1,7 +1,7 @@
 // #67 step 1: oc_doctor's view of the host-held Keystone tokens (WS-C wires it). States and times
 // only, never a value. Whether front actually serves the credential is front's own check (WS-A2/C).
 import { attempt } from "./attempt.ts"
-import type { KeystoneAuthDeps } from "./manager.ts"
+import { pendingMarkerLive, type KeystoneAuthDeps } from "./manager.ts"
 import { assertConnectionId, knownConnections, ksRefreshAt, readKsState } from "./state.ts"
 
 export type KsStatus = {
@@ -44,7 +44,9 @@ export async function keystoneAuthStatus(deps: KeystoneAuthDeps, connectionIds?:
       const store = deps.store(id)
       const has = await attempt(() => store.has())
       const stored = has.ok && has.value
-      const pendingSave = deps.memory.held.get(id)?.refreshToken !== undefined || state?.pendingBy !== undefined
+      // A marker counts only while its holder lives (this bridge, or a live peer process).
+      const markerHeld = state?.pendingBy !== undefined && (state.pendingBy === deps.memory.id || (await pendingMarkerLive(deps, state)))
+      const pendingSave = deps.memory.held.get(id)?.refreshToken !== undefined || markerHeld
       const now = deps.now()
       const kind: KsStatus["state"] =
         state === undefined && !pendingSave ? "signed_out"
