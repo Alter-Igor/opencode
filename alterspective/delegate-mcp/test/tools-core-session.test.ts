@@ -40,6 +40,23 @@ describe("oc_start_session", () => {
     expect(JSON.stringify(result)).not.toContain(TARGET.password)
   })
 
+  // #71: Synapse is the only provider; a model outside it is refused before any clone is made.
+  test("a non-Synapse model is refused without asking the box; a synapse model the box lacks is refused too", async () => {
+    const f = fakeContext()
+    canCreate(f)
+    const other = await invoke(startSessionTool, { directory: "C:\\GitHub\\demo", model: "opencode/big-pickle" }, f.ctx)
+    expect(data(other)).toMatchObject({ code: "invalid_input" })
+    expect(String(data(other).message)).toContain("only Synapse models")
+    expect(String(data(other).action)).toContain("synapse/auto")
+    expect(f.api.find("GET", "/config/providers")).toBeUndefined()
+    f.api.on("GET /config/providers", { status: 200, data: { providers: [{ id: "synapse", models: { auto: { id: "auto" } } }] } })
+    const missing = await invoke(startSessionTool, { directory: "C:\\GitHub\\demo", model: "synapse/openai/gpt-5.6-sol" }, f.ctx)
+    expect(data(missing)).toMatchObject({ code: "invalid_input" })
+    expect(f.opened).toEqual([])
+    const ok = await invoke(startSessionTool, { directory: "C:\\GitHub\\demo", model: "synapse/auto" }, f.ctx)
+    expect(ok.isError).toBeUndefined()
+  })
+
   test("readonly profile sends the readonly baseline", async () => {
     const f = fakeContext()
     canCreate(f)

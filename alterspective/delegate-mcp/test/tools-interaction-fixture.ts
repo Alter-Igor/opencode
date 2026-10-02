@@ -136,7 +136,7 @@ export function fixture(sessions: SessionRecord[] = []): Fixture {
     synapse: fakeSynapse(),
     guard,
     supervisorService: {} as unknown as DelegateSupervisor,
-    workspaces: { open: unused, collect: unused, resolveRepo: unused, bindSession: unused, sessionState: async () => undefined, listSessionStates: async () => [], pruneSessionStates: async () => [], discard: async () => {} },
+    workspaces: { open: unused, collect: unused, resolveRepo: unused, bindSession: unused, sessionState: async () => undefined, listSessionStates: async () => [], pruneSessionStates: async () => [], discard: async () => {}, inspectClose: unused, closeSession: unused, closeCandidates: unused },
     inbox,
     box: async () => box,
     peekBox: () => (boxes.started ? box : undefined),

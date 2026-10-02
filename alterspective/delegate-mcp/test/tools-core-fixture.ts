@@ -34,7 +34,7 @@ export const BASE = "a".repeat(40)
 export const TARGET: ApiTarget = { baseUrl: "http://127.0.0.1:45678", password: "secret-password-XYZ123" }
 
 export type Reply = { status: number; data?: unknown } | Error
-export type Recorded = { method: string; path: string; directory?: string; body?: unknown; correlationId?: string }
+export type Recorded = { method: string; path: string; directory?: string; body?: unknown; correlationId?: string; timeoutMs?: number }
 
 export class FakeApi implements OpencodeApi {
   readonly calls: Recorded[] = []
@@ -49,7 +49,7 @@ export class FakeApi implements OpencodeApi {
 
   async call<T>(input: Call) {
     const method = input.method ?? "GET"
-    this.calls.push({ method, path: input.path, directory: input.directory, body: input.body, correlationId: input.correlationId })
+    this.calls.push({ method, path: input.path, directory: input.directory, body: input.body, correlationId: input.correlationId, timeoutMs: input.timeoutMs })
     this.order.push(`${method} ${input.path}`)
     const reply = this.routes.get(`${method} ${input.path}`) ?? { status: 404 }
     if (reply instanceof Error) throw reply
@@ -178,6 +178,14 @@ function fakeServices(f: Fake): Pick<ToolContext, "supervisorService" | "workspa
         f.discarded.push(key)
         f.states.delete(key)
       },
+      // #72: tests of oc_close_session / oc_cleanup use the real workspaces (tools-close.test.ts).
+      inspectClose: async () => {
+        throw new Error("not used: tools-close.test.ts uses real workspaces")
+      },
+      closeSession: async () => {
+        throw new Error("not used: tools-close.test.ts uses real workspaces")
+      },
+      closeCandidates: async () => ({ states: [], legacy: 0, otherBox: 0, otherBridge: 0 }),
     },
   }
 }

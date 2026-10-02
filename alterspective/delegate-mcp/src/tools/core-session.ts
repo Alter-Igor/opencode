@@ -12,6 +12,7 @@ import { DelegateError } from "../shared/errors.ts"
 import type { ApiTarget } from "../shared/opencode-api.ts"
 import { AGENT_RE, MODEL_RE, SESSION_ID_RE, SESSION_KEY, type HostSessionState, type SessionProfile } from "../supervisor/workspaces-state.ts"
 import type { Box, SessionRecord, ToolContext } from "./context.ts"
+import { closingError, isClosing } from "./closing.ts"
 
 export { AGENT_RE, MODEL_RE, SESSION_ID_RE, type SessionProfile }
 export const CORRELATION_RE = /^[A-Za-z0-9_.:-]{1,64}$/
@@ -46,6 +47,15 @@ export function parseModel(value: string): { providerID: string; modelID: string
   if (!MODEL_RE.test(value)) throw new DelegateError("invalid_input", "The model must look like provider/model.", "Pick one from oc_list_models, for example synapse/auto.")
   const slash = value.indexOf("/")
   return { providerID: value.slice(0, slash), modelID: value.slice(slash + 1) }
+}
+
+/**
+ * #71: Synapse is the box's only provider (enabled_providers: ["synapse"]), so a model of any other
+ * provider is refused with a clear error rather than failing inside the box.
+ */
+export function requireSynapseModel(model: string): void {
+  if (parseModel(model).providerID === "synapse") return
+  throw new DelegateError("invalid_input", "The sandbox offers only Synapse models (synapse/<id>).", "Call oc_list_models and pick one of its ids, for example synapse/auto (the default).")
 }
 
 export function formatCursor(cursor: Cursor): string {
@@ -147,6 +157,8 @@ export type OwnedSession = { record: SessionRecord; remote?: RemoteSession }
  */
 export async function ownSession(ctx: ToolContext, box: Box, sessionID: string, correlationId: string, read = false): Promise<OwnedSession> {
   checkSessionId(sessionID)
+  // #72: a session being closed is not handed to send, collect or any other tool meanwhile.
+  if (isClosing(ctx, sessionID)) throw closingError(sessionID)
   const known = ctx.sessions.get(sessionID)
   if (known && !read) return { record: known }
   const remote = await readSession(ctx, box, sessionID, correlationId, known?.boxPath, known !== undefined)

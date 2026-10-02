@@ -8,6 +8,7 @@
 // of the box-wide set (oc_server_restart {keystone} sets that, and front enforces it).
 import { z } from "zod"
 import { SESSION_SUPERVISOR_KEY } from "../inbox/index.ts"
+import { recordStart } from "../reporting/hooks.ts"
 import { currentKeystone } from "../shared/config.ts"
 import { DelegateError } from "../shared/errors.ts"
 import { CONNECTION_ID, MAX_CONNECTIONS, keystoneIds } from "../shared/keystone.ts"
@@ -77,7 +78,7 @@ export const startSessionTool = defineTool({
     directory: z.string().min(1).max(1024).describe("The owner's repository (a folder under the allowed roots, e.g. C:\\GitHub\\my-repo)."),
     title: z.string().max(200).optional(),
     agent: agentSchema.optional().describe("OpenCode agent for the session, e.g. build (default) or plan."),
-    model: modelSchema.optional().describe("Default model for this session's sends, as provider/model."),
+    model: modelSchema.optional().describe("Default model for this session's sends: a Synapse model from oc_list_models (synapse/<id>). Default: the sandbox's default, synapse/auto."),
     profile: z.enum(["standard", "readonly"]).optional().describe("Permission profile. readonly denies edits and asks before any shell command. Default standard."),
     allowShared: z.boolean().optional().describe("Allow this session while another one of ours is still working in the same repo (each has its own copy)."),
     keystone: z
@@ -97,6 +98,7 @@ export const startSessionTool = defineTool({
     const record = await startIn(ctx, box, { ...args, keystone }, ws, correlationId)
     ctx.sessions.set(record.sessionID, record)
     box.hub.track(record.sessionID, ws.boxPath)
+    recordStart(ctx, record)
     return ok(`Session ${record.sessionID} started on ${ws.branch}. Next: oc_send, then oc_wait.`, {
       sessionID: record.sessionID, sessionKey: ws.sessionKey, branch: ws.branch, boxPath: ws.boxPath, hostRepo: ws.hostRepo, profile: record.profile, base: ws.base,
       ...(keystone ? { keystone } : {}),

@@ -2,6 +2,7 @@
 // the session's clone against its base commit, and the todo list.
 import { z } from "zod"
 import { errorLabel } from "../events/describe.ts"
+import { recordResult } from "../reporting/hooks.ts"
 import { DelegateError } from "../shared/errors.ts"
 import type { Box, SessionRecord } from "./context.ts"
 import { diffSummary } from "./core-box.ts"
@@ -28,7 +29,7 @@ async function lastAssistant(box: Box, record: SessionRecord, count: number, cor
   const res = await box.api.call<Message[]>({ path: `/session/${record.sessionID}/message?limit=${Math.min(200, count * 8)}`, directory: record.boxPath, correlationId })
   if (res.status !== 200 || !Array.isArray(res.data)) throw new DelegateError("upstream_error", "The delegate server failed to return the session's messages.", "Retry; if it repeats, run oc_doctor.", `HTTP ${res.status}`)
   const replies = res.data.filter((m) => m.info?.role === "assistant").slice(-count)
-  return replies.map((m) => {
+  const shaped = replies.map((m) => {
     const name = m.info?.error?.name
     const id = m.info?.id
     return {
@@ -38,6 +39,8 @@ async function lastAssistant(box: Box, record: SessionRecord, count: number, cor
       untrusted: untrusted(assistantText(m), Math.floor(8000 / Math.max(1, count))),
     }
   })
+  // #73: the fetched messages go to the task record hook, which keeps only model ids and token counts.
+  return { replies: shaped, messages: res.data }
 }
 
 async function todos(box: Box, record: SessionRecord, correlationId: string) {
@@ -59,12 +62,13 @@ export const resultTool = defineTool({
   async run(args, ctx, correlationId) {
     const box = await ctx.box()
     const { record } = await ownSession(ctx, box, args.sessionID, correlationId)
-    const [replies, diff, todo, view] = await Promise.all([
+    const [{ replies, messages }, diff, todo, view] = await Promise.all([
       lastAssistant(box, record, args.messages ?? 1, correlationId),
       diffSummary(ctx, record),
       todos(box, record, correlationId),
       box.hub.view(record.sessionID),
     ])
+    recordResult(ctx, record, { state: view.state, at: view.since }, messages)
     const n = diff.boxReportedCommits
     const commits = n === undefined ? "commit count unknown" : `${n} commit${n === 1 ? "" : "s"} (box-reported)`
     return ok(`${record.sessionID} is ${view.state}; ${replies.length} repl${replies.length === 1 ? "y" : "ies"}; ${commits} on ${record.branch}.`, {

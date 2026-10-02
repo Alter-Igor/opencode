@@ -8,6 +8,15 @@ import { OauthCallbackPage } from "@opencode-ai/core/oauth/page"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { INJECTED_LEARNINGS_LIMIT, learningStorePaths, sessionObserver, sanitizeJsonSchemaForOpenAI } from "./observer"
 import { EscalationTracker, declaredTier, classifyFailure, malformedToolCallFromEvent } from "./synapse-escalation"
+import {
+  createSynapseModelsFailureLogger,
+  loadSynapseModels,
+  readStoredSynapseCredential,
+  synapseModelsTarget,
+  updateSynapseModelsCache,
+  type SynapseModelsTarget,
+  type SynapseStoredCredential,
+} from "./synapse-models"
 
 export const KEYSTONE_ISSUER = "https://identity.alterspective.com.au"
 export const KEYSTONE_REGISTER = `${KEYSTONE_ISSUER}/api/oauth/register`
@@ -663,6 +672,75 @@ export function extractMcpChatContent(rawText: string): string {
   return ""
 }
 
+// Distinct startup model-fetch failures already logged by this process.
+const synapseModelsFailuresSeen = new Set<string>()
+
+/** How long a chat request waits for a Keystone refresh before it goes ahead with the old token. */
+export const SYNAPSE_CHAT_REFRESH_WAIT_MS = 15_000
+
+interface SynapseCredentialState {
+  /** Newest refreshed credential. */
+  latest?: SynapseStoredCredential & { refreshToken: string; expiresAt: number }
+  /** Every access and refresh token this process has replaced. A stored one in here is stale, not a new login. */
+  replaced: Set<string>
+  /** The one in-flight Keystone refresh grant. Never rejects; undefined when it failed. */
+  refresh?: Promise<string | undefined>
+  /** The save of `latest`. Never rejects. */
+  save?: Promise<void>
+  saveFailureLogged: boolean
+}
+
+// Process-wide, because every plugin instance shares the one stored `synapse`
+// credential and a Keystone refresh token can be used only once: a reuse revokes the
+// whole login. The single-flight guard is per process only; two OpenCode processes
+// refreshing at the same moment can still race (as before #74).
+const synapseCredentialState: SynapseCredentialState = { replaced: new Set(), saveFailureLogged: false }
+
+/**
+ * The credential to use: the newest refreshed one in memory, unless the stored one
+ * is a new login. A stored credential whose access or refresh token this process has
+ * already replaced is stale (its save is pending or failed, or OPENCODE_AUTH_CONTENT
+ * pins it), so the in-memory one wins.
+ */
+function currentSynapseCredential(stored: SynapseStoredCredential): SynapseStoredCredential {
+  const { latest, replaced } = synapseCredentialState
+  if (!latest) return stored
+  if (stored.token === latest.token || replaced.has(stored.token)) return latest
+  if (stored.refreshToken && (stored.refreshToken === latest.refreshToken || replaced.has(stored.refreshToken))) {
+    return latest
+  }
+  return stored
+}
+
+/**
+ * The token for the startup `/models` fetch, and whether it is already expired.
+ * Startup never refreshes: with an expired token the cached (or configured) list is
+ * used, and the cache is brought up to date after the next chat refresh.
+ */
+export function synapseModelsToken(
+  cred: SynapseStoredCredential | undefined,
+  now: number = Date.now(),
+): { token?: string; expired: boolean } {
+  if (!cred) return { expired: false }
+  const expired =
+    (cred.expiresAt !== undefined && cred.expiresAt - now <= ACCESS_TOKEN_REFRESH_SKEW_MS) ||
+    accessTokenIsExpiring(cred.token)
+  return { token: cred.token, expired }
+}
+
+/** Resolve with `promise`, or with undefined once `ms` has passed. `promise` keeps running. */
+async function waitAtMost<T>(promise: Promise<T | undefined>, ms: number): Promise<T | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const gaveUp = new Promise<undefined>((resolve) => {
+    timer = setTimeout(() => resolve(undefined), ms)
+  })
+  try {
+    return await Promise.race([promise, gaveUp])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 interface SynapsePluginOptions {
   authorizeUrl?: string
   loginUrl?: string
@@ -670,17 +748,117 @@ interface SynapsePluginOptions {
   registerUrl?: string
   inferenceUrl?: string
   audience?: string
+  /** How long a chat request waits for a token refresh. Default SYNAPSE_CHAT_REFRESH_WAIT_MS. */
+  refreshWaitMs?: number
 }
 
 export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePluginOptions): Promise<Hooks> {
   const inferenceUrl = options?.inferenceUrl || process.env.SYNAPSE_BASE_URL || SYNAPSE_DEFAULT_INFERENCE_URL
   const audience = options?.audience || SYNAPSE_AUDIENCE
-  let refreshPromise: Promise<{ access_token: string; refresh_token?: string; expires_in?: number }> | undefined
+  const userAgent = `opencode/${InstallationVersion}`
   // Set by the auth loader per request: true when the credential is a Keystone
   // JWT (MCP bridge path, text tool-call protocol), false on the native REST path.
   let bridgeMode = false
+  // Where this instance's model list comes from; set by the config hook.
+  let modelsTarget: SynapseModelsTarget | undefined
+
+  async function saveSynapseCredential(cred: NonNullable<SynapseCredentialState["latest"]>): Promise<void> {
+    try {
+      await input.client.auth.set({
+        path: { id: "synapse" },
+        body: {
+          type: "api",
+          key: cred.token,
+          metadata: {
+            clientId: cred.clientId ?? "ai-office-cli",
+            refreshToken: cred.refreshToken,
+            expiresAt: String(cred.expiresAt),
+          },
+        },
+      })
+    } catch (error) {
+      // The new token stays in memory for this process, so nothing reuses the spent
+      // refresh token; only a restart would need a fresh login.
+      if (synapseCredentialState.saveFailureLogged) return
+      synapseCredentialState.saveFailureLogged = true
+      sessionObserver.logDiagnostic(
+        {
+          timestamp: new Date().toISOString(),
+          type: "AUTH_EVENT",
+          details: { event: "synapse-token-save-failed", error: error instanceof Error ? error.name : "unknown" },
+        },
+        input.directory,
+      )
+    }
+  }
+
+  // One Keystone refresh at a time per process (refresh tokens are single-use). The
+  // grant is never aborted: its new credential is held in memory, the replaced
+  // tokens are remembered, the save is tracked in synapseCredentialState.save, and
+  // the model-list cache is updated in the background.
+  function refreshSynapseCredential(cred: {
+    token: string
+    clientId?: string
+    refreshToken: string
+    clientSecret?: string
+  }): Promise<string | undefined> {
+    if (synapseCredentialState.refresh) return synapseCredentialState.refresh
+    const clientId = cred.clientId || "ai-office-cli"
+    const run = async (): Promise<string | undefined> => {
+      try {
+        const tokens = await refreshKeystoneToken({
+          clientId,
+          refreshToken: cred.refreshToken,
+          clientSecret: cred.clientSecret || process.env[CLIENT_SECRET_ENV] || "",
+          tokenUrl: options?.tokenUrl,
+          audience,
+        })
+        const latest = {
+          token: tokens.access_token,
+          refreshToken: tokens.refresh_token || cred.refreshToken,
+          expiresAt: Date.now() + (tokens.expires_in ?? 3600) * 1000,
+          clientId,
+          clientSecret: cred.clientSecret,
+        }
+        synapseCredentialState.replaced.add(cred.token)
+        if (latest.refreshToken !== cred.refreshToken) synapseCredentialState.replaced.add(cred.refreshToken)
+        synapseCredentialState.latest = latest
+        synapseCredentialState.save = saveSynapseCredential(latest)
+        if (modelsTarget) {
+          void updateSynapseModelsCache({ target: modelsTarget, token: latest.token, userAgent })
+        }
+        return tokens.access_token
+      } catch {
+        return undefined
+      } finally {
+        synapseCredentialState.refresh = undefined
+      }
+    }
+    const pending = run()
+    synapseCredentialState.refresh = pending
+    return pending
+  }
 
   return {
+    // Fork-only (#74): the live Synapse model list replaces a hand-typed one.
+    // Core reads cfg.provider after this hook resolves (provider/provider.ts).
+    config: async (cfg) => {
+      modelsTarget = synapseModelsTarget(cfg, inferenceUrl)
+      await loadSynapseModels(cfg, {
+        defaultBaseURL: inferenceUrl,
+        userAgent,
+        resolveToken: async () => {
+          const stored = await readStoredSynapseCredential()
+          return synapseModelsToken(stored && currentSynapseCredential(stored))
+        },
+        log: createSynapseModelsFailureLogger((event) => {
+          sessionObserver.logDiagnostic(
+            { timestamp: new Date().toISOString(), type: "FALLBACK_TRIGGERED", details: { ...event } },
+            input.directory,
+          )
+        }, synapseModelsFailuresSeen),
+      })
+    },
     auth: {
       provider: "synapse",
       loader: async (getAuth) => {
@@ -702,8 +880,10 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
           apiKey: isJwtToken ? "oauth-synapse-bearer" : resolvedKey,
           baseURL: inferenceUrl,
           async fetch(requestInput: RequestInfo | URL, init?: RequestInit) {
+            // An earlier refresh may still be saving its rotated token.
+            await synapseCredentialState.save
             let currentAuth = await getAuth()
-            let activeToken =
+            const storedToken =
               currentAuth.type === "api"
                 ? currentAuth.key
                 : currentAuth.type === "oauth"
@@ -711,50 +891,30 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                   : ""
 
             const meta = (currentAuth as any).metadata || {}
-            const clientId = meta.clientId || "ai-office-cli"
-            const refreshToken = meta.refreshToken || (currentAuth.type === "oauth" ? currentAuth.refresh : undefined)
-            const expires = Number(meta.expiresAt || (currentAuth.type === "oauth" ? currentAuth.expires : 0))
+            // Prefer the newest refreshed credential held in memory over a stored one it replaced.
+            const cred = currentSynapseCredential({
+              token: storedToken,
+              refreshToken: meta.refreshToken || (currentAuth.type === "oauth" ? currentAuth.refresh : undefined),
+              expiresAt: Number(meta.expiresAt || (currentAuth.type === "oauth" ? currentAuth.expires : 0)) || undefined,
+              clientId: meta.clientId,
+              clientSecret: meta.clientSecret,
+            })
+            let activeToken = cred.token
+            const refreshToken = cred.refreshToken
+            const expires = cred.expiresAt ?? 0
 
             const isExpiring = !expires || expires - Date.now() <= ACCESS_TOKEN_REFRESH_SKEW_MS || accessTokenIsExpiring(activeToken)
 
             if (isExpiring && refreshToken) {
-              if (!refreshPromise) {
-                refreshPromise = refreshKeystoneToken({
-                  clientId,
-                  refreshToken,
-                  clientSecret: meta.clientSecret || process.env[CLIENT_SECRET_ENV] || "",
-                  tokenUrl: options?.tokenUrl,
-                  audience,
-                })
-                  .then(async (tokens) => {
-                    const refreshedExpires = Date.now() + (tokens.expires_in ?? 3600) * 1000
-                    const refreshedRefresh = tokens.refresh_token || refreshToken
-                    activeToken = tokens.access_token
-                    await input.client.auth
-                      .set({
-                        path: { id: "synapse" },
-                        body: {
-                          type: "api",
-                          key: tokens.access_token,
-                          metadata: {
-                            clientId,
-                            refreshToken: refreshedRefresh,
-                            expiresAt: String(refreshedExpires),
-                          },
-                        },
-                      })
-                      .catch(() => {})
-                    return tokens
-                  })
-                  .finally(() => {
-                    refreshPromise = undefined
-                  })
-              }
-
-              try {
-                const refreshed = await refreshPromise
-                activeToken = refreshed.access_token
-              } catch {}
+              // Only the waiting is bounded. The grant itself always runs to the end and
+              // its new token is kept and saved, so a late reply is never thrown away.
+              const refreshed = await waitAtMost(
+                refreshSynapseCredential({ ...cred, refreshToken }),
+                options?.refreshWaitMs ?? SYNAPSE_CHAT_REFRESH_WAIT_MS,
+              )
+              if (refreshed) activeToken = refreshed
+              // Keep the chat path's guarantee: the rotated token is saved before use.
+              await synapseCredentialState.save
             }
 
             // Parse request body for logging and tool sanitization

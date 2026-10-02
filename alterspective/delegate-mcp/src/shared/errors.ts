@@ -25,6 +25,10 @@ export const ErrorCode = [
   "inbox_unavailable",
   // The inbox refused a post because a rate or hop limit was reached (HTTP 429 from the sidecar).
   "inbox_limited",
+  // #72 oc_close_session / oc_cleanup: the session is running (or being closed), so it was not closed.
+  "session_active",
+  // #72: the session's copy holds commits no host branch has, or uncommitted files; nothing was deleted.
+  "uncollected_work",
   "upstream_error",
   "invalid_input",
 ] as const

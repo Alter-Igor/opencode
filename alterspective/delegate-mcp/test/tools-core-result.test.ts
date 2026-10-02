@@ -185,12 +185,24 @@ describe("oc_doctor, oc_login, oc_list_models, oc_server_restart", () => {
 
   test("models are listed as provider/model, filtered, and junk ids dropped; the Keystone set is shown too", async () => {
     const f = fakeContext()
-    f.api.on("GET /config/providers", { status: 200, data: { providers: [{ id: "synapse", models: { auto: { id: "auto" }, bad: { id: "has space" } } }, { id: "x y", models: { m: {} } }], default: { synapse: "auto" } } })
+    // #71: only synapse/* is listed (even if the box had another provider), and the default is the
+    // box config's `model` (GET /config), not OpenCode's per-provider sort order (/config/providers default).
+    f.api.on("GET /config/providers", { status: 200, data: { providers: [{ id: "synapse", models: { auto: { id: "auto" }, bad: { id: "has space" } } }, { id: "opencode", models: { "big-pickle": {} } }, { id: "x y", models: { m: {} } }], default: { synapse: "openai/gpt-5.6-sol", opencode: "big-pickle" } } })
+    f.api.on("GET /config", { status: 200, data: { model: "synapse/auto" } })
     const all = await invoke(modelsTool, {}, f.ctx)
     expect(data(all)).toEqual({ models: ["synapse/auto"], defaults: ["synapse/auto"], keystone: { connections: ["rag-read", "github", "seqlogs"], source: "default", ceiling: ["rag-read", "github", "seqlogs"], highRisk: [], warnings: [] } })
     expect(text(all).split("\n")[0]).toBe("1 model. Keystone services: rag-read, github, seqlogs (default).")
     const none = await invoke(modelsTool, { provider: "openai" }, f.ctx)
     expect(data(none).models).toEqual([])
+  })
+
+  test("oc_list_models reports no default when the box's model is not a Synapse model (#71)", async () => {
+    const f = fakeContext()
+    f.api.on("GET /config/providers", { status: 200, data: { providers: [{ id: "synapse", models: { auto: { id: "auto" } } }] } })
+    f.api.on("GET /config", { status: 200, data: { model: "opencode/big-pickle" } })
+    expect(data(await invoke(modelsTool, {}, f.ctx))).toMatchObject({ models: ["synapse/auto"], defaults: [] })
+    f.api.on("GET /config", { status: 500 })
+    expect(data(await invoke(modelsTool, {}, f.ctx))).toMatchObject({ code: "upstream_error" })
   })
 
   test("oc_server_restart without confirm is refused and restarts nothing", async () => {
