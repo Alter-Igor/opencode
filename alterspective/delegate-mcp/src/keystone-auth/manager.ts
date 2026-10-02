@@ -170,11 +170,39 @@ async function saveHeld(deps: KeystoneAuthDeps, id: string, held: Held, state: K
   const saved = await attempt(() => store.write(token))
   if (saved.ok) {
     held.refreshToken = undefined
+    // Review cycle 3: the stored token is current again, so drop the failed-save flag at once (the
+    // marker itself stays until the commit). Otherwise a failed commit write plus a silent holder
+    // would make a peer fail closed over a valid token. Best effort: if this write fails, the token
+    // is still saved and the commit's state write clears the flag anyway.
+    if (marker.pendingSaveFailed) {
+      const { pendingSaveFailed: _f, lastError, ...cleared } = marker
+      await attempt(() => writeKsState(deps.home, { ...cleared, ...(lastError && !lastError.startsWith("refresh token not saved") ? { lastError } : {}) }))
+    }
     return true
   }
   safeLog(deps.log, marked.ok ? "warn" : "error", COMPONENT, "keystone refresh token not saved; kept in memory, not published, will retry", { connection: id, store: store.kind, marked: marked.ok })
   if (marked.ok) await attempt(() => writeKsState(deps.home, { ...marker, pendingSaveFailed: true, lastError: `refresh token not saved (${store.kind}); retrying` }))
   return false
+}
+
+/**
+ * Save this bridge's held (unsaved) refresh token for one connection, under the shared lock,
+ * without committing or publishing anything. refreshConnection does this as its first step; it is
+ * exported so the save step can be checked on its own.
+ *
+ * @param deps manager dependencies
+ * @param connectionId Keystone connection id
+ * @returns true when nothing was pending or the token is now saved, false when the save failed
+ * @throws DelegateError invalid_input for a bad id; a lock timeout
+ * @example await savePendingRefresh(deps, "rag-read")
+ */
+export function savePendingRefresh(deps: KeystoneAuthDeps, connectionId: string): Promise<boolean> {
+  const id = assertConnectionId(connectionId)
+  return deps.lock(async () => {
+    const state = await readKsState(deps.home, id)
+    const held = currentHeld(deps, id, state)
+    return held === undefined ? true : saveHeld(deps, id, held, state)
+  })
 }
 
 /** The held set is saved: publish its access token, or record why it cannot be used. */

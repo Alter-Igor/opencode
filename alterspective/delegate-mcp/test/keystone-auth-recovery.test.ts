@@ -6,7 +6,7 @@ import { afterEach, expect, test } from "bun:test"
 import { mkdir, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { readKsState, writeKsState } from "../src/keystone-auth/state.ts"
-import { refreshConnection, refreshDue, signIn, startKeystoneRefreshLoop, type KeystoneAuthDeps } from "../src/keystone-auth/manager.ts"
+import { refreshConnection, refreshDue, savePendingRefresh, signIn, startKeystoneRefreshLoop, type KeystoneAuthDeps } from "../src/keystone-auth/manager.ts"
 import { keystoneAuthStatus } from "../src/keystone-auth/report.ts"
 import { synapseLockFile } from "../src/synapse/lock.ts"
 import { cleanupHomes, harness, type Harness } from "./keystone-auth-fixture.ts"
@@ -203,4 +203,56 @@ test("the loop survives a throwing connection list and keeps ticking", async () 
   stop()
   expect(calls >= 2).toBe(true)
   expect(h.log.lines.some((l) => l.includes("connection list"))).toBe(true)
+})
+
+/** Bridge A whose store refuses writes until `fixed` is set; same store value as the harness. */
+function flakyHolder(h: Harness) {
+  const shared = h.stores.get("rag-read")
+  if (!shared) throw new Error("no store")
+  const control = { fixed: false }
+  const write = shared.write.bind(shared)
+  const deps: KeystoneAuthDeps = { ...h.deps, store: () => ({ ...shared, write: async (v: string) => {
+    if (!control.fixed) throw new Error("test store write failure")
+    await write(v)
+  } }) }
+  return { deps, control, shared }
+}
+
+test("a successful save clears the failed-save flag at once, so a later silent holder never makes a peer fail closed", async () => {
+  const h = await harness()
+  await signedIn(h)
+  const a = flakyHolder(h)
+  h.clock.now += DUE
+  expect((await refreshConnection(a.deps, "rag-read")).outcome).toBe("pending_save")
+  expect((await readKsState(h.home, "rag-read"))?.pendingSaveFailed).toBe(true)
+  // The save alone succeeds (as if the commit's state write after it then failed).
+  a.control.fixed = true
+  expect(await savePendingRefresh(a.deps, "rag-read")).toBe(true)
+  const after = await readKsState(h.home, "rag-read")
+  expect(after?.pendingSaveFailed).toBeUndefined()
+  expect(after?.pendingBy).toBe("test-bridge-a")
+  // The holder goes silent: the peer refreshes with the (valid) stored token, it does not fail closed.
+  h.clock.now += 11 * 60_000
+  expect((await refreshConnection(h.peer("test-bridge-b"), "rag-read")).outcome).toBe("refreshed")
+  expect((await readKsState(h.home, "rag-read"))?.needsSignIn).toBeUndefined()
+})
+
+test("the holder recovers after a peer failed closed: its saved token is committed and published", async () => {
+  const h = await harness()
+  await signedIn(h)
+  const a = flakyHolder(h)
+  h.clock.now += DUE
+  expect((await refreshConnection(a.deps, "rag-read")).outcome).toBe("pending_save")
+  const held = h.keystone.issued[2]
+  h.clock.now += 11 * 60_000
+  expect((await refreshConnection(h.peer("test-bridge-b"), "rag-read")).outcome).toBe("needs_sign_in")
+  a.control.fixed = true
+  h.clock.now += 15_000
+  expect((await refreshConnection(a.deps, "rag-read")).outcome).toBe("refreshed")
+  const state = await readKsState(h.home, "rag-read")
+  expect(state?.needsSignIn).toBeUndefined()
+  expect(state?.pendingBy).toBeUndefined()
+  expect(state?.pendingSaveFailed).toBeUndefined()
+  expect(h.published.at(-1)?.bearer === held).toBe(true)
+  expect(a.shared.value === h.keystone.issued[3]).toBe(true)
 })
