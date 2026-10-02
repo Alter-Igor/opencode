@@ -155,6 +155,9 @@ export class WorkspaceFixture {
       writeFileSync(path.join(this.boxClone(key), file), content)
     }
     await this.boxGit(key, ["add", "-A"])
-    await this.boxGit(key, ["commit", "-q", "-m", message])
+    // The key in the body keeps each test's commit unique: two tests committing the same tree with
+    // the same message in the same second would otherwise make one commit id (and one could look
+    // collected because another test already put it on a host branch).
+    await this.boxGit(key, ["commit", "-q", "-m", message, "-m", `fixture: ${key}`])
   }
 }
