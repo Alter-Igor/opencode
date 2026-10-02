@@ -5,7 +5,7 @@
 // `nginx` on PATH when `sh` and `flock` are available (Git Bash lacks flock).
 import { describe, expect, test } from "bun:test"
 import { createHash } from "node:crypto"
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { MAX_TOKEN_LENGTH, authConf, isAuthConf } from "../src/synapse/auth-conf.ts"
@@ -46,7 +46,8 @@ describe.skipIf(!sh || !Bun.which("flock"))("front-reload run with sh (fake ngin
   const HASH = createHash("sha256").update(SERVERS).digest("hex")
   const TOKEN = jwt({ sub: "oid-1" })
 
-  type Step = { auth?: string; servers?: string; hash?: string; nginxTest?: number; args?: string[] }
+  /** `before` runs just before the script, with the run directory (to plant leftovers). */
+  type Step = { auth?: string; servers?: string; hash?: string; nginxTest?: number; args?: string[]; before?: (run: string) => void }
   const run = (opts: Step = {}) => runSteps([opts])[0]!
 
   /** Runs the script once per step in one directory, so a later step sees an earlier step's files. */
@@ -70,12 +71,14 @@ describe.skipIf(!sh || !Bun.which("flock"))("front-reload run with sh (fake ngin
         rmSync(calls, { force: true })
         writeFileSync(fake, `#!/bin/sh\necho "$*" >> '${calls.replaceAll("\\", "/")}'\n[ "$1" = "-t" ] && exit ${opts.nginxTest ?? 0}\nexit 0\n`)
         chmodSync(fake, 0o755)
+        opts.before?.(path.join(dir, "run"))
         const result = Bun.spawnSync([sh!, SCRIPT, ...(opts.args ?? [])], {
           env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}`, OCD_FRONT_GEN: gen.replaceAll("\\", "/"), OCD_FRONT_RUN: path.join(dir, "run").replaceAll("\\", "/"), OCD_FRONT_HASH: opts.hash ?? HASH },
         })
         const current = path.join(dir, "run", "current.conf")
         const published = existsSync(current) ? readFileSync(current, "utf8") : undefined
-        return { code: result.exitCode, stderr: result.stderr.toString(), nginx: existsSync(calls) ? readFileSync(calls, "utf8").trim().split("\n") : [], published }
+        const list = (name: string) => (existsSync(path.join(dir, "run", name)) ? readdirSync(path.join(dir, "run", name)).sort() : [])
+        return { code: result.exitCode, stderr: result.stderr.toString(), nginx: existsSync(calls) ? readFileSync(calls, "utf8").trim().split("\n") : [], published, attempts: list("attempts"), generations: list("generations") }
       })
     } finally {
       rmSync(dir, { recursive: true, force: true })
@@ -134,5 +137,40 @@ describe.skipIf(!sh || !Bun.which("flock"))("front-reload run with sh (fake ngin
     const [loaded, refused] = runSteps([{ auth: authConf(undefined) }, { auth: authConf(TOKEN), nginxTest: 1 }])
     expect(loaded).toMatchObject({ code: 0, published: expect.stringContaining(`${HASH}-${sha(authConf(undefined))}/servers.conf;`) })
     expect(refused).toMatchObject({ code: 4, nginx: ["-t -q"], published: loaded!.published })
+  })
+
+  test("a refused attempt leaves no marker behind (it was never signalled)", () => {
+    expect(run({ auth: authConf(undefined), nginxTest: 1 })).toMatchObject({ code: 4, attempts: [] })
+  })
+
+  test("leftovers older than ten minutes go at the next run; recent ones and what current.conf names stay", () => {
+    const age = (file: string) => utimesSync(file, new Date(Date.now() - 20 * 60_000), new Date(Date.now() - 20 * 60_000))
+    const [loaded, next] = runSteps([
+      { auth: authConf(undefined) },
+      {
+        auth: authConf(TOKEN),
+        nginxTest: 1,
+        before: (runDir) => {
+          // The loaded generation and marker are old too, but current.conf names them, so they stay.
+          for (const name of readdirSync(path.join(runDir, "attempts"))) age(path.join(runDir, "attempts", name))
+          for (const name of readdirSync(path.join(runDir, "generations"))) age(path.join(runDir, "generations", name))
+          writeFileSync(path.join(runDir, "attempts", `${"a".repeat(32)}.conf`), "")
+          age(path.join(runDir, "attempts", `${"a".repeat(32)}.conf`))
+          writeFileSync(path.join(runDir, "attempts", `${"b".repeat(32)}.conf`), "")
+          for (const name of ["deadbeef", ".stage.killed"]) {
+            mkdirSync(path.join(runDir, "generations", name))
+            age(path.join(runDir, "generations", name))
+          }
+        },
+      },
+    ])
+    // Copied first: toMatchObject with an asymmetric matcher rewrites the received array in bun.
+    const [attempts, generations] = [[...loaded!.attempts], [...loaded!.generations]]
+    expect(loaded).toMatchObject({ code: 0, attempts: [expect.stringMatching(/^[0-9a-f]{32}\.conf$/)] })
+    expect(next).toMatchObject({ code: 4, published: loaded!.published })
+    expect(next!.attempts).toEqual([...attempts, `${"b".repeat(32)}.conf`].sort())
+    expect(next!.generations).toEqual(expect.arrayContaining(generations))
+    expect(next!.generations).not.toContain("deadbeef")
+    expect(next!.generations).not.toContain(".stage.killed")
   })
 })

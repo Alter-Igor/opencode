@@ -96,12 +96,21 @@ mkdir -p "$RUN/generations" "$RUN/attempts" || exit 6
 # Never remove the lock file: a new inode could let overlapping callers acquire separate locks.
 exec 9>"$RUN/reload.lock" || exit 6
 flock -n 9 || { log "another reload is running"; exit 8; }
+# Failed or killed attempts leave markers, generations and stage folders (cleanup otherwise runs only
+# after an acknowledgement). Under the lock, drop those older than ten minutes, long past any parse a
+# signal could have started, and keep what current.conf names.
+KEEP=$(cat "$RUN/current.conf" 2> /dev/null) || KEEP=
+for old in "$RUN"/attempts/*.conf "$RUN"/generations/* "$RUN"/generations/.stage.*; do
+  [ -e "$old" ] || continue
+  case "$KEEP" in *"$old/"* | *"$old;"*) continue ;; esac
+  [ -n "$(find "$old" -maxdepth 0 -mmin +10 2> /dev/null)" ] && rm -rf "$old"
+done
 STAGE=$(mktemp -d "$RUN/generations/.stage.XXXXXX") || exit 6
 trap 'rm -rf "$STAGE"' EXIT
 snapshot || exit $?
 [ "${1:-}" = --start ] && exit 0
 # nginx's own messages may quote config text: never pass them on.
-nginx -t -q > /dev/null 2>&1 || { restore; log "nginx -t refused the config; kept the last one; not reloading"; exit 4; }
+nginx -t -q > /dev/null 2>&1 || { restore; rm -f "$MARKER"; log "nginx -t refused the config; kept the last one; not reloading"; exit 4; }
 nginx -s reload > /dev/null 2>&1 || { log "nginx -s reload failed"; exit 5; }
 deadline=$(( $(date +%s) + 20 ))
 while [ "$(date +%s)" -lt "$deadline" ]; do
