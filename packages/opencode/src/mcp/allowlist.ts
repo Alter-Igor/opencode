@@ -37,8 +37,9 @@ function loadRules(raw: string): Rule[] | string {
 }
 
 function checkOAuth(oauth: ConfigMCPV1.Remote["oauth"]): Result {
-  if (oauth === undefined) return ok
-  if (oauth === false) return refuse("oauth:false is not allowed")
+  // #67: oauth:false is allowed. OpenCode then builds no OAuth client, does no discovery and refuses
+  // an in-box sign-in; the Authorization header is added outside the box. URL rules still apply.
+  if (oauth === undefined || oauth === false) return ok
   const extra = Object.keys(oauth).filter((key) => !ALLOWED_OAUTH_KEYS.has(key))
   if (extra.length > 0) return refuse(`oauth.${extra.join(", oauth.")} is not allowed`)
   return ok
