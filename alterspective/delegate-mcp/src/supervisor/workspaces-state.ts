@@ -6,6 +6,7 @@
 // metadata is only a lookup key. Files are written whole (temp file + rename) and validated on read.
 import { mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs"
 import path from "node:path"
+import { PROJECT_RE } from "../shared/config.ts"
 import { SESSION_ID_RE } from "../shared/contracts.ts"
 import { DelegateError } from "../shared/errors.ts"
 import { CONNECTION_ID, MAX_CONNECTIONS } from "../shared/keystone.ts"
@@ -38,10 +39,15 @@ export type HostSessionState = {
   agent?: string
   /** R4-01: the Keystone connections the session was narrowed to; absent = the whole box-wide set. */
   keystone?: string[]
+  /**
+   * #53: the compose project (OPENCODE_DELEGATE_PROJECT) of the box whose `sessions` volume holds the
+   * clone, stamped at bind time. Absent on records from older bridges; those are never pruned.
+   */
+  boxProject?: string
 }
 
-/** Written by oc_start_session right after POST /session. */
-export type SessionBinding = { sessionID: string; profile: SessionProfile; supervisor: string; model?: string; agent?: string; keystone?: string[] }
+/** Written by oc_start_session right after POST /session; the workspaces layer adds `boxProject`. */
+export type SessionBinding = { sessionID: string; profile: SessionProfile; supervisor: string; model?: string; agent?: string; keystone?: string[]; boxProject?: string }
 
 /** A valid narrowing list (each a connection id, bounded), or undefined. */
 function keystoneList(value: unknown): string[] | undefined {
@@ -81,7 +87,9 @@ export function parseHostState(raw: string, key: string): HostSessionState | und
   // A narrowing list that does not parse is dropped; the session's permission rules then no longer
   // match on the next send (send.ts), which refuses it: fails closed.
   const keystone = keystoneList(p.keystone)
-  return { ...state, ...(model ? { model } : {}), ...(agent ? { agent } : {}), ...(keystone ? { keystone } : {}) }
+  // A box name that does not parse is dropped: the record then counts as legacy and is never pruned.
+  const boxProject = optional(p.boxProject, PROJECT_RE)
+  return { ...state, ...(model ? { model } : {}), ...(agent ? { agent } : {}), ...(keystone ? { keystone } : {}), ...(boxProject ? { boxProject } : {}) }
 }
 
 function checkState(state: HostSessionState): void {
@@ -92,7 +100,8 @@ function checkState(state: HostSessionState): void {
     (state.supervisor !== undefined && !SUPERVISOR_RE.test(state.supervisor)) ||
     (state.model !== undefined && !MODEL_RE.test(state.model)) ||
     (state.agent !== undefined && !AGENT_RE.test(state.agent)) ||
-    (state.keystone !== undefined && keystoneList(state.keystone) === undefined)
+    (state.keystone !== undefined && keystoneList(state.keystone) === undefined) ||
+    (state.boxProject !== undefined && !PROJECT_RE.test(state.boxProject))
   if (bad) throw new DelegateError("upstream_error", "The session's host record would not be valid, so it was not saved.", "Start the session again with oc_start_session.", "invalid host state")
 }
 

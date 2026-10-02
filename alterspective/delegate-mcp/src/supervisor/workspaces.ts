@@ -20,6 +20,7 @@ import { boxFailure, canonicalPath, invalidFolder, isUnder, runCommand, samePath
 import { copyOutBundle, dockerTarSource, type TarSource } from "./workspaces-copyout.ts"
 import { assertRegularFile, DEFAULT_MAX_BUNDLE_BYTES, planOutBundle, randomNonce, removeQuietly, reserveInBundle } from "./workspaces-handoff.ts"
 import { bindHostState, COMMIT_ID, listHostStates, readHostState, removeHostState, SESSION_KEY, writeHostState, type HostSessionState, type SessionBinding } from "./workspaces-state.ts"
+import { createSessionPruner, type MissingSession } from "./workspaces-prune.ts"
 
 export { canonicalPath, cleanEnv, isUnder, parseSubst, runCommand, TIMEOUT_CODE, type Exec, type ExecOptions, type ExecResult } from "./workspaces-exec.ts"
 export { isHostExecutableMode, isHostExecutablePath, parseRawDiff, scriptsChanged, type RawEntry } from "./workspaces-detect.ts"
@@ -281,6 +282,11 @@ export type DelegateWorkspaces = Omit<Workspaces, "open" | "collect"> & {
   sessionState(sessionKey: string): Promise<HostSessionState | undefined>
   /** Every readable host record, newest first. */
   listSessionStates(): Promise<HostSessionState[]>
+  /**
+   * #53: bounded cleanup of confirmed missing sessions whose clones are also proved absent. Only
+   * records this box made (same `boxProject`) and sessions not `tracked` in memory. Returns removed keys.
+   */
+  pruneSessionStates(supervisor: string, missing: MissingSession, tracked?: (sessionID: string) => boolean): Promise<string[]>
   /** Best effort (W3A-14): remove the box clone and the host record of a session that never started. Never throws. */
   discard(sessionKey: string): Promise<void>
 }
@@ -324,6 +330,9 @@ export function createWorkspaces(options: WorkspacesOptions): DelegateWorkspaces
     nonce: options.nonce ?? randomNonce,
   }
   const logger = options.logger ?? silentLogger
+  // #53: the host records folder is shared by every project under one home; the record names its box.
+  const boxProject = options.config.project
+  const pruneSessionStates = createSessionPruner({ stateDir: ctx.stateDir, boxSessions: ctx.boxSessions, box: ctx.box, boxProject, timeoutMs: ctx.timeouts.short })
   // Session keys are logged (they are the owner's own labels); repo paths go only to failure detail.
   return {
     open: (hostRepo: string, sessionKey: string, call?: CallOptions) =>
@@ -331,9 +340,10 @@ export function createWorkspaces(options: WorkspacesOptions): DelegateWorkspaces
     collect: (ws: Workspace, call?: CallOptions) =>
       traced(logger, "collect", call, { sessionKey: ws.sessionKey }, () => collect(ctx, ws), (r) => ({ branch: r.branch, commits: r.commits, hostExecutableChanges: r.hostExecutableChanges.length })),
     resolveRepo: (hostRepo: string, call?: CallOptions) => traced(logger, "resolveRepo", call, {}, () => resolveRepo(ctx, hostRepo)),
-    bindSession: async (key, binding) => bindHostState(ctx.stateDir, key, binding),
+    bindSession: async (key, binding) => bindHostState(ctx.stateDir, key, { ...binding, boxProject }),
     sessionState: async (key) => readHostState(ctx.stateDir, key),
     listSessionStates: async () => listHostStates(ctx.stateDir),
+    pruneSessionStates,
     discard: (key) => discard(ctx, key),
   }
 }

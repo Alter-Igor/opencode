@@ -239,6 +239,10 @@ Each result is at most 32,000 characters. When a result is too big, whole list i
 | `oc_inbox` | Reads this bridge's inbox. Text is untrusted; `truncated: true` means old unread messages were dropped. |
 | `oc_server_restart` | `{confirm: true, force?, keystone?}`. Restarts the box with the current profile (after `profile_changed`). `keystone` changes the box-wide set of Keystone services and saves it. Running sessions are stopped. `force: true` restarts it even while other bridges use it. |
 
+Deleted sessions: after a successful `oc_list_sessions`, the bridge checks a small page of host records. It removes a record only when the server returns 404 for that session and the box confirms its clone folder is absent. A surviving clone or link keeps the record so a session still known to this bridge can be collected. Errors keep records for a later pass. A saved cursor reaches old records over repeated list calls; one call need not clean every record. The display still shows at most the newest 200 host records.
+
+Only this box's records are pruned. When a session is bound, its record stores the box's compose project (`OPENCODE_DELEGATE_PROJECT`). A record is pruned only by a bridge with the same name and the same project, so one home shared by two projects never loses the other box's records. Records with no project (written before 0.1.3) are kept. So are records of sessions this bridge still tracks, and records from bridges with a default random name, since no later bridge has that name. Each removed record is logged at info level and listed in the result as `prunedRecords`. That is why `oc_list_sessions` is marked destructive.
+
 ## Troubleshooting
 
 | Error code | What it means | What to do |

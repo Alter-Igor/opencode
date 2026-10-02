@@ -173,6 +173,7 @@ function fakeServices(f: Fake): Pick<ToolContext, "supervisorService" | "workspa
       },
       sessionState: async (key) => f.states.get(key),
       listSessionStates: async () => [...f.states.values()],
+      pruneSessionStates: async () => [],
       discard: async (key) => {
         f.discarded.push(key)
         f.states.delete(key)
