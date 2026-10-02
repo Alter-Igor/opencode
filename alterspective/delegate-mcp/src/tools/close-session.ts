@@ -13,7 +13,7 @@ import type { Box, ToolContext } from "./context.ts"
 import { whileClosing } from "./closing.ts"
 import { boxPathOf, checkSessionId, hostState, ownedStates, recordFromState, sessionIdSchema, type RemoteSession } from "./core-session.ts"
 import { defineTool } from "./define.ts"
-import { ok } from "./shape.ts"
+import { ok, untrusted } from "./shape.ts"
 
 export const TTL_ENV = "OPENCODE_DELEGATE_SESSION_TTL_DAYS"
 export const DEFAULT_TTL_DAYS = 14
@@ -75,7 +75,21 @@ const active = (sessionID: string, state: SessionState, aborted: boolean) =>
     ? new DelegateError("session_active", `Session ${sessionID} was asked to abort but is still ${state}, so nothing was deleted.`, "Retry in a moment; check oc_status.")
     : new DelegateError("session_active", `Session ${sessionID} is ${state}, so nothing was deleted.`, "Wait for it with oc_wait, or pass abort: true to stop it first.")
 
-function refusalError(sessionID: string, outcome: Pick<CloseOutcome, "refused" | "uncollectedCommits" | "uncommittedPaths">, canCollect: boolean): DelegateError {
+/** Box-supplied path names, shown only when they are plain (anything else is counted, not echoed). */
+const PLAIN_PATH = /^[A-Za-z0-9._@+/-]{1,200}$/
+function examples(paths: readonly string[]): string {
+  const plain = paths.filter((p) => PLAIN_PATH.test(p))
+  const odd = paths.length - plain.length
+  return [...plain, ...(odd ? [`${odd} with unusual names`] : [])].join(", ")
+}
+
+function refusalError(sessionID: string, outcome: Pick<CloseOutcome, "refused" | "uncollectedCommits" | "uncommittedPaths" | "ignoredPaths" | "ignoredExamples">, canCollect: boolean): DelegateError {
+  if (outcome.refused === "ignored_files")
+    return new DelegateError(
+      "uncollected_work",
+      `Session ${sessionID}'s copy has ${plural(outcome.ignoredPaths, "git-ignored path")} that oc_collect does not carry (${examples(outcome.ignoredExamples)}), so nothing was deleted.`,
+      "Copy what you need out of the sandbox first, or pass discardWork: true to delete them. Dependency and cache folders (node_modules, .cache, .turbo, __pycache__, .pytest_cache, .venv, coverage) never block.",
+    )
   if (outcome.refused === "check_failed") return new DelegateError("upstream_error", `Could not check session ${sessionID}'s copy for uncollected work, so nothing was deleted.`, "Retry; if it repeats, run oc_doctor.")
   const lost = [outcome.uncollectedCommits ? plural(outcome.uncollectedCommits, "uncollected commit") : "", outcome.uncommittedPaths ? plural(outcome.uncommittedPaths, "uncommitted file") : ""].filter(Boolean).join(" and ")
   const action = canCollect
@@ -122,9 +136,10 @@ async function keepTracked(ctx: ToolContext, sessionID: string, sessionKey: stri
 
 function closeSummary(o: CloseOutcome): string {
   const lost = o.uncollectedCommits || o.uncommittedPaths ? ` Deleted (discardWork) ${plural(o.uncollectedCommits, "uncollected commit")} and ${plural(o.uncommittedPaths, "uncommitted file")}.` : ""
-  const ignored = o.ignoredPaths ? ` ${plural(o.ignoredPaths, "git-ignored path")} went with the copy.` : ""
-  if (o.closed) return `Session ${o.sessionID} closed: session ${o.session}, copy ${o.clone}, record removed, branch ${o.branch}.${lost}${ignored}`
-  const why = o.refused ? ` Refused (${o.refused}): ${plural(o.uncollectedCommits, "uncollected commit")} and ${plural(o.uncommittedPaths, "uncommitted file")} appeared while closing, so the copy was kept; oc_collect can still fetch it while this bridge runs.` : ""
+  const ignored = o.ignoredPaths ? ` Deleted (discardWork) ${plural(o.ignoredPaths, "git-ignored path")}.` : ""
+  const discarded = o.discardedCommits ? ` ${plural(o.discardedCommits, "discarded commit")} (replaced by amend or reset, reflog only) went with the copy.` : ""
+  if (o.closed) return `Session ${o.sessionID} closed: session ${o.session}, copy ${o.clone}, record removed, branch ${o.branch}.${lost}${ignored}${discarded}`
+  const why = o.refused ? ` Refused (${o.refused}): ${plural(o.uncollectedCommits, "uncollected commit")}, ${plural(o.uncommittedPaths, "uncommitted file")} and ${plural(o.ignoredPaths, "git-ignored path")} appeared while closing, so the copy and its host record were kept; oc_collect can still fetch it.` : ""
   return `Session ${o.sessionID} only partly closed (session ${o.session}, copy ${o.clone}, branch ${o.branch}, record ${o.record}); the host record was kept, so oc_close_session can be retried.${why}`
 }
 
@@ -150,14 +165,15 @@ async function closeOne(ctx: ToolContext, box: Box, located: Located, args: Clos
   }
   if (outcome.closed) ctx.sessions.delete(args.sessionID)
   else if (outcome.session !== "kept") await keepTracked(ctx, args.sessionID, located.sessionKey)
-  return ok(closeSummary(outcome), { ...outcome, aborted })
+  const { ignoredExamples, ...rest } = outcome
+  return ok(closeSummary(outcome), { ...rest, aborted, ...(ignoredExamples.length ? { ignoredExamples: untrusted(ignoredExamples.join("\n"), 2000) } : {}) })
 }
 
 export const closeSessionTool = defineTool({
   name: "oc_close_session",
   title: "Close a finished session",
   description:
-    "Delete one of this bridge's finished sessions: the OpenCode session, its copy in the sandbox and the bridge's host record. Refused while the session is running or needs input (abort: true stops it first), while its state cannot be read (retry), and while its copy has commits no host branch has or uncommitted files (run oc_collect first, or discardWork: true deletes them). " +
+    "Delete one of this bridge's finished sessions: the OpenCode session, its copy in the sandbox and the bridge's host record. Refused while the session is running or needs input (abort: true stops it first), while its state cannot be read (retry), and while its copy has commits no host branch has, uncommitted files, or git-ignored files other than dependency/cache folders (node_modules, .cache, .turbo, __pycache__, .pytest_cache, .venv, coverage) such as dist/ or .env (run oc_collect or copy them first; discardWork: true deletes them). Commits only the reflog still holds (replaced by amend or reset) never block and are reported as discardedCommits. " +
     "deleteBranch: true also deletes the host branch delegate/<key>, only when another host branch contains it (discardWork: true deletes it unmerged); a branch checked out anywhere or a symbolic ref is never deleted, and no other branch is touched.",
   input: {
     sessionID: sessionIdSchema,
@@ -173,7 +189,7 @@ export const closeSessionTool = defineTool({
   },
 })
 
-type Row = { sessionKey: string; reason: string; uncollectedCommits: number; uncommittedPaths: number }
+type Row = { sessionKey: string; reason: string; uncollectedCommits: number; uncommittedPaths: number; ignoredPaths: number; discardedCommits: number }
 type Sweep = { closed: string[]; wouldClose: string[]; kept: Row[]; partial: string[]; skipped: { recent: number; active: number; unknown: number } }
 type Candidate = { sessionID: string; sessionKey: string; createdAt: string }
 type SweepRun = { ctx: ToolContext; box: Box; cutoff: number; dryRun: boolean; deleteBranch: boolean; correlationId: string; out: Sweep }
@@ -198,8 +214,8 @@ async function staleness(run: SweepRun, state: Candidate): Promise<{ skip: keyof
   return UNVERIFIED.has(now) ? { skip: "unknown" } : ACTIVE.has(now) ? { skip: "active" } : { present: true }
 }
 
-function keep(out: Sweep, sessionKey: string, reason: string, o: { uncollectedCommits: number; uncommittedPaths: number }): void {
-  out.kept.push({ sessionKey, reason, uncollectedCommits: o.uncollectedCommits, uncommittedPaths: o.uncommittedPaths })
+function keep(out: Sweep, sessionKey: string, reason: string, o: Omit<Row, "sessionKey" | "reason">): void {
+  out.kept.push({ sessionKey, reason, uncollectedCommits: o.uncollectedCommits, uncommittedPaths: o.uncommittedPaths, ignoredPaths: o.ignoredPaths, discardedCommits: o.discardedCommits })
 }
 
 /** One stale candidate: listed (dry run) or closed with every guard, never aborted, never discarding work. */
@@ -230,7 +246,11 @@ async function sweepOne(run: SweepRun, state: Candidate): Promise<void> {
     ctx.sessions.delete(state.sessionID)
     out.closed.push(state.sessionKey)
   } else if (o.refused && o.session === "kept") keep(out, state.sessionKey, o.refused, o)
-  else out.partial.push(state.sessionKey)
+  else {
+    // Late refusal (session deleted, copy and host record kept): same handling as oc_close_session.
+    out.partial.push(state.sessionKey)
+    if (o.session !== "kept") await keepTracked(ctx, state.sessionID, state.sessionKey)
+  }
 }
 
 function sweepSummary(out: Sweep, dryRun: boolean, days: number, examined: number, otherBridge: number): string {
@@ -243,7 +263,7 @@ export const cleanupTool = defineTool({
   name: "oc_cleanup",
   title: "Sweep stale sessions",
   description:
-    `Find this bridge's sessions idle longer than ${TTL_ENV} days (default ${DEFAULT_TTL_DAYS}; 0 disables) and close them with oc_close_session's guards, never aborting and never discarding work: a session with uncollected commits or uncommitted files, or one that is running, needs input or cannot be checked, is kept. ` +
+    `Find this bridge's sessions idle longer than ${TTL_ENV} days (default ${DEFAULT_TTL_DAYS}; 0 disables) and close them with oc_close_session's guards, never aborting and never discarding work: a session with uncollected commits, uncommitted files or blocking git-ignored files (anything but dependency/cache folders), or one that is running, needs input or cannot be checked, is kept and listed with its reason. ` +
     `dryRun (default true) only lists what would be removed. Each call looks at up to ${MAX_EXAMINED} records and closes up to ${MAX_CLOSED}, continuing where the last call stopped. Only sessions of this bridge's name are seen. deleteBranch: true also deletes delegate/<key> branches another host branch contains.`,
   input: {
     dryRun: z.boolean().optional().describe("Only report what would be removed. Default true."),
@@ -256,7 +276,8 @@ export const cleanupTool = defineTool({
     const out: Sweep = { closed: [], wouldClose: [], kept: [], partial: [], skipped: { recent: 0, active: 0, unknown: 0 } }
     if (days === 0) return ok(`The session sweep is disabled (${TTL_ENV}=0).`, { disabled: true, dryRun, ttlDays: 0, ...out })
     const cutoff = Date.now() - days * DAY_MS
-    const candidates = await ctx.workspaces.closeCandidates(ctx.supervisor, new Date(cutoff), MAX_EXAMINED)
+    // A dry run leaves the sweep cursor where it is, so the real run then sees the same records.
+    const candidates = await ctx.workspaces.closeCandidates(ctx.supervisor, new Date(cutoff), MAX_EXAMINED, { moveCursor: !dryRun })
     const run: SweepRun = { ctx, box: await ctx.box(), cutoff, dryRun, deleteBranch: args.deleteBranch === true, correlationId, out }
     for (const state of candidates.states) {
       if (out.closed.length + out.wouldClose.length >= MAX_CLOSED) break

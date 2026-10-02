@@ -65,15 +65,47 @@ describe("closeSession: happy path", () => {
   )
 
   test(
-    "git-ignored files are counted and reported but do not block (oc_collect never carries them); the bridge's own scratch is not counted",
+    "cycle 2: ignored dependency/cache folders do not block; the bridge's own scratch is not counted",
     async () => {
       const s = await started()
-      appendFileSync(path.join(fx.boxClone(s.key), ".git", "info", "exclude"), "*.log\n")
-      writeFileSync(path.join(fx.boxClone(s.key), "build.log"), "x\n")
+      appendFileSync(path.join(fx.boxClone(s.key), ".git", "info", "exclude"), "node_modules/\n")
+      mkdirSync(path.join(fx.boxClone(s.key), "node_modules", "x"), { recursive: true })
+      writeFileSync(path.join(fx.boxClone(s.key), "node_modules", "x", "index.js"), "x\n")
       mkdirSync(path.join(fx.boxClone(s.key), ".system_generated"), { recursive: true })
       writeFileSync(path.join(fx.boxClone(s.key), ".system_generated", "obs.json"), "{}\n")
       const out = await s.ws.closeSession(s.key, s.owner, KEEP, s.hooks())
-      expect(out).toMatchObject({ closed: true, ignoredPaths: 1, uncommittedPaths: 0 })
+      expect(out).toMatchObject({ closed: true, ignoredPaths: 0, uncommittedPaths: 0 })
+    },
+    T,
+  )
+
+  test(
+    "cycle 2: other git-ignored files (dist/out.js, .env) block unless discardWork, with up to 10 example paths",
+    async () => {
+      const s = await started()
+      appendFileSync(path.join(fx.boxClone(s.key), ".git", "info", "exclude"), "dist/\n.env\n")
+      mkdirSync(path.join(fx.boxClone(s.key), "dist"), { recursive: true })
+      writeFileSync(path.join(fx.boxClone(s.key), "dist", "out.js"), "x\n")
+      writeFileSync(path.join(fx.boxClone(s.key), ".env"), "A=1\n")
+      const out = await s.ws.closeSession(s.key, s.owner, KEEP, s.hooks())
+      expect(out).toMatchObject({ closed: false, refused: "ignored_files", session: "kept", clone: "kept", record: "kept", ignoredPaths: 2 })
+      expect([...out.ignoredExamples].sort()).toEqual([".env", "dist/"])
+      expect(s.calls).toEqual([])
+      const discarded = await s.ws.closeSession(s.key, s.owner, { discardWork: true, deleteBranch: false }, s.hooks())
+      expect(discarded).toMatchObject({ closed: true, ignoredPaths: 2 })
+    },
+    T,
+  )
+
+  test(
+    "cycle 2: a commit replaced by --amend is reported as discarded and does not block after collect",
+    async () => {
+      const s = await started()
+      await fx.boxCommit(s.key, { "a.txt": "one\n" }, "first try")
+      await fx.boxGit(s.key, ["commit", "-q", "--amend", "-m", "amended"])
+      await s.ws.collect(s.opened)
+      const out = await s.ws.closeSession(s.key, s.owner, KEEP, s.hooks())
+      expect(out).toMatchObject({ closed: true, uncollectedCommits: 0, discardedCommits: 1 })
     },
     T,
   )
@@ -134,7 +166,7 @@ describe("closeSession: data-loss guards", () => {
   )
 
   test(
-    "commits on another box branch, reflog-only commits and uncommitted files are all uncollected work",
+    "commits on another box branch and uncommitted files are uncollected work; reflog-only commits are only reported",
     async () => {
       const s = await started()
       await fx.boxGit(s.key, ["checkout", "-q", "-b", "side"])
@@ -144,7 +176,7 @@ describe("closeSession: data-loss guards", () => {
       await fx.boxGit(s.key, ["reset", "-q", "--hard", "HEAD~1"])
       writeFileSync(path.join(fx.boxClone(s.key), "loose.txt"), "not committed\n")
       const out = await s.ws.closeSession(s.key, s.owner, KEEP, s.hooks())
-      expect(out).toMatchObject({ closed: false, refused: "uncollected_work", uncollectedCommits: 2, uncommittedPaths: 1 })
+      expect(out).toMatchObject({ closed: false, refused: "uncollected_work", uncollectedCommits: 1, discardedCommits: 1, uncommittedPaths: 1 })
       expect(s.calls).toEqual([])
     },
     T,
@@ -372,8 +404,11 @@ describe("closeCandidates", () => {
       const dir = path.join(fx.tmp, "cand-b")
       await seeded(dir, 25)
       const cutoff = new Date(Date.UTC(2026, 0, 10))
+      const preview = await fx.workspaces({ stateDir: dir }).closeCandidates(SUPERVISOR, cutoff, 20, { moveCursor: false })
       const first = await fx.workspaces({ stateDir: dir }).closeCandidates(SUPERVISOR, cutoff, 20)
       const second = await fx.workspaces({ stateDir: dir }).closeCandidates(SUPERVISOR, cutoff, 20)
+      // cycle 2: a dry run (moveCursor: false) sees exactly what the real run then sees.
+      expect(preview.states.map((s) => s.sessionKey)).toEqual(first.states.map((s) => s.sessionKey))
       expect(first.states.map((s) => s.sessionKey)[0]).toBe("cand-001")
       expect(first.states).toHaveLength(20)
       expect(second.states.map((s) => s.sessionKey).slice(0, 5)).toEqual(["cand-021", "cand-022", "cand-023", "cand-024", "cand-025"])

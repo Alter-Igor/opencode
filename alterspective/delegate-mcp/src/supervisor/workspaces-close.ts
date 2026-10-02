@@ -6,8 +6,9 @@
 //      oc_collect keeps working, because the OpenCode session still exists;
 //   4. delete the session, then (unless discardWork) a last check catches work that slipped in;
 //   5. remove the clone, the branch, the record; the first failure stops there and keeps the record.
-// Data-loss guards: commits in the clone (refs, HEAD and reflogs) that no host branch contains, and
-// uncommitted files, are refused unless discardWork. Git-ignored files are counted and reported only.
+// Data-loss guards: commits reachable from the clone's refs or HEAD that no host branch contains,
+// uncommitted files, and git-ignored files outside IGNORED_ALLOWED are refused unless discardWork.
+// Reflog-only commits (e.g. replaced by --amend or reset) never block; they are reported as discarded.
 // The host branch goes only when another host branch contains it (never HEAD alone, never a
 // symbolic ref, never when checked out), unless discardWork; the delete is a --no-deref
 // compare-and-delete of that one ref. Only records of this bridge, this box and this session id.
@@ -23,6 +24,10 @@ import { COMMIT_ID, parseHostState, SESSION_KEY, SUPERVISOR_RE, type HostSession
 const MAX_TIPS = 50
 /** Record names read per closeCandidates call (a persisted cursor continues from the last one). */
 const MAX_SCAN = 100
+/** Git-ignored dependency and cache folders that never block a close (anything else ignored does). */
+export const IGNORED_ALLOWED: ReadonlySet<string> = new Set(["node_modules", ".cache", ".turbo", "__pycache__", ".pytest_cache", ".venv", "coverage"])
+/** Ignored paths named in a refusal. */
+const MAX_IGNORED_EXAMPLES = 10
 
 export type CloseOwner = { supervisor: string; sessionID: string }
 export type CloseOptions = { discardWork: boolean; deleteBranch: boolean }
@@ -31,9 +36,14 @@ export type SessionRemoval = "deleted" | "already_gone"
 /** `stop` makes sure nothing writes the clone any more (or throws); `deleteSession` removes the OpenCode session. */
 export type CloseHooks = { stop: () => Promise<void>; deleteSession: () => Promise<SessionRemoval> }
 export type BranchPlan = "not_requested" | "absent" | "merged" | "unmerged" | "checked_out" | "symbolic" | "unknown"
-export type CloseRefusal = "uncollected_work" | "check_failed"
+export type CloseRefusal = "uncollected_work" | "ignored_files" | "check_failed"
 
-type Counts = { uncollectedCommits: number; uncommittedPaths: number; ignoredPaths: number }
+/**
+ * uncollectedCommits: reachable commits no host branch has (block). discardedCommits: reflog-only
+ * commits no host branch has (reported, never block). ignoredPaths: git-ignored paths outside
+ * IGNORED_ALLOWED (block); ignoredExamples: up to 10 of them, as the box names them (box data).
+ */
+type Counts = { uncollectedCommits: number; discardedCommits: number; uncommittedPaths: number; ignoredPaths: number; ignoredExamples: string[] }
 
 export type ClosePlan = Counts & {
   sessionKey: string
@@ -121,18 +131,29 @@ async function cloneTips(deps: CloseDeps, key: string): Promise<string[] | undef
   return tips.size <= MAX_TIPS ? [...tips] : undefined
 }
 
-/** Uncommitted (changed, untracked) and git-ignored paths; `-z`: a rename or copy carries a second path. */
-async function worktreeCounts(deps: CloseDeps, key: string): Promise<Pick<Counts, "uncommittedPaths" | "ignoredPaths"> | undefined> {
+type Tree = Pick<Counts, "uncommittedPaths" | "ignoredPaths" | "ignoredExamples">
+
+/** An ignored path inside an allowed dependency/cache folder (any folder level), or the bridge's own scratch. */
+function ignoredAllowed(deps: CloseDeps, file: string): boolean {
+  if (deps.excludes.some((prefix) => file.startsWith(prefix))) return true
+  return file.split("/").slice(0, -1).some((folder) => IGNORED_ALLOWED.has(folder))
+}
+
+/** Uncommitted (changed, untracked) and blocking git-ignored paths; `-z`: a rename or copy carries a second path. */
+async function worktreeCounts(deps: CloseDeps, key: string): Promise<Tree | undefined> {
   const result = await boxGit(deps, key, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching", "--ignore-submodules=none"])
   if (result.code !== 0) return undefined
   const entries = result.stdout.split("\u0000")
-  const out = { uncommittedPaths: 0, ignoredPaths: 0 }
+  const out: Tree = { uncommittedPaths: 0, ignoredPaths: 0, ignoredExamples: [] }
   for (let i = 0; i < entries.length; i++) {
     const entry = entries[i] ?? ""
     if (!entry) continue
     if (/^[RC]/.test(entry)) i++
     if (!entry.startsWith("!! ")) out.uncommittedPaths++
-    else if (!deps.excludes.some((prefix) => entry.slice(3).startsWith(prefix))) out.ignoredPaths++
+    else if (!ignoredAllowed(deps, entry.slice(3))) {
+      out.ignoredPaths++
+      if (out.ignoredExamples.length < MAX_IGNORED_EXAMPLES) out.ignoredExamples.push(entry.slice(3, 203))
+    }
   }
   return out
 }
@@ -167,17 +188,18 @@ const numberOf = (result: { code: number; stdout: string }) => {
   return result.code === 0 && Number.isInteger(n) ? n : undefined
 }
 
-/** Commits only the clone has: from refs the host lacks, plus reflog-only commits (e.g. after reset --hard). */
-async function countLost(deps: CloseDeps, key: string, repo: string, base: string, lost: string[], collected: string[]): Promise<number | undefined> {
+/** Commits only the clone has: reachable from refs the host lacks (block), and reflog-only (reported as discarded). */
+async function countLost(deps: CloseDeps, key: string, repo: string, base: string, lost: string[], collected: string[]): Promise<Pick<Counts, "uncollectedCommits" | "discardedCommits"> | undefined> {
   const hostTip = await hostBranchTip(deps, repo, key)
   const known = [base, ...collected]
   if (hostTip && COMMIT_ID.test(hostTip) && (await boxGit(deps, key, ["rev-parse", "--verify", "--quiet", `${hostTip}^{commit}`])).code === 0) known.push(hostTip)
   const fromRefs = lost.length ? numberOf(await boxGit(deps, key, ["rev-list", "--count", ...lost, "--not", ...known])) : 0
   const fromReflogs = numberOf(await boxGit(deps, key, ["rev-list", "--count", "--reflog", "--not", "--all", "HEAD", ...known]))
-  return fromRefs === undefined || fromReflogs === undefined ? undefined : fromRefs + fromReflogs
+  return fromRefs === undefined || fromReflogs === undefined ? undefined : { uncollectedCommits: fromRefs, discardedCommits: fromReflogs }
 }
 
-const failedClone = (clone: ClosePlan["clone"], tree?: Pick<Counts, "uncommittedPaths" | "ignoredPaths">): CloneState => ({ clone, uncollectedCommits: 0, uncommittedPaths: tree?.uncommittedPaths ?? 0, ignoredPaths: tree?.ignoredPaths ?? 0, failed: true })
+const NO_TREE: Tree = { uncommittedPaths: 0, ignoredPaths: 0, ignoredExamples: [] }
+const failedClone = (clone: ClosePlan["clone"], tree: Tree = NO_TREE): CloneState => ({ clone, uncollectedCommits: 0, discardedCommits: 0, ...tree, failed: true })
 
 /** Which tips no host branch contains (undefined when git could not say). */
 async function splitTips(deps: CloseDeps, repo: string, tips: string[]): Promise<{ lost: string[]; collected: string[] } | undefined> {
@@ -194,20 +216,20 @@ async function splitTips(deps: CloseDeps, repo: string, tips: string[]): Promise
 async function inspectClone(deps: CloseDeps, state: HostSessionState): Promise<CloneState> {
   const key = state.sessionKey
   const presence = await probeClone(deps, key)
-  if (presence === "absent") return { clone: "absent", uncollectedCommits: 0, uncommittedPaths: 0, ignoredPaths: 0 }
+  if (presence === "absent") return { clone: "absent", uncollectedCommits: 0, discardedCommits: 0, ...NO_TREE }
   if (presence === "unknown") return failedClone("unknown")
   const [tips, tree] = [await cloneTips(deps, key), await worktreeCounts(deps, key)]
   if (tips === undefined || tree === undefined) return failedClone("present", tree)
   const reflogOnly = numberOf(await boxGit(deps, key, ["rev-list", "--count", "--reflog", "--not", "--all", "HEAD", state.base]))
   if (reflogOnly === undefined) return failedClone("present", tree)
   const candidates = tips.filter((tip) => tip !== state.base)
-  if (!candidates.length && reflogOnly === 0) return { clone: "present", uncollectedCommits: 0, ...tree }
+  if (!candidates.length && reflogOnly === 0) return { clone: "present", uncollectedCommits: 0, discardedCommits: 0, ...tree }
   const repo = await deps.resolveRepo(state.hostRepo).catch(() => undefined)
   const split = repo ? await splitTips(deps, repo, candidates) : undefined
   if (!repo || !split) return failedClone("present", tree)
-  if (!split.lost.length && reflogOnly === 0) return { clone: "present", uncollectedCommits: 0, ...tree }
-  const count = await countLost(deps, key, repo, state.base, split.lost, split.collected)
-  return count === undefined ? failedClone("present", tree) : { clone: "present", uncollectedCommits: count, ...tree }
+  if (!split.lost.length && reflogOnly === 0) return { clone: "present", uncollectedCommits: 0, discardedCommits: 0, ...tree }
+  const counts = await countLost(deps, key, repo, state.base, split.lost, split.collected)
+  return counts === undefined ? failedClone("present", tree) : { clone: "present", ...counts, ...tree }
 }
 
 /** Contained by some OTHER real host branch (not delegate/<key>, not a symbolic ref, never HEAD alone). */
@@ -236,10 +258,13 @@ async function inspectBranch(deps: CloseDeps, state: HostSessionState): Promise<
   return { plan: merged === undefined ? "unknown" : merged ? "merged" : "unmerged", repo, tip }
 }
 
-const reasonOf = (clone: CloneState): CloseRefusal | undefined =>
-  clone.failed ? "check_failed" : clone.uncollectedCommits > 0 || clone.uncommittedPaths > 0 ? "uncollected_work" : undefined
+function reasonOf(clone: CloneState): CloseRefusal | undefined {
+  if (clone.failed) return "check_failed"
+  if (clone.uncollectedCommits > 0 || clone.uncommittedPaths > 0) return "uncollected_work"
+  return clone.ignoredPaths > 0 ? "ignored_files" : undefined
+}
 
-const countsOf = (c: Counts): Counts => ({ uncollectedCommits: c.uncollectedCommits, uncommittedPaths: c.uncommittedPaths, ignoredPaths: c.ignoredPaths })
+const countsOf = (c: Counts): Counts => ({ uncollectedCommits: c.uncollectedCommits, discardedCommits: c.discardedCommits, uncommittedPaths: c.uncommittedPaths, ignoredPaths: c.ignoredPaths, ignoredExamples: [...c.ignoredExamples] })
 
 /** Read-only: what closing would do and lose. */
 export async function inspectClose(deps: CloseDeps, key: string, owner: CloseOwner, options: Pick<CloseOptions, "deleteBranch">): Promise<ClosePlan> {
@@ -291,7 +316,11 @@ function kept(o: Owned, clone: CloneState, session: CloseOutcome["session"], ref
   return { sessionKey: o.state.sessionKey, sessionID: o.state.sessionID, closed: false, ...(refused ? { refused } : {}), session, clone: "kept", branch: "not_requested", record: "kept", ...countsOf(clone) }
 }
 
-/** Close one session (see the order at the top). A refusal before step 4 deletes nothing. */
+/**
+ * Close one session (see the order at the top). A refusal before step 4 deletes nothing. A refusal at
+ * the last check (after the session is deleted) returns before the clone and the host record are
+ * touched, so the record stays on disk and oc_collect can still fetch the copy, even after a restart.
+ */
 export async function closeSession(deps: CloseDeps, key: string, owner: CloseOwner, options: CloseOptions, hooks: CloseHooks): Promise<CloseOutcome> {
   const o = owned(deps, key, owner)
   const first = await inspectClone(deps, o.state)
@@ -315,6 +344,8 @@ export async function closeSession(deps: CloseDeps, key: string, owner: CloseOwn
   return { ...out, closed: out.record === "removed" }
 }
 
+/** moveCursor: false reads the same page again next time (oc_cleanup's dry run). Default true. */
+export type CandidateOptions = { moveCursor?: boolean }
 export type CloseCandidates = { states: Array<HostSessionState & { sessionID: string }>; legacy: number; otherBox: number; otherBridge: number }
 
 function readCursor(file: string): string {
@@ -353,7 +384,7 @@ function readCandidate(dir: string, name: string): HostSessionState | undefined 
  * the last name a previous call reached (persisted cursor), so kept records never block later ones.
  * Reads records only; writes only its cursor file. Counts legacy, other-box and other-bridge records seen.
  */
-export function closeCandidates(deps: Pick<CloseDeps, "stateDir" | "boxProject">, supervisor: string, before: Date, limit: number): CloseCandidates {
+export function closeCandidates(deps: Pick<CloseDeps, "stateDir" | "boxProject">, supervisor: string, before: Date, limit: number, options: CandidateOptions = {}): CloseCandidates {
   const out: CloseCandidates = { states: [], legacy: 0, otherBox: 0, otherBridge: 0 }
   if (!SUPERVISOR_RE.test(supervisor)) return out
   let names: string[]
@@ -377,6 +408,7 @@ export function closeCandidates(deps: Pick<CloseDeps, "stateDir" | "boxProject">
     else if (state.boxProject !== deps.boxProject) out.otherBox++
     else if (Date.parse(state.createdAt) < before.getTime()) out.states.push({ ...state, sessionID: state.sessionID })
   }
-  if (last) saveCursor(cursorFile, last)
+  // A dry run (moveCursor: false) leaves the cursor, so the real run then sees the same records.
+  if (last && options.moveCursor !== false) saveCursor(cursorFile, last)
   return out
 }

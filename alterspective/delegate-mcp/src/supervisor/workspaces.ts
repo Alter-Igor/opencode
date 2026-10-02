@@ -21,14 +21,14 @@ import { copyOutBundle, dockerTarSource, type TarSource } from "./workspaces-cop
 import { assertRegularFile, DEFAULT_MAX_BUNDLE_BYTES, planOutBundle, randomNonce, removeQuietly, reserveInBundle } from "./workspaces-handoff.ts"
 import { bindHostState, COMMIT_ID, listHostStates, readHostState, removeHostState, SESSION_KEY, writeHostState, type HostSessionState, type SessionBinding } from "./workspaces-state.ts"
 import { createSessionPruner, type MissingSession } from "./workspaces-prune.ts"
-import { closeCandidates, closeSession, inspectClose, type CloseCandidates, type CloseDeps, type CloseHooks, type CloseOptions, type CloseOutcome, type CloseOwner, type ClosePlan } from "./workspaces-close.ts"
+import { closeCandidates, closeSession, inspectClose, type CandidateOptions, type CloseCandidates, type CloseDeps, type CloseHooks, type CloseOptions, type CloseOutcome, type CloseOwner, type ClosePlan } from "./workspaces-close.ts"
 
 export { canonicalPath, cleanEnv, isUnder, parseSubst, runCommand, TIMEOUT_CODE, type Exec, type ExecOptions, type ExecResult } from "./workspaces-exec.ts"
 export { isHostExecutableMode, isHostExecutablePath, parseRawDiff, scriptsChanged, type RawEntry } from "./workspaces-detect.ts"
 export { DEFAULT_MAX_BUNDLE_BYTES, HANDOFF_IN, HANDOFF_OUT } from "./workspaces-handoff.ts"
 export { TAR_SLACK_BYTES, type TarSource, type TarStream } from "./workspaces-copyout.ts"
 
-export type { CloseCandidates, CloseHooks, CloseOptions, CloseOutcome, CloseOwner, ClosePlan, SessionRemoval } from "./workspaces-close.ts"
+export type { CandidateOptions, CloseCandidates, CloseHooks, CloseOptions, CloseOutcome, CloseOwner, ClosePlan, SessionRemoval } from "./workspaces-close.ts"
 export { AGENT_RE, COMMIT_ID, MODEL_RE, SESSION_ID_RE, SESSION_KEY, SUPERVISOR_RE, type HostSessionState, type SessionBinding, type SessionProfile } from "./workspaces-state.ts"
 /** bundle, clone and fetch: whole repositories. */
 export const LONG_TIMEOUT_MS = 10 * 60_000
@@ -296,7 +296,7 @@ export type DelegateWorkspaces = Omit<Workspaces, "open" | "collect"> & {
   /** #72: close one of this bridge's sessions (workspaces-close.ts): check, stop, check, delete, remove. */
   closeSession(sessionKey: string, owner: CloseOwner, options: CloseOptions, hooks: CloseHooks): Promise<CloseOutcome>
   /** #72: this bridge's records of this box created before `before`, continuing from a persisted cursor. */
-  closeCandidates(supervisor: string, before: Date, limit: number): Promise<CloseCandidates>
+  closeCandidates(supervisor: string, before: Date, limit: number, options?: CandidateOptions): Promise<CloseCandidates>
 }
 
 /** Anything that is not a DelegateError yet becomes one; its text goes to detail only. */
@@ -357,6 +357,6 @@ export function createWorkspaces(options: WorkspacesOptions): DelegateWorkspaces
     inspectClose: (key, owner, options) => traced(logger, "inspectClose", undefined, { sessionKey: key }, () => inspectClose(closeDeps, key, owner, options), (p) => ({ safe: p.safe, uncollectedCommits: p.uncollectedCommits })),
     closeSession: (key, owner, options, hooks) =>
       traced(logger, "closeSession", undefined, { sessionKey: key }, () => closeSession(closeDeps, key, owner, options, hooks), (o) => ({ closed: o.closed, clone: o.clone, branch: o.branch, record: o.record, uncollectedCommits: o.uncollectedCommits })),
-    closeCandidates: async (supervisor, before, limit) => closeCandidates(closeDeps, supervisor, before, limit),
+    closeCandidates: async (supervisor, before, limit, options) => closeCandidates(closeDeps, supervisor, before, limit, options),
   }
 }

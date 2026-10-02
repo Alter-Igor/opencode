@@ -1,9 +1,10 @@
 // #72: oc_close_session and oc_cleanup through the tool layer. Real workspaces on scratch git repos
 // (workspaces-fixture.ts) behind a fake API and hub (tools-core-fixture.ts).
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test"
-import { existsSync, readFileSync } from "node:fs"
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs"
 import path from "node:path"
 import type { SessionState, SessionView } from "../src/shared/contracts.ts"
+import type { Call } from "../src/shared/opencode-api.ts"
 import { writeHostState, type HostSessionState } from "../src/supervisor/workspaces-state.ts"
 import { cleanupTool, closeSessionTool } from "../src/tools/close-session.ts"
 import { collectTool } from "../src/tools/collect.ts"
@@ -249,7 +250,10 @@ describe("oc_cleanup", () => {
     const legacy = await start(f, { ageDays: 30, track: false })
     const { boxProject: _dropped, ...legacyState } = legacy.state
     writeHostState(stateDir(), legacyState)
-    return { stale, uncollected, young, busy, recent, other, legacy }
+    const ignored = await start(f, { ageDays: 30, track: false })
+    appendFileSync(path.join(fx.boxClone(ignored.key), ".git", "info", "exclude"), ".env\n")
+    writeFileSync(path.join(fx.boxClone(ignored.key), ".env"), "SECRET_NAME_ONLY=1\n")
+    return { stale, uncollected, young, busy, recent, other, legacy, ignored }
   }
 
   test(
@@ -263,7 +267,10 @@ describe("oc_cleanup", () => {
       expect(dry.isError).toBeUndefined()
       const d = data(dry)
       expect(d).toMatchObject({ dryRun: true, ttlDays: 14, wouldClose: [s.stale.key], closed: [] })
-      expect(d.kept).toEqual([{ sessionKey: s.uncollected.key, reason: "uncollected_work", uncollectedCommits: 1, uncommittedPaths: 0 }])
+      expect(d.kept).toEqual([
+        { sessionKey: s.uncollected.key, reason: "uncollected_work", uncollectedCommits: 1, uncommittedPaths: 0, ignoredPaths: 0, discardedCommits: 0 },
+        { sessionKey: s.ignored.key, reason: "ignored_files", uncollectedCommits: 0, uncommittedPaths: 0, ignoredPaths: 1, discardedCommits: 0 },
+      ])
       expect(d.skipped).toMatchObject({ active: 1, recent: 1 })
       expect(d.legacyRecords).toBe(1)
       expect(Number(d.otherBridgeRecords)).toBeGreaterThanOrEqual(1)
@@ -277,12 +284,34 @@ describe("oc_cleanup", () => {
       expect(fx.leftovers(s.stale.key)).toEqual([])
       expect(f.api.calls.filter((c) => c.method === "DELETE").map((c) => c.path)).toEqual([`/session/${s.stale.sessionID}`])
       expect(f.api.calls.some((c) => c.path.endsWith("/abort"))).toBe(false)
-      for (const kept of [s.uncollected, s.young, s.busy, s.recent, s.other, s.legacy]) {
+      for (const kept of [s.uncollected, s.young, s.busy, s.recent, s.other, s.legacy, s.ignored]) {
         expect(existsSync(recordFile(kept.key))).toBe(true)
         expect(fx.leftovers(kept.key)).toEqual([kept.key])
       }
     },
     T * 3,
+  )
+
+  test(
+    "cycle 2: a sweep's late refusal keeps the host record on disk, and oc_collect still works after a bridge restart",
+    async () => {
+      const f = context()
+      const s = await start(f, { ageDays: 30, track: false })
+      const call = f.api.call.bind(f.api)
+      f.api.call = async <T,>(input: Call) => {
+        if (input.method === "DELETE" && input.path === `/session/${s.sessionID}`) await fx.boxCommit(s.key, { "race.txt": "race\n" }, "race")
+        return call<T>(input)
+      }
+      const real = await invoke(cleanupTool, { dryRun: false }, f.ctx)
+      expect((data(real).partial as string[]).includes(s.key)).toBe(true)
+      expect(existsSync(recordFile(s.key))).toBe(true)
+      expect(f.ctx.sessions.has(s.sessionID)).toBe(true)
+      const restarted = context()
+      const collected = await invoke(collectTool, { sessionID: s.sessionID }, restarted.ctx)
+      expect(collected.isError).toBeUndefined()
+      expect(data(collected)).toMatchObject({ commits: 1 })
+    },
+    T * 2,
   )
 
   test("a TTL of 0 disables the sweep", async () => {
