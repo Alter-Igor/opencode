@@ -136,6 +136,6 @@ WS-A2 and WS-A1 were synced with the integration branch before merge. The only i
 
 ## Next actions
 
-1. Create worktrees for WS-A and WS-B; brief one developer agent each.
-2. Independent `code-review` for each workstream; fix loop within budget.
-3. Merge WS-B, then WS-A, into `keystone-host-spike`; then start WS-C.
+1. Owner approval to merge PR #69 into `dev` (Gate A). Safe with the flag off by default.
+2. Live cutover on the owner's box (README "Host-held Keystone tokens"): set `OCD_KEYSTONE_HOST_AUTH=1` for every bridge, restart the clients, `oc_server_restart {confirm: true, force: true}`, `oc_login` each `ks-*`, then `oc_doctor` (`keystoneAuth.ok`, `verified`). Record the value evidence: `mcp-auth.json` is `{}`, entries connected, a `rag-read` search works, a forced refresh holds, 403 on the token paths.
+3. Revoke the old box client ids from `live.signIns.removedBefore` (expect `revokedCount > 0`). Close #67 with the observed evidence, then clean up the worktrees once the close tool is fixed.
