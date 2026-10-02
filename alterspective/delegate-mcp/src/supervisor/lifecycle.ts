@@ -15,7 +15,8 @@ import { DelegateError, isDelegateError } from "../shared/errors.ts"
 import type { Logger } from "../shared/log.ts"
 import type { ApiTarget } from "../shared/opencode-api.ts"
 import { FRONT_SERVERS_NAME } from "../guard/egress.ts"
-import { ensureAuthConf } from "../synapse/auth-conf.ts"
+import { ensureAuthConf, ensureKsAuthConf } from "../synapse/auth-conf.ts"
+import { keystoneHostAuth } from "../guard/egress-identity.ts"
 import { SYNAPSE_LOCK_WAIT_MS } from "../synapse/lock.ts"
 import { INSPECT_ENV, MCP_ALLOW_ENV, approvedValues, boxEnvOverride, composeDownEnv, composeEnv, siblingContainers } from "./compose-env.ts"
 import { LABEL, dockerArgs, imageExists, inspectBox, redactAll, requireDocker, type BoxInspect, type Exec, type ExecResult } from "./docker.ts"
@@ -183,6 +184,9 @@ async function prepareFiles(run: Run, plan: Plan): Promise<void> {
       await writeFile(path.join(dirs.front, FRONT_SERVERS_NAME), plan.front.servers, "utf8")
       // WS2 (#48): servers.conf includes the Synapse auth file, so it must exist (empty = no credential).
       await ensureAuthConf(dirs.front)
+      // #67 step 4: with host-held Keystone tokens servers.conf includes one ks-auth-<id>.conf per
+      // chosen connection, so each must exist (empty = no credential until the host publishes one).
+      if (keystoneHostAuth()) await ensureKsAuthConf(dirs.front, plan.config.keystoneConnections)
     } catch (error) {
       throw fsFailure("write front's generated files", error, deps.config.home)
     }

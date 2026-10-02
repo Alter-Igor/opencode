@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.4 — 2026-10-02
+
+Host-held Keystone tokens, behind `OCD_KEYSTONE_HOST_AUTH=1`. **Off by default:** with the flag unset nothing changes.
+
+With the flag on:
+
+- The box holds no Keystone token. The bridge signs you in on your PC (`oc_login`, same loopback port), keeps the refresh token in DPAPI and renews the access token in the background.
+- The access token goes only into `front`'s read-only include for that connection. `front` sends it on `/mcp/c/<id>` only.
+- Each box entry is `oauth: false`. The bridge's profile check requires it; the fork accepts it.
+- After a new token is written, the bridge connects the box entry (OpenCode does not reconnect by itself). It also connects signed-in entries when it gets a new box.
+- The box's sign-in store is emptied on every start, reuse and set change. The client ids removed are recorded for you to revoke in Keystone; tokens are never shown or logged.
+- `oc_doctor` adds `keystoneAuth`: each connection's state and expiry, whether `front` loaded its token, front's ids against the chosen ids, and whether the box store is empty. `verified` is false if the box store holds anything.
+
+How to turn it on: README "Host-held Keystone tokens". Tracks [#67](https://github.com/Alter-Igor/opencode/issues/67).
+
 ## 0.1.3 — 2026-10-02
 
 - Prune a deleted session's host record only after its clone is also proved absent. Keep records while a clone or link may hold work.

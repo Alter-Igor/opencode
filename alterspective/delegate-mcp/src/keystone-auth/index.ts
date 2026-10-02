@@ -1,5 +1,5 @@
-// #67 step 1: production wiring of the host Keystone token manager (manager.ts). Not wired into the
-// bridge yet: WS-C calls createKeystoneAuth with the front writer WS-A2 provides as `publish`.
+// #67 step 1: production wiring of the host Keystone token manager (manager.ts). Step 4: runtime.ts
+// creates it only with OCD_KEYSTONE_HOST_AUTH=1, with host-wiring.ts createKsPublisher as `publish`.
 // The lock is the SAME file and options as the Synapse refresh (synapse/index.ts), so every write
 // of front's files across bridges sharing one home happens under one lock.
 import { randomUUID } from "node:crypto"

@@ -14,6 +14,7 @@ import { defineTool } from "./define.ts"
 import { keystoneLine, keystoneReport, type KeystoneReport } from "./keystone-report.ts"
 import { ok, untrusted } from "./shape.ts"
 import type { SynapseReport } from "../synapse/index.ts"
+import { keystoneAuthLine, keystoneAuthReport } from "./keystone-auth-report.ts"
 
 export const PROBE_DIRECTORY = "/sessions"
 const ENTRY_NAME = /^[a-z0-9-]{1,67}$/
@@ -147,9 +148,10 @@ async function inspect(ctx: ToolContext, start: boolean, correlationId: string) 
 }
 
 /** Live checks in one sentence, with each failure's reason, and earlier removals the owner should revoke. */
-function liveSummary(live: LiveChecks | undefined): string {
+function liveSummary(live: LiveChecks | undefined, hostAuth: boolean): string {
   if (!live) return ""
-  const state = live.ok ? " Live: stored sign-ins only for the chosen set; front runs the generated config with its folder read-only." : ` Live checks FAILED: ${live.problems.join("; ").slice(0, 600)}.`
+  const stored = hostAuth ? "the box stores no sign-in (host-held Keystone tokens)" : "stored sign-ins only for the chosen set"
+  const state = live.ok ? ` Live: ${stored}; front runs the generated config with its folder read-only.` : ` Live checks FAILED: ${live.problems.join("; ").slice(0, 600)}.`
   const removed = live.signIns.removedBefore
   if (removed.length === 0) return state
   const list = removed.slice(-10).map((entry) => `${entry.name}${entry.clientId ? ` (client ${entry.clientId})` : ""}`).join(", ")
@@ -182,7 +184,7 @@ export const doctorTool = defineTool({
   name: "oc_doctor",
   title: "Check the OpenCode sandbox",
   description:
-    "Health check: sandbox state and Docker health, image, MCP-policy and front-config checks, the chosen Keystone services (`keystone`: the box-wide set, saved or default, each entry's sign-in state, the owner's allowed list `ceiling` and high-risk `warnings`), live checks (`live`: sign-ins stored in the box are only for the chosen set, front's loaded config and mount modes; entries removed earlier), the owner's Synapse token (`synapse`: signed_in / include_empty / expired / needs_sign_in, expiry and renewal time, refresh token stored on the host, front's loaded auth include has the strict shape, and the last reload result and whether front loaded the include written last; never a value), the policy guard verdict and this bridge's name and version, plus the configured egress allowlist, the egress control check (the TLS front generated from that allowlist and the Keystone set, no CONNECT proxy) and isolation level (configuration, not measured). `verified` is true only when every check ran and passed. Does not start the sandbox unless start is true.",
+    "Health check: sandbox state and Docker health, image, MCP-policy and front-config checks, the chosen Keystone services (`keystone`: the box-wide set, saved or default, each entry's sign-in state, the owner's allowed list `ceiling` and high-risk `warnings`), live checks (`live`: sign-ins stored in the box are only for the chosen set, front's loaded config and mount modes; entries removed earlier), the owner's Synapse token (`synapse`: signed_in / include_empty / expired / needs_sign_in, expiry and renewal time, refresh token stored on the host, front's loaded auth include has the strict shape, and the last reload result and whether front loaded the include written last; never a value), the host-held Keystone tokens when OCD_KEYSTONE_HOST_AUTH=1 (`keystoneAuth`: per chosen connection signed in, expiry, needs sign-in, and whether front's loaded include has the strict shape and a token; front's listed ids against the chosen ids; the box's sign-in store is empty; never a value), the policy guard verdict and this bridge's name and version, plus the configured egress allowlist, the egress control check (the TLS front generated from that allowlist and the Keystone set, no CONNECT proxy) and isolation level (configuration, not measured). `verified` is true only when every check ran and passed. Does not start the sandbox unless start is true.",
   input: { start: z.boolean().optional().describe("Start (or reuse) the sandbox first. Default false.") },
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   async run(args, ctx, correlationId) {
@@ -190,10 +192,12 @@ export const doctorTool = defineTool({
     const keystone = keystoneReport(ctx.config, mcp && "entries" in mcp ? statusMap(mcp) : undefined)
     const egress = egressFor(ctx, keystone)
     const synapse = await ctx.synapse.status()
-    const verified = isVerified(status, mcp, verdict) && egress.ok && keystoneEntriesOk(keystone) && live?.ok === true && synapse.ok
-    return ok(`${summaryOf(status, mcp, verdict, verified)} ${keystoneLine(keystone)}.${keystoneEntriesHint(keystone)}${egressSummary(egress)}${liveSummary(live)}${synapseLine(synapse)}`, {
+    const keystoneAuth = await keystoneAuthReport(ctx, keystone, live)
+    const verified = isVerified(status, mcp, verdict) && egress.ok && keystoneEntriesOk(keystone) && live?.ok === true && synapse.ok && (!keystoneAuth.enabled || keystoneAuth.ok)
+    return ok(`${summaryOf(status, mcp, verdict, verified)} ${keystoneLine(keystone)}.${keystoneEntriesHint(keystone)}${egressSummary(egress)}${liveSummary(live, keystoneAuth.enabled)}${synapseLine(synapse)}${keystoneAuthLine(keystoneAuth)}`, {
       verified,
       synapse,
+      keystoneAuth,
       bridge: { name: ctx.supervisor.replace(/^supervisor:/, ""), supervisor: ctx.supervisor, bridgeId: ctx.bridgeId, version: ctx.version, holdsBox: held, sessions: ctx.sessions.size },
       isolation: { level: "S", source: "configuration" },
       box: boxReport(status),
