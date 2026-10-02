@@ -262,6 +262,8 @@ it.instance("oauth:false marks a 401 as failed and never discovers OAuth metadat
 
     const status = (result.status as Record<string, MCP.Status>)["ks-401"]
     expect(status.status).toBe("failed")
+    // The 401 itself failed it, not a timeout or a refused connection.
+    expect(status.status === "failed" ? status.error : "").toMatch(/401|unauthori[sz]ed/i)
     expect((yield* mcp.status())["ks-401"].status).toBe("failed")
     expect(server.requests.length).toBeGreaterThan(0)
     expect(wellKnown(server.requests)).toEqual([])
