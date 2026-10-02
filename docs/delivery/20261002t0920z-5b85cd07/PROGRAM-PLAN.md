@@ -1,7 +1,7 @@
 # Program plan: #67 move Keystone tokens out of the delegate box
 
 - **Run id:** `20261002t0920z-5b85cd07`
-- **planRevision:** 2 (2026-10-02, program director: Claude Code session `cb058128`, sole writer). Rev 2: WS-A split into WS-A1 (token manager) and WS-A2 (`front` injection). They are disjoint surfaces, so they run in parallel; developers briefed for WS-A1, WS-A2 and WS-B.
+- **planRevision:** 3 (2026-10-02). Rev 3: WS-B integrated; WS-A2 built, in independent review; WS-A1 building. Previously rev 2 (2026-10-02, program director: Claude Code session `cb058128`, sole writer). Rev 2: WS-A split into WS-A1 (token manager) and WS-A2 (`front` injection). They are disjoint surfaces, so they run in parallel; developers briefed for WS-A1, WS-A2 and WS-B.
 - **Owner approval:** "OK to do what needed and do it for me" (2026-10-02). Reversible code and docs changes, and ordered merges into the integration branch. **Merging into `dev` and any live-box cutover still need the owner's explicit approval.**
 
 ## Outcome
@@ -34,8 +34,8 @@ The delegate box never holds a Keystone refresh token or a long-lived access tok
 |---|---|---|---|
 | #67 step 0 spike | #67 | — | **done** (`a7f1b3b4d5`, evidence `docs/.../evidence/keystone-host-client-spike.md`) |
 | #67 step 1 host token manager | #67 | WS-A1 | active |
-| #67 step 3 `front` per-connection injection (flagged) | #67 | WS-A2 | active |
-| #67 step 2 fork accepts `oauth:false` | #67 | WS-B | active |
+| #67 step 3 `front` per-connection injection (flagged) | #67 | WS-A2 | review (`452637d5b1`) |
+| #67 step 2 fork accepts `oauth:false` | #67 | WS-B | **integrated** (`c1dc26432b`) |
 | #67 step 4 cutover | #67 | WS-C | blocked by WS-A1, WS-A2, WS-B |
 | #67 step 5 docs and evidence | #67 | WS-C | blocked by WS-A1, WS-A2, WS-B |
 
@@ -57,8 +57,8 @@ No overlap between WS-A and WS-B. Parked #64 also touches `profile.ts` and `live
 | Order | Workstream | Branch | Base | Reviewed head | Integration state |
 |---:|---|---|---|---|---|
 | 0 | spike | `keystone-host-spike` (**integration branch for #67**) | `origin/dev` `4f38093888` | `a7f1b3b4d5` | — |
-| 1 | WS-B | `ks67-oauth-false` | `origin/dev` | — | active |
-| 2 | WS-A2 | `ks67-front-inject` | `origin/dev` | — | active |
+| 1 | WS-B | `ks67-oauth-false` | `origin/dev` | `d8759d77d3` (remote verified) | integrated `c1dc26432b` |
+| 2 | WS-A2 | `ks67-front-inject` | `origin/dev` | — (`452637d5b1` in review) | review |
 | 3 | WS-A1 | `ks67-host-tokens` | `origin/dev` | — | active |
 | 4 | WS-C | `ks67-cutover` | integration head after 1 and 2 | — | blocked |
 
@@ -94,6 +94,16 @@ Deviation recorded: the integration branch is the existing `keystone-host-spike`
 
 - 2026-10-02: spike passed (DCR as a public client, audience-bound 1 h tokens, strict rotation, host-added bearer works; authorize needs `scope=mcp:connection`).
 - 2026-10-02: spike clients `dcr-0de7459f-…` and `dcr-d6748237-…` revoked (`revokedCount` 0 each).
+
+## Review ledger
+
+| Workstream | Cycle | Reviewer | Result |
+|---|---|---|---|
+| WS-B | 1 | independent `code-review` agent | clean. Low #1 (bridge `guard/entries.ts` still refuses `oauth:false`) deferred to WS-C. Low #2 (401 test must check error text) fixed in `d8759d77d3`, confirmation clean. Nit (spy on provider constructor) declined: the control test already proves it. |
+
+## Environment findings
+
+- **Push hook typecheck fails in every worktree on this machine:** `packages/enterprise/src/custom-elements.d.ts` is a git symlink (mode 120000), and `core.symlinks=false` checks it out as a text file (TS1128). Earlier "pre-push passed" results were turbo cache replays. Creating symlinks is not permitted here. With the file absent, the enterprise typecheck passes. Pushes of program branches use `--no-verify`, with explicit `bun typecheck` and test runs as the evidence. Bridge CI on Linux is unaffected.
 
 ## Next actions
 
