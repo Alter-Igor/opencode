@@ -1,7 +1,7 @@
 # Program plan: #67 move Keystone tokens out of the delegate box
 
 - **Run id:** `20261002t0920z-5b85cd07`
-- **planRevision:** 4 (2026-10-02). Rev 4: WS-A2 and WS-A1 clean and integrated (`e95c7be32a`); draft PR #69 opened for Linux CI; WS-C started. Rev 3: WS-B integrated; WS-A2 built, in independent review; WS-A1 building. Previously rev 2 (2026-10-02, program director: Claude Code session `cb058128`, sole writer). Rev 2: WS-A split into WS-A1 (token manager) and WS-A2 (`front` injection). They are disjoint surfaces, so they run in parallel; developers briefed for WS-A1, WS-A2 and WS-B.
+- **planRevision:** 5 (2026-10-02). Rev 5: WS-C clean (2 cycles) and integrated; combined review clean, seam Lows fixed (`24b78afe3c`), integration head `8bb814f3c6`; Linux CI green; awaiting owner for the merge to `dev` (Gate A) and the live cutover. Rev 4: WS-A2 and WS-A1 clean and integrated (`e95c7be32a`); draft PR #69 opened for Linux CI; WS-C started. Rev 3: WS-B integrated; WS-A2 built, in independent review; WS-A1 building. Previously rev 2 (2026-10-02, program director: Claude Code session `cb058128`, sole writer). Rev 2: WS-A split into WS-A1 (token manager) and WS-A2 (`front` injection). They are disjoint surfaces, so they run in parallel; developers briefed for WS-A1, WS-A2 and WS-B.
 - **Owner approval:** "OK to do what needed and do it for me" (2026-10-02). Reversible code and docs changes, and ordered merges into the integration branch. **Merging into `dev` and any live-box cutover still need the owner's explicit approval.**
 
 ## Outcome
@@ -36,8 +36,8 @@ The delegate box never holds a Keystone refresh token or a long-lived access tok
 | #67 step 1 host token manager | #67 | WS-A1 | **integrated** (`e95c7be32a`) |
 | #67 step 3 `front` per-connection injection (flagged) | #67 | WS-A2 | **integrated** (`4b778dabea`) |
 | #67 step 2 fork accepts `oauth:false` | #67 | WS-B | **integrated** (`c1dc26432b`) |
-| #67 step 4 cutover | #67 | WS-C | active (code); live check needs owner |
-| #67 step 5 docs and evidence | #67 | WS-C | active |
+| #67 step 4 cutover | #67 | WS-C | **code integrated**; live cutover needs owner |
+| #67 step 5 docs and evidence | #67 | WS-C | **integrated**; live evidence pending |
 
 ## Workstreams
 
@@ -60,7 +60,7 @@ No overlap between WS-A and WS-B. Parked #64 also touches `profile.ts` and `live
 | 1 | WS-B | `ks67-oauth-false` | `origin/dev` | `d8759d77d3` (remote verified) | integrated `c1dc26432b` |
 | 2 | WS-A2 | `ks67-front-inject` | `origin/dev` | `8aa690939a` reviewed; synced `9b74e94f17` (remote verified) | integrated `4b778dabea` |
 | 3 | WS-A1 | `ks67-host-tokens` | `origin/dev` | `a0d2317f08` reviewed; synced `6cf9fdb905` (remote verified) | integrated `e95c7be32a` |
-| 4 | WS-C | `ks67-cutover` | `e95c7be32a` | — | active |
+| 4 | WS-C | `ks67-cutover` | `e95c7be32a` | `5eac5eee64` reviewed; synced `2ec88fca7a`; seam fixes `24b78afe3c` (remote verified) | integrated `17c1cf1aa1`, `8bb814f3c6` |
 
 Deviation recorded: the integration branch is the existing `keystone-host-spike`, not `program/<run-id>/integration`. Worktrees can only be created through `aio repo-worktree new`, which names the branch after the worktree. One PR from `keystone-host-spike` to `dev` at the end (Gate A, owner approval).
 
@@ -104,11 +104,27 @@ Deviation recorded: the integration branch is the existing `keystone-host-spike`
 | WS-A1 | 1 | independent `code-review` agent | needs fixes: High (rotated refresh token lost when access-token check fails, reproduced), 3 Medium, Lows; fixed in `8cf4bc8027` |
 | WS-A1 | 2 | same reviewer | confirmation found a new Medium (marker with no time limit) and a Low (`redirect: "error"`); fixed in `9d29d05384`; confirmation clean with one Low |
 | WS-A1 | 3 | same reviewer | Low (double-fault flag) fixed in `a0d2317f08`; confirmation clean |
+| WS-C | 1 | independent `code-review` agent | needs fixes: 3 Medium (reconnect across bridges, reconnect without consent, rollback docs) + Lows; fixed `2fb46d4605`; confirmation found a High regression (empty service set refused every box) |
+| WS-C | 2 | same reviewer | High + 2 Lows fixed `5eac5eee64`; confirmation clean (Nit declined: duplicate connects harmless, OpenCode replaces the client) |
+| Combined (§11) | — | independent combined reviewer | clean across 6 seams; 4 Lows + 3 Nits fixed `24b78afe3c`; confirmation clean |
 | WS-B | 1 | independent `code-review` agent | clean. Low #1 (bridge `guard/entries.ts` still refuses `oauth:false`) deferred to WS-C. Low #2 (401 test must check error text) fixed in `d8759d77d3`, confirmation clean. Nit (spy on provider constructor) declined: the control test already proves it. |
 
 ## Post-sync verification
 
 WS-A2 and WS-A1 were synced with the integration branch before merge. The only incoming files were the spike script and docs, disjoint from each workstream's write scope. Every reviewed file was proven byte-identical after the sync (`git diff <reviewed> <synced> -- <scope>` empty), and the combined suite on the synced WS-A1 head (B + A2 + A1) passed: 969 pass, 25 skip, 0 fail. So the reserved post-sync review cycle was not needed. The combined `code-review` at program verification (§11) still covers the integrated result.
+
+## Program verification (§11)
+
+- Integration head `8bb814f3c6` contains `origin/dev` `4f38093888` (no base-sync needed).
+- Linux CI (bridge workflow) on `17c1cf1aa1`: 1012 pass, 24 skip, 0 fail. Re-run on `8bb814f3c6` via PR #69.
+- Combined suite locally (stub flock): 1018 pass, 25 skip, 0 fail (twice; one run hit the known Windows-only `inbox-sidecar` W2C-11 rename `EPERM` flake).
+- Front: `front-reload --start` and `nginx -t` pass in a throwaway container from the built front image with a flag-on config (3 connections, 63-char id, 3800-char token, one missing include).
+- Keystone revocation: `revokeTokensByClient` revokes all unrevoked refresh tokens of a client (`alterspective-keystone` `oauth-refresh-repository.ts:316`). Access tokens (1 h JWT) cannot be revoked.
+- **Not verified (live only):** host sign-in through `oc_login`, an empty Authorization header giving 401, `/connect` restoring entries, forced refresh, and `revokedCount > 0` for the old box clients.
+
+## Value state
+
+**enabled** (code merged into the integration branch, flag off by default). It becomes **observed** only after the live cutover check: box `mcp-auth.json` is `{}`, all `ks-*` entries connected, a `rag-read` search works, a forced refresh keeps them connected, and the box gets 403 on the token paths.
 
 ## Follow-ups filed
 
