@@ -308,7 +308,9 @@ describe.skipIf(!sh || !Bun.which("flock"))("front-reload run with sh (fake ngin
   })
 
   test("a connection id containing `front-gen` reloads fine (review cycle 1: no double count)", () => {
-    const servers = KS_SERVERS.replaceAll("github", "my-front-gen")
+    // The id also appears outside the include lines (location and proxy_pass), as generated.
+    const servers = KS_SERVERS.replaceAll("github", "my-front-gen").replace("    location = /mcp/c/my-front-gen {\n", "    location = /mcp/c/my-front-gen {\n        proxy_pass https://$front_upstream/mcp/c/my-front-gen;\n")
+    expect(servers).toContain("proxy_pass https://$front_upstream/mcp/c/my-front-gen;")
     const result = run({ servers, hash: sha(servers), auth: authConf(undefined), ks: { "my-front-gen": authConf(KS_TOKEN, KS_AUTH_VAR) } })
     expect(result).toMatchObject({ code: 0, nginx: ["-t -q", "-s reload"] })
     expect(result.destFiles).toContain("ks-auth-my-front-gen.conf")
@@ -321,6 +323,13 @@ describe.skipIf(!sh || !Bun.which("flock"))("front-reload run with sh (fake ngin
     expect(run({ servers: odd, hash: sha(odd), auth: authConf(undefined) })).toMatchObject({ code: 3, nginx: [] })
     const other = KS_SERVERS.replace("ks-auth-github.conf", "evil.conf")
     expect(run({ servers: other, hash: sha(other), auth: authConf(undefined) })).toMatchObject({ code: 3, nginx: [] })
+    // Review cycle 2: non-canonical spellings of the host folder nginx would still resolve.
+    for (const spelling of ["include /etc/nginx//front-gen/evil.conf;", "include /etc/nginx/./front-gen/evil.conf;", "include front-gen/evil.conf;"]) {
+      const odd2 = KS_SERVERS.replace("}\n", `    location = /x { ${spelling} }\n}\n`)
+      expect(odd2).toContain(spelling)
+      for (const args of [[], ["--check"], ["--start"]])
+        expect({ spelling, args, code: run({ servers: odd2, hash: sha(odd2), auth: authConf(undefined), args }).code }).toEqual({ spelling, args, code: 3 })
+    }
   })
 
   test("a token change in one ks include makes a new generation; the old one goes after the acknowledgement", () => {
