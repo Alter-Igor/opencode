@@ -1,4 +1,5 @@
 import { NodeHttpServer } from "@effect/platform-node"
+import { createHash } from "node:crypto"
 import { describe, expect } from "bun:test"
 import { Effect, Layer, Option, Schema } from "effect"
 import { HttpClient, HttpClientRequest, HttpRouter } from "effect/unstable/http"
@@ -64,6 +65,12 @@ const it = testEffect(apiLayer.pipe(Layer.provide(noAuthLayer)))
 const itSecret = testEffect(apiLayer.pipe(Layer.provide(secretLayer)))
 const itKitSecret = testEffect(apiLayer.pipe(Layer.provide(kitSecretLayer)))
 const itV2Secret = testEffect(v2ApiLayer.pipe(Layer.provide(secretLayer)))
+const verifier = createHash("sha256").update("digest-test-secret").digest("hex")
+const verifierLayer = ServerAuth.Config.configLayer({
+  password: Option.none(),
+  username: "opencode",
+  passwordSHA256: verifier,
+})
 
 const basic = (username: string, password: string) => ServerAuth.header({ username, password }) ?? ""
 
@@ -74,6 +81,34 @@ const getProbe = (headers?: Record<string, string>) =>
     headers ? HttpClientRequest.setHeaders(headers) : (request) => request,
     HttpClient.execute,
   )
+
+for (const item of [
+  { name: "legacy", layer: apiLayer, path: "/probe" },
+  { name: "V2", layer: v2ApiLayer, path: "/api/probe" },
+]) {
+  const verifierIt = testEffect(item.layer.pipe(Layer.provide(verifierLayer)))
+  verifierIt.live(
+    `${item.name} verifier auth rejects absent/copied digest and accepts password through header/query`,
+    () =>
+      Effect.gen(function* () {
+        for (const candidate of [undefined, verifier, "wrong", "digest-test-secret"]) {
+          const response = yield* HttpClientRequest.get(item.path).pipe(
+            candidate === undefined
+              ? (request) => request
+              : HttpClientRequest.setHeader("authorization", basic("opencode", candidate)),
+            HttpClient.execute,
+          )
+          expect(response.status).toBe(candidate === "digest-test-secret" ? 200 : 401)
+        }
+        for (const candidate of [verifier, "digest-test-secret"]) {
+          const response = yield* HttpClient.get(
+            `${item.path}?auth_token=${encodeURIComponent(token("opencode", candidate))}`,
+          )
+          expect(response.status).toBe(candidate === "digest-test-secret" ? 200 : 401)
+        }
+      }),
+  )
+}
 
 describe("HttpApi authorization middleware", () => {
   it.live("allows requests when server password is not configured", () =>

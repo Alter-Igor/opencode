@@ -2,6 +2,7 @@
 // the bridge's memory and in this child env (and so the container). It is never written to a
 // file or logged. Box env vars are listed in the override file by NAME only.
 import path from "node:path"
+import { createHash } from "node:crypto"
 import { frontDir, mcpAllowPolicy, type BridgeConfig } from "../shared/config.ts"
 import { DelegateError } from "../shared/errors.ts"
 import { synapseLockFile } from "../synapse/lock.ts"
@@ -12,9 +13,10 @@ import type { BuiltProfile } from "./profile.ts"
 export type FrontFiles = { servers: string; hash: string }
 
 export const PASSWORD_ENV = "OPENCODE_SERVER_PASSWORD"
+export const VERIFIER_ENV = "OPENCODE_SERVER_PASSWORD_SHA256"
 export const MCP_ALLOW_ENV = "OPENCODE_MCP_ALLOW"
 /** Container env the supervisor reads back from `docker inspect`; everything else is discarded unread. */
-export const INSPECT_ENV = [PASSWORD_ENV, MCP_ALLOW_ENV]
+export const INSPECT_ENV = [PASSWORD_ENV, VERIFIER_ENV, MCP_ALLOW_ENV, "OPENCODE_DISABLE_REMOTE_CONFIG", "OPENCODE_DISABLE_EXTERNAL_PROVIDERS"]
 /**
  * MOD-05 inbox sidecar admin token: generated per box start like the password, given to the
  * `docker compose up` child and so to the INBOX container only (never the box), and read back by
@@ -65,8 +67,8 @@ export function siblingContainers(config: Pick<BridgeConfig, "project">): Array<
  */
 /** TLS trust settings: the box trusts front's internal CA only, and nothing may turn checks off (R3-01). */
 const TLS_TRUST_ENV = ["NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO", "GIT_SSL_NO_VERIFY", "REQUESTS_CA_BUNDLE", "NODE_TLS_REJECT_UNAUTHORIZED"]
-const RESERVED_EXACT = new Set(["INBOX_ADMIN_TOKEN", "HOME", "PATH", "BUN_CONFIG_REGISTRY", ...TLS_TRUST_ENV])
-const RESERVED_PREFIX = ["OCD_", "OPENCODE_", "INBOX_", "XDG_", "NPM_CONFIG_", "PIP_", "UV_"]
+const RESERVED_EXACT = new Set(["INBOX_ADMIN_TOKEN", "HOME", "PATH", "NODE_OPTIONS", "NODE_PATH", ...TLS_TRUST_ENV])
+const RESERVED_PREFIX = ["OCD_", "OPENCODE_", "INBOX_", "XDG_", "NPM_CONFIG_", "PIP_", "UV_", "BUN_", "JSC_", "LD_", "DYLD_", "PYTHON"]
 const RESERVED_SUFFIX = ["_PROXY"]
 
 export function isReservedBoxEnv(name: string): boolean {
@@ -156,6 +158,7 @@ export function composeEnv(inputs: ComposeInputs, start: StartValues): Record<st
     ...frontEnv(inputs.hostEnv),
     [MCP_ALLOW_ENV]: mcpAllowPolicy(inputs.config),
     [PASSWORD_ENV]: start.password,
+    [VERIFIER_ENV]: createHash("sha256").update(start.password).digest("hex"),
     ...inboxEnv,
   })
 }

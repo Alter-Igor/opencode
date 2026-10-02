@@ -1,40 +1,20 @@
 export * as ServerAuth from "./auth"
 
-import { ConfigService } from "@/effect/config-service"
 import { Flag } from "@opencode-ai/core/flag/flag"
-import { Config as EffectConfig, Context, Option, Redacted } from "effect"
+import { ServerVerifier } from "@opencode-ai/server/auth-verifier"
+import type { Credentials } from "@opencode-ai/server/auth"
 
-export type Credentials = {
-  password?: string
-  username?: string
-}
-
-export type DecodedCredentials = {
-  readonly username: string
-  readonly password: Redacted.Redacted
-}
-
-export class Config extends ConfigService.Service<Config>()("@opencode/ServerAuthConfig", {
-  password: EffectConfig.string("OPENCODE_SERVER_PASSWORD").pipe(EffectConfig.option),
-  username: EffectConfig.string("OPENCODE_SERVER_USERNAME").pipe(EffectConfig.withDefault("opencode")),
-}) {}
-
-export type Info = Context.Service.Shape<typeof Config>
-
-export function required(config: Info) {
-  return Option.isSome(config.password) && config.password.value !== ""
-}
-
-export function authorized(credentials: DecodedCredentials, config: Info) {
-  return (
-    Option.isSome(config.password) &&
-    credentials.username === config.username &&
-    Redacted.value(credentials.password) === config.password.value
-  )
-}
+export { Config, required, authorized } from "@opencode-ai/server/auth"
+export type { Credentials, DecodedCredentials, Info } from "@opencode-ai/server/auth"
 
 export function header(credentials?: Credentials) {
-  const password = credentials?.password ?? Flag.OPENCODE_SERVER_PASSWORD
+  const password =
+    credentials?.password ??
+    ServerVerifier.internalPassword({
+      password: Flag.OPENCODE_SERVER_PASSWORD,
+      passwordSHA256: process.env.OPENCODE_SERVER_PASSWORD_SHA256,
+    }) ??
+    Flag.OPENCODE_SERVER_PASSWORD
   if (!password) return undefined
 
   const username = credentials?.username ?? Flag.OPENCODE_SERVER_USERNAME ?? "opencode"

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test"
+import { createHash } from "node:crypto"
 import { ConfigProvider, Layer } from "effect"
 import { HttpRouter } from "effect/unstable/http"
 import { EventPaths } from "../../src/server/routes/instance/httpapi/groups/event"
@@ -9,7 +10,7 @@ import { PtyID } from "@opencode-ai/core/pty/schema"
 import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, tmpdir } from "../fixture/fixture"
 
-function app(input: { password?: string; username?: string }) {
+function app(input: { password?: string; username?: string; passwordSHA256?: string }) {
   const handler = HttpRouter.toWebHandler(
     HttpApiApp.routes.pipe(
       Layer.provide(
@@ -17,6 +18,7 @@ function app(input: { password?: string; username?: string }) {
           ConfigProvider.fromUnknown({
             OPENCODE_SERVER_PASSWORD: input.password,
             OPENCODE_SERVER_USERNAME: input.username,
+            OPENCODE_SERVER_PASSWORD_SHA256: input.passwordSHA256,
           }),
         ),
       ),
@@ -46,6 +48,23 @@ afterEach(async () => {
 })
 
 describe("HttpApi instance route authorization", () => {
+  test.each(["", "/api"])("verifier protects %s PTY ticket minting", async (prefix) => {
+    await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    const digest = createHash("sha256").update("secret").digest("hex")
+    const server = app({ passwordSHA256: digest })
+    const route = prefix + PtyPaths.connectToken.replace(":ptyID", PtyID.ascending())
+    const headers = { "x-opencode-directory": tmp.path, "x-opencode-ticket": "1" }
+    for (const password of [undefined, digest, "secret"]) {
+      const response = await server.request(route, {
+        method: "POST",
+        headers: { ...headers, ...(password === undefined ? {} : { authorization: basic("opencode", password) }) },
+      })
+      await cancelBody(response)
+      // An authenticated request reaches the missing-PTY lookup; no native PTY is needed.
+      expect(response.status).toBe(password === "secret" ? 404 : 401)
+    }
+  })
+
   test("requires configured auth before opening the instance event stream", async () => {
     await using tmp = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
     const server = app({ password: "secret" })

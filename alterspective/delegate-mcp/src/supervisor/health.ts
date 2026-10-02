@@ -12,28 +12,28 @@ export type HealthDeps = {
 
 type Probe = { ok: boolean; note: string }
 
-async function probeOnce(deps: HealthDeps, target: ApiTarget): Promise<Probe> {
+async function probeOnce(deps: HealthDeps, target: ApiTarget, challengeOnly: boolean): Promise<Probe> {
   const auth = "Basic " + Buffer.from(`${target.username ?? "opencode"}:${target.password}`).toString("base64")
   try {
     // Per-probe timeout: Docker Desktop can accept on the published port before the gate is
     // wired and then hold the connection open (observed live), so one probe must never hang.
-    const res = await deps.fetch(`${target.baseUrl}/path?directory=/sessions`, { headers: { authorization: auth }, signal: AbortSignal.timeout(3000) })
-    return { ok: res.status === 200, note: `HTTP ${res.status}` }
+    const res = await deps.fetch(`${target.baseUrl}/path?directory=/sessions`, { headers: challengeOnly ? {} : { authorization: auth }, signal: AbortSignal.timeout(3000) })
+    return { ok: res.status === (challengeOnly ? 401 : 200), note: `HTTP ${res.status}` }
   } catch (error) {
     return { ok: false, note: `no answer (${error instanceof Error ? error.name : "error"})` }
   }
 }
 
-export async function waitHealthy(deps: HealthDeps, target: ApiTarget, container: string): Promise<void> {
+export async function waitHealthy(deps: HealthDeps, target: ApiTarget, container: string, challengeOnly = false): Promise<void> {
   const deadline = deps.now() + (deps.healthTimeoutMs ?? 120_000)
   let last = "no probe ran"
   while (deps.now() < deadline) {
-    const probe = await probeOnce(deps, target)
+    const probe = await probeOnce(deps, target, challengeOnly)
     if (probe.ok) return
     last = probe.note
     await deps.sleep(1000)
   }
-  if (last === "HTTP 401")
+  if (!challengeOnly && last === "HTTP 401")
     throw new DelegateError(
       "auth_mismatch",
       "The sandbox is running but refused this bridge's password.",

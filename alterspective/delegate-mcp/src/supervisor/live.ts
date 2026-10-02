@@ -10,6 +10,7 @@ import { readPruned, recordPruned, runAuthStore, type PrunedRecord } from "./aut
 import { readFrontLive, type FrontLive } from "./front-live.ts"
 import { frontFilesFor, type Plan } from "./plan.ts"
 import { toDelegateError, type Run } from "./run.ts"
+import { failedMemory, memoryProtection, type MemoryProtection } from "./api-isolation.ts"
 
 export type SignInCheck = {
   ok: boolean
@@ -22,7 +23,7 @@ export type SignInCheck = {
   /** Entries the bridge removed earlier. Keystone cannot revoke them for the bridge: the owner revokes by client id. */
   removedBefore: PrunedRecord[]
 }
-export type LiveChecks = { ok: boolean; signIns: SignInCheck; front: FrontLive; problems: string[] }
+export type LiveChecks = { ok: boolean; signIns: SignInCheck; front: FrontLive; apiIsolation: MemoryProtection; problems: string[] }
 
 /** Remove sign-ins outside `plan`'s set. Throws policy_unverified when the store cannot be cleaned (fails closed). */
 export async function pruneSignIns(run: Run, plan: Pick<Plan, "config">): Promise<void> {
@@ -70,10 +71,11 @@ export async function verifyLive(run: Run): Promise<LiveChecks> {
     config = effectiveConfig(run.deps.config)
   } catch (error) {
     const why = toDelegateError(error).message
-    return { ok: false, signIns: failedSignIns(run.deps.config.home), front: failedFront(why), problems: [why] }
+    return { ok: false, signIns: failedSignIns(run.deps.config.home), front: failedFront(why), apiIsolation: failedMemory(), problems: [why] }
   }
   const sign = await signInsOrFailed(run, config.keystoneConnections.map(entryName))
   const front = await readFrontLive(run.deps.exec, run.container, frontFilesFor(config).servers).catch((error: unknown) => failedFront(toDelegateError(error).message))
-  const problems = [...(sign.problem ? [sign.problem] : []), ...problemsOf(sign.check, front)]
-  return { ok: sign.check.ok && front.ok, signIns: sign.check, front, problems }
+  const apiIsolation = await memoryProtection(run.deps.exec, run.container)
+  const problems = [...(sign.problem ? [sign.problem] : []), ...problemsOf(sign.check, front), ...apiIsolation.problems]
+  return { ok: sign.check.ok && front.ok && apiIsolation.ok, signIns: sign.check, front, apiIsolation, problems }
 }

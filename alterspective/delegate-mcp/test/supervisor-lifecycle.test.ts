@@ -11,10 +11,24 @@ import { boxEnvOverride, composeEnv, createSupervisor, type DelegateSupervisor, 
 import type { ProcessProbe } from "../src/supervisor/process.ts"
 import { buildProfile, nodeProfileFs } from "../src/supervisor/profile.ts"
 import { IMAGE, L, deps, fail, fakeDocker, home, leaseDir, made, owner, probe, recorder, supervisor, writeOwner, type Box, type Call, type Line, useSupervisorFixture } from "./supervisor-lifecycle-fixture.ts"
+import { apiEnv } from "./session-isolation-fixture.ts"
 
 useSupervisorFixture()
 
 describe("supervisor: start and reuse", () => {
+  test("a failed live memory check stops before any host API credential is sent", async () => {
+    const authorizations: boolean[] = []
+    const sup = supervisor(deps(fakeDocker({ running: false, labels: {}, env: [] }, [], { memory: { code: 1, stdout: '{"ok":false}', stderr: "" } }), {
+      fetch: (async (_url, init) => {
+        authorizations.push(new Headers(init?.headers).has("authorization"))
+        return new Response("", { status: 401 })
+      }) as typeof fetch,
+    }))
+    expect((await fail(sup.ensure())).code).toBe("policy_unverified")
+    expect(authorizations).toEqual([false])
+    expect(await sup.status()).toMatchObject({ state: "unavailable" })
+    expect(authorizations).toEqual([false])
+  })
   test("ensure starts the box, passes the password only via child env, and writes no secret to disk", async () => {
     await writeOwner()
     const calls: Call[] = []
@@ -60,7 +74,7 @@ describe("supervisor: start and reuse", () => {
   const running = (over: Partial<Record<keyof typeof L, string>>, allow = mcpAllowPolicy(defaultConfig())): Box => ({
     running: true,
     labels: { [L.hash]: over.hash ?? "old", [L.port]: over.port ?? "4711", [L.image]: over.image ?? IMAGE },
-    env: ["OPENCODE_SERVER_PASSWORD=x", `OPENCODE_MCP_ALLOW=${allow}`],
+    env: [...apiEnv("x"), `OPENCODE_MCP_ALLOW=${allow}`],
   })
 
   async function currentHash(): Promise<string> {
@@ -176,7 +190,7 @@ describe("supervisor: failures map to stable codes", () => {
     const garbage = supervisor(deps(fakeDocker({ running: true, labels: {}, env: [] }, [], { inspect: { code: 0, stdout: "nope", stderr: "" } })))
     expect((await garbage.status()).state).toBe("unavailable")
     const unlabeled = supervisor(deps(fakeDocker({ running: true, labels: {}, env: [] }, [])))
-    expect(await unlabeled.status()).toMatchObject({ state: "unavailable", reason: "The running sandbox is missing its bridge settings." })
+    expect(await unlabeled.status()).toMatchObject({ state: "unavailable", reason: "The running sandbox's API isolation could not be verified." })
   })
 
   test("a plain fs error becomes a DelegateError with the path only in detail (A-07)", async () => {

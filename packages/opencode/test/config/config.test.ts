@@ -134,6 +134,7 @@ const clear = (wait = false) => Effect.runPromise(clearEffect(wait))
 const managedConfigDir = process.env.OPENCODE_TEST_MANAGED_CONFIG_DIR!
 const originalTestToken = process.env.TEST_TOKEN
 const originalConsoleToken = process.env.OPENCODE_CONSOLE_TOKEN
+const originalRemoteConfig = process.env.OPENCODE_DISABLE_REMOTE_CONFIG
 
 beforeEach(async () => {
   await clear(true)
@@ -145,6 +146,8 @@ afterEach(async () => {
   else process.env.TEST_TOKEN = originalTestToken
   if (originalConsoleToken === undefined) delete process.env.OPENCODE_CONSOLE_TOKEN
   else process.env.OPENCODE_CONSOLE_TOKEN = originalConsoleToken
+  if (originalRemoteConfig === undefined) delete process.env.OPENCODE_DISABLE_REMOTE_CONFIG
+  else process.env.OPENCODE_DISABLE_REMOTE_CONFIG = originalRemoteConfig
   await clear(true)
 })
 
@@ -781,6 +784,28 @@ accountTokenIt.instance("resolves env templates in account config with account t
   Effect.gen(function* () {
     const config = yield* Config.use.get()
     expect(config.provider?.["opencode"]?.options?.apiKey).toBe("st_test_token")
+  }),
+)
+
+configIt({ auth: wellKnownAuth("http://127.0.0.1:12345") }).instance(
+  "disabled remote config ignores writable well-known auth without fetching it",
+  () =>
+    Effect.gen(function* () {
+      process.env.OPENCODE_DISABLE_REMOTE_CONFIG = "1"
+      const config = yield* Config.use.get()
+      expect(config.plugin).toEqual([])
+    }),
+)
+
+configIt({
+  account: Layer.mock(Account.Service)({
+    active: () => Effect.die("disabled remote config must not consult the writable account store"),
+  }),
+}).instance("disabled remote config does not read the active account", () =>
+  Effect.gen(function* () {
+    process.env.OPENCODE_DISABLE_REMOTE_CONFIG = "1"
+    const config = yield* Config.use.get()
+    expect(config.plugin).toEqual([])
   }),
 )
 

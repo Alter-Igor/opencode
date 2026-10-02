@@ -10,6 +10,8 @@
 !patches
 !packages
 !.github/TEAM_MEMBERS
+!alterspective/delegate-mcp/docker/box/entrypoint.sh
+!alterspective/delegate-mcp/docker/box/memory-probe.py
 
 # Never ship host installs, build output or caches.
 **/node_modules

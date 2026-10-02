@@ -138,7 +138,7 @@ async function inspect(ctx: ToolContext, start: boolean, correlationId: string) 
   if (start && !ctx.peekBox()) await ctx.box()
   const status = await ctx.supervisorService.status()
   const held = ctx.peekBox()
-  const api = held?.api ?? (status.state === "running" ? ctx.apiFor(status.target) : undefined)
+  const api = status.state === "running" ? held?.api ?? ctx.apiFor(status.target) : undefined
   const mcp = api ? await readMcp(api, correlationId) : undefined
   const verdict: Verdict = api ? await ctx.guard.checkRuntime(api, PROBE_DIRECTORY) : { ok: false, code: "policy_unverified", reason: "the sandbox is not running" }
   // R5-01 / R5-05: what is running, not what the labels say.
@@ -149,7 +149,7 @@ async function inspect(ctx: ToolContext, start: boolean, correlationId: string) 
 /** Live checks in one sentence, with each failure's reason, and earlier removals the owner should revoke. */
 function liveSummary(live: LiveChecks | undefined): string {
   if (!live) return ""
-  const state = live.ok ? " Live: stored sign-ins only for the chosen set; front runs the generated config with its folder read-only." : ` Live checks FAILED: ${live.problems.join("; ").slice(0, 600)}.`
+  const state = live.ok ? " Live: stored sign-ins only for the chosen set; front runs the generated config with its folder read-only; API password stays outside the box, server memory reads denied, core dumps and debugger off." : ` Live checks FAILED: ${live.problems.join("; ").slice(0, 600)}.`
   const removed = live.signIns.removedBefore
   if (removed.length === 0) return state
   const list = removed.slice(-10).map((entry) => `${entry.name}${entry.clientId ? ` (client ${entry.clientId})` : ""}`).join(", ")
@@ -190,7 +190,7 @@ export const doctorTool = defineTool({
     const keystone = keystoneReport(ctx.config, mcp && "entries" in mcp ? statusMap(mcp) : undefined)
     const egress = egressFor(ctx, keystone)
     const synapse = await ctx.synapse.status()
-    const verified = isVerified(status, mcp, verdict) && egress.ok && keystoneEntriesOk(keystone) && live?.ok === true && synapse.ok
+    const verified = isVerified(status, mcp, verdict) && egress.ok && keystoneEntriesOk(keystone) && live?.ok === true && (live.apiIsolation?.ok ?? false) && synapse.ok
     return ok(`${summaryOf(status, mcp, verdict, verified)} ${keystoneLine(keystone)}.${keystoneEntriesHint(keystone)}${egressSummary(egress)}${liveSummary(live)}${synapseLine(synapse)}`, {
       verified,
       synapse,

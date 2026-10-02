@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test"
+import { createHash } from "node:crypto"
 import net from "node:net"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
@@ -14,6 +15,7 @@ const original = {
   OPENCODE_SERVER_USERNAME: Flag.OPENCODE_SERVER_USERNAME,
   envPassword: process.env.OPENCODE_SERVER_PASSWORD,
   envUsername: process.env.OPENCODE_SERVER_USERNAME,
+  envPasswordSHA256: process.env.OPENCODE_SERVER_PASSWORD_SHA256,
 }
 const auth = { username: "opencode", password: "listen-secret" }
 const testPty = process.platform === "win32" ? test.skip : test
@@ -25,14 +27,22 @@ afterEach(async () => {
   else process.env.OPENCODE_SERVER_PASSWORD = original.envPassword
   if (original.envUsername === undefined) delete process.env.OPENCODE_SERVER_USERNAME
   else process.env.OPENCODE_SERVER_USERNAME = original.envUsername
+  if (original.envPasswordSHA256 === undefined) delete process.env.OPENCODE_SERVER_PASSWORD_SHA256
+  else process.env.OPENCODE_SERVER_PASSWORD_SHA256 = original.envPasswordSHA256
   await disposeAllInstances()
   await resetDatabase()
 })
 
-async function startListener() {
-  Flag.OPENCODE_SERVER_PASSWORD = auth.password
+async function startListener(mode: "password" | "verifier" = "password") {
+  Flag.OPENCODE_SERVER_PASSWORD = mode === "password" ? auth.password : undefined
   Flag.OPENCODE_SERVER_USERNAME = auth.username
-  process.env.OPENCODE_SERVER_PASSWORD = auth.password
+  if (mode === "password") {
+    process.env.OPENCODE_SERVER_PASSWORD = auth.password
+    delete process.env.OPENCODE_SERVER_PASSWORD_SHA256
+  } else {
+    delete process.env.OPENCODE_SERVER_PASSWORD
+    process.env.OPENCODE_SERVER_PASSWORD_SHA256 = createHash("sha256").update(auth.password).digest("hex")
+  }
   process.env.OPENCODE_SERVER_USERNAME = auth.username
   return Server.listen({ hostname: "127.0.0.1", port: 0 })
 }
@@ -41,6 +51,7 @@ async function startNoAuthListener() {
   Flag.OPENCODE_SERVER_PASSWORD = undefined
   Flag.OPENCODE_SERVER_USERNAME = auth.username
   delete process.env.OPENCODE_SERVER_PASSWORD
+  delete process.env.OPENCODE_SERVER_PASSWORD_SHA256
   process.env.OPENCODE_SERVER_USERNAME = auth.username
   return Server.listen({ hostname: "127.0.0.1", port: 0 })
 }
@@ -302,56 +313,76 @@ describe("HttpApi Server.listen", () => {
     expect(output).not.toContain("Sent HTTP response")
   })
 
-  test("plugin client requests reuse the listening server instance", async () => {
-    await using tmp = await tmpdir({
-      init: async (directory) => {
-        const plugin = path.join(directory, "plugin.ts")
-        const initialized = path.join(directory, "initialized.txt")
-        const completed = path.join(directory, "completed.txt")
-        await Bun.write(
-          plugin,
-          [
-            "export default async function plugin(input) {",
-            `  await Bun.write(${JSON.stringify(initialized)}, (await Bun.file(${JSON.stringify(initialized)}).text().catch(() => "")) + "initialized\\n")`,
-            "  setTimeout(async () => {",
-            "    await input.client.config.get()",
-            `    await Bun.write(${JSON.stringify(completed)}, "completed")`,
-            "  }, 50)",
-            "  return {}",
-            "}",
-            "",
-          ].join("\n"),
-        )
-        await Bun.write(
-          path.join(directory, "opencode.json"),
-          JSON.stringify({ formatter: false, lsp: false, plugin: [pathToFileURL(plugin).href] }),
-        )
-        return { initialized, completed }
-      },
-    })
-    const previous = process.env.OPENCODE_DISABLE_DEFAULT_PLUGINS
-    process.env.OPENCODE_DISABLE_DEFAULT_PLUGINS = "1"
-    let listener: Awaited<ReturnType<typeof startListener>> | undefined
-    try {
-      listener = await startListener()
-      const response = await fetch(new URL("/config", listener.url), {
-        headers: { authorization: authorization(), "x-opencode-directory": tmp.path },
+  test.each(["password", "verifier"] as const)(
+    "plugin client requests reuse the listening server instance (%s)",
+    async (mode) => {
+      await using tmp = await tmpdir({
+        init: async (directory) => {
+          const plugin = path.join(directory, "plugin.ts")
+          const initialized = path.join(directory, "initialized.txt")
+          const completed = path.join(directory, "completed.txt")
+          await Bun.write(
+            plugin,
+            [
+              "export default async function plugin(input) {",
+              `  await Bun.write(${JSON.stringify(initialized)}, (await Bun.file(${JSON.stringify(initialized)}).text().catch(() => "")) + "initialized\\n")`,
+              "  setTimeout(async () => {",
+              "    const response = await input.client.config.get()",
+              `    await Bun.write(${JSON.stringify(completed)}, String(response.response.status))`,
+              "  }, 50)",
+              "  return {}",
+              "}",
+              "",
+            ].join("\n"),
+          )
+          await Bun.write(
+            path.join(directory, "opencode.json"),
+            JSON.stringify({ formatter: false, lsp: false, plugin: [pathToFileURL(plugin).href] }),
+          )
+          return { initialized, completed }
+        },
       })
-      expect(response.status).toBe(200)
-      await withTimeout(
-        (async () => {
-          while (!(await Bun.file(tmp.extra.completed).exists())) await Bun.sleep(10)
-        })(),
-        5_000,
-        "timed out waiting for plugin client request",
-      )
-      expect(await Bun.file(tmp.extra.initialized).text()).toBe("initialized\n")
-    } finally {
-      if (listener) await stop(listener, "timed out cleaning up plugin client listener").catch(() => undefined)
-      if (previous === undefined) delete process.env.OPENCODE_DISABLE_DEFAULT_PLUGINS
-      else process.env.OPENCODE_DISABLE_DEFAULT_PLUGINS = previous
-    }
-  })
+      const previous = process.env.OPENCODE_DISABLE_DEFAULT_PLUGINS
+      process.env.OPENCODE_DISABLE_DEFAULT_PLUGINS = "1"
+      let listener: Awaited<ReturnType<typeof startListener>> | undefined
+      try {
+        listener = await startListener(mode)
+        const response = await fetch(new URL("/config", listener.url), {
+          headers: { authorization: authorization(), "x-opencode-directory": tmp.path },
+        })
+        expect(response.status).toBe(200)
+        await withTimeout(
+          (async () => {
+            while (!(await Bun.file(tmp.extra.completed).exists())) await Bun.sleep(10)
+          })(),
+          5_000,
+          "timed out waiting for plugin client request",
+        )
+        expect(await Bun.file(tmp.extra.initialized).text()).toBe("initialized\n")
+        expect(await Bun.file(tmp.extra.completed).text()).toBe("200")
+        if (mode === "verifier") {
+          const child = Bun.spawn(
+            [
+              process.execPath,
+              "-e",
+              [
+                `import { ServerAuth } from ${JSON.stringify(path.resolve(import.meta.dir, "../../src/server/auth.ts"))}`,
+                `const response = await fetch(${JSON.stringify(new URL("/config", listener.url).href)}, { headers: { ...ServerAuth.headers(), "x-opencode-directory": ${JSON.stringify(tmp.path)} } })`,
+                "process.stdout.write(String(response.status))",
+              ].join("\n"),
+            ],
+            { stdout: "pipe", stderr: "pipe" },
+          )
+          expect(await child.exited).toBe(0)
+          expect(await new Response(child.stdout).text()).toBe("401")
+        }
+      } finally {
+        if (listener) await stop(listener, "timed out cleaning up plugin client listener").catch(() => undefined)
+        if (previous === undefined) delete process.env.OPENCODE_DISABLE_DEFAULT_PLUGINS
+        else process.env.OPENCODE_DISABLE_DEFAULT_PLUGINS = previous
+      }
+    },
+  )
 
   test("port 0 prefers 4096 when free", async () => {
     if (!(await isPortFree(4096))) return

@@ -1,9 +1,10 @@
 import { afterEach, expect, test } from "bun:test"
 import { mkdir, unlink } from "fs/promises"
 import path from "path"
+import { pathToFileURL } from "url"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
-import { Effect, Layer } from "effect"
+import { Cause, Effect, Layer } from "effect"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
@@ -85,6 +86,52 @@ const paid = (providers: Record<string, { models: Record<string, { cost: { input
 const languageBaseURL = (language: unknown) => (language as { config: { baseURL: string } }).config.baseURL
 
 const it = testEffect(LayerNode.compile(LayerNode.group([Provider.node, Env.node, Plugin.node])))
+
+it.instance("disabled external providers never import an agent-writable provider module", () =>
+  Effect.gen(function* () {
+    yield* setProcessEnv("OPENCODE_DISABLE_EXTERNAL_PROVIDERS", "1")
+    const tmp = yield* TestInstance
+    const marker = path.join(tmp.directory, "provider-executed")
+    const source = path.join(tmp.directory, "provider-canary.ts")
+    yield* Effect.promise(() =>
+      Bun.write(
+        source,
+        `await Bun.write(${JSON.stringify(marker)}, "loaded"); throw new Error("provider canary executed")`,
+      ),
+    )
+    yield* Effect.promise(() =>
+      Bun.write(
+        path.join(tmp.directory, "opencode.json"),
+        JSON.stringify({
+          provider: {
+            canary: {
+              npm: pathToFileURL(source).href,
+              models: { test: { name: "Canary" } },
+              options: { apiKey: "test-only" },
+            },
+          },
+        }),
+      ),
+    )
+    const provider = yield* Provider.Service
+    const model = yield* provider.getModel(ProviderV2.ID.make("canary"), ModelV2.ID.make("test"))
+    const result = yield* provider.getLanguage(model).pipe(Effect.exit)
+    expect(result._tag).toBe("Failure")
+    if (result._tag === "Failure")
+      expect(Cause.pretty(result.cause)).toContain("External provider modules are disabled")
+    expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(false)
+  }),
+)
+
+it.instance("disabled external providers still load a bundled provider", () =>
+  Effect.gen(function* () {
+    yield* setProcessEnv("OPENCODE_DISABLE_EXTERNAL_PROVIDERS", "1")
+    yield* setProcessEnv("OPENAI_API_KEY", "test-only")
+    const provider = yield* Provider.Service
+    const model = yield* provider.getModel(ProviderV2.ID.openai, ModelV2.ID.make("gpt-4o"))
+    expect(yield* provider.getLanguage(model)).toBeDefined()
+  }),
+)
 const experimentalModels = testEffect(providerLayer({ enableExperimentalModels: true }))
 
 const alphaProviderConfig = {

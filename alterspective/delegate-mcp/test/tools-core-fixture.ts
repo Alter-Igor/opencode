@@ -11,6 +11,7 @@ import { silentLogger } from "../src/shared/log.ts"
 import type { ApiTarget, Call, OpencodeApi } from "../src/shared/opencode-api.ts"
 import type { DelegateHub } from "../src/events/index.ts"
 import type { LiveChecks } from "../src/supervisor/live.ts"
+import { MEMORY_OK } from "./session-isolation-fixture.ts"
 import type { SupervisorStatus } from "../src/supervisor/status.ts"
 import type { HostSessionState } from "../src/supervisor/workspaces-state.ts"
 import type { Box, CommandResult, SessionRecord, ToolContext } from "../src/tools/context.ts"
@@ -132,6 +133,7 @@ export type Fake = {
 
 export const LIVE_OK: LiveChecks = {
   ok: true,
+  apiIsolation: MEMORY_OK,
   signIns: { ok: true, names: ["ks-rag-read", "ks-github", "ks-seqlogs"], stale: [], unrecognised: 0, removedBefore: [] },
   front: { ok: true, loadedConfigMatches: true, mountReadOnly: true, boxMountsOk: true, problems: [] },
   problems: [],

@@ -70,6 +70,8 @@ services:
     mem_limit: 4g
     memswap_limit: 4g
     cpus: 4
+    ulimits:
+      core: { soft: 0, hard: 0 }
     tmpfs:
       # /tmp cannot run programs; /home/agent can (bun/npm/pip keep caches and bins there).
       - /tmp:mode=1777,nosuid,nodev,noexec
@@ -125,11 +127,14 @@ services:
       # No skills from ~/.claude, ~/.agents or the repo, and no Claude Code prompt/skill discovery.
       OPENCODE_DISABLE_EXTERNAL_SKILLS: "1"
       OPENCODE_DISABLE_CLAUDE_CODE: "1"
+      OPENCODE_DISABLE_REMOTE_CONFIG: "1"
+      OPENCODE_DISABLE_EXTERNAL_PROVIDERS: "1"
       # By name only: values come from the `docker compose` process env, never a file.
       OPENCODE_MCP_ALLOW:
-      OPENCODE_SERVER_PASSWORD:
+      OPENCODE_SERVER_PASSWORD_SHA256:
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS -o /dev/null -u \"opencode:$$OPENCODE_SERVER_PASSWORD\" 'http://127.0.0.1:4096/path?directory=/sessions'"]
+      # Liveness only; the host also checks readiness with its password after these checks.
+      test: ["CMD-SHELL", "test \"$$(curl -sS -o /dev/null -w '%{http_code}' 'http://127.0.0.1:4096/path?directory=/sessions')\" = 401"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -138,7 +143,7 @@ services:
       # The CA file must exist before OpenCode starts: Bun reads NODE_EXTRA_CA_CERTS once.
       front: { condition: service_healthy }
       inbox: { condition: service_started }
-    command: ["opencode", "serve", "--hostname", "0.0.0.0", "--port", "4096"]
+    command: ["serve", "--hostname", "0.0.0.0", "--port", "4096"]
 
   # Publishes the box API on the host loopback only. On `sealed` (to reach the box) and `outside`
   # (internal networks cannot publish ports). It forwards to the box only: the inbox admin API
@@ -149,6 +154,13 @@ services:
     # `docker buildx imagetools inspect alpine/socat:1.8.1.3` (same index digest as :latest then).
     image: alpine/socat:1.8.1.3@sha256:5ffbd6ae916cbad86a58fabe0d6d5a6fd5c2b47ddf031e82996baac9300e732f
     container_name: ${OCD_CONTAINER:-opencode-delegate}-gate-box
+    labels:
+      com.alterspective.opencode-delegate.profile-hash: ${OCD_PROFILE_HASH:?OCD_PROFILE_HASH is set by the bridge}
+      com.alterspective.opencode-delegate.port: ${OCD_PORT:?OCD_PORT is set by the bridge}
+      com.alterspective.opencode-delegate.image: ${OCD_IMAGE}
+    environment:
+      # Host adoption only: socat never adds this credential to forwarded requests.
+      OPENCODE_SERVER_PASSWORD:
     user: "65534:65534"
     command: ["TCP-LISTEN:4096,fork,reuseaddr", "TCP:box:4096"]
     networks: [sealed, outside]
