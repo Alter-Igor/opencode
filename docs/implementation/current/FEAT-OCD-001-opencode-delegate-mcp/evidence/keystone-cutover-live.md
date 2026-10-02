@@ -26,7 +26,7 @@ The first `oc_doctor` in the refresh run read `NOT verified` with "Docker health
 
 ## Value
 
-Usable Keystone tokens reachable from the box's storage: 12 live refresh tokens before, **0** after. Delegated sessions keep their Keystone connections, at one consent per connection (no more than before).
+Refresh tokens in the box's storage: **3 before, 0 after** (`mcp-auth.json` is `{}`). Separately, revoking the old box clients killed **12 live refresh tokens at Keystone** (the server-side total for those clients, including older tokens that were still valid). Delegated sessions keep their Keystone connections, at one consent per connection (no more than before).
 
 ## Not covered
 
