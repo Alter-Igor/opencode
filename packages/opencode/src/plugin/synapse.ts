@@ -8,6 +8,7 @@ import { OauthCallbackPage } from "@opencode-ai/core/oauth/page"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { INJECTED_LEARNINGS_LIMIT, learningStorePaths, sessionObserver, sanitizeJsonSchemaForOpenAI } from "./observer"
 import { EscalationTracker, declaredTier, classifyFailure, malformedToolCallFromEvent } from "./synapse-escalation"
+import { loadSynapseModels, type SynapseModelsLogEvent } from "./synapse-models"
 
 export const KEYSTONE_ISSUER = "https://identity.alterspective.com.au"
 export const KEYSTONE_REGISTER = `${KEYSTONE_ISSUER}/api/oauth/register`
@@ -663,6 +664,19 @@ export function extractMcpChatContent(rawText: string): string {
   return ""
 }
 
+let synapseModelsFailureLogged = false
+
+function logSynapseModelsFailureOnce(directory: string): (event: SynapseModelsLogEvent) => void {
+  return (event) => {
+    if (synapseModelsFailureLogged) return
+    synapseModelsFailureLogged = true
+    sessionObserver.logDiagnostic(
+      { timestamp: new Date().toISOString(), type: "FALLBACK_TRIGGERED", details: { ...event } },
+      directory,
+    )
+  }
+}
+
 interface SynapsePluginOptions {
   authorizeUrl?: string
   loginUrl?: string
@@ -681,6 +695,15 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
   let bridgeMode = false
 
   return {
+    // Fork-only (#74): the live Synapse model list replaces a hand-typed one.
+    // Core reads cfg.provider after this hook resolves (provider/provider.ts).
+    config: async (cfg) => {
+      await loadSynapseModels(cfg, {
+        defaultBaseURL: inferenceUrl,
+        userAgent: `opencode/${InstallationVersion}`,
+        log: logSynapseModelsFailureOnce(input.directory),
+      })
+    },
     auth: {
       provider: "synapse",
       loader: async (getAuth) => {
