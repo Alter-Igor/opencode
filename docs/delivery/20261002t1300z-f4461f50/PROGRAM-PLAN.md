@@ -1,7 +1,7 @@
 # Program plan: delegate-mcp operations (Synapse-only models, clean-up, reporting, agent skill)
 
 - **Run id:** `20261002t1300z-f4461f50`
-- **planRevision:** 2 (2026-10-03). Rev 2: owner confirmed Synapse-only everywhere; owner's local config made Synapse-only; #74 (fork plugin live models) added as WS-1b; WS-1, WS-1b and WS-2 built and pushed (`ed26ea57c6`, `07621eb61e`, `f8ec25f7e6`) and in independent review; RAG outage and owner deviation recorded. Rev 1 (2026-10-02, program director: Claude Code session `cb058128`, sole writer)
+- **planRevision:** 3 (2026-10-03). Rev 3: WS-1, WS-1b and WS-2 reviewed clean and integrated (review ledger); RAG search working again; WS-3 started; follow-up #75 filed. Rev 2: owner confirmed Synapse-only everywhere; owner's local config made Synapse-only; #74 (fork plugin live models) added as WS-1b; WS-1, WS-1b and WS-2 built and pushed (`ed26ea57c6`, `07621eb61e`, `f8ec25f7e6`) and in independent review; RAG outage and owner deviation recorded. Rev 1 (2026-10-02, program director: Claude Code session `cb058128`, sole writer)
 - **Owner direction:** "we need to make sure our opencodealt only uses Synapse as the provider and only offers the models registered in synapse with the default being auto. continue" (2026-10-02), plus the earlier pick A (build clean-up, skill and reporting together). Standing merge approval to 2026-10-04 ~21:00 AEST (merges only; no production promotion).
 - **Integration branch:** `delegate-ops` (worktree `X:\opencode---delegate-ops`). One PR to `dev` at the end.
 
@@ -39,6 +39,7 @@ Shared files (README, CHANGELOG, `package.json` version) are written only by the
 - **Observed:** since the RAG production deploy (v1.153.0, `2606f2e`, 2026-10-02 13:46 UTC), `rag_search` returns `embedding_space_mismatch` ("The collection does not match the required embedding space.") on both the MCP tool and REST `/search`. `/health` reports ok.
 - **Rule set aside:** `C:\GitHub\AGENTS.md` § Knowledge Search: "do not continue substantive work until it is restored".
 - **Owner decision:** "B" (2026-10-03): continue with the standards already loaded this session. Agents read the standards files directly (`WEBSTA-001-CODING-STANDARDS`, `WEBSTA-001-SECRETS-MANAGEMENT-STANDARDS`, `AILES-056`) and record that RAG was unavailable.
+- **Restored:** `rag_search` answered normally again on 2026-10-03 (receipt `754c1030-7c65-4849-97a3-78cc63bd4fa0`). Later reviews and WS-3 record their own RAG receipts.
 
 ## Owner local config (2026-10-02)
 
@@ -54,10 +55,20 @@ Standards used by earlier workstreams this session apply: `WEBSTA-001-CODING-STA
 
 ## Review ledger
 
-(none yet)
+One independent reviewer per workstream, 4-cycle budget. Each line: the cycle, the commit reviewed, the result.
+
+| WS | Cycle 0 | Cycle 1 | Cycle 2 | Cycle 3 | Integrated |
+|---|---|---|---|---|---|
+| WS-1 #71 | `ed26ea57c6`: not clean (stalled body hang, allowlists) | `4d6b3d365e`: not clean (saved-model fallback sent no model) | `30f60e4f03`: not clean (no saved model sent no model) | `ff4d753acc`: **clean** | yes, no drift |
+| WS-1b #74 | `07621eb61e`: not clean (refresh race) | `b0be39d093`: not clean (spent refresh token reused; no startup timeout) | `83c4d7ef29`: not clean (token reuse after second refresh; abort mid-rotation) | `c84f564173`: **clean** (startup refresh removed) | yes, no drift |
+| WS-2 #72 | `f8ec25f7e6`: not clean (detached HEAD counted merged; delete order; symref) | `504d534579`: not clean (amend false positive; ignored files deleted) | `d99f24d38b`: **clean** | — | yes; overlap with WS-1 in `core-session.ts` is additive |
+
+Bridge suite on `delegate-ops` after merging WS-1 and WS-2 (before WS-1b, which changes only `packages/opencode`): 1091 pass, 25 skip, 0 fail; bridge typecheck exit 0. Plugin suite on `delegate-ops` after WS-1b (`packages/opencode`, `bun test test/plugin`): 380 pass, 0 fail; `tsgo --noEmit` exit 0.
+
+Open Lows carried to the PR: WS-2 allowlist matches at any folder level (description to say so); WS-1b cache read-modify-write not atomic (self-heals); a chat that stops waiting sends the expired token once (one 401). Follow-up filed: #75 (two processes can spend the same Synapse refresh token).
 
 ## Next actions
 
-1. Brief WS-1 and WS-2 developers.
-2. Independent review per workstream; integrate WS-1 and WS-2 into `delegate-ops`.
-3. WS-3, then WS-4; combined review; PR to `dev`; live check of every value measure.
+1. WS-3 #73 in `X:\opencode---delegate-reporting` (branched from `delegate-ops` at `f8adb36592`), then its independent review.
+2. WS-4 skill: amend `KB-AI-036` and add a skill in Alterspective-Intelligence (cross-repo worktree and PR).
+3. Combined review; README, CHANGELOG, version; PR to `dev`; live check of every value measure.
