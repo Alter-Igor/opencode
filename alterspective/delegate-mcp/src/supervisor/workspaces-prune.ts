@@ -12,6 +12,10 @@ const PAGE_SESSIONS = 20
 const PAGE_MS = 5_000
 const PROBE_MS = 1_000
 // Distinct exit codes avoid treating a docker/exec failure as proof of absence. Keep dangling links.
+/** ABSENT_CLONE_PROBE exit codes: clone absent, clone (or a link) present, sessions folder unreadable. */
+export const PROBE_ABSENT = 44
+export const PROBE_PRESENT = 45
+export const PROBE_UNREADABLE = 46
 export const ABSENT_CLONE_PROBE = 'if [ ! -d "$2" ] || [ ! -r "$2" ] || [ ! -x "$2" ]; then exit 46; fi; if [ -e "$1" ] || [ -L "$1" ]; then exit 45; fi; exit 44'
 
 export function snapshotRecord(file: string) {
@@ -118,7 +122,7 @@ export function createSessionPruner(options: { stateDir: string; boxSessions: st
         if (!(await missing({ ...state, sessionID: state.sessionID }, Math.max(1, Math.min(PROBE_MS, deadline - Date.now()))))) continue
         if (Date.now() >= deadline) continue
         const result = await options.box(["sh", "-c", ABSENT_CLONE_PROBE, "sh", `${options.boxSessions}/${state.sessionKey}`, options.boxSessions], { timeoutMs: Math.max(1, Math.min(options.timeoutMs, PROBE_MS, deadline - Date.now())) })
-        if (result.timedOut || result.code !== 44 || result.stdout.trim() || result.stderr.trim()) continue
+        if (result.timedOut || result.code !== PROBE_ABSENT || result.stdout.trim() || result.stderr.trim()) continue
         if (tracked(state.sessionID)) continue
         if (removeUnchanged(file, before)) removed.push(state.sessionKey)
       } catch {
