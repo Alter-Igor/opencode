@@ -48,22 +48,32 @@ export type TokenState = {
   pendingAt?: number
   /** Review M3: when this bridge home last wrote front's include (any value). */
   includeAt?: number
-  /** Review M3: the last reload of front and when; oc_doctor needs one that worked after includeAt. */
-  lastReload?: { result: Reload; at: number }
+  /**
+   * Review M3: the last reload of front and when; oc_doctor needs one that worked after includeAt.
+   * `failures`: transient failures in a row (front-reload exits 4-8 while front runs). Only these
+   * are retried on the timer, with backoff; other results wait for a new token or a sandbox start.
+   */
+  lastReload?: { result: Reload; at: number; failures?: number }
 }
 
 /** A pending marker older than this is from a bridge that went away (it retries every tick). */
 export const PENDING_STALE_MS = 2 * 60_000
 /**
- * reloaded; front_not_running; config_invalid (nginx -t refused, or the reload failed: front keeps
- * the last good config); config_changed (review M1: front-reload refused because servers.conf is not
- * the file front started with, or the include is not the strict shape; nothing was reloaded).
+ * reloaded: a new worker acknowledged this attempt. front_not_running: front loads the current
+ * files when it next starts. config_changed (exit 3, review M1): servers.conf is not the file front
+ * started with, or the include is not the strict shape; nothing was reloaded. config_invalid
+ * (exits 4-6 or an unexpected exit while front runs): nginx -t refused, the signal failed, or the
+ * private copy failed; front keeps the last good config. unverified (exit 7): no worker
+ * acknowledged in time; nginx may still load it later. busy (exit 8): another reload was running.
  */
-export type Reload = "reloaded" | "front_not_running" | "config_invalid" | "config_changed"
+export type Reload = "reloaded" | "front_not_running" | "config_invalid" | "config_changed" | "unverified" | "busy"
 /** Review M1: baked into the front image (docker/front/front-reload.sh); the only reload path. */
 export const FRONT_RELOAD = "/usr/local/bin/front-reload"
 /** front-reload's exit code when the generated files are not the ones front started with. */
 const FILES_CHANGED = 3
+/** front-reload's exits that may clear by themselves: 4 config test, 5 signal, 6 copy, 7 no reply, 8 busy. */
+const TRANSIENT_EXITS = new Set([4, 5, 6, 7, 8])
+const EXIT_RESULTS: Record<number, Reload> = { 7: "unverified", 8: "busy" }
 export type Refreshed = { outcome: "fresh" | "refreshed" | "retrying" | "expired" | "failed_closed"; reload?: Reload; error?: string }
 
 export type SynapseDeps = {
@@ -121,18 +131,21 @@ export const isDue = (state: TokenState | undefined, now: number, fraction: numb
  */
 export async function reloadFront(deps: Pick<SynapseDeps, "exec" | "frontContainer" | "home" | "now" | "log">): Promise<Reload> {
   const run = await deps.exec(["docker", "exec", deps.frontContainer, FRONT_RELOAD], { timeoutMs: 30_000 })
-  const result: Reload = run.code === 0 ? "reloaded" : run.code === FILES_CHANGED ? "config_changed" : await notReloaded(deps)
+  const result: Reload = run.code === 0 ? "reloaded" : run.code === FILES_CHANGED ? "config_changed" : await notReloaded(deps, run.code)
   // front-reload prints fixed messages only (never the include); the last line says why.
   const reason = run.stderr.trim().split("\n").at(-1)?.slice(0, 300)
   safeLog(deps.log, result === "reloaded" ? "info" : "warn", "synapse", result === "reloaded" ? "front reloaded" : "front NOT reloaded", { result, ...(result === "reloaded" ? {} : { exit: run.code, reason }) })
   const state = await readState(deps.home)
-  if (state) await writeState(deps.home, { ...state, lastReload: { result, at: deps.now() } })
+  const transient = result !== "front_not_running" && TRANSIENT_EXITS.has(run.code)
+  const failures = transient ? (state?.lastReload?.failures ?? 0) + 1 : undefined
+  if (state) await writeState(deps.home, { ...state, lastReload: { result, at: deps.now(), ...(failures ? { failures } : {}) } })
   return result
 }
 
-async function notReloaded(deps: Pick<SynapseDeps, "exec" | "frontContainer">): Promise<Reload> {
+async function notReloaded(deps: Pick<SynapseDeps, "exec" | "frontContainer">, code: number): Promise<Reload> {
   const running = await deps.exec(["docker", "inspect", "--type", "container", "--format", "{{.State.Running}}", deps.frontContainer], { timeoutMs: 20_000 })
-  return running.code === 0 && running.stdout.trim() === "true" ? "config_invalid" : "front_not_running"
+  if (running.code !== 0 || running.stdout.trim() !== "true") return "front_not_running"
+  return EXIT_RESULTS[code] ?? "config_invalid"
 }
 
 /**

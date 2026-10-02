@@ -46,29 +46,37 @@ describe.skipIf(!sh || !Bun.which("flock"))("front-reload run with sh (fake ngin
   const HASH = createHash("sha256").update(SERVERS).digest("hex")
   const TOKEN = jwt({ sub: "oid-1" })
 
-  function run(opts: { auth?: string; servers?: string; hash?: string; nginxTest?: number; args?: string[] } = {}) {
+  type Step = { auth?: string; servers?: string; hash?: string; nginxTest?: number; args?: string[] }
+  const run = (opts: Step = {}) => runSteps([opts])[0]!
+
+  /** Runs the script once per step in one directory, so a later step sees an earlier step's files. */
+  function runSteps(steps: Step[]) {
     const dir = mkdtempSync(path.join(os.tmpdir(), "ocd-front-reload-"))
     try {
       const gen = path.join(dir, "gen")
       const bin = path.join(dir, "bin")
       for (const d of [gen, bin]) mkdirSync(d)
-      writeFileSync(path.join(gen, "servers.conf"), opts.servers ?? SERVERS)
-      if (opts.auth !== undefined) writeFileSync(path.join(gen, "synapse-auth.conf"), opts.auth)
       const calls = path.join(dir, "calls.txt")
       const fake = path.join(bin, "nginx")
-      writeFileSync(fake, `#!/bin/sh\necho "$*" >> '${calls.replaceAll("\\", "/")}'\n[ "$1" = "-t" ] && exit ${opts.nginxTest ?? 0}\nexit 0\n`)
-      chmodSync(fake, 0o755)
       // A worker acknowledges the published generation. The real-nginx pause/race proof lives
       // in spike/review-reload-proof.ts; these cases exercise malformed files and shell exits.
       const wget = path.join(bin, "wget")
       writeFileSync(wget, `#!/bin/sh\nmarker=$(sed -n 's|^include \\(.*attempts/.*\\.conf\\);$|\\1|p' "$OCD_FRONT_RUN/current.conf")\nsed -n 's|.*return 200 "\\([a-f0-9]* [a-f0-9]* [a-f0-9]*\\)".*|\\1|p' "$marker"\n`)
       chmodSync(wget, 0o755)
-      const result = Bun.spawnSync([sh!, SCRIPT, ...(opts.args ?? [])], {
-        env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}`, OCD_FRONT_GEN: gen.replaceAll("\\", "/"), OCD_FRONT_RUN: path.join(dir, "run").replaceAll("\\", "/"), OCD_FRONT_HASH: opts.hash ?? HASH },
+      return steps.map((opts) => {
+        writeFileSync(path.join(gen, "servers.conf"), opts.servers ?? SERVERS)
+        rmSync(path.join(gen, "synapse-auth.conf"), { force: true })
+        if (opts.auth !== undefined) writeFileSync(path.join(gen, "synapse-auth.conf"), opts.auth)
+        rmSync(calls, { force: true })
+        writeFileSync(fake, `#!/bin/sh\necho "$*" >> '${calls.replaceAll("\\", "/")}'\n[ "$1" = "-t" ] && exit ${opts.nginxTest ?? 0}\nexit 0\n`)
+        chmodSync(fake, 0o755)
+        const result = Bun.spawnSync([sh!, SCRIPT, ...(opts.args ?? [])], {
+          env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}`, OCD_FRONT_GEN: gen.replaceAll("\\", "/"), OCD_FRONT_RUN: path.join(dir, "run").replaceAll("\\", "/"), OCD_FRONT_HASH: opts.hash ?? HASH },
+        })
+        const current = path.join(dir, "run", "current.conf")
+        const published = existsSync(current) ? readFileSync(current, "utf8") : undefined
+        return { code: result.exitCode, stderr: result.stderr.toString(), nginx: existsSync(calls) ? readFileSync(calls, "utf8").trim().split("\n") : [], published }
       })
-      const current = path.join(dir, "run", "current.conf")
-      const published = existsSync(current) ? readFileSync(current, "utf8") : undefined
-      return { code: result.exitCode, stderr: result.stderr.toString(), nginx: existsSync(calls) ? readFileSync(calls, "utf8").trim().split("\n") : [], published }
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
@@ -121,6 +129,10 @@ describe.skipIf(!sh || !Bun.which("flock"))("front-reload run with sh (fake ngin
   })
 
   test("nginx -t refuses: exit 4 and no reload (front keeps the last good config)", () => {
-    expect(run({ auth: authConf(undefined), nginxTest: 1 })).toMatchObject({ code: 4, nginx: ["-t -q"] })
+    expect(run({ auth: authConf(undefined), nginxTest: 1 })).toMatchObject({ code: 4, nginx: ["-t -q"], published: undefined })
+    // current.conf goes back to the last target, never the config nginx refused.
+    const [loaded, refused] = runSteps([{ auth: authConf(undefined) }, { auth: authConf(TOKEN), nginxTest: 1 }])
+    expect(loaded).toMatchObject({ code: 0, published: expect.stringContaining(`${HASH}-${sha(authConf(undefined))}/servers.conf;`) })
+    expect(refused).toMatchObject({ code: 4, nginx: ["-t -q"], published: loaded!.published })
   })
 })

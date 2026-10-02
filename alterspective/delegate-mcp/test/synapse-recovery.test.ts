@@ -3,9 +3,9 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { silentLogger } from "../src/shared/log.ts"
-import { refreshIfDue } from "../src/synapse/refresh.ts"
+import { RELOAD_RETRY_MAX_MS, refreshIfDue, reloadBackoffMs } from "../src/synapse/refresh.ts"
 import { dpapiStore, memoryStore } from "../src/synapse/secret-store.ts"
-import { adopt, FRONT_RELOAD, readState, stateFile, writeState, type SynapseDeps } from "../src/synapse/token-manager.ts"
+import { adopt, FRONT_RELOAD, readState, stateFile, writeState, type Reload, type SynapseDeps } from "../src/synapse/token-manager.ts"
 import { jwt } from "./synapse-fixture.ts"
 
 const homes: string[] = []
@@ -17,7 +17,7 @@ async function fixture() {
   const home = await mkdtemp(path.join(os.tmpdir(), "ocd-recovery-"))
   homes.push(home)
   const store = memoryStore("test-original")
-  const calls = { refresh: 0, reload: 0, reloadExit: 0 }
+  const calls = { refresh: 0, reload: 0, reloadExit: 0, running: true }
   const clock = { now: 1_000_000 }
   const accessToken = jwt({ sub: "test-owner" })
   const deps: SynapseDeps = {
@@ -37,7 +37,7 @@ async function fixture() {
         calls.reload++
         return { code: calls.reloadExit, stdout: "", stderr: "" }
       }
-      return { code: 0, stdout: "true", stderr: "" }
+      return { code: 0, stdout: String(calls.running), stderr: "" }
     },
     lock: (fn) => fn(),
     now: () => clock.now,
@@ -118,6 +118,62 @@ test("a transient reload failure is retried before the new token's next renewal"
   h.clock.now += 15_000
   await refreshIfDue(h.deps)
   expect(h.calls.reload).toBe(2)
+  expect(h.calls.refresh).toBe(1)
+})
+
+test.each<{ exit: number; running: boolean; result: Reload }>([
+  { exit: 1, running: false, result: "front_not_running" },
+  { exit: 3, running: true, result: "config_changed" },
+])("a reload that cannot clear by itself ($result) is not retried on every tick", async ({ exit, running, result }) => {
+  const h = await fixture()
+  h.calls.reloadExit = exit
+  h.calls.running = running
+  expect((await refreshIfDue(h.deps)).reload).toBe(result)
+  for (let tick = 0; tick < 8; tick++) {
+    h.clock.now += 15_000
+    await refreshIfDue(h.deps)
+  }
+  expect(h.calls.reload).toBe(1)
+  // A real event (here a new token) still reloads.
+  h.calls.reloadExit = 0
+  h.calls.running = true
+  await adopt(h.deps, { accessToken: jwt({ sub: "test-owner" }), expiresInSec: 1000 })
+  expect(h.calls.reload).toBe(2)
+})
+
+test("front-reload exits map to results: 6 config_invalid, 7 unverified, 8 busy", async () => {
+  const h = await fixture()
+  for (const [exit, result] of [[6, "config_invalid"], [7, "unverified"], [8, "busy"]] as const) {
+    h.calls.reloadExit = exit
+    expect(await adopt(h.deps, { accessToken: jwt({ sub: "test-owner" }), expiresInSec: 1000 })).toBe(result)
+  }
+})
+
+test("a transient reload failure backs off, doubling from one tick, and success resets it", async () => {
+  const h = await fixture()
+  h.calls.reloadExit = 7
+  expect((await refreshIfDue(h.deps)).reload).toBe("unverified")
+  const reloadsAfter = async (ms: number) => {
+    h.clock.now += ms
+    await refreshIfDue(h.deps)
+    return h.calls.reload
+  }
+  expect(await reloadsAfter(15_000)).toBe(2) // 15 s after the first failure
+  expect(await reloadsAfter(15_000)).toBe(2) // now waits 30 s
+  expect(await reloadsAfter(15_000)).toBe(3)
+  expect(await reloadsAfter(45_000)).toBe(3) // now waits 60 s
+  expect(await reloadsAfter(15_000)).toBe(4)
+  expect((await readState(h.home))?.lastReload?.failures).toBe(4)
+  expect(reloadBackoffMs(20)).toBe(RELOAD_RETRY_MAX_MS)
+  h.calls.reloadExit = 0
+  expect(await reloadsAfter(120_000)).toBe(5)
+  expect((await readState(h.home))?.lastReload).toEqual({ result: "reloaded", at: h.clock.now })
+  expect(await reloadsAfter(15_000)).toBe(5)
+  // The next failure starts again at one tick.
+  h.calls.reloadExit = 8
+  expect(await adopt(h.deps, { accessToken: jwt({ sub: "test-owner" }), expiresInSec: 1000 })).toBe("busy")
+  expect((await readState(h.home))?.lastReload?.failures).toBe(1)
+  expect(await reloadsAfter(15_000)).toBe(7)
   expect(h.calls.refresh).toBe(1)
 })
 

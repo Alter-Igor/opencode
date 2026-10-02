@@ -95,6 +95,27 @@ RAG returned no useful lock-specific lesson; the lessons README was checked. The
 
 A fault check read the actual assertion lines and supplied a wrong value for each of their 14 fields, one at a time. Before the fix it reported **9 masked failures** (queue PID 36584, exit 1). Each assertion now has its own line. The same check reported **0 masked failures** (queue PID 54568). That queue job then reran the full real-nginx proof against `ocd-review-flock:pr61`: all five result records matched the expected values, cleanup succeeded, and bridge typecheck passed. A separate agent reviewed every changed assertion and the runner's error and cleanup paths; no blocker remained. Runtime source and the container image did not change. The fault driver is `C:\Users\IgorJericevich\AppData\Local\Temp\ocd-reload-assertions.ps1`.
 
+## PR #61 follow-up: retry only transient reload failures
+
+An independent review of head `208ff271f2` found one Medium and two Low faults:
+
+- **Medium:** the renewal tick retried the front reload every 15 seconds after any result other than `reloaded`, including `front_not_running` and `config_changed`. Neither clears by itself, so each bridge ran `docker exec` and `docker inspect`, rewrote state and logged a warning on every tick, forever. Now only front-reload exits 4-8 while front runs are retried on the timer, after one tick and then doubling, at most 5 minutes apart. `lastReload.failures` counts them; success resets it. A new token still reloads. A box start needs no bridge reload: the entrypoint's `front-reload --start` publishes the current files before nginx starts.
+- **Low:** exit 4 left `current.conf` pointing at the config `nginx -t` refused. The script now restores the previous target, or removes the file if there was none.
+- **Low:** exits 7 and 8 were reported as `config_invalid`. They are now `unverified` (no worker reply in time) and `busy` (another reload running). `oc_login` words them separately; doctor prints the result as recorded.
+
+Test first, with Bun `1.3.14` from `alterspective/delegate-mcp`:
+
+- `bun test --timeout 30000 ./test/synapse-recovery.test.ts` before the fix: **9 pass, 4 fail**. The two no-retry cases saw 9 reloads in 9 ticks (expected 1); the mapping and backoff cases saw `config_invalid` (expected `unverified`). After the fix: 13 pass, 0 fail.
+- `test/synapse-front-reload.test.ts` needs `sh` and `flock`, so it skips on Windows. For a local check only, a fake `flock` that exits 0 was put first on `PATH` (not committed). Against the old script the restore case failed (1 fail, 6 pass); with the fix it passed (7 pass). Real `flock` in Linux was not run for this change.
+
+Final checks:
+
+- `bun test --timeout 30000 ./test/*.test.ts`: **878 pass, 0 fail, 30 skip**, 3,470 assertions across 66 files.
+- `bun run typecheck`: exit 0.
+- `git diff --check`: clean.
+
+Not run: lint, the live route suite, the real-nginx proof, and any Docker or live Keystone test. No running container was touched.
+
 ## Documentation and rules
 
 README, package changelog/version, technical design, issue log and index were updated with the change (PDOC-LOC-01, VER-SRC-01, VER-LOG-01). The bridge is a single-purpose local tool; its operational guide is the package README. Existing fork-wide gaps G-1 through G-4 remain tracked under #41; this patch does not create a Project board or rewrite the fork documentation suite.

@@ -13,9 +13,17 @@ export const RETRY_BASE_MS = 30_000
 export const RETRY_MAX_MS = 10 * 60_000
 
 export const backoffMs = (failures: number) => Math.min(RETRY_MAX_MS, RETRY_BASE_MS * 2 ** Math.max(0, failures - 1))
+/** A transient reload failure is retried after one tick, then doubling, at most 5 min apart. */
+export const RELOAD_RETRY_MAX_MS = 5 * 60_000
+export const reloadBackoffMs = (failures: number) => Math.min(RELOAD_RETRY_MAX_MS, TICK_MS * 2 ** Math.max(0, failures - 1))
 
 const includeHasToken = async (deps: SynapseDeps) => authConfHasToken(await readFile(authConfPath(deps.frontDir), "utf8").catch(() => ""))
 const pastExpiry = (state: TokenState | undefined, now: number) => state !== undefined && now >= state.expiresAt
+/** Only a transient failure (it carries `failures`) is retried on the timer, once its backoff ends. */
+const reloadRetryDue = (state: TokenState | undefined, now: number) => {
+  const last = state?.lastReload
+  return last?.failures !== undefined && now >= last.at + reloadBackoffMs(last.failures)
+}
 
 /**
  * Review L5: signed in, not expired, outside any backoff, yet front's include has no token (it was
@@ -37,9 +45,11 @@ async function refreshLocked(deps: SynapseDeps, force: boolean): Promise<Refresh
   const state = await readState(deps.home)
   if (!force && !isDue(state, deps.now(), deps.refreshFraction) && !(await includeLost(deps, state))) {
     const expired = await expireIfPast(deps, state)
-    if (expired.reload || !state?.lastReload || state.lastReload.result === "reloaded") return expired
-    // Publishing the token and loading it are separate steps. Retry a failed load every tick,
-    // without rotating again or waiting until the newly issued token's next renewal point.
+    if (expired.reload || !reloadRetryDue(state, deps.now())) return expired
+    // Publishing the token and loading it are separate steps. Retry a transient load failure with
+    // backoff, without rotating again or waiting until the newly issued token's next renewal point.
+    // front_not_running and config_changed do not clear by themselves: front loads the current
+    // files when it starts, and a changed servers.conf needs a sandbox restart.
     return { ...expired, reload: await reloadFront(deps) }
   }
   // N1: another bridge holds the rotated refresh token in memory; the stored one is stale. Wait for it.

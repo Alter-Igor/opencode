@@ -18,7 +18,7 @@ export const SYNAPSE_SERVER = "synapse"
 
 async function signInSynapse(ctx: ToolContext) {
   const result = await ctx.synapse.signIn()
-  const front = result.reload === "reloaded" ? "front reloaded" : result.reload === "front_not_running" ? "front not running (it loads the token when the sandbox starts)" : result.reload === "config_changed" ? "front did NOT reload: its generated files are not the ones it started with (restart the sandbox: oc_server_restart {confirm: true})" : "front REFUSED the new config (it keeps the last good one; run oc_doctor)"
+  const front = result.reload === "reloaded" ? "front reloaded" : result.reload === "front_not_running" ? "front not running (it loads the token when the sandbox starts)" : result.reload === "config_changed" ? "front did NOT reload: its generated files are not the ones it started with (restart the sandbox: oc_server_restart {confirm: true})" : result.reload === "unverified" ? "front did not confirm the reload in time (the bridge retries; run oc_doctor)" : result.reload === "busy" ? "front was busy with another reload (the bridge retries; run oc_doctor)" : "front REFUSED the new config (it keeps the last good one; run oc_doctor)"
   return ok(`Synapse signed in on the host${result.user ? ` as ${result.user}` : ""}; token until ${new Date(result.expiresAt).toISOString()}, renewed silently; ${front}.`, {
     server: SYNAPSE_SERVER,
     result: "connected",
