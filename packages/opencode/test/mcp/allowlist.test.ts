@@ -65,8 +65,28 @@ describe("McpAllow.check with a policy", () => {
     expectRefused(remote(url, { oauth: { callbackPort: 1234 } }), /oauth\.callbackPort/)
   })
 
-  test("refuses oauth:false", () => {
-    expectRefused(remote("https://identity.alterspective.com.au/mcp/dynamic", { oauth: false }), /oauth:false/)
+  // #67: the delegate box sets oauth:false; the Authorization header is added outside the box.
+  test("allows oauth:false on an allowed remote URL", () => {
+    expect(check(remote("https://identity.alterspective.com.au/mcp/dynamic", { oauth: false }))).toEqual({ ok: true })
+    expect(check(remote("https://identity.alterspective.com.au/mcp/c/rag-global", { oauth: false }))).toEqual({
+      ok: true,
+    })
+  })
+
+  test("oauth:false does not relax any other rule", () => {
+    const off = { oauth: false } as const
+    expectRefused(remote("https://rag.alterspective.com.au/mcp", off), /not an allowed MCP URL/)
+    expectRefused(remote("https://identity.alterspective.com.au.evil.com/mcp/dynamic", off), /not an allowed MCP URL/)
+    expectRefused(remote("http://identity.alterspective.com.au/mcp/dynamic", off), /not an allowed MCP URL/)
+    expectRefused(remote("https://identity.alterspective.com.au/mcp/c/../x", off), /not an allowed MCP URL/)
+    expectRefused(remote("https://identity.alterspective.com.au/mcp/dynamic?x=1", off), /query or fragment/)
+    expectRefused(remote("https://user:pw@identity.alterspective.com.au/mcp/dynamic", off), /credentials/)
+    expectRefused(remote("not a url", off), /does not parse/)
+    expectRefused(
+      remote("https://identity.alterspective.com.au/mcp/dynamic", { ...off, headers: { Authorization: "x" } }),
+      /headers/,
+    )
+    expectRefused(remote("https://identity.alterspective.com.au/mcp/dynamic", off), /not valid JSON/, "{remote:[")
   })
 
   test("refuses local servers", () => {
