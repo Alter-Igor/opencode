@@ -36,7 +36,7 @@ export const collectTool = defineTool({
     const box = await ctx.box()
     const record = await collectRecord(ctx, box, args.sessionID, correlationId)
     const result = await ctx.workspaces.collect({ sessionKey: record.sessionKey, hostRepo: record.hostRepo, boxPath: record.boxPath, branch: record.branch })
-    await recordCollect(ctx, record, result.commits)
+    recordCollect(ctx, record, result.commits)
     const risky = result.hostExecutableChanges
     const warning = risky.length
       ? `WARNING: ${risky.length} changed file${risky.length === 1 ? "" : "s"} can run on the host (hooks, scripts or CI). Review them before running anything from ${result.branch}.`

@@ -68,7 +68,7 @@ export const resultTool = defineTool({
       todos(box, record, correlationId),
       box.hub.view(record.sessionID),
     ])
-    await recordResult(ctx, record, { state: view.state, at: view.since }, messages)
+    recordResult(ctx, record, { state: view.state, at: view.since }, messages)
     const n = diff.boxReportedCommits
     const commits = n === undefined ? "commit count unknown" : `${n} commit${n === 1 ? "" : "s"} (box-reported)`
     return ok(`${record.sessionID} is ${view.state}; ${replies.length} repl${replies.length === 1 ? "y" : "ies"}; ${commits} on ${record.branch}.`, {

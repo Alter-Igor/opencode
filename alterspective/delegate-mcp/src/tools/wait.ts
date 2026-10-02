@@ -76,11 +76,11 @@ async function waitOn(ctx: ToolContext, box: Box, args: WaitArgs) {
   const page = capEvents(result.events, formatCursor(result.next), 100)
   if (result.timedOut) {
     const states = await Promise.all(args.sessionIDs.map((id) => box.hub.view(id)))
-    await recordStates(ctx, observed(result.events, states))
+    recordStates(ctx, observed(result.events, states))
     return timedOut(timeoutSec, page.next, page.events, states)
   }
   const views = result.views ?? []
-  await recordStates(ctx, observed(result.events, views))
+  recordStates(ctx, observed(result.events, views))
   const matched = [...page.events.filter((e) => e.state).map((e) => `${e.sessionID ?? "?"} ${e.state}`), ...views.map((v) => `${v.sessionID} ${v.state}`)]
   return ok(`Done waiting: ${matched.join("; ") || "matching event"}.`, { still_running: false, next: page.next, events: page.events, views, ...(page.more ? { more: true } : {}) })
 }

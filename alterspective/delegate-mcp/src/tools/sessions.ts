@@ -98,7 +98,7 @@ export const startSessionTool = defineTool({
     const record = await startIn(ctx, box, { ...args, keystone }, ws, correlationId)
     ctx.sessions.set(record.sessionID, record)
     box.hub.track(record.sessionID, ws.boxPath)
-    await recordStart(ctx, record)
+    recordStart(ctx, record)
     return ok(`Session ${record.sessionID} started on ${ws.branch}. Next: oc_send, then oc_wait.`, {
       sessionID: record.sessionID, sessionKey: ws.sessionKey, branch: ws.branch, boxPath: ws.boxPath, hostRepo: ws.hostRepo, profile: record.profile, base: ws.base,
       ...(keystone ? { keystone } : {}),

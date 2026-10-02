@@ -6,7 +6,7 @@ import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from
 import os from "node:os"
 import path from "node:path"
 import { z } from "zod"
-import { reportsDir } from "../src/reporting/hooks.ts"
+import { flushReports, reportsDir } from "../src/reporting/hooks.ts"
 import type { TaskRecord } from "../src/reporting/record.ts"
 import type { CloseOutcome } from "../src/supervisor/workspaces.ts"
 import { cleanupTool, closeSessionTool } from "../src/tools/close-session.ts"
@@ -17,9 +17,16 @@ import { resultTool } from "../src/tools/result.ts"
 import { sendTool } from "../src/tools/send.ts"
 import { startSessionTool } from "../src/tools/sessions.ts"
 import { waitTool } from "../src/tools/wait.ts"
-import { SID, data, fakeContext, invoke, remoteSession, text, type Fake } from "./tools-core-fixture.ts"
+import { SID, data, fakeContext, invoke as invokeNow, remoteSession, text, type Fake } from "./tools-core-fixture.ts"
 
 const MARKER = "PROMPT-MARKER-7f3a9c-client-confidential"
+
+/** Review cycle 2: hooks never make a tool wait, so a test waits for the background record updates. */
+const invoke: typeof invokeNow = async (spec, args, ctx) => {
+  const result = await invokeNow(spec, args, ctx)
+  await flushReports()
+  return result
+}
 
 /** A fake context with its own bridge home, so its report folder holds only this test's records. */
 function context(): Fake {
@@ -147,6 +154,39 @@ describe("task records across the session lifecycle", () => {
     f.hub.waitResult = { events: [], next: { epoch: "ep1", seq: 12 }, timedOut: false, views: [{ sessionID: SID, directory: `/sessions/${key}`, state: "idle", since: postAt }] }
     await invoke(waitTool, { sessionIDs: [SID] }, f.ctx)
     expect(stored(f, key).outcome).toBe("completed")
+  })
+
+  test("C1: a run nobody waited on is recorded from the state the close holds", async () => {
+    const cases: Array<[string, Record<string, unknown>, Record<string, unknown>]> = [
+      ["idle", {}, { outcome: "completed" }],
+      ["error", { lastError: "ProviderAuthError" }, { outcome: "error", errorCode: "ProviderAuthError" }],
+      ["idle", { lastError: "APIError" }, { outcome: "error", errorCode: "APIError" }],
+      ["aborted", {}, { outcome: "aborted" }],
+    ]
+    for (const [state, extra, expected] of cases) {
+      const f = context()
+      const key = await started(f)
+      await invoke(sendTool, { sessionID: SID, message: "go" }, f.ctx)
+      await new Promise((resolve) => setTimeout(resolve, 2))
+      f.hub.views.set(SID, { sessionID: SID, directory: `/sessions/${key}`, state: state as "idle", since: new Date().toISOString(), ...extra })
+      f.api.on(`DELETE /session/${SID}`, { status: 200, data: true })
+      closeWith(f, {})
+      expect((await invoke(closeSessionTool, { sessionID: SID }, f.ctx)).isError).toBeUndefined()
+      expect(stored(f, key)).toMatchObject({ ...expected, disposition: "closed_clean" })
+    }
+  })
+
+  test("a held record lock never slows a tool: oc_send returns in well under 100 ms", async () => {
+    const f = context()
+    const key = await started(f)
+    writeFileSync(path.join(dir(f), `${key}.json.lock`), "another process")
+    const t0 = performance.now()
+    const result = await invokeNow(sendTool, { sessionID: SID, message: "go" }, f.ctx)
+    const ms = performance.now() - t0
+    expect(result.isError).toBeUndefined()
+    expect(ms).toBeLessThan(100)
+    await flushReports()
+    expect(stored(f, key).sendCount).toBe(0)
   })
 
   test("closing a task that is still running records unknown; closing with abort: true records aborted", async () => {

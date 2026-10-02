@@ -186,6 +186,85 @@ describe("report store", () => {
     expect(existsSync(lock)).toBe(false)
   })
 
+  test("a lock dated in the future counts as stale and is taken over", async () => {
+    const dir = tmpDir()
+    const store = createReportStore({ dir, now: () => NOW, sleep: async () => {} })
+    await store.update("s-0000000151", () => rec("s-0000000151"))
+    const lock = path.join(dir, "s-0000000151.json.lock")
+    writeFileSync(lock, "clock skew")
+    const future = new Date(Date.now() + 60_000)
+    utimesSync(lock, future, future)
+    expect((await store.update("s-0000000151", (r) => (r ? { ...r, sendCount: 3 } : r)))?.sendCount).toBe(3)
+  })
+
+  test("two takers racing on one stale lock: only one takes it, the other waits its turn, nothing is lost", async () => {
+    const dir = tmpDir()
+    const slow = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
+    const setup = createReportStore({ dir, now: () => NOW })
+    await setup.update("s-0000000161", () => rec("s-0000000161"))
+    const lock = path.join(dir, "s-0000000161.json.lock")
+    writeFileSync(lock, "crashed writer")
+    const old = new Date(Date.now() - 20_000)
+    utimesSync(lock, old, old)
+    // Both takers see the stale lock before either acts on it.
+    let arrived = 0
+    const gate = async () => {
+      arrived++
+      while (arrived < 2) await slow(2)
+    }
+    // B arrives second, so it takes the stale lock first; it then holds it across an await (a slow
+    // rename) while A, waking, moves B's fresh lock aside and must put it back instead of going on.
+    let failNext = true
+    const a = createReportStore({ dir, now: () => NOW, onStaleLock: gate })
+    const b = createReportStore({ dir, now: () => NOW, sleep: () => slow(40), onStaleLock: gate, rename: (from, to) => {
+      if (failNext) {
+        failNext = false
+        throw errno("EBUSY")
+      }
+      renameSync(from, to)
+    } })
+    const bump = (r: TaskRecord | undefined) => (r ? { ...r, sendCount: r.sendCount + 1 } : r)
+    await Promise.all([a.update("s-0000000161", bump), b.update("s-0000000161", bump)])
+    expect(setup.get("s-0000000161")?.sendCount).toBe(2)
+    expect(readdirSync(dir).sort()).toEqual(["s-0000000161.json"])
+  })
+
+  test("release deletes only its own lock", async () => {
+    const dir = tmpDir()
+    const lock = path.join(dir, "s-0000000171.json.lock")
+    let failNext = true
+    const store = createReportStore({ dir, now: () => NOW, sleep: async () => writeFileSync(lock, "someone else took it over"), rename: (from, to) => {
+      if (failNext) {
+        failNext = false
+        throw errno("EBUSY")
+      }
+      renameSync(from, to)
+    } })
+    await store.update("s-0000000171", () => rec("s-0000000171"))
+    expect(readFileSync(lock, "utf8")).toBe("someone else took it over")
+  })
+
+  test("retention removes stale lock files that have no record, and keeps the rest", async () => {
+    const dir = tmpDir()
+    const store = createReportStore({ dir, now: () => NOW })
+    await store.update("s-0000000181", () => rec("s-0000000181"))
+    const old = new Date(Date.now() - 20_000)
+    for (const name of ["s-0000000181.json.lock", "s-0000000182.json.lock", "s-0000000183.json.lock"]) writeFileSync(path.join(dir, name), "x")
+    utimesSync(path.join(dir, "s-0000000181.json.lock"), old, old)
+    utimesSync(path.join(dir, "s-0000000182.json.lock"), old, old)
+    store.prune()
+    expect(readdirSync(dir).sort()).toEqual(["s-0000000181.json", "s-0000000181.json.lock", "s-0000000183.json.lock"])
+  })
+
+  test("flush() waits for updates that were queued without being awaited", async () => {
+    const dir = tmpDir()
+    const store = createReportStore({ dir, now: () => NOW })
+    void store.update("s-0000000191", () => rec("s-0000000191"))
+    void store.update("s-0000000192", () => rec("s-0000000192"))
+    await store.flush()
+    expect(readdirSync(dir).sort()).toEqual(["s-0000000191.json", "s-0000000192.json"])
+  })
+
   test("retention also runs when a new task is recorded", async () => {
     const dir = tmpDir()
     writeFileSync(path.join(dir, "s-0000000201.json"), JSON.stringify(rec("s-0000000201", { startedAt: new Date(NOW - 100 * DAY).toISOString() })))

@@ -77,7 +77,7 @@ export async function sendPrompt(ctx: ToolContext, box: Box, record: SessionReco
   if (res.status < 200 || res.status >= 300) throw new DelegateError("upstream_error", "The delegate server did not accept the message.", "Check oc_status, then retry.", `HTTP ${res.status}`)
   box.hub.markSent(record.sessionID)
   // #73: metadata only (the model and agent sent); the prompt text never reaches the record.
-  await recordSend(ctx, record, { model, agent, at: sendStartedAt })
+  recordSend(ctx, record, { model, agent, at: sendStartedAt })
   ctx.log.log("info", "tools", "prompt sent", { sessionID: record.sessionID, correlationId: prompt.correlationId, instructions: instructions.files.join(","), instructionsTruncated: instructions.truncated, instructionsFailed: (instructions.failed ?? []).join(","), savedModelFallback: saved.fallback !== undefined })
   return { cursor: formatCursor(cursor), instructions, ...(saved.fallback ? { modelFallback: saved.fallback } : {}) }
 }

@@ -8,7 +8,7 @@
 import { z } from "zod"
 import { recordClose } from "../reporting/hooks.ts"
 import { DelegateError } from "../shared/errors.ts"
-import type { SessionState } from "../shared/contracts.ts"
+import type { SessionState, SessionView } from "../shared/contracts.ts"
 import type { CloseOutcome, SessionRemoval } from "../supervisor/workspaces.ts"
 import type { Box, ToolContext } from "./context.ts"
 import { whileClosing } from "./closing.ts"
@@ -99,25 +99,37 @@ function refusalError(sessionID: string, outcome: Pick<CloseOutcome, "refused" |
   return new DelegateError("uncollected_work", `Session ${sessionID} still has ${lost} in the sandbox, so nothing was deleted.`, action)
 }
 
-/** The state now; refuses an unverifiable one. */
-async function stateOf(box: Box, sessionID: string): Promise<SessionState> {
-  const state = (await box.hub.view(sessionID)).state
-  if (UNVERIFIED.has(state)) throw unverified(sessionID, state)
-  return state
+/** The view now; refuses an unverifiable state. */
+async function viewOf(box: Box, sessionID: string): Promise<SessionView> {
+  const view = await box.hub.view(sessionID)
+  if (UNVERIFIED.has(view.state)) throw unverified(sessionID, view.state)
+  return view
 }
 
+/** The state now; refuses an unverifiable one. */
+async function stateOf(box: Box, sessionID: string): Promise<SessionState> {
+  return (await viewOf(box, sessionID)).state
+}
+
+/** #73 review cycle 2: whether the close aborted the run, and the settled view it read (for the task record). */
+type Stopped = { aborted: boolean; view?: SessionView }
+
+/** The part of a view the task record uses: state, when it began, and the bridge's error label. */
+const closeSeen = (view: SessionView | undefined) => (view ? { state: view.state, at: view.since, ...(view.lastError ? { lastError: view.lastError } : {}) } : undefined)
+
 /** The stop hook: nothing to do for a session the sandbox lost; an active one is refused, or aborted and awaited. */
-async function stopSession(ctx: ToolContext, box: Box, located: Located, sessionID: string, abort: boolean, correlationId: string): Promise<boolean> {
-  if (!located.remote) return false
-  let state = await stateOf(box, sessionID)
-  if (!ACTIVE.has(state)) return false
+async function stopSession(ctx: ToolContext, box: Box, located: Located, sessionID: string, abort: boolean, correlationId: string): Promise<Stopped> {
+  if (!located.remote) return { aborted: false }
+  const view = await viewOf(box, sessionID)
+  let state = view.state
+  if (!ACTIVE.has(state)) return { aborted: false, view }
   if (!abort) throw active(sessionID, state, false)
   const res = await box.api.call<unknown>({ method: "POST", path: `/session/${sessionID}/abort`, directory: boxPathOf(located.sessionKey), correlationId })
   ctx.log.log("info", "tools", "abort sent before closing a session", { sessionID, correlationId, status: res.status })
   if (res.status < 200 || res.status >= 300) throw new DelegateError("upstream_error", `The sandbox did not accept the abort of session ${sessionID}, so nothing was deleted.`, "Retry; check oc_status.", `HTTP ${res.status}`)
   for (let poll = 0; poll < STOP_POLLS; poll++) {
     state = await stateOf(box, sessionID)
-    if (!ACTIVE.has(state)) return true
+    if (!ACTIVE.has(state)) return { aborted: true }
     await new Promise((resolve) => setTimeout(resolve, STOP_POLL_MS))
   }
   throw active(sessionID, state, true)
@@ -148,10 +160,13 @@ type CloseArgs = { sessionID: string; deleteBranch?: boolean; abort?: boolean; d
 
 async function closeOne(ctx: ToolContext, box: Box, located: Located, args: CloseArgs, correlationId: string) {
   let aborted = false
+  let seen: SessionView | undefined
   const owner = { supervisor: ctx.supervisor, sessionID: args.sessionID }
   const outcome = await ctx.workspaces.closeSession(located.sessionKey, owner, { discardWork: args.discardWork === true, deleteBranch: args.deleteBranch === true }, {
     stop: async () => {
-      aborted = await stopSession(ctx, box, located, args.sessionID, args.abort === true, correlationId)
+      const stopped = await stopSession(ctx, box, located, args.sessionID, args.abort === true, correlationId)
+      aborted = stopped.aborted
+      seen = stopped.view
     },
     deleteSession: sessionDeleter(box, args.sessionID, located.sessionKey, correlationId),
   })
@@ -167,7 +182,7 @@ async function closeOne(ctx: ToolContext, box: Box, located: Located, args: Clos
   if (outcome.closed) {
     ctx.sessions.delete(args.sessionID)
     const lostWork = outcome.uncollectedCommits + outcome.uncommittedPaths + outcome.ignoredPaths > 0
-    await recordClose(ctx, located.sessionKey, args.discardWork === true && lostWork ? "closed_discarded" : "closed_clean", aborted)
+    recordClose(ctx, located.sessionKey, args.discardWork === true && lostWork ? "closed_discarded" : "closed_clean", { aborted, seen: closeSeen(seen) })
   } else if (outcome.session !== "kept") await keepTracked(ctx, args.sessionID, located.sessionKey)
   const { ignoredExamples, ...rest } = outcome
   return ok(closeSummary(outcome), { ...rest, aborted, ...(ignoredExamples.length ? { ignoredExamples: untrusted(ignoredExamples.join("\n"), 2000) } : {}) })
@@ -238,10 +253,11 @@ async function sweepOne(run: SweepRun, state: Candidate): Promise<void> {
     return
   }
   const located: Located = { sessionKey: state.sessionKey, ...(stale.present ? { remote: { id: state.sessionID } } : {}) }
+  let seen: SessionView | undefined
   const o = await whileClosing(ctx, state.sessionID, () =>
     ctx.workspaces.closeSession(state.sessionKey, owner, { discardWork: false, deleteBranch: run.deleteBranch }, {
       stop: async () => {
-        await stopSession(ctx, run.box, located, state.sessionID, false, run.correlationId)
+        seen = (await stopSession(ctx, run.box, located, state.sessionID, false, run.correlationId)).view
       },
       deleteSession: sessionDeleter(run.box, state.sessionID, state.sessionKey, run.correlationId),
     }),
@@ -249,7 +265,7 @@ async function sweepOne(run: SweepRun, state: Candidate): Promise<void> {
   if (o.closed) {
     ctx.sessions.delete(state.sessionID)
     out.closed.push(state.sessionKey)
-    await recordClose(ctx, state.sessionKey, "swept")
+    recordClose(ctx, state.sessionKey, "swept", { seen: closeSeen(seen) })
   } else if (o.refused && o.session === "kept") keep(out, state.sessionKey, o.refused, o)
   else {
     // Late refusal (session deleted, copy and host record kept): same handling as oc_close_session.

@@ -6,7 +6,8 @@
 // then a count cap that open tasks are exempt from) runs when a new task is recorded and before a report. AILES-056: retention decides on
 // every file first and deletes after. Nothing here throws to a caller: a failed write is logged
 // once (the error code only, no path or content) and otherwise ignored.
-import { closeSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs"
+import { randomBytes } from "node:crypto"
+import { closeSync, existsSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs"
 import path from "node:path"
 import { SESSION_KEY } from "../supervisor/workspaces-state.ts"
 import { parseTaskRecord, type TaskRecord } from "./record.ts"
@@ -26,6 +27,8 @@ const DAY_MS = 24 * 60 * 60 * 1000
 const LOCK_ATTEMPTS = 20
 const LOCK_RETRY_MS = 25
 export const STALE_LOCK_MS = 10_000
+/** A lock dated further ahead than this is from a skewed clock (a fresh one can read a few ms ahead). */
+const FUTURE_TOLERANCE_MS = 1_000
 
 export type ReportStoreOptions = {
   dir: string
@@ -39,6 +42,8 @@ export type ReportStoreOptions = {
   lockAttempts?: number
   lockRetryMs?: number
   staleLockMs?: number
+  /** Test seam: awaited after a stale lock is seen and before it is taken over. */
+  onStaleLock?: () => Promise<void>
 }
 
 export type ReportStore = {
@@ -53,6 +58,8 @@ export type ReportStore = {
   list(): TaskRecord[]
   /** Apply retention now; returns how many records were removed. Never throws. */
   prune(): number
+  /** Wait for every queued update to finish (tests, shutdown). Never rejects. */
+  flush(): Promise<void>
 }
 
 const errno = (error: unknown): string => {
@@ -154,45 +161,77 @@ export function createReportStore(options: ReportStoreOptions): ReportStore {
     return next
   }
 
+  /** Review cycle 2 (LOW 2): older than the timeout, or dated in the future (a lock from a skewed clock). */
+  const isStale = (file: string): boolean => {
+    const age = Date.now() - statSync(file).mtimeMs
+    return age > staleLockMs || age < -FUTURE_TOLERANCE_MS
+  }
+
   /**
-   * Review cycle 1 (LOW 3): a cross-process lock per key (<key>.json.lock, created O_EXCL), so two
-   * bridge processes with the same name cannot lose each other's read-modify-write. A lock older than
-   * STALE_LOCK_MS is a crashed writer's and is taken over. Undefined when it stays busy: the caller
-   * skips the update rather than wait longer.
+   * Review cycles 1-2 (LOW 3): a cross-process lock per key (<key>.json.lock, created O_EXCL and
+   * holding a random owner token), so two bridge processes with the same name cannot lose each
+   * other's read-modify-write. A stale lock (a crashed writer's) is taken over atomically: it is
+   * renamed aside to a unique name, which only one taker can do; if what was moved turns out to be a
+   * fresh lock (someone else took over first), it is linked back (never over another lock). The new
+   * lock is then created with O_EXCL like any other. Release deletes the lock only while it still
+   * holds this owner's token. Undefined when it stays busy: the caller skips the update.
    */
   async function lock(key: string): Promise<(() => void) | undefined> {
     const file = `${fileOf(key)}.lock`
+    const token = randomBytes(12).toString("hex")
     mkdirSync(dir, { recursive: true })
     for (let attempt = 1; attempt <= lockAttempts; attempt++) {
       try {
-        closeSync(openSync(file, "wx"))
+        const fd = openSync(file, "wx")
+        try {
+          writeSync(fd, token)
+        } finally {
+          closeSync(fd)
+        }
         return () => {
           try {
-            unlinkSync(file)
+            if (readFileSync(file, "utf8") === token) unlinkSync(file)
           } catch {
-            // already removed (taken over as stale): nothing to release
+            // already gone: nothing to release
           }
         }
       } catch (error) {
         if (errno(error) !== "EEXIST") throw error
       }
-      let age = 0
+      let stale: boolean
       try {
-        age = Date.now() - statSync(file).mtimeMs
+        stale = isStale(file)
       } catch {
         continue // released meanwhile: try again at once
       }
-      if (age > staleLockMs) {
+      if (stale) {
+        await options.onStaleLock?.()
+        const aside = `${file}.${token}.${attempt}.stale`
         try {
-          unlinkSync(file)
+          renameSync(file, aside)
         } catch {
-          // another process took it over first
+          continue // another taker moved it first
+        }
+        try {
+          if (!isStale(aside)) linkSync(aside, file) // a live lock was moved: put it back
+        } catch {
+          // a new lock already stands there: the moved one's owner still releases only its own
+        }
+        try {
+          unlinkSync(aside)
+        } catch {
+          // left for retention
         }
         continue
       }
       if (attempt < lockAttempts) await sleep(lockRetryMs)
     }
     return undefined
+  }
+
+  /** Review cycle 2 (LOW 1): resolves once every queued update (of every key) has finished. */
+  async function flush(): Promise<void> {
+    while (chains.size) await Promise.all([...chains.values()])
   }
 
   function update(key: string, fn: (current: TaskRecord | undefined) => TaskRecord | undefined): Promise<TaskRecord | undefined> {
@@ -246,8 +285,19 @@ export function createReportStore(options: ReportStoreOptions): ReportStore {
             return false
           }
         })
+      // Review cycle 2 (LOW 4): a stale lock with no record left (and a taken-over lock set aside).
+      const staleLocks = names()
+        .filter((n) => (n.endsWith(".json.lock") && !existsSync(path.join(dir, n.slice(0, -".lock".length)))) || n.endsWith(".stale"))
+        .map((n) => path.join(dir, n))
+        .filter((file) => {
+          try {
+            return isStale(file)
+          } catch {
+            return false
+          }
+        })
       let removed = 0
-      for (const file of [...drop, ...staleTmp]) {
+      for (const file of [...drop, ...staleTmp, ...staleLocks]) {
         try {
           unlinkSync(file)
           if (file.endsWith(".json")) removed++
@@ -261,5 +311,5 @@ export function createReportStore(options: ReportStoreOptions): ReportStore {
     }
   }
 
-  return { dir, get, update, list, prune }
+  return { dir, get, update, list, prune, flush }
 }

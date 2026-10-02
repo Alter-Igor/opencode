@@ -32,16 +32,30 @@ export function reportsFor(ctx: Pick<ToolContext, "config" | "log">): ReportStor
   return store
 }
 
+/** Review cycle 2 (LOW 1): wait for every queued record update of every store (tests, shutdown). */
+export async function flushReports(): Promise<void> {
+  await Promise.all([...stores.values()].map((s) => s.flush()))
+}
+
 let hookFailureLogged = false
 
-/** Run a hook; anything it throws is logged once per process and otherwise ignored. */
-async function guarded(ctx: Pick<ToolContext, "log">, fn: () => Promise<unknown>): Promise<void> {
+function hookFailed(ctx: Pick<ToolContext, "log">, error: unknown): void {
+  if (hookFailureLogged) return
+  hookFailureLogged = true
+  safeLog(ctx.log, "warn", "reporting", "task record hook failed; reporting goes on without it", { code: error instanceof Error ? error.name : "unknown" })
+}
+
+/**
+ * Run a hook. Review cycle 2 (LOW 1): a tool never waits on its record. The hook only queues the
+ * update (the store keeps per-key order in this process) and returns at once; the update runs in
+ * the background. Anything it throws, now or later, is logged once per process and otherwise ignored.
+ */
+function guarded(ctx: Pick<ToolContext, "log">, fn: () => Promise<unknown> | void): void {
   try {
-    await fn()
+    const pending = fn()
+    if (pending) void pending.catch((error: unknown) => hookFailed(ctx, error))
   } catch (error) {
-    if (hookFailureLogged) return
-    hookFailureLogged = true
-    safeLog(ctx.log, "warn", "reporting", "task record hook failed; reporting goes on without it", { code: error instanceof Error ? error.name : "unknown" })
+    hookFailed(ctx, error)
   }
 }
 
@@ -62,7 +76,7 @@ function fresh(ctx: Ctx, rec: SessionRecord): TaskRecord {
 }
 
 /** oc_start_session: create the task's record. */
-export function recordStart(ctx: Ctx, rec: SessionRecord): Promise<void> {
+export function recordStart(ctx: Ctx, rec: SessionRecord): void {
   return guarded(ctx, () => reportsFor(ctx).update(rec.sessionKey, (current) => current ?? { ...fresh(ctx, rec), startedAt: nowIso() }))
 }
 
@@ -71,7 +85,7 @@ export function recordStart(ctx: Ctx, rec: SessionRecord): Promise<void> {
  * `at` is when the send began, taken before the prompt POST (review cycle 1, LOW 5): a run that
  * settles while the POST is in flight is then not mistaken for a stale state.
  */
-export function recordSend(ctx: Ctx, rec: SessionRecord, sent: { model?: string; agent?: string; at?: string }): Promise<void> {
+export function recordSend(ctx: Ctx, rec: SessionRecord, sent: { model?: string; agent?: string; at?: string }): void {
   return guarded(ctx, () =>
     reportsFor(ctx).update(rec.sessionKey, (current) => {
       const base = current ?? fresh(ctx, rec)
@@ -133,13 +147,13 @@ function ended(record: TaskRecord, outcome: Outcome, finishedAt: string, code?: 
 }
 
 /** oc_wait: the states the wait already returned (views, then the latest state event per session). */
-export function recordStates(ctx: Ctx, states: readonly ObservedState[]): Promise<void> {
-  return guarded(ctx, async () => {
+export function recordStates(ctx: Ctx, states: readonly ObservedState[]): void {
+  return guarded(ctx, () => {
     const latest = new Map<string, ObservedState>()
     for (const s of states) latest.set(s.sessionID, s)
     for (const seen of latest.values()) {
       const key = ctx.sessions.get(seen.sessionID)?.sessionKey
-      if (key) await reportsFor(ctx).update(key, (current) => (current ? finish(current, seen) : undefined))
+      if (key) void reportsFor(ctx).update(key, (current) => (current ? finish(current, seen) : undefined))
     }
   })
 }
@@ -171,7 +185,7 @@ export function usageOf(messages: readonly unknown[]): { tokens?: Tokens } {
 const total = (t: Tokens | undefined) => (t ? t.input + t.output + t.reasoning + t.cacheRead + t.cacheWrite : -1)
 
 /** oc_result: tokens from the messages it fetched, and the state it read. */
-export function recordResult(ctx: Ctx, rec: SessionRecord, seen: { state: SessionState; at?: string }, messages: readonly unknown[]): Promise<void> {
+export function recordResult(ctx: Ctx, rec: SessionRecord, seen: { state: SessionState; at?: string }, messages: readonly unknown[]): void {
   return guarded(ctx, () =>
     reportsFor(ctx).update(rec.sessionKey, (current) => {
       if (!current) return undefined
@@ -186,7 +200,7 @@ export function recordResult(ctx: Ctx, rec: SessionRecord, seen: { state: Sessio
 }
 
 /** oc_collect: the host-verified commit count. */
-export function recordCollect(ctx: Ctx, rec: SessionRecord, commits: number): Promise<void> {
+export function recordCollect(ctx: Ctx, rec: SessionRecord, commits: number): void {
   return guarded(ctx, () =>
     reportsFor(ctx).update(rec.sessionKey, (current) => {
       const base = current ?? fresh(ctx, rec)
@@ -198,16 +212,26 @@ export function recordCollect(ctx: Ctx, rec: SessionRecord, commits: number): Pr
 
 /**
  * oc_close_session / oc_cleanup: what happened to the copy. Only an existing record is updated.
- * Review cycle 1 (MEDIUM 1): a run still marked running ends here, as aborted when the close
- * aborted it, else unknown (unknown counts as finished and so lowers the success rate).
+ * Review cycles 1-2: a run still marked running ends here. An abort the close sent makes it aborted;
+ * else the state the close read decides (idle with no error: completed; an error state, or idle
+ * with an error seen: error; a hub abort: aborted). A state from before the last send, or none,
+ * gives unknown, which counts as finished and so lowers the success rate.
  */
-export function recordClose(ctx: Ctx, key: string, disposition: Exclude<Disposition, "open" | "collected">, aborted = false): Promise<void> {
+export function recordClose(ctx: Ctx, key: string, disposition: Exclude<Disposition, "open" | "collected">, end: { aborted?: boolean; seen?: Omit<ObservedState, "sessionID"> } = {}): void {
   return guarded(ctx, () =>
     reportsFor(ctx).update(key, (current) => {
       if (!current) return undefined
       const at = nowIso()
-      const base = current.outcome === "running" ? ended(current, aborted ? "aborted" : "unknown", at) : current
-      return { ...base, disposition, closedAt: at }
+      return { ...(current.outcome === "running" ? closedRun(current, at, end) : current), disposition, closedAt: at }
     }),
   )
+}
+
+function closedRun(record: TaskRecord, at: string, end: { aborted?: boolean; seen?: Omit<ObservedState, "sessionID"> }): TaskRecord {
+  if (end.aborted) return ended(record, "aborted", at)
+  const seen = end.seen
+  // Idle with an error seen is a failed run, not a completed one.
+  const state: SessionState | undefined = seen?.state === "idle" && seen.lastError ? "error" : seen?.state
+  const done = state && seen && state !== "not_found" ? finish(record, { sessionID: record.sessionID, ...seen, state }) : undefined
+  return done ?? ended(record, "unknown", at)
 }
