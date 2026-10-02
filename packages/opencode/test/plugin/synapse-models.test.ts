@@ -4,13 +4,22 @@ import {
   SYNAPSE_AUTO_MODEL,
   SYNAPSE_DEFAULT_CONTEXT,
   SYNAPSE_DEFAULT_OUTPUT,
+  SYNAPSE_MODELS_TIMEOUT_MS,
+  createSynapseModelsFailureLogger,
+  fileSynapseModelsCache,
   loadSynapseModels,
   parseSynapseModelList,
+  readStoredSynapseCredential,
   synapseModelsUrl,
+  type SynapseModelEntry,
+  type SynapseModelsCache,
   type SynapseModelsFetch,
   type SynapseModelsLogEvent,
 } from "../../src/plugin/synapse-models"
-import { SynapseAuthPlugin } from "../../src/plugin/synapse"
+import { SynapseAuthPlugin, resolveSynapseModelsToken } from "../../src/plugin/synapse"
+import * as fs from "fs/promises"
+import * as os from "os"
+import * as path from "path"
 
 const BASE = "https://synapse.example.test/v1"
 const TOKEN = "sk-live-token-value-1234567890"
@@ -75,13 +84,37 @@ function synapseOf(cfg: Config) {
   return provider
 }
 
-function deps(fetchImpl: SynapseModelsFetch, logs: SynapseModelsLogEvent[], token?: string) {
+function memoryCache(seed: Record<string, Record<string, SynapseModelEntry>> = {}): SynapseModelsCache & {
+  store: Record<string, Record<string, SynapseModelEntry>>
+} {
+  const store = { ...seed }
+  return {
+    store,
+    read: async (baseURL) => store[baseURL],
+    write: async (baseURL, models) => {
+      store[baseURL] = models
+    },
+  }
+}
+
+function deps(
+  fetchImpl: SynapseModelsFetch,
+  logs: SynapseModelsLogEvent[],
+  token?: string,
+  cache: SynapseModelsCache = memoryCache(),
+) {
   return {
     fetch: fetchImpl,
-    readStoredToken: async () => token,
+    resolveToken: async () => token,
     log: (event: SynapseModelsLogEvent) => logs.push(event),
     defaultBaseURL: "https://default.example.test/v1",
+    cache,
   }
+}
+
+function jwt(payload: object): string {
+  const header = Buffer.from(JSON.stringify({ alg: "none", typ: "JWT" })).toString("base64url")
+  return `${header}.${Buffer.from(JSON.stringify(payload)).toString("base64url")}.sig`
 }
 
 describe("synapseModelsUrl", () => {
@@ -211,51 +244,216 @@ describe("loadSynapseModels", () => {
     expect(cfg.provider?.synapse).toBeUndefined()
   })
 
-  test("SynapseAuthPlugin's config hook loads the live list with the stored token", async () => {
+  test("skips the fetch, and sends no credentials, when synapse is in disabled_providers", async () => {
+    const cfg = { ...configWithStaleModels(), disabled_providers: ["synapse"] }
+    const calls: Call[] = []
+    expect(await loadSynapseModels(cfg, deps(okFetch(LIVE_REPLY, calls), [], TOKEN))).toBe("skipped")
+    expect(calls).toHaveLength(0)
+  })
+
+  test("skips the fetch when enabled_providers excludes synapse", async () => {
+    const cfg = { ...configWithStaleModels(), enabled_providers: ["other"] }
+    const calls: Call[] = []
+    expect(await loadSynapseModels(cfg, deps(okFetch(LIVE_REPLY, calls), [], TOKEN))).toBe("skipped")
+    expect(calls).toHaveLength(0)
+  })
+
+  test("a slow gateway is abandoned at the timeout and the fallback is used", async () => {
+    expect(SYNAPSE_MODELS_TIMEOUT_MS).toBeLessThanOrEqual(2_500)
+    const slow: SynapseModelsFetch = (_url, init) =>
+      new Promise((_resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("should have been aborted")), 10_000)
+        init.signal?.addEventListener("abort", () => {
+          clearTimeout(timer)
+          reject(new Error("aborted by timeout"))
+        })
+      })
+    const cfg = configWithStaleModels()
+    const logs: SynapseModelsLogEvent[] = []
+    const started = Date.now()
+    const result = await loadSynapseModels(cfg, { ...deps(slow, logs, TOKEN), timeoutMs: 50 })
+    expect(Date.now() - started).toBeLessThan(2_000)
+    expect(result).toBe("fallback")
+    expect(logs[0]?.error).toContain("aborted")
+  })
+
+  test("success writes the last good list to the cache, without any token", async () => {
+    const cache = memoryCache()
+    await loadSynapseModels(configWithStaleModels(), deps(okFetch(LIVE_REPLY, []), [], TOKEN, cache))
+    expect(Object.keys(cache.store[BASE] ?? {})).toContain("claude-opus-5")
+    expect(JSON.stringify(cache.store)).not.toContain(TOKEN)
+  })
+
+  test("failure uses the cached last good list, plus auto, before the configured list", async () => {
+    const cache = memoryCache({ [BASE]: { "cached-model": { name: "cached-model" } } })
+    const cfg = configWithStaleModels()
+    const result = await loadSynapseModels(cfg, deps(failingFetch([]), [], TOKEN, cache))
+    expect(result).toBe("cache")
+    expect(Object.keys(cfg.provider?.synapse?.models ?? {}).sort()).toEqual(["cached-model", SYNAPSE_AUTO_MODEL].sort())
+  })
+})
+
+describe("fileSynapseModelsCache", () => {
+  test("round-trips per base URL and survives a missing or corrupt file", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "synapse-models-cache-"))
+    try {
+      const file = path.join(dir, "synapse-models.json")
+      const cache = fileSynapseModelsCache(file)
+      expect(await cache.read(BASE)).toBeUndefined()
+      await cache.write(BASE, { "m-1": { name: "m-1" } })
+      await cache.write("https://other.test/v1", { "m-2": { name: "m-2" } })
+      expect(Object.keys((await cache.read(BASE)) ?? {})).toEqual(["m-1"])
+      await fs.writeFile(file, "{not json")
+      expect(await cache.read(BASE)).toBeUndefined()
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("createSynapseModelsFailureLogger", () => {
+  test("logs each distinct failure once per process, not every startup", () => {
+    const sink: SynapseModelsLogEvent[] = []
+    const log = createSynapseModelsFailureLogger((event) => sink.push(event), new Set())
+    const event: SynapseModelsLogEvent = { reason: "synapse-models-fetch-failed", url: BASE, error: "HTTP 503" }
+    log(event)
+    log(event)
+    log({ ...event, error: "HTTP 401" })
+    log({ ...event, url: "https://other.test/v1/models" })
+    expect(sink.map((e) => `${e.url} ${e.error}`)).toEqual([
+      `${BASE} HTTP 503`,
+      `${BASE} HTTP 401`,
+      "https://other.test/v1/models HTTP 503",
+    ])
+  })
+})
+
+describe("readStoredSynapseCredential", () => {
+  test("falls back to auth.json when OPENCODE_AUTH_CONTENT is not valid JSON, like the Auth service", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "synapse-auth-"))
+    const previous = process.env.OPENCODE_AUTH_CONTENT
+    try {
+      const file = path.join(dir, "auth.json")
+      await fs.writeFile(
+        file,
+        JSON.stringify({
+          synapse: { type: "api", key: TOKEN, metadata: { refreshToken: "r-1", expiresAt: "1700000000000" } },
+        }),
+      )
+      process.env.OPENCODE_AUTH_CONTENT = "{broken"
+      const cred = await readStoredSynapseCredential(file)
+      expect(cred?.token).toBe(TOKEN)
+      expect(cred?.refreshToken).toBe("r-1")
+      expect(cred?.expiresAt).toBe(1_700_000_000_000)
+    } finally {
+      if (previous === undefined) delete process.env.OPENCODE_AUTH_CONTENT
+      else process.env.OPENCODE_AUTH_CONTENT = previous
+      await fs.rm(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("resolveSynapseModelsToken", () => {
+  const future = Date.now() + 3_600_000
+  const freshSynapseJwt = jwt({ aud: "synapse", exp: Math.floor(future / 1000) })
+
+  test("an expired token is refreshed before the fetch", async () => {
+    const expired = jwt({ aud: "synapse", exp: Math.floor(Date.now() / 1000) - 60 })
+    let refreshed = 0
+    const token = await resolveSynapseModelsToken(
+      { token: expired, refreshToken: "r-1", expiresAt: Date.now() - 60_000 },
+      async () => {
+        refreshed++
+        return freshSynapseJwt
+      },
+    )
+    expect(refreshed).toBe(1)
+    expect(token).toBe(freshSynapseJwt)
+  })
+
+  test("an MCP-audience token is exchanged for a Synapse-audience one", async () => {
+    const mcpJwt = jwt({ aud: "https://synapse-mcp.example.test/mcp", exp: Math.floor(future / 1000) })
+    const token = await resolveSynapseModelsToken(
+      { token: mcpJwt, refreshToken: "r-1", expiresAt: future },
+      async () => freshSynapseJwt,
+    )
+    expect(token).toBe(freshSynapseJwt)
+  })
+
+  test("a fresh Synapse-audience token is used as is", async () => {
+    let refreshed = 0
+    const token = await resolveSynapseModelsToken(
+      { token: freshSynapseJwt, refreshToken: "r-1", expiresAt: future },
+      async () => {
+        refreshed++
+        return "never"
+      },
+    )
+    expect(refreshed).toBe(0)
+    expect(token).toBe(freshSynapseJwt)
+  })
+
+  test("when the refresh fails the stored token is used, so the fetch fails over as before", async () => {
+    const expired = jwt({ aud: "synapse", exp: Math.floor(Date.now() / 1000) - 60 })
+    const token = await resolveSynapseModelsToken(
+      { token: expired, refreshToken: "r-1", expiresAt: Date.now() - 60_000 },
+      async () => {
+        throw new Error("invalid_grant")
+      },
+    )
+    expect(token).toBe(expired)
+  })
+
+  test("no credential means no token", async () => {
+    expect(await resolveSynapseModelsToken(undefined, async () => "never")).toBeUndefined()
+  })
+})
+
+describe("SynapseAuthPlugin config hook", () => {
+  test("refreshes an expired stored token, persists it, and loads the live list", async () => {
     const previousFetch = globalThis.fetch
     const previousAuth = process.env.OPENCODE_AUTH_CONTENT
+    const expired = jwt({ aud: "synapse", exp: Math.floor(Date.now() / 1000) - 60 })
+    const fresh = jwt({ aud: "synapse", exp: Math.floor(Date.now() / 1000) + 3600 })
+    process.env.OPENCODE_AUTH_CONTENT = JSON.stringify({
+      synapse: { type: "api", key: expired, metadata: { refreshToken: "r-1", expiresAt: String(Date.now() - 1000) } },
+    })
     const calls: Call[] = []
-    process.env.OPENCODE_AUTH_CONTENT = JSON.stringify({ synapse: { type: "api", key: TOKEN } })
-    const recorder = okFetch(LIVE_REPLY, calls)
-    const stub = async (url: RequestInfo | URL, init?: RequestInit) =>
-      recorder(typeof url === "string" ? url : url instanceof URL ? url.href : url.url, init ?? {})
+    const persisted: unknown[] = []
+    const stub = async (url: RequestInfo | URL, init?: RequestInit) => {
+      const href = typeof url === "string" ? url : url instanceof URL ? url.href : url.url
+      calls.push({ url: href, headers: new Headers(init?.headers) })
+      if (href.endsWith("/token")) {
+        return Response.json({ access_token: fresh, refresh_token: "r-2", expires_in: 3600 })
+      }
+      return Response.json(LIVE_REPLY)
+    }
     globalThis.fetch = Object.assign(stub, { preconnect: previousFetch.preconnect })
     try {
-      const hooks = await SynapseAuthPlugin({
-        client: {} as never,
-        project: {} as never,
-        directory: "",
-        worktree: "",
-        experimental_workspace: { register() {} },
-        serverUrl: new URL("https://example.com"),
-        $: {} as never,
-      })
+      const hooks = await SynapseAuthPlugin(
+        {
+          client: { auth: { set: async (body: unknown) => persisted.push(body) } } as never,
+          project: {} as never,
+          directory: "",
+          worktree: "",
+          experimental_workspace: { register() {} },
+          serverUrl: new URL("https://example.com"),
+          $: {} as never,
+        },
+        { tokenUrl: "https://keystone.example.test/token" },
+      )
       const cfg = configWithStaleModels()
       await hooks.config?.(cfg)
-      expect(calls).toHaveLength(1)
-      expect(calls[0].url).toBe(`${BASE}/models`)
-      expect(calls[0].headers.get("authorization")).toBe(`Bearer ${TOKEN}`)
+      const modelsCall = calls.find((c) => c.url === `${BASE}/models`)
+      expect(modelsCall?.headers.get("authorization")).toBe(`Bearer ${fresh}`)
       expect(Object.keys(cfg.provider?.synapse?.models ?? {})).toContain("claude-opus-5")
       expect(Object.keys(cfg.provider?.synapse?.models ?? {})).toContain(SYNAPSE_AUTO_MODEL)
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      expect(JSON.stringify(persisted)).toContain("r-2")
     } finally {
       globalThis.fetch = previousFetch
       if (previousAuth === undefined) delete process.env.OPENCODE_AUTH_CONTENT
       else process.env.OPENCODE_AUTH_CONTENT = previousAuth
-    }
-  })
-
-  test("still loads when OPENCODE_DISABLE_MODELS_FETCH is set (that flag only gates models.dev)", async () => {
-    const previous = process.env.OPENCODE_DISABLE_MODELS_FETCH
-    process.env.OPENCODE_DISABLE_MODELS_FETCH = "true"
-    try {
-      const cfg = configWithStaleModels()
-      const calls: Call[] = []
-      const result = await loadSynapseModels(cfg, deps(okFetch(LIVE_REPLY, calls), [], TOKEN))
-      expect(result).toBe("live")
-      expect(calls).toHaveLength(1)
-    } finally {
-      if (previous === undefined) delete process.env.OPENCODE_DISABLE_MODELS_FETCH
-      else process.env.OPENCODE_DISABLE_MODELS_FETCH = previous
     }
   })
 })

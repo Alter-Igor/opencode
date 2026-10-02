@@ -8,7 +8,12 @@ import { OauthCallbackPage } from "@opencode-ai/core/oauth/page"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { INJECTED_LEARNINGS_LIMIT, learningStorePaths, sessionObserver, sanitizeJsonSchemaForOpenAI } from "./observer"
 import { EscalationTracker, declaredTier, classifyFailure, malformedToolCallFromEvent } from "./synapse-escalation"
-import { loadSynapseModels, type SynapseModelsLogEvent } from "./synapse-models"
+import {
+  createSynapseModelsFailureLogger,
+  loadSynapseModels,
+  readStoredSynapseCredential,
+  type SynapseStoredCredential,
+} from "./synapse-models"
 
 export const KEYSTONE_ISSUER = "https://identity.alterspective.com.au"
 export const KEYSTONE_REGISTER = `${KEYSTONE_ISSUER}/api/oauth/register`
@@ -664,16 +669,33 @@ export function extractMcpChatContent(rawText: string): string {
   return ""
 }
 
-let synapseModelsFailureLogged = false
+// Distinct startup model-fetch failures already logged by this process.
+const synapseModelsFailuresSeen = new Set<string>()
 
-function logSynapseModelsFailureOnce(directory: string): (event: SynapseModelsLogEvent) => void {
-  return (event) => {
-    if (synapseModelsFailureLogged) return
-    synapseModelsFailureLogged = true
-    sessionObserver.logDiagnostic(
-      { timestamp: new Date().toISOString(), type: "FALLBACK_TRIGGERED", details: { ...event } },
-      directory,
-    )
+/**
+ * The token for the startup `/models` fetch. A stored token that is expired, about
+ * to expire, or minted for the MCP audience (which the REST plane rejects) is
+ * refreshed for the `synapse` audience first, the same way the chat path does. When
+ * the refresh fails the stored token is returned, so the fetch fails over as before.
+ */
+export async function resolveSynapseModelsToken(
+  cred: SynapseStoredCredential | undefined,
+  refresh: (cred: SynapseStoredCredential & { refreshToken: string }) => Promise<string>,
+  now: number = Date.now(),
+): Promise<string | undefined> {
+  if (!cred) return undefined
+  const isJwt = cred.token.startsWith("eyJ")
+  const stale =
+    !cred.expiresAt ||
+    cred.expiresAt - now <= ACCESS_TOKEN_REFRESH_SKEW_MS ||
+    accessTokenIsExpiring(cred.token) ||
+    (isJwt && !audienceIsSynapse(cred.token))
+  const refreshToken = cred.refreshToken
+  if (!stale || !refreshToken) return cred.token
+  try {
+    return await refresh({ ...cred, refreshToken })
+  } catch {
+    return cred.token
   }
 }
 
@@ -694,6 +716,48 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
   // JWT (MCP bridge path, text tool-call protocol), false on the native REST path.
   let bridgeMode = false
 
+  // One Keystone refresh at a time, shared by the chat path and the startup model
+  // fetch. The rotated refresh token is persisted; at startup that write is not
+  // awaited, because the in-process server it goes through is still starting.
+  function refreshSynapseCredential(
+    cred: { clientId?: string; refreshToken: string; clientSecret?: string },
+    persist: "await" | "background",
+  ): Promise<{ access_token: string; refresh_token?: string; expires_in?: number }> {
+    if (refreshPromise) return refreshPromise
+    const clientId = cred.clientId || "ai-office-cli"
+    const run = async () => {
+      const tokens = await refreshKeystoneToken({
+        clientId,
+        refreshToken: cred.refreshToken,
+        clientSecret: cred.clientSecret || process.env[CLIENT_SECRET_ENV] || "",
+        tokenUrl: options?.tokenUrl,
+        audience,
+      })
+      const write = (async () => {
+        try {
+          await input.client.auth.set({
+            path: { id: "synapse" },
+            body: {
+              type: "api",
+              key: tokens.access_token,
+              metadata: {
+                clientId,
+                refreshToken: tokens.refresh_token || cred.refreshToken,
+                expiresAt: String(Date.now() + (tokens.expires_in ?? 3600) * 1000),
+              },
+            },
+          })
+        } catch {}
+      })()
+      if (persist === "await") await write
+      return tokens
+    }
+    refreshPromise = run().finally(() => {
+      refreshPromise = undefined
+    })
+    return refreshPromise
+  }
+
   return {
     // Fork-only (#74): the live Synapse model list replaces a hand-typed one.
     // Core reads cfg.provider after this hook resolves (provider/provider.ts).
@@ -701,7 +765,17 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
       await loadSynapseModels(cfg, {
         defaultBaseURL: inferenceUrl,
         userAgent: `opencode/${InstallationVersion}`,
-        log: logSynapseModelsFailureOnce(input.directory),
+        resolveToken: async () =>
+          resolveSynapseModelsToken(await readStoredSynapseCredential(), async (cred) => {
+            const tokens = await refreshSynapseCredential(cred, "background")
+            return tokens.access_token
+          }),
+        log: createSynapseModelsFailureLogger((event) => {
+          sessionObserver.logDiagnostic(
+            { timestamp: new Date().toISOString(), type: "FALLBACK_TRIGGERED", details: { ...event } },
+            input.directory,
+          )
+        }, synapseModelsFailuresSeen),
       })
     },
     auth: {
@@ -741,41 +815,11 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
             const isExpiring = !expires || expires - Date.now() <= ACCESS_TOKEN_REFRESH_SKEW_MS || accessTokenIsExpiring(activeToken)
 
             if (isExpiring && refreshToken) {
-              if (!refreshPromise) {
-                refreshPromise = refreshKeystoneToken({
-                  clientId,
-                  refreshToken,
-                  clientSecret: meta.clientSecret || process.env[CLIENT_SECRET_ENV] || "",
-                  tokenUrl: options?.tokenUrl,
-                  audience,
-                })
-                  .then(async (tokens) => {
-                    const refreshedExpires = Date.now() + (tokens.expires_in ?? 3600) * 1000
-                    const refreshedRefresh = tokens.refresh_token || refreshToken
-                    activeToken = tokens.access_token
-                    await input.client.auth
-                      .set({
-                        path: { id: "synapse" },
-                        body: {
-                          type: "api",
-                          key: tokens.access_token,
-                          metadata: {
-                            clientId,
-                            refreshToken: refreshedRefresh,
-                            expiresAt: String(refreshedExpires),
-                          },
-                        },
-                      })
-                      .catch(() => {})
-                    return tokens
-                  })
-                  .finally(() => {
-                    refreshPromise = undefined
-                  })
-              }
-
               try {
-                const refreshed = await refreshPromise
+                const refreshed = await refreshSynapseCredential(
+                  { clientId, refreshToken, clientSecret: meta.clientSecret },
+                  "await",
+                )
                 activeToken = refreshed.access_token
               } catch {}
             }
