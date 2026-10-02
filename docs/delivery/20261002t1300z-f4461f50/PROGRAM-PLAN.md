@@ -1,7 +1,7 @@
 # Program plan: delegate-mcp operations (Synapse-only models, clean-up, reporting, agent skill)
 
 - **Run id:** `20261002t1300z-f4461f50`
-- **planRevision:** 5 (2026-10-03). Rev 5: #77 merged (`20fcf451d5`); live value check passed for #71-#73; skill PR in the merge queue. Rev 4: WS-3 reviewed and integrated; WS-4 skill PR open (Alterspective-IO/Alterspective-Intelligence#1270); combined review done and fixed; PR #77 to `dev`; follow-up #76 filed; local paths removed. Rev 3: WS-1, WS-1b and WS-2 reviewed clean and integrated (review ledger); RAG search working again; WS-3 started; follow-up #75 filed. Rev 2: owner confirmed Synapse-only everywhere; owner's local config made Synapse-only; #74 (fork plugin live models) added as WS-1b; WS-1, WS-1b and WS-2 built and pushed (`ed26ea57c6`, `07621eb61e`, `f8ec25f7e6`) and in independent review; RAG outage and owner deviation recorded. Rev 1 (2026-10-02, program director: Claude Code session `cb058128`, sole writer)
+- **planRevision:** 5 (2026-10-03). Rev 5: #77 merged (`20fcf451d5`); live value check passed for #71-#73; skill PR merged. Rev 4: WS-3 reviewed and integrated; WS-4 skill PR open (Alterspective-IO/Alterspective-Intelligence#1270); combined review done and fixed; PR #77 to `dev`; follow-up #76 filed; local paths removed. Rev 3: WS-1, WS-1b and WS-2 reviewed clean and integrated (review ledger); RAG search working again; WS-3 started; follow-up #75 filed. Rev 2: owner confirmed Synapse-only everywhere; owner's local config made Synapse-only; #74 (fork plugin live models) added as WS-1b; WS-1, WS-1b and WS-2 built and pushed (`ed26ea57c6`, `07621eb61e`, `f8ec25f7e6`) and in independent review; RAG outage and owner deviation recorded. Rev 1 (2026-10-02, program director: Claude Code session `cb058128`, sole writer)
 - **Owner direction:** "we need to make sure our opencodealt only uses Synapse as the provider and only offers the models registered in synapse with the default being auto. continue" (2026-10-02), plus the earlier pick A (build clean-up, skill and reporting together). Standing merge approval to 2026-10-04 ~21:00 AEST (merges only; no production promotion).
 - **Integration branch:** `delegate-ops`. One PR to `dev` at the end: #77.
 
@@ -18,7 +18,7 @@ Delegated coding is safe to run every day: it uses only Synapse with `auto` by d
 | #73 Reporting | Owner: proof delegation works and which model is best | Per-task records with model and outcome; `oc_report` summary | No model recorded; no summary | Every task recorded; `oc_report` gives tasks, success rate, duration, collected vs discarded, by model | Run 2+ tasks live, read `oc_report` |
 | Skill | Every agent that delegates | An agent following the skill runs start, send, wait, review, collect, merge or close, and clean-up correctly | No skill in the catalogue | Skill published in Alterspective-Intelligence and found by `rag_match_skills` | `rag_match_skills` for a delegate task returns it |
 
-Value state (2026-10-03, after #77 merged): **observed** for #71, #72 and #73 on the live box (evidence: `docs/implementation/current/FEAT-OCD-001-opencode-delegate-mcp/evidence/value-check-0.2.0-live.md`). #74: the owner's OpenCode offers only Synapse models, but the plugin's live fetch was not observed (stored sign-in expired at startup, so the configured list was used, by design). Skill: merge queued (Alterspective-IO/Alterspective-Intelligence#1270); the `rag_match_skills` measure waits for the catalogue sync.
+Value state (2026-10-03, after #77 merged): **observed** for #71, #72 and #73 on the live box (evidence: `docs/implementation/current/FEAT-OCD-001-opencode-delegate-mcp/evidence/value-check-0.2.0-live.md`). #74: the owner's OpenCode offers only Synapse models, but the plugin's live fetch was not observed. The likely cause, not verified, is an expired stored sign-in at startup; startup then uses the configured list, by design. Skill: merged (Alterspective-IO/Alterspective-Intelligence#1270); the `rag_match_skills` measure waits for the catalogue to pick it up.
 
 ## Workstreams
 
@@ -74,6 +74,6 @@ Open Lows carried to the PR: WS-2 allowlist matches at any folder level (descrip
 
 ## Next actions
 
-1. Merge #77 once CodeRabbit covers its head, CI is green and every thread is resolved.
-2. Merge the skill PR (Alterspective-IO/Alterspective-Intelligence#1270) after #77, once its reviewers cover its head; then sync the skill catalogue.
-3. Live check of every value measure on a real box; record the evidence; then close #71-#74.
+1. Merge #78 (this evidence); then close #71, #72 and #73 with a link to it.
+2. #74: keep open until the plugin's live fetch is observed (after a chat renews the owner's Synapse sign-in).
+3. Skill: merged (Alterspective-IO/Alterspective-Intelligence#1270, `f068af18`); close its issue once `rag_match_skills` returns it; then add the stash and failed-check rules from #77's last review.

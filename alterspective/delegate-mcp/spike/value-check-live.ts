@@ -74,12 +74,17 @@ async function runTask(message: string): Promise<string> {
   const sessionID = String(started.data.sessionID)
   const sent = await call("oc_send", { sessionID, message })
   let cursor = String(sent.data.cursor)
-  for (let i = 0; i < 12; i++) {
-    const waited = await call("oc_wait", { sessionIDs: [sessionID], cursor, timeoutSec: 240 })
-    cursor = String(waited.data.cursor ?? cursor)
-    const states = JSON.stringify(waited.data)
-    if (/"(idle|error|needs_input)"/.test(states)) break
+  // oc_wait returns the next cursor in `next`, and a status event per settled session. Only a status
+  // event for this session counts; a run that never settles is a failed check, never a silent pass.
+  type Waited = { still_running?: boolean; next?: string; events?: { type?: string; sessionID?: string; state?: string }[] }
+  let settled: string | undefined
+  for (let i = 0; i < 12 && !settled; i++) {
+    const waited = (await call("oc_wait", { sessionIDs: [sessionID], cursor, timeoutSec: 240 })).data as Waited
+    cursor = waited.next ?? cursor
+    settled = waited.events?.find((e) => e.type === "status" && e.sessionID === sessionID && ["idle", "error", "needs_input"].includes(e.state ?? ""))?.state
   }
+  if (!settled) throw new Error(`session ${sessionID} did not settle within the wait budget`)
+  record("run", `task settled (${settled})`, settled === "idle", settled)
   await call("oc_result", { sessionID })
   return sessionID
 }
