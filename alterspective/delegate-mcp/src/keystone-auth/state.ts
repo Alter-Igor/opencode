@@ -30,7 +30,10 @@ export type KsState = {
   /** The holder process (pid + start time): the marker counts while that process lives. */
   pendingPid?: number
   pendingStartedAt?: number
+  /** Refreshed by the holder on every save attempt; a marker older than the window is stale. */
   pendingAt?: number
+  /** The holder TRIED to save and failed: the stored refresh token is spent (Keystone rotated it). */
+  pendingSaveFailed?: boolean
   /** What front was last given: a bearer, or an empty credential. */
   credential?: "published" | "empty"
   /** The current token set was saved but its access token is not in front yet. */

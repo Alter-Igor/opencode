@@ -204,6 +204,9 @@ async function tokenRequest(fetchFn: FetchLike, server: KeystoneServer, params: 
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
     body: params,
+    // A 307/308 keeps method and body: following it would re-send the refresh token (or the code
+    // and verifier) to whatever Location says. Refuse any redirect; it surfaces as a passing failure.
+    redirect: "error",
   })
   const text = await response.text()
   // An error reply carries no token. parseErrorResponse maps it to the SDK's OAuthError classes;

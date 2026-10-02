@@ -129,8 +129,12 @@ function currentHeld(deps: KeystoneAuthDeps, id: string, state: KsState | undefi
   return undefined
 }
 
+/** Ten minutes: far above the 2-minute lock wait and many 15-second ticks of a retrying holder. */
+export const PENDING_MARKER_MAX_AGE_MS = 10 * 60_000
+
 /**
- * Another bridge holds an unsaved refresh token for the current set and its process still lives.
+ * Another bridge holds an unsaved refresh token for the current set, its process still lives, and
+ * it touched the marker within PENDING_MARKER_MAX_AGE_MS.
  * Judged by pid + start time like the lock holder (synapse/lock.ts via start-lock): a live holder
  * waiting on the lock is never taken for gone, however long it waits, and a reused pid is.
  *
@@ -140,8 +144,12 @@ function currentHeld(deps: KeystoneAuthDeps, id: string, state: KsState | undefi
  * @throws never (an unreadable start time keeps the marker: waiting is the safe side)
  * @example if (await pendingMarkerLive(deps, state)) return "waiting"
  */
-export async function pendingMarkerLive(deps: Pick<KeystoneAuthDeps, "memory" | "probe">, state: KsState): Promise<boolean> {
+export async function pendingMarkerLive(deps: Pick<KeystoneAuthDeps, "memory" | "probe" | "now">, state: KsState): Promise<boolean> {
   if (state.pendingBy === undefined || state.pendingBy === deps.memory.id) return false
+  // Review cycle 2: a live holder that stopped retrying (connection dropped from its list, loop
+  // stopped) must not block peers for ever. The holder rewrites pendingAt on every save attempt
+  // (every tick), so only a marker untouched for the whole window is stale.
+  if (deps.now() - (state.pendingAt ?? 0) >= PENDING_MARKER_MAX_AGE_MS) return false
   // A marker without a holder record cannot be judged; nothing in this module writes one.
   if (state.pendingPid === undefined) return false
   const gone = await attempt(() => recordGone({ pid: state.pendingPid ?? 0, ...(state.pendingStartedAt !== undefined ? { startedAt: state.pendingStartedAt } : {}) }, deps.probe))
@@ -165,7 +173,7 @@ async function saveHeld(deps: KeystoneAuthDeps, id: string, held: Held, state: K
     return true
   }
   safeLog(deps.log, marked.ok ? "warn" : "error", COMPONENT, "keystone refresh token not saved; kept in memory, not published, will retry", { connection: id, store: store.kind, marked: marked.ok })
-  if (marked.ok) await attempt(() => writeKsState(deps.home, { ...marker, lastError: `refresh token not saved (${store.kind}); retrying` }))
+  if (marked.ok) await attempt(() => writeKsState(deps.home, { ...marker, pendingSaveFailed: true, lastError: `refresh token not saved (${store.kind}); retrying` }))
   return false
 }
 
@@ -183,7 +191,7 @@ async function accessUnusable(deps: KeystoneAuthDeps, id: string, held: Held, pr
   deps.memory.held.delete(id)
   const now = deps.now()
   const base: KsState = previous && !previous.needsSignIn ? previous : { connection: id, obtainedAt: now, expiresAt: now, ...(previous?.credential ? { credential: previous.credential } : {}) }
-  const { pendingBy: _b, pendingPid: _p, pendingStartedAt: _s, pendingAt: _a, needsSignIn: _n, ...rest } = base
+  const { pendingBy: _b, pendingPid: _p, pendingStartedAt: _s, pendingAt: _a, pendingSaveFailed: _f, needsSignIn: _n, ...rest } = base
   const failures = (base.failures ?? 0) + 1
   const reason = `${UNUSABLE} (${held.unusable ?? "unknown"}); refresh token saved`
   const next: KsState = { ...rest, ...held.client, failures, retryAt: now + backoffMs(failures), lastError: reason }
@@ -209,7 +217,7 @@ async function publishHeld(deps: KeystoneAuthDeps, id: string, held: Held, state
     safeLog(deps.log, "warn", COMPONENT, "keystone token saved but not published to front; will retry", { connection: id, failures })
     return result(id, "retrying", "publish to front failed")
   }
-  const { needsPublish: _n, failures: _f, retryAt: _r, lastError: _e, pendingBy: _b, pendingPid: _p, pendingStartedAt: _s, pendingAt: _a, ...rest } = state
+  const { needsPublish: _n, failures: _f, retryAt: _r, lastError: _e, pendingBy: _b, pendingPid: _p, pendingStartedAt: _s, pendingAt: _a, pendingSaveFailed: _x, ...rest } = state
   await writeKsState(deps.home, { ...rest, credential: "published", publishedAt: deps.now() })
   return result(id, "refreshed")
 }
@@ -302,6 +310,15 @@ async function refreshLocked(deps: KeystoneAuthDeps, id: string, force: boolean)
     const expired = await expireIfPast(deps, id, state)
     return result(id, expired.outcome === "expired" ? "expired" : "waiting", "another bridge holds an unsaved refresh token")
   }
+  // 4. Review cycle 2 decision: another bridge's marker is no longer honoured (holder gone, or alive
+  // but silent past the window) and it says that bridge FAILED to save its rotated token. Then the
+  // stored token is spent: presenting it would only earn invalid_grant (and may trip Keystone's
+  // reuse detection). Fail closed without using it. If the holder is in fact still alive and later
+  // saves, its commit replaces this needs-sign-in state (same obtainedAt, so it is not superseded).
+  // A stale marker WITHOUT the flag may belong to a save that completed (only the state write
+  // after it failed), so the stored token may be current: the refresh below goes ahead.
+  if (state.pendingBy !== undefined && state.pendingBy !== deps.memory.id && state.pendingSaveFailed)
+    return failClosed(deps, id, state, "another bridge could not save the rotated refresh token; the stored one is spent", false)
   const client = clientOf(state)
   if (client === undefined) return failClosed(deps, id, state, "no registered client", false)
   const store = deps.store(id)

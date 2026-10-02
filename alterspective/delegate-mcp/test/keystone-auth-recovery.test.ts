@@ -88,16 +88,16 @@ test("the pending marker is written BEFORE the store write is attempted", async 
   expect(markerSeen).toBe(true)
 })
 
-test("a live holder's marker is honoured however old; a dead or reused pid's marker is not", async () => {
+test("a live holder's recent marker is honoured; a reused pid's marker is not", async () => {
   const h = await harness()
   await signedIn(h)
+  h.clock.now += DUE
   const state = await readKsState(h.home, "rag-read")
   if (!state) throw new Error("no state")
   h.processes.set(4242, 777)
   await writeKsState(h.home, { ...state, pendingBy: "4242-other", pendingPid: 4242, pendingStartedAt: 777, pendingAt: h.clock.now })
-  // Far past the old 2-minute window: the holder is alive, so peers still wait.
-  h.clock.now += DUE + 60 * 60_000
-  expect((await refreshConnection(h.deps, "rag-read")).outcome).toBe("expired")
+  h.clock.now += 5 * 60_000
+  expect((await refreshConnection(h.deps, "rag-read")).outcome).toBe("waiting")
   expect(h.keystone.calls.refresh).toBe(0)
   const [status] = await keystoneAuthStatus(h.deps)
   expect(status?.pendingSave).toBe(true)
@@ -107,6 +107,65 @@ test("a live holder's marker is honoured however old; a dead or reused pid's mar
   expect(stale?.pendingSave).toBe(false)
   await refreshConnection(h.deps, "rag-read")
   expect(h.keystone.calls.refresh).toBe(1)
+})
+
+test("an alive holder that keeps retrying refreshes its marker, so peers keep waiting past 10 minutes", async () => {
+  const h = await harness()
+  await signedIn(h)
+  const shared = h.stores.get("rag-read")
+  if (!shared) throw new Error("no store")
+  const a: KeystoneAuthDeps = { ...h.deps, store: () => ({ ...shared, write: async () => { throw new Error("test store write failure") } }) }
+  h.clock.now += DUE
+  expect((await refreshConnection(a, "rag-read")).outcome).toBe("pending_save")
+  for (let i = 0; i < 3; i++) {
+    h.clock.now += 6 * 60_000
+    expect((await refreshConnection(a, "rag-read")).outcome).toBe("pending_save")
+  }
+  // The old bearer is past expiry by now, so the waiting peer reports "expired" (credential
+  // emptied), but it neither refreshes nor fails closed: the holder still owns the live token.
+  const peer = await refreshConnection(h.peer("test-bridge-b"), "rag-read")
+  expect(peer.outcome).toBe("expired")
+  expect(peer.error).toContain("another bridge holds an unsaved refresh token")
+  expect(h.keystone.calls.refresh).toBe(1)
+  expect((await readKsState(h.home, "rag-read"))?.needsSignIn).toBeUndefined()
+})
+
+test("an alive holder that STOPPED retrying with an unsaved token: the peer fails closed and never reuses the spent token", async () => {
+  const h = await harness()
+  await signedIn(h)
+  const shared = h.stores.get("rag-read")
+  if (!shared) throw new Error("no store")
+  const a: KeystoneAuthDeps = { ...h.deps, store: () => ({ ...shared, write: async () => { throw new Error("test store write failure") } }) }
+  h.clock.now += DUE
+  expect((await refreshConnection(a, "rag-read")).outcome).toBe("pending_save")
+  // A is alive (same process) but no longer ticks this connection.
+  h.clock.now += 11 * 60_000
+  const peer = await refreshConnection(h.peer("test-bridge-b"), "rag-read")
+  expect(peer.outcome).toBe("needs_sign_in")
+  expect(h.keystone.calls.refresh).toBe(1)
+  expect(h.published.at(-1)?.bearer).toBeUndefined()
+  expect((await readKsState(h.home, "rag-read"))?.needsSignIn).toBe(true)
+})
+
+test("a stale marker whose save did not fail (it may have completed): the peer refreshes with the stored token", async () => {
+  const h = await harness()
+  await signedIn(h)
+  h.clock.now += DUE
+  const state = await readKsState(h.home, "rag-read")
+  if (!state) throw new Error("no state")
+  await writeKsState(h.home, { ...state, pendingBy: "test-bridge-x", pendingPid: process.pid, pendingStartedAt: 1, pendingAt: h.clock.now })
+  h.clock.now += 11 * 60_000
+  expect((await refreshConnection(h.deps, "rag-read")).outcome).toBe("refreshed")
+  expect(h.keystone.calls.refresh).toBe(1)
+})
+
+test("a redirect from the token endpoint is refused: the refresh token is never re-sent elsewhere", async () => {
+  const h = await harness()
+  await signedIn(h)
+  h.keystone.redirectToken = "https://elsewhere.example.test/steal"
+  h.clock.now += DUE
+  expect((await refreshConnection(h.deps, "rag-read")).outcome).toBe("retrying")
+  expect(h.keystone.redirectedBodies).toHaveLength(0)
 })
 
 test("a dead process's marker does not block peers", async () => {

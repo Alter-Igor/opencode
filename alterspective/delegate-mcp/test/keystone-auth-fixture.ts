@@ -36,6 +36,9 @@ export type FakeKeystone = {
   resource: Record<string, unknown>
   /** Overrides merged into every successful token reply (e.g. a short expires_in, a bad field). */
   reply: Record<string, unknown>
+  /** When set, the token endpoint answers 307 to this URL; bodies a client re-sends there are kept. */
+  redirectToken?: string
+  redirectedBodies: string[]
   issue(): { access: string; refresh: string }
 }
 
@@ -51,6 +54,7 @@ export function fakeKeystone(): FakeKeystone {
     metadata: {},
     resource: {},
     reply: {},
+    redirectedBodies: [],
     issue() {
       counter++
       const access = jwt({ sub: "test-owner", aud: `${ORIGIN}/mcp/c/rag-read`, n: counter })
@@ -86,6 +90,13 @@ export function fakeKeystone(): FakeKeystone {
         const body = JSON.parse(String(init?.body)) as Record<string, unknown>
         k.registrations.push(body)
         return Response.json({ ...body, client_id: `test-client-${k.calls.register}` }, { status: 201 })
+      }
+      if (url.pathname === "/api/oauth/token" && k.redirectToken) {
+        // Behave like real fetch: redirect "error" refuses a redirect; otherwise the POST body
+        // would be re-sent to the Location (307/308 keep method and body).
+        if (init?.redirect === "error") throw new TypeError("fetch failed: unexpected redirect")
+        k.redirectedBodies.push(String(init?.body))
+        return new Response("moved", { status: 500 })
       }
       if (url.pathname === "/api/oauth/token") {
         const params = new URLSearchParams(String(init?.body))
