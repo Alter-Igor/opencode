@@ -1,7 +1,7 @@
 {
   "base": "f20d17082ec9da05a7e02ac3cf95571f98cdd913",
   "worktree": "C:\\GitHub\\opencode---session-records",
-  "commandTemplate": "thisrig-work-queue.exe run --lane light -- cmd.exe //d //c \"cd /d X:\\opencode---session-records\\alterspective\\delegate-mcp && bun.exe test --timeout 30000 <files>\"",
+  "commandTemplate": "<work-queue> run --lane light -- cmd.exe //d //c \"cd /d X:\\opencode---session-records\\alterspective\\delegate-mcp && bun.exe test --timeout 30000 <files>\"",
   "pass": 883,
   "skip": 25,
   "fail": 0,
