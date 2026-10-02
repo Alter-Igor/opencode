@@ -301,7 +301,7 @@ A finished session should not leave anything behind. The usual order is `oc_coll
   - uncommitted files;
   - git-ignored files such as `dist/` or `.env`.
 
-  The refusal names up to 10 of them. `oc_collect` fetches commits; ask the agent to commit loose files. `oc_collect` never carries git-ignored files, so copy any you need out of the box by hand. `discardWork: true` deletes them on purpose.
+  The refusal gives the counts. For git-ignored files it also names up to 10 of them (plain names only). `oc_collect` fetches commits; ask the agent to commit loose files. `oc_collect` never carries git-ignored files, so copy any you need out of the box by hand. `discardWork: true` deletes them on purpose.
 
 **What never blocks a close:**
 
@@ -325,10 +325,10 @@ The bridge keeps one small record per task on your PC, at `<home>/workspaces/rep
 
 - **When records change:** start, send, wait, result, collect, close and the sweep. A tool never waits for a record to be saved. Saves run in the background and are flushed before `oc_report` reads and at shutdown. A failed save is logged once and never fails a tool.
 - **Several bridges** can share the home folder. Each record has its own lock file, so two processes do not lose each other's counts. In one rare race (an old lock being taken over while its owner wakes up), two writers can still overlap; the worst case is one lost count. This is logged as `lock_relink_failed`.
-- **Kept for:** 90 days. Beyond the newest 2,000, finished records are dropped too; open tasks are kept.
+- **Kept for:** 90 days. Beyond the newest 2,000, every record whose work is no longer open (collected or closed) is dropped too; open tasks are kept.
 - **`oc_report`** returns `notes`, `sinceDays`, `groupBy`, `since`, `totals`, `groups` (each `name` under `untrusted`), and `recent` when asked for. `totals` and each group hold `tasks`, `completed`, `error`, `aborted`, `unknown`, `notSent`, `running`, `finished`, `successRate`, `durationMs {median, p90, samples}` and `dispositions {collected, closedDiscarded, open, closedClean, swept}`.
-  - `finished` = completed + error + aborted + unknown. Tasks never sent are left out.
-  - A task nobody waited on is settled at close from the session's state: idle is `completed`, an error state is `error`, a real abort is `aborted`, anything else is `unknown`.
+  - `unknown` includes `notSent` (started but never given a task). `finished` = completed + error + aborted + unknown − notSent, so tasks never sent are left out.
+  - A task nobody waited on is settled at close from the session's state: idle is `completed`, an error state or a session that never started is `error`, a real abort is `aborted`, anything else is `unknown`.
   - "Model" means the model the bridge sent. **A `synapse/auto` row does not say which model Synapse picked** (follow-up #76).
   - Token counts are a lower bound: they cover only the messages `oc_result` fetched.
 
@@ -346,7 +346,7 @@ The bridge keeps one small record per task on your PC, at `<home>/workspaces/rep
 | `cursor_expired` | The cursor is from before a restart or reset. | Call again without a cursor (after `oc_status`). |
 | `not_found` | The session or request is not one of this bridge's, or it is gone. | `oc_list_sessions` or `oc_pending` for fresh ids. |
 | `invalid_input` (model) | The model is not a Synapse model. | `oc_list_models`, then pick a `synapse/<id>`, for example `synapse/auto`. |
-| `session_active` | `oc_close_session` was called on a session that is running, needs input, or is already closing. | Wait for it, or pass `abort: true`. |
+| `session_active` | `oc_close_session` was called on a session that is running or needs input; or any tool (`oc_send`, `oc_collect`, a second close) was called while a close of that session runs. | For a busy session: wait for it, or close with `abort: true`. While a close runs: wait for it to finish, then check `oc_list_sessions`. |
 | `uncollected_work` | Closing would delete commits, uncommitted files or git-ignored files the host does not have. | `oc_collect` for commits; copy git-ignored files out by hand. Then close again. Or pass `discardWork: true` on purpose. |
 
 Logs are JSON lines on stderr and in `<home>\logs` (default home `~/.local/share/opencode-delegate`, or `OPENCODE_DELEGATE_HOME`). They never contain secrets or message text.

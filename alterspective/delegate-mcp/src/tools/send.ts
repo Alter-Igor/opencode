@@ -9,6 +9,7 @@ import { recordSend } from "../reporting/hooks.ts"
 import { DelegateError } from "../shared/errors.ts"
 import type { Box, SessionRecord, ToolContext } from "./context.ts"
 import { readInstructions, type Instructions } from "./core-box.ts"
+import { closingError, isClosing } from "./closing.ts"
 import { CORRELATION_RE, agentSchema, formatCursor, modelSchema, ownSession, parseModel, requireSynapseModel, sameRules, sessionGone, sessionIdSchema } from "./core-session.ts"
 import { DEFAULT_MODEL, SYNAPSE_PROVIDER } from "../supervisor/profile.ts"
 import { defineTool } from "./define.ts"
@@ -69,6 +70,9 @@ export async function sendPrompt(ctx: ToolContext, box: Box, record: SessionReco
     ...(agent ? { agent } : {}),
     ...(instructions.system ? { system: instructions.system } : {}),
   }
+  // Combined review: a close may have started while this send waited (the default-model read, the
+  // instructions read). Checked again with no await before the POST, so it reaches no closing session.
+  if (isClosing(ctx, record.sessionID)) throw closingError(record.sessionID)
   const cursor = box.hub.cursor()
   // #73: the run's start for the task record, taken before the POST (a fast run can settle during it).
   const sendStartedAt = new Date().toISOString()

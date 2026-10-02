@@ -4,6 +4,7 @@ import { describe, expect, test } from "bun:test"
 import { MAX_INSTRUCTIONS_CHARS } from "../src/tools/core-box.ts"
 import { DEFAULT_READ_TIMEOUT_MS } from "../src/tools/models.ts"
 import { sendTool } from "../src/tools/send.ts"
+import { whileClosing } from "../src/tools/closing.ts"
 import { BASE, SID, data, fakeContext, invoke, okCmd, ours, record, remoteSession, seedState, text, type Fake } from "./tools-core-fixture.ts"
 import type { CommandResult } from "../src/tools/context.ts"
 
@@ -245,6 +246,34 @@ describe("oc_send", () => {
     g.api.on("GET /config", { status: 500 })
     await send(g)
     expect(promptBody(g)?.model).toEqual({ providerID: "synapse", modelID: "auto" })
+  })
+
+  // Combined review: a close that starts while the send waits (here on the default-model read) is
+  // seen again just before the POST, so no prompt reaches a session being closed.
+  test("a close that starts while the send is waiting refuses the send before the POST (session_active)", async () => {
+    const f = fakeContext()
+    ready(f)
+    f.api.on("GET /config", { status: 200, data: { model: "synapse/auto" } })
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => (release = resolve))
+    let entered!: () => void
+    const reached = new Promise<void>((resolve) => (entered = resolve))
+    const call = f.api.call.bind(f.api)
+    f.api.call = (async (input: Parameters<typeof call>[0]) => {
+      if (input.path === "/config") {
+        entered()
+        await gate
+      }
+      return call(input)
+    }) as typeof f.api.call
+    const sending = send(f)
+    await reached
+    const result = await whileClosing(f.ctx, SID, async () => {
+      release()
+      return sending
+    })
+    expect(data(result).code).toBe("session_active")
+    expect(f.api.calls.some((c) => c.path.endsWith("prompt_async"))).toBe(false)
   })
 
   test("the /config read for the default has its own short deadline", async () => {

@@ -14,7 +14,7 @@
 - `oc_close_session {sessionID, deleteBranch?, abort?, discardWork?}` deletes a finished session, its copy in the box and its host record.
 - A close is refused while the session runs or needs input, while its state cannot be read, or while its copy has commits no host branch has, uncommitted files, or git-ignored files outside dependency and cache folders. `discardWork: true` deletes them on purpose. Commits only the reflog holds are reported as `discardedCommits` and never block.
 - `deleteBranch: true` deletes `delegate/<key>` only when another host branch contains it. A checked-out branch or a symbolic ref is never deleted.
-- A per-session close lock stops other tools using a session while it closes. Work that appears during a close keeps the copy and the record, and `oc_collect` can fetch it from this bridge's own record after a restart.
+- A per-session close lock stops other tools using a session while it closes. `oc_send` checks it again just before the prompt is posted. Work that appears during a close keeps the copy and the record, and `oc_collect` can fetch it from this bridge's own record after a restart.
 - `oc_cleanup {dryRun? = true, deleteBranch?}` sweeps sessions idle longer than `OPENCODE_DELEGATE_SESSION_TTL_DAYS` (default 14; 0 turns it off). It never aborts or discards, and a dry run leaves the sweep position unchanged.
 - New error codes: `session_active`, `uncollected_work`.
 
@@ -23,7 +23,7 @@
 - One metadata record per task, host-side in `<home>/workspaces/reports/`, never mounted in the box. No prompt or answer text, file contents or error bodies.
 - Records are updated at start, send, wait, result, collect, close and sweep. Updates run in the background and never slow or fail a tool. They are flushed before `oc_report` and at shutdown.
 - A per-record lock file keeps two processes from losing counts. A rare takeover race can still lose one count; it is logged as `lock_relink_failed`.
-- Kept 90 days, and at most the newest 2,000 finished records.
+- Kept 90 days. Beyond the newest 2,000, records whose work is no longer open are dropped; open tasks are kept.
 - `oc_report {sinceDays, groupBy, recent}` gives task counts, success rate, median and p90 duration, and collected / discarded / open work, overall and by model, agent or repo. Its `notes` say that `synapse/auto` hides the routed model (#76) and that token counts are a lower bound.
 - The server instructions now name the Synapse-only rule, close, clean-up and `oc_report`.
 
