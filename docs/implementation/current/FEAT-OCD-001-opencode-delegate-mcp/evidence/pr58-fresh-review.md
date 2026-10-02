@@ -48,7 +48,7 @@ All tests and typechecking used the owner's work queue. Bridge tests ran in ligh
 The exact queue form was:
 
 ```text
-"C:/Users/IgorJericevich/Desktop/This Rig/scripts/automation/work-queue/bin/thisrig-work-queue.exe" run --lane light -- "C:/Windows/System32/cmd.exe" //d //c "cd /d X:\opencode---delegate-hardening\alterspective\delegate-mcp && C:\Users\IgorJericevich\.bun\bin\bun.exe test --timeout 30000 test/synapse-recovery.test.ts"
+"<work-queue>" run --lane light -- "C:/Windows/System32/cmd.exe" //d //c "cd /d X:\opencode---delegate-hardening\alterspective\delegate-mcp && bun test --timeout 30000 test/synapse-recovery.test.ts"
 ```
 
 On this machine it is invoked through native Git Bash from PowerShell so `cmd.exe` receives normalized switches. The runner remains the first command inside Bash. The live egress build used the heavy lane.
@@ -81,10 +81,10 @@ Final verification on the unchanged base `f20d17082ec9da05a7e02ac3cf95571f98cdd9
 - The final full rerun passed **874 tests, 0 failed, 30 skipped**, across all 66 files in 17 batches of at most four files (queue PID 51972). The five extra skips above were exercised separately in Linux. Bridge `bun run typecheck` also passed. Lint passed with **0 errors and 356 warnings**, unchanged from the earlier receipt.
 - The live route suite rebuilt front and passed **22 tests, 0 failed** (queue PID 76180). It used the unchanged `opencode-delegate-box:1.18.31-bc1a3343c278` box image. The scratch Compose project was removed.
 
-Every build and check used the work queue. The full-run command list and output are `C:\Users\IgorJericevich\AppData\Local\Temp\ocd-pr61-flock-checks.cmd` and `C:\Users\IgorJericevich\AppData\Local\Temp\ocd-pr61-flock-tests.log`. The live proof's exact command inside the PowerShell-to-Git-Bash wrapper was:
+Every build and check used the work queue. The full-run command list and output are `<local path>` and `<local path>`. The live proof's exact command inside the PowerShell-to-Git-Bash wrapper was:
 
 ```text
-"C:/Users/IgorJericevich/Desktop/This Rig/scripts/automation/work-queue/bin/thisrig-work-queue.exe" run --lane light -- "C:/Windows/System32/cmd.exe" //d //c "cd /d X:\opencode---delegate-hardening\alterspective\delegate-mcp && set OCD_RELOAD_PROOF_IMAGE=ocd-review-flock:pr61&& C:\Users\IgorJericevich\.bun\bin\bun.exe spike/review-reload-proof.ts"
+"<work-queue>" run --lane light -- "C:/Windows/System32/cmd.exe" //d //c "cd /d X:\opencode---delegate-hardening\alterspective\delegate-mcp && set OCD_RELOAD_PROOF_IMAGE=ocd-review-flock:pr61&& bun spike/review-reload-proof.ts"
 ```
 
 RAG returned no useful lock-specific lesson; the lessons README was checked. The correction was recorded in Synapse Coder as candidate `8c431934-027d-48b1-8255-d5096288b455`; it was not promoted. README, changelog and technical design describe the new recovery behavior. No visual check applies to this shell/proxy change.
@@ -93,7 +93,7 @@ RAG returned no useful lock-specific lesson; the lessons README was checked. The
 
 [CodeRabbit comment 4157442306](https://github.com/Alter-Igor/opencode/pull/61#discussion_r4157442306) found a Low fault in the proof runner. A failed non-final command in an `&&` list does not trigger shell `set -e`. The same pattern also appeared in the older worker and timeout assertions. The observed JSON above remains evidence, but the runner could return success with a wrong early field.
 
-A fault check read the actual assertion lines and supplied a wrong value for each of their 14 fields, one at a time. Before the fix it reported **9 masked failures** (queue PID 36584, exit 1). Each assertion now has its own line. The same check reported **0 masked failures** (queue PID 54568). That queue job then reran the full real-nginx proof against `ocd-review-flock:pr61`: all five result records matched the expected values, cleanup succeeded, and bridge typecheck passed. A separate agent reviewed every changed assertion and the runner's error and cleanup paths; no blocker remained. Runtime source and the container image did not change. The fault driver is `C:\Users\IgorJericevich\AppData\Local\Temp\ocd-reload-assertions.ps1`.
+A fault check read the actual assertion lines and supplied a wrong value for each of their 14 fields, one at a time. Before the fix it reported **9 masked failures** (queue PID 36584, exit 1). Each assertion now has its own line. The same check reported **0 masked failures** (queue PID 54568). That queue job then reran the full real-nginx proof against `ocd-review-flock:pr61`: all five result records matched the expected values, cleanup succeeded, and bridge typecheck passed. A separate agent reviewed every changed assertion and the runner's error and cleanup paths; no blocker remained. Runtime source and the container image did not change. The fault driver is `<local path>`.
 
 ## PR #61 follow-up: retry only transient reload failures
 

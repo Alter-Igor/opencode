@@ -37,7 +37,7 @@ The accepted clock-skew/equal-timestamp edge was not reopened. No production ser
 The reviewer independently ran the recovery test through the work queue: **9 pass, 0 fail, 27 assertions**; Bun `1.3.14`, queue child PID `96820`, exit `0`. The final lint-cleaned state was independently rerun with the same result, queue child PID `105012`, exit `0`. This covers real local filesystem failures with fake upstream and Docker responses. It is not a live Keystone/Synapse test.
 
 ```powershell
-& "C:\Program Files\Git\bin\bash.exe" --noprofile --norc -c '"C:/Users/IgorJericevich/Desktop/This Rig/scripts/automation/work-queue/bin/thisrig-work-queue.exe" run --lane light -- "C:/Windows/System32/cmd.exe" //d //c "cd /d X:\opencode---delegate-hardening\alterspective\delegate-mcp && C:\Users\IgorJericevich\.bun\bin\bun.exe test --timeout 30000 test/synapse-recovery.test.ts"'
+bash -c '"<work-queue>" run --lane light -- "C:/Windows/System32/cmd.exe" //d //c "cd /d X:\opencode---delegate-hardening\alterspective\delegate-mcp && bun test --timeout 30000 test/synapse-recovery.test.ts"'
 ```
 
 `git diff --check` passed for the three source files. Full package suite, typecheck, lint and live-image validation remain part of the parent delivery checks; this receipt does not claim them.
