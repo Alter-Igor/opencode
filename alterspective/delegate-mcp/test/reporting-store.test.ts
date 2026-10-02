@@ -1,10 +1,10 @@
 // #73 delegate reporting: the host-side task record store (one JSON file per task, written
 // atomically, retried on Windows EPERM/EBUSY, retention at write and report time) and the report maths.
 import { describe, expect, test } from "bun:test"
-import { existsSync, mkdtempSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
+import { existsSync, mkdtempSync, readdirSync, readFileSync, renameSync, utimesSync, writeFileSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { newTaskRecord, parseTaskRecord, type TaskRecord } from "../src/reporting/record.ts"
+import { errorCode, newTaskRecord, parseTaskRecord, type TaskRecord } from "../src/reporting/record.ts"
 import { createReportStore, REPORT_MAX_AGE_DAYS, REPORT_MAX_RECORDS } from "../src/reporting/store.ts"
 import { percentile, median, summarise } from "../src/reporting/summary.ts"
 
@@ -117,10 +117,73 @@ describe("report store", () => {
     const ages = { "s-0000000101": 91, "s-0000000102": 5, "s-0000000103": 4, "s-0000000104": 3, "s-0000000105": 2 }
     for (const [key, days] of Object.entries(ages)) {
       const started = new Date(NOW - days * DAY).toISOString()
-      writeFileSync(path.join(dir, `${key}.json`), JSON.stringify(rec(key, { startedAt: started })))
+      writeFileSync(path.join(dir, `${key}.json`), JSON.stringify(rec(key, { startedAt: started, disposition: "closed_clean" })))
     }
     expect(store.prune()).toBe(2)
     expect(store.list().map((r) => r.key).sort()).toEqual(["s-0000000103", "s-0000000104", "s-0000000105"])
+  })
+
+  test("open tasks are exempt from the count cap, but not from the age limit", async () => {
+    const dir = tmpDir()
+    const store = createReportStore({ dir, now: () => NOW, maxRecords: 2 })
+    const rows: Array<[string, number, TaskRecord["disposition"]]> = [
+      ["s-0000000111", 1, "closed_clean"],
+      ["s-0000000112", 2, "closed_clean"],
+      ["s-0000000113", 3, "open"],
+      ["s-0000000114", 4, "closed_clean"],
+      ["s-0000000115", 5, "open"],
+      ["s-0000000116", 95, "open"],
+    ]
+    for (const [key, days, disposition] of rows) writeFileSync(path.join(dir, `${key}.json`), JSON.stringify(rec(key, { startedAt: new Date(NOW - days * DAY).toISOString(), disposition })))
+    store.prune()
+    expect(store.list().map((r) => r.key).sort()).toEqual(["s-0000000111", "s-0000000112", "s-0000000113", "s-0000000115"])
+  })
+
+  test("two stores on one folder (two bridge processes) do not lose an update", async () => {
+    const dir = tmpDir()
+    const slow = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
+    let failNext = false
+    // A's rename fails once with EBUSY, so A sits between its read and its write while B runs.
+    const a = createReportStore({ dir, now: () => NOW, sleep: () => slow(60), rename: (from, to) => {
+      if (failNext) {
+        failNext = false
+        throw errno("EBUSY")
+      }
+      renameSync(from, to)
+    } })
+    const b = createReportStore({ dir, now: () => NOW })
+    await b.update("s-0000000121", () => rec("s-0000000121"))
+    failNext = true
+    const bump = (r: TaskRecord | undefined) => (r ? { ...r, sendCount: r.sendCount + 1 } : r)
+    const first = a.update("s-0000000121", bump)
+    await slow(10)
+    await Promise.all([first, b.update("s-0000000121", bump)])
+    expect(a.get("s-0000000121")?.sendCount).toBe(2)
+    expect(readdirSync(dir).filter((n) => n.endsWith(".lock"))).toEqual([])
+  })
+
+  test("a lock another process holds: the update is skipped and logged once, never thrown", async () => {
+    const dir = tmpDir()
+    const warnings: string[] = []
+    const store = createReportStore({ dir, now: () => NOW, sleep: async () => {}, warn: (code) => warnings.push(code) })
+    await store.update("s-0000000131", () => rec("s-0000000131"))
+    writeFileSync(path.join(dir, "s-0000000131.json.lock"), "other")
+    expect(await store.update("s-0000000131", (r) => (r ? { ...r, sendCount: 5 } : r))).toBeUndefined()
+    expect(await store.update("s-0000000131", (r) => (r ? { ...r, sendCount: 6 } : r))).toBeUndefined()
+    expect(store.get("s-0000000131")?.sendCount).toBe(0)
+    expect(warnings).toEqual(["lock_busy"])
+  })
+
+  test("a stale lock (older than about 10 s) is taken over", async () => {
+    const dir = tmpDir()
+    const store = createReportStore({ dir, now: () => NOW, sleep: async () => {} })
+    await store.update("s-0000000141", () => rec("s-0000000141"))
+    const lock = path.join(dir, "s-0000000141.json.lock")
+    writeFileSync(lock, "crashed writer")
+    const old = new Date(Date.now() - 20_000)
+    utimesSync(lock, old, old)
+    expect((await store.update("s-0000000141", (r) => (r ? { ...r, sendCount: 7 } : r)))?.sendCount).toBe(7)
+    expect(existsSync(lock)).toBe(false)
   })
 
   test("retention also runs when a new task is recorded", async () => {
@@ -134,13 +197,23 @@ describe("report store", () => {
 
 describe("record parsing", () => {
   test("keeps only known, valid fields", () => {
-    const raw = { ...rec("s-0000000301"), prompt: "secret task text", agent: "build", tokens: { input: 5, output: "x" }, requestedModel: "not a model" }
+    const raw = { ...rec("s-0000000301"), prompt: "secret task text", agent: "build", tokens: { input: 5, output: "x" }, requestedModel: "not a model", servedModel: "synapse/auto", errorCode: "Some box text 123" }
     const parsed = parseTaskRecord(JSON.stringify(raw))
     expect(parsed).toBeDefined()
     expect(parsed).not.toHaveProperty("prompt")
     expect(parsed).not.toHaveProperty("requestedModel")
+    expect(parsed).not.toHaveProperty("servedModel")
+    expect(parsed?.errorCode).toBe("other")
     expect(parsed?.agent).toBe("build")
     expect(parsed?.tokens).toEqual({ input: 5, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 })
+  })
+
+  test("errorCode allowlist: bridge error codes and OpenCode error names kept, anything else is other", () => {
+    expect(errorCode("not_started")).toBe("not_started")
+    expect(errorCode("upstream_error")).toBe("upstream_error")
+    expect(errorCode("ProviderAuthError")).toBe("ProviderAuthError")
+    expect(errorCode("unrecognised error")).toBe("other")
+    expect(errorCode("rm -rf /")).toBe("other")
   })
 
   test("refuses a record without its required fields", () => {
@@ -171,7 +244,7 @@ describe("report maths", () => {
 
   test("totals, success rate, durations and dispositions over the window", () => {
     const report = summarise(sample, { sinceDays: 30, groupBy: "model", recent: 0, now: NOW })
-    expect(report.totals).toMatchObject({ tasks: 5, completed: 2, error: 1, aborted: 1, running: 1, unknown: 0, finished: 4 })
+    expect(report.totals).toMatchObject({ tasks: 5, completed: 2, error: 1, aborted: 1, running: 1, unknown: 0, notSent: 0, finished: 4 })
     expect(report.totals.successRate).toBe(0.5)
     expect(report.totals.durationMs).toEqual({ median: 2500, p90: 9000, samples: 4 })
     expect(report.totals.dispositions).toEqual({ collected: 2, closedDiscarded: 1, open: 1, closedClean: 0, swept: 1 })
@@ -195,9 +268,22 @@ describe("report maths", () => {
     ])
   })
 
-  test("the served model wins over the requested one when grouping by model; none is (unknown)", () => {
-    const groups = summarise([rec("s-0000000501", { requestedModel: "synapse/auto", servedModel: "synapse/qwen-coder" }), rec("s-0000000502")], { sinceDays: 30, groupBy: "model", recent: 0, now: NOW }).groups
+  test("groupBy model uses the model actually sent; none is (unknown)", () => {
+    const groups = summarise([rec("s-0000000501", { requestedModel: "synapse/qwen-coder" }), rec("s-0000000502")], { sinceDays: 30, groupBy: "model", recent: 0, now: NOW }).groups
     expect(groups.map((g) => g.name).sort()).toEqual(["(unknown)", "synapse/qwen-coder"])
+  })
+
+  test("an unknown outcome after a send counts as finished and lowers the rate; a task never sent does not", () => {
+    const report = summarise(
+      [
+        rec("s-0000000511", { outcome: "completed", sendCount: 1, durationMs: 10 }),
+        rec("s-0000000512", { outcome: "unknown", sendCount: 2, durationMs: 30 }),
+        rec("s-0000000513", { outcome: "unknown", sendCount: 0 }),
+      ],
+      { sinceDays: 30, groupBy: "model", recent: 0, now: NOW },
+    )
+    expect(report.totals).toMatchObject({ tasks: 3, completed: 1, unknown: 2, notSent: 1, finished: 2, successRate: 0.5 })
+    expect(report.totals.durationMs).toEqual({ median: 20, p90: 30, samples: 2 })
   })
 
   test("no finished tasks: success rate and durations are null, not zero", () => {

@@ -87,7 +87,7 @@ describe("task records across the session lifecycle", () => {
     ] })
     expect((await invoke(resultTool, { sessionID: SID }, f.ctx)).isError).toBeUndefined()
     r = stored(f, key)
-    expect(r.servedModel).toBe("synapse/qwen-coder")
+    expect(r).not.toHaveProperty("servedModel")
     expect(r.tokens).toEqual({ input: 150, output: 30, reasoning: 5, cacheRead: 7, cacheWrite: 1 })
 
     expect((await invoke(collectTool, { sessionID: SID }, f.ctx)).isError).toBeUndefined()
@@ -122,6 +122,54 @@ describe("task records across the session lifecycle", () => {
     expect(stored(f, key)).toMatchObject({ sendCount: 2, outcome: "error", errorCode: "ProviderAuthError" })
   })
 
+  test("an error label outside the allowlist is stored as other", async () => {
+    const f = context()
+    const key = await started(f)
+    await invoke(sendTool, { sessionID: SID, message: "go" }, f.ctx)
+    settle(f, "error", key, "unrecognised error")
+    await invoke(waitTool, { sessionIDs: [SID] }, f.ctx)
+    expect(stored(f, key)).toMatchObject({ outcome: "error", errorCode: "other" })
+  })
+
+  test("a run that settles while the prompt POST is still in flight is completed, not left running", async () => {
+    const f = context()
+    const key = await started(f)
+    const call = f.api.call.bind(f.api)
+    let postAt = ""
+    f.api.call = async (input) => {
+      if (input.path.endsWith("/prompt_async")) {
+        postAt = new Date().toISOString()
+        await new Promise((resolve) => setTimeout(resolve, 15))
+      }
+      return call(input)
+    }
+    await invoke(sendTool, { sessionID: SID, message: "go" }, f.ctx)
+    f.hub.waitResult = { events: [], next: { epoch: "ep1", seq: 12 }, timedOut: false, views: [{ sessionID: SID, directory: `/sessions/${key}`, state: "idle", since: postAt }] }
+    await invoke(waitTool, { sessionIDs: [SID] }, f.ctx)
+    expect(stored(f, key).outcome).toBe("completed")
+  })
+
+  test("closing a task that is still running records unknown; closing with abort: true records aborted", async () => {
+    const f = context()
+    const key = await started(f)
+    await invoke(sendTool, { sessionID: SID, message: "go" }, f.ctx)
+    f.api.on(`DELETE /session/${SID}`, { status: 200, data: true })
+    closeWith(f, {})
+    await invoke(closeSessionTool, { sessionID: SID }, f.ctx)
+    expect(stored(f, key)).toMatchObject({ outcome: "unknown", disposition: "closed_clean" })
+    expect(stored(f, key).finishedAt).toBeDefined()
+
+    const g = context()
+    const key2 = await started(g)
+    await invoke(sendTool, { sessionID: SID, message: "go" }, g.ctx)
+    g.api.on(`DELETE /session/${SID}`, { status: 200, data: true })
+    g.api.on(`POST /session/${SID}/abort`, { status: 200, data: true })
+    g.hub.view = async (id: string) => ({ sessionID: id, directory: `/sessions/${key2}`, state: g.api.find("POST", `/session/${SID}/abort`) ? "idle" : "busy", since: new Date().toISOString() })
+    closeWith(g, {})
+    expect((await invoke(closeSessionTool, { sessionID: SID, abort: true }, g.ctx)).isError).toBeUndefined()
+    expect(stored(g, key2)).toMatchObject({ outcome: "aborted", disposition: "closed_clean" })
+  })
+
   test("a timed-out wait leaves a running task running", async () => {
     const f = context()
     const key = await started(f)
@@ -150,9 +198,10 @@ describe("task records across the session lifecycle", () => {
     expect(stored(f, key).disposition).toBe("closed_discarded")
   })
 
-  test("a session swept by oc_cleanup is swept", async () => {
+  test("a session swept by oc_cleanup is swept; a run still marked running becomes unknown", async () => {
     const f = context()
     const key = await started(f)
+    await invoke(sendTool, { sessionID: SID, message: "go" }, f.ctx)
     const old = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString()
     f.ctx.workspaces.closeCandidates = async () => ({ states: [{ sessionID: SID, sessionKey: key, createdAt: old, hostRepo: "C:\\GitHub\\demo-repo", base: "a".repeat(40) }], legacy: 0, otherBox: 0, otherBridge: 0 })
     f.api.on(`GET /session/${SID}`, { status: 404 })
@@ -160,7 +209,7 @@ describe("task records across the session lifecycle", () => {
     closeWith(f, {})
     const result = await invoke(cleanupTool, { dryRun: false }, f.ctx)
     expect(data(result).closed).toEqual([key])
-    expect(stored(f, key).disposition).toBe("swept")
+    expect(stored(f, key)).toMatchObject({ disposition: "swept", outcome: "unknown" })
   })
 })
 
@@ -250,6 +299,18 @@ describe("oc_report", () => {
     expect(line).toContain("1 task in the last 30 days")
     expect(line).toContain("success rate 100% of 1 finished")
     expect(line).not.toContain("build")
+    expect(recent[0]).not.toHaveProperty("servedModel")
+  })
+
+  test("notes say synapse/auto hides the routed model and tokens are a lower bound; the description says how unknown counts", async () => {
+    const f = context()
+    const result = await invoke(reportTool, {}, f.ctx)
+    const notes = data(result).notes as string[]
+    expect(notes).toHaveLength(2)
+    expect(notes[0]).toContain("synapse/auto")
+    expect(notes[1]).toContain("lower bound")
+    expect(reportTool.description).toContain("unknown")
+    expect(reportTool.description).not.toContain("served")
   })
 
   test("an empty folder gives an empty report, not an error", async () => {

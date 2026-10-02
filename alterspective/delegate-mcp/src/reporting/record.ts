@@ -2,6 +2,8 @@
 // file contents or an error body (prompts may hold client data; WEBSTA-001-SECRETS-MANAGEMENT-STANDARDS).
 // Records are read back from a folder several bridges share, so every field is validated on read
 // and anything unknown or malformed is dropped.
+import { errorLabel } from "../events/describe.ts"
+import { ErrorCode } from "../shared/errors.ts"
 import { AGENT_RE, MODEL_RE, SESSION_ID_RE, SESSION_KEY } from "../supervisor/workspaces-state.ts"
 
 export const RECORD_VERSION = 1
@@ -19,10 +21,11 @@ export type TaskRecord = {
   /** The owner repo's folder name only, never the full path. */
   repo: string
   agent?: string
-  /** The model last sent (`synapse/<id>` since #71). */
+  /**
+   * The model last sent (`synapse/<id>` since #71). Review cycle 1: there is no served model; OpenCode
+   * only echoes the requested ids, so `synapse/auto` hides which model Synapse routed to.
+   */
   requestedModel?: string
-  /** The model the sandbox reports it answered with (assistant message providerID/modelID). */
-  servedModel?: string
   startedAt: string
   sendCount: number
   firstSendAt?: string
@@ -31,7 +34,7 @@ export type TaskRecord = {
   outcome: Outcome
   /** First send to the latest finish. */
   durationMs?: number
-  /** A short bridge label for an error outcome, never an error body. */
+  /** An allowlisted code for an error outcome (see errorCode), never an error body. */
   errorCode?: string
   /** Summed over the assistant messages oc_result read (a lower bound for long sessions). */
   tokens?: Tokens
@@ -48,7 +51,17 @@ const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/
 const BRIDGE_RE = /^[a-z0-9-]{1,40}$/
 /** A folder name: printable, no separators. */
 const REPO_RE = /^[^\\/\u0000-\u001f\u007f]{1,128}$/
-export const ERROR_CODE_RE = /^[A-Za-z0-9 _.:-]{1,60}$/
+
+/** Review cycle 1 (INFO 7): the only error codes a record keeps. Anything else is stored as "other". */
+const KNOWN_ERROR_CODES: ReadonlySet<string> = new Set<string>(ErrorCode)
+export const OTHER_ERROR = "other"
+/** What errorLabel returns for a name outside OpenCode's own. */
+const UNRECOGNISED = errorLabel("")
+
+/** A bridge DelegateError code or one of OpenCode's own error names (errorLabel), else "other". */
+export function errorCode(value: string): string {
+  return KNOWN_ERROR_CODES.has(value) || (value !== UNRECOGNISED && errorLabel(value) === value) ? value : OTHER_ERROR
+}
 
 /** The owner repo's folder name (Windows or POSIX path), or "(unknown)". */
 export function repoName(hostRepo: string): string {
@@ -104,12 +117,11 @@ export function parseTaskRecord(raw: string): TaskRecord | undefined {
   const optional = {
     agent: str(p.agent, AGENT_RE),
     requestedModel: str(p.requestedModel, MODEL_RE),
-    servedModel: str(p.servedModel, MODEL_RE),
     firstSendAt: str(p.firstSendAt, ISO_RE),
     lastSendAt: str(p.lastSendAt, ISO_RE),
     finishedAt: str(p.finishedAt, ISO_RE),
     durationMs: count(p.durationMs),
-    errorCode: str(p.errorCode, ERROR_CODE_RE),
+    errorCode: typeof p.errorCode === "string" ? errorCode(p.errorCode) : undefined,
     tokens: tokens(p.tokens),
     commitsCollected: count(p.commitsCollected),
     closedAt: str(p.closedAt, ISO_RE),

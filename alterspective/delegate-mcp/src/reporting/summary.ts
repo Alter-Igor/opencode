@@ -1,5 +1,5 @@
 // #73: the report maths behind oc_report. Pure functions over task records: counts by outcome,
-// success rate = completed / finished (completed + error + aborted), median and p90 (nearest rank)
+// success rate = completed / finished (completed + error + aborted + unknown after a send), median and p90 (nearest rank)
 // of first-send-to-finish durations, and what happened to each task's work.
 import type { TaskRecord } from "./record.ts"
 
@@ -14,7 +14,11 @@ export type Metrics = {
   error: number
   aborted: number
   running: number
+  /** Includes `notSent`. */
   unknown: number
+  /** Started but never sent a prompt: not a run, so not in `finished`. */
+  notSent: number
+  /** completed + error + aborted + unknown (excluding notSent). */
   finished: number
   /** completed / finished, 0..1; null when nothing has finished. */
   successRate: number | null
@@ -48,8 +52,11 @@ function metrics(records: readonly TaskRecord[]): Metrics {
   const completed = by("completed")
   const error = by("error")
   const aborted = by("aborted")
-  const finished = completed + error + aborted
-  const durations = records.filter((r) => r.outcome !== "running" && r.outcome !== "unknown" && r.durationMs !== undefined).map((r) => r.durationMs as number)
+  // Review cycle 1 (MEDIUM 1): unknown counts as finished (a run that was closed or lost without a
+  // settled state), so it lowers the success rate and never raises it. A task never sent is not a run.
+  const isFinished = (r: TaskRecord) => r.outcome === "completed" || r.outcome === "error" || r.outcome === "aborted" || (r.outcome === "unknown" && r.sendCount > 0)
+  const finished = records.filter(isFinished).length
+  const durations = records.filter((r) => isFinished(r) && r.durationMs !== undefined).map((r) => r.durationMs as number)
   // Each task counts once: collected work first, then what happened to the rest.
   const notCollected = records.filter((r) => !r.collected)
   const disposed = (d: TaskRecord["disposition"]) => notCollected.filter((r) => r.disposition === d).length
@@ -60,6 +67,7 @@ function metrics(records: readonly TaskRecord[]): Metrics {
     aborted,
     running: by("running"),
     unknown: by("unknown"),
+    notSent: records.filter((r) => r.outcome === "unknown" && r.sendCount === 0).length,
     finished,
     successRate: finished ? completed / finished : null,
     durationMs: { median: median(durations) ?? null, p90: percentile(durations, 90) ?? null, samples: durations.length },
@@ -74,7 +82,7 @@ function metrics(records: readonly TaskRecord[]): Metrics {
 }
 
 function groupName(record: TaskRecord, groupBy: GroupBy): string {
-  if (groupBy === "model") return record.servedModel ?? record.requestedModel ?? UNKNOWN_GROUP
+  if (groupBy === "model") return record.requestedModel ?? UNKNOWN_GROUP
   if (groupBy === "agent") return record.agent ?? UNKNOWN_GROUP
   return record.repo
 }

@@ -167,7 +167,7 @@ async function closeOne(ctx: ToolContext, box: Box, located: Located, args: Clos
   if (outcome.closed) {
     ctx.sessions.delete(args.sessionID)
     const lostWork = outcome.uncollectedCommits + outcome.uncommittedPaths + outcome.ignoredPaths > 0
-    await recordClose(ctx, located.sessionKey, args.discardWork === true && lostWork ? "closed_discarded" : "closed_clean")
+    await recordClose(ctx, located.sessionKey, args.discardWork === true && lostWork ? "closed_discarded" : "closed_clean", aborted)
   } else if (outcome.session !== "kept") await keepTracked(ctx, args.sessionID, located.sessionKey)
   const { ignoredExamples, ...rest } = outcome
   return ok(closeSummary(outcome), { ...rest, aborted, ...(ignoredExamples.length ? { ignoredExamples: untrusted(ignoredExamples.join("\n"), 2000) } : {}) })

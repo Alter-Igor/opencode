@@ -8,7 +8,7 @@ import type { SessionState } from "../shared/contracts.ts"
 import { safeLog } from "../shared/log.ts"
 import { MODEL_RE } from "../supervisor/workspaces-state.ts"
 import type { SessionRecord, ToolContext } from "../tools/context.ts"
-import { ERROR_CODE_RE, newTaskRecord, repoName, type Disposition, type Outcome, type TaskRecord, type Tokens } from "./record.ts"
+import { errorCode, newTaskRecord, repoName, type Disposition, type Outcome, type TaskRecord, type Tokens } from "./record.ts"
 import { createReportStore, type ReportStore } from "./store.ts"
 
 type Ctx = Pick<ToolContext, "config" | "log" | "supervisor" | "sessions">
@@ -66,12 +66,16 @@ export function recordStart(ctx: Ctx, rec: SessionRecord): Promise<void> {
   return guarded(ctx, () => reportsFor(ctx).update(rec.sessionKey, (current) => current ?? { ...fresh(ctx, rec), startedAt: nowIso() }))
 }
 
-/** oc_send (and every prompt through sendPrompt): the model and agent actually sent; a new run starts. */
-export function recordSend(ctx: Ctx, rec: SessionRecord, sent: { model?: string; agent?: string }): Promise<void> {
+/**
+ * oc_send (and every prompt through sendPrompt): the model and agent actually sent; a new run starts.
+ * `at` is when the send began, taken before the prompt POST (review cycle 1, LOW 5): a run that
+ * settles while the POST is in flight is then not mistaken for a stale state.
+ */
+export function recordSend(ctx: Ctx, rec: SessionRecord, sent: { model?: string; agent?: string; at?: string }): Promise<void> {
   return guarded(ctx, () =>
     reportsFor(ctx).update(rec.sessionKey, (current) => {
       const base = current ?? fresh(ctx, rec)
-      const at = nowIso()
+      const at = sent.at && ISO_RE.test(sent.at) ? sent.at : nowIso()
       const { finishedAt: _f, durationMs: _d, errorCode: _e, ...rest } = base
       return {
         ...rest,
@@ -113,11 +117,15 @@ function finish(record: TaskRecord, seen: ObservedState): TaskRecord | undefined
   const at = seen.at ? Date.parse(seen.at) : Number.NaN
   if (record.lastSendAt && at < Date.parse(record.lastSendAt)) return undefined
   const finishedAt = Number.isFinite(at) ? new Date(at).toISOString() : nowIso()
+  const code = end.code ?? (end.outcome === "error" ? errorCode(seen.lastError ?? "") : undefined)
+  return ended(record, end.outcome, finishedAt, code)
+}
+
+function ended(record: TaskRecord, outcome: Outcome, finishedAt: string, code?: string): TaskRecord {
   const first = record.firstSendAt ? Date.parse(record.firstSendAt) : Number.NaN
-  const code = end.code ?? (end.outcome === "error" && seen.lastError && ERROR_CODE_RE.test(seen.lastError) ? seen.lastError : undefined)
   return {
     ...record,
-    outcome: end.outcome,
+    outcome,
     finishedAt,
     ...(Number.isFinite(first) ? { durationMs: Math.max(0, Date.parse(finishedAt) - first) } : {}),
     ...(code ? { errorCode: code } : {}),
@@ -136,17 +144,18 @@ export function recordStates(ctx: Ctx, states: readonly ObservedState[]): Promis
   })
 }
 
-type MessageInfo = { role?: unknown; providerID?: unknown; modelID?: unknown; tokens?: { input?: unknown; output?: unknown; reasoning?: unknown; cache?: { read?: unknown; write?: unknown } } }
+type MessageInfo = { role?: unknown; tokens?: { input?: unknown; output?: unknown; reasoning?: unknown; cache?: { read?: unknown; write?: unknown } } }
 const n = (v: unknown) => (typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? v : 0)
 
-/** The served model (last assistant message) and token totals over the messages oc_result read. */
-export function usageOf(messages: readonly unknown[]): { servedModel?: string; tokens?: Tokens } {
-  let servedModel: string | undefined
+/**
+ * Token totals over the assistant messages oc_result read (a lower bound). Review cycle 1: no served
+ * model is taken from them: providerID/modelID only echo the requested ids (synapse/auto).
+ */
+export function usageOf(messages: readonly unknown[]): { tokens?: Tokens } {
   let tokens: Tokens | undefined
   for (const m of messages) {
     const info = (m as { info?: MessageInfo } | undefined)?.info
     if (!info || info.role !== "assistant") continue
-    if (typeof info.providerID === "string" && typeof info.modelID === "string" && MODEL_RE.test(`${info.providerID}/${info.modelID}`)) servedModel = `${info.providerID}/${info.modelID}`
     const t = info.tokens
     if (!t || typeof t !== "object") continue
     tokens ??= { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 }
@@ -156,12 +165,12 @@ export function usageOf(messages: readonly unknown[]): { servedModel?: string; t
     tokens.cacheRead += n(t.cache?.read)
     tokens.cacheWrite += n(t.cache?.write)
   }
-  return { ...(servedModel ? { servedModel } : {}), ...(tokens ? { tokens } : {}) }
+  return tokens ? { tokens } : {}
 }
 
 const total = (t: Tokens | undefined) => (t ? t.input + t.output + t.reasoning + t.cacheRead + t.cacheWrite : -1)
 
-/** oc_result: served model and tokens from the messages it fetched, and the state it read. */
+/** oc_result: tokens from the messages it fetched, and the state it read. */
 export function recordResult(ctx: Ctx, rec: SessionRecord, seen: { state: SessionState; at?: string }, messages: readonly unknown[]): Promise<void> {
   return guarded(ctx, () =>
     reportsFor(ctx).update(rec.sessionKey, (current) => {
@@ -170,7 +179,7 @@ export function recordResult(ctx: Ctx, rec: SessionRecord, seen: { state: Sessio
       const done = finish(current, { sessionID: rec.sessionID, ...seen }) ?? current
       // Repeated reads never lower the count (a later read may see a shorter window).
       const tokens = total(usage.tokens) > total(done.tokens) ? usage.tokens : done.tokens
-      const next: TaskRecord = { ...done, ...(usage.servedModel ? { servedModel: usage.servedModel } : {}), ...(tokens ? { tokens } : {}) }
+      const next: TaskRecord = { ...done, ...(tokens ? { tokens } : {}) }
       return JSON.stringify(next) === JSON.stringify(current) ? undefined : next
     }),
   )
@@ -187,7 +196,18 @@ export function recordCollect(ctx: Ctx, rec: SessionRecord, commits: number): Pr
   )
 }
 
-/** oc_close_session / oc_cleanup: what happened to the copy. Only an existing record is updated. */
-export function recordClose(ctx: Ctx, key: string, disposition: Exclude<Disposition, "open" | "collected">): Promise<void> {
-  return guarded(ctx, () => reportsFor(ctx).update(key, (current) => (current ? { ...current, disposition, closedAt: nowIso() } : undefined)))
+/**
+ * oc_close_session / oc_cleanup: what happened to the copy. Only an existing record is updated.
+ * Review cycle 1 (MEDIUM 1): a run still marked running ends here, as aborted when the close
+ * aborted it, else unknown (unknown counts as finished and so lowers the success rate).
+ */
+export function recordClose(ctx: Ctx, key: string, disposition: Exclude<Disposition, "open" | "collected">, aborted = false): Promise<void> {
+  return guarded(ctx, () =>
+    reportsFor(ctx).update(key, (current) => {
+      if (!current) return undefined
+      const at = nowIso()
+      const base = current.outcome === "running" ? ended(current, aborted ? "aborted" : "unknown", at) : current
+      return { ...base, disposition, closedAt: at }
+    }),
+  )
 }

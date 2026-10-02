@@ -1,11 +1,12 @@
 // #73: the task record store, host-side in the bridge's host state folder (<home>/workspaces/reports,
 // never mounted in the box). One JSON file per task (<key>.json), so bridges sharing the folder never
 // race on one file; each write is a whole file (temp file, then rename), and a Windows EPERM/EBUSY on
-// the rename is retried a few times (seen in inbox-sidecar/src/store.ts). Retention (age, then
-// count) runs when a new task is recorded and before a report. AILES-056: retention decides on
+// the rename is retried a few times (seen in inbox-sidecar/src/store.ts). Each read-modify-write
+// holds a per-key lock file, so two processes of one bridge name do not lose updates. Retention (age,
+// then a count cap that open tasks are exempt from) runs when a new task is recorded and before a report. AILES-056: retention decides on
 // every file first and deletes after. Nothing here throws to a caller: a failed write is logged
 // once (the error code only, no path or content) and otherwise ignored.
-import { readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, mkdirSync } from "node:fs"
+import { closeSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import path from "node:path"
 import { SESSION_KEY } from "../supervisor/workspaces-state.ts"
 import { parseTaskRecord, type TaskRecord } from "./record.ts"
@@ -21,6 +22,10 @@ const PRUNE_EVERY_MS = 10 * 60 * 1000
 /** Temp files a crashed writer left behind are removed after this long. */
 const STALE_TMP_MS = 60 * 60 * 1000
 const DAY_MS = 24 * 60 * 60 * 1000
+/** Per-key lock: tries, the wait between them (about 0.5 s in all), and when a held lock is a crashed writer's. */
+const LOCK_ATTEMPTS = 20
+const LOCK_RETRY_MS = 25
+export const STALE_LOCK_MS = 10_000
 
 export type ReportStoreOptions = {
   dir: string
@@ -31,6 +36,9 @@ export type ReportStoreOptions = {
   warn?: (code: string) => void
   maxAgeDays?: number
   maxRecords?: number
+  lockAttempts?: number
+  lockRetryMs?: number
+  staleLockMs?: number
 }
 
 export type ReportStore = {
@@ -59,6 +67,9 @@ export function createReportStore(options: ReportStoreOptions): ReportStore {
   const now = options.now ?? Date.now
   const maxAgeMs = (options.maxAgeDays ?? REPORT_MAX_AGE_DAYS) * DAY_MS
   const maxRecords = options.maxRecords ?? REPORT_MAX_RECORDS
+  const lockAttempts = options.lockAttempts ?? LOCK_ATTEMPTS
+  const lockRetryMs = options.lockRetryMs ?? LOCK_RETRY_MS
+  const staleLockMs = options.staleLockMs ?? STALE_LOCK_MS
   const chains = new Map<string, Promise<unknown>>()
   let warned = false
   let lastPrune = Number.NEGATIVE_INFINITY
@@ -120,17 +131,68 @@ export function createReportStore(options: ReportStoreOptions): ReportStore {
       warnOnce("invalid_key")
       return undefined
     }
-    const current = get(key)
-    const next = fn(current)
-    if (!next || next.key !== key) return undefined
+    let release: (() => void) | undefined
+    let current: TaskRecord | undefined
+    let next: TaskRecord | undefined
     try {
+      release = await lock(key)
+      if (!release) {
+        warnOnce("lock_busy")
+        return undefined
+      }
+      current = get(key)
+      next = fn(current)
+      if (!next || next.key !== key) return undefined
       await write(next)
     } catch (error) {
       warnOnce(errno(error))
       return undefined
+    } finally {
+      release?.()
     }
     if (!current && now() - lastPrune >= PRUNE_EVERY_MS) prune()
     return next
+  }
+
+  /**
+   * Review cycle 1 (LOW 3): a cross-process lock per key (<key>.json.lock, created O_EXCL), so two
+   * bridge processes with the same name cannot lose each other's read-modify-write. A lock older than
+   * STALE_LOCK_MS is a crashed writer's and is taken over. Undefined when it stays busy: the caller
+   * skips the update rather than wait longer.
+   */
+  async function lock(key: string): Promise<(() => void) | undefined> {
+    const file = `${fileOf(key)}.lock`
+    mkdirSync(dir, { recursive: true })
+    for (let attempt = 1; attempt <= lockAttempts; attempt++) {
+      try {
+        closeSync(openSync(file, "wx"))
+        return () => {
+          try {
+            unlinkSync(file)
+          } catch {
+            // already removed (taken over as stale): nothing to release
+          }
+        }
+      } catch (error) {
+        if (errno(error) !== "EEXIST") throw error
+      }
+      let age = 0
+      try {
+        age = Date.now() - statSync(file).mtimeMs
+      } catch {
+        continue // released meanwhile: try again at once
+      }
+      if (age > staleLockMs) {
+        try {
+          unlinkSync(file)
+        } catch {
+          // another process took it over first
+        }
+        continue
+      }
+      if (attempt < lockAttempts) await sleep(lockRetryMs)
+    }
+    return undefined
   }
 
   function update(key: string, fn: (current: TaskRecord | undefined) => TaskRecord | undefined): Promise<TaskRecord | undefined> {
@@ -170,13 +232,16 @@ export function createReportStore(options: ReportStoreOptions): ReportStore {
       // Pass 1: decide on every file. Pass 2: delete.
       const cutoff = now() - maxAgeMs
       const records = list().sort((a, b) => b.startedAt.localeCompare(a.startedAt))
-      const drop = records.filter((r, i) => i >= maxRecords || Date.parse(r.startedAt) < cutoff).map((r) => fileOf(r.key))
+      const old = records.filter((r) => Date.parse(r.startedAt) < cutoff)
+      // Review cycle 1 (LOW 4): open tasks never count towards the cap (their work is still out there).
+      const overCap = records.filter((r) => Date.parse(r.startedAt) >= cutoff && r.disposition !== "open").slice(maxRecords)
+      const drop = [...old, ...overCap].map((r) => fileOf(r.key))
       const staleTmp = names()
         .filter((n) => n.endsWith(".tmp"))
         .map((n) => path.join(dir, n))
         .filter((file) => {
           try {
-            return now() - statSync(file).mtimeMs > STALE_TMP_MS
+            return Date.now() - statSync(file).mtimeMs > STALE_TMP_MS
           } catch {
             return false
           }
