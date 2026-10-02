@@ -7,7 +7,7 @@
 import { describe, expect, test } from "bun:test"
 import { existsSync, readFileSync } from "node:fs"
 import path from "node:path"
-import { ensureEntryConnected, reconnectTick } from "../src/keystone-auth/host-wiring.ts"
+import { connectSignedIn, ensureEntryConnected, reconnectTick } from "../src/keystone-auth/host-wiring.ts"
 import type { KsStatus } from "../src/keystone-auth/index.ts"
 import type { Level, Logger } from "../src/shared/log.ts"
 import { doctorTool } from "../src/tools/doctor.ts"
@@ -72,6 +72,17 @@ describe("M1: a box this bridge does not hold yet", () => {
     expect(await reconnectTick(() => undefined, status, () => ["rag-read"], silent)).toEqual({})
     await reconnectTick(() => api, status, () => ["rag-read"], silent)
     expect(api.find("POST", "/mcp/ks-rag-read/connect")).toBeDefined()
+  })
+
+  test("CodeRabbit: a retrying entry whose published bearer is still valid is reconnected; expired, needs_sign_in and unpublished are not", async () => {
+    const api = new FakeApi([]).on("GET /mcp", { status: 200, data: { "ks-a": { status: "failed" }, "ks-b": { status: "failed" }, "ks-c": { status: "failed" }, "ks-d": { status: "failed" } } })
+    for (const e of ["a", "b", "c", "d"]) api.on(`POST /mcp/ks-${e}/connect`, { status: 200, data: true })
+    const now = Date.parse("2026-10-02T00:30:00.000Z")
+    const s = (connection: string, st: KsStatus["state"], credential?: "published" | "empty", expiresAt = "2026-10-02T01:00:00.000Z"): KsStatus => ({ ...state(connection, st), expiresAt, ...(credential ? { credential } : {}) })
+    const states = [s("a", "retrying", "published"), s("b", "expired", "published", "2026-10-02T00:10:00.000Z"), s("c", "needs_sign_in", "empty"), s("d", "retrying")]
+    const result = await connectSignedIn(async () => states, ["a", "b", "c", "d"], api, silent, () => now)
+    expect(Object.keys(result)).toEqual(["ks-a"])
+    for (const e of ["b", "c", "d"]) expect(api.find("POST", `/mcp/ks-${e}/connect`)).toBeUndefined()
   })
 
   test("oc_doctor reconnects signed-in entries on the box it reads before reporting them", async () => {
