@@ -47,7 +47,7 @@ describe.skipIf(!sh || !Bun.which("flock"))("front-reload run with sh (fake ngin
   const TOKEN = jwt({ sub: "oid-1" })
 
   /** `before` runs just before the script, with the run directory (to plant leftovers). */
-  type Step = { auth?: string; servers?: string; hash?: string; nginxTest?: number; args?: string[]; before?: (run: string) => void }
+  type Step = { auth?: string; servers?: string; hash?: string; nginxTest?: number; args?: string[]; before?: (run: string) => void; ack?: false }
   const run = (opts: Step = {}) => runSteps([opts])[0]!
 
   /** Runs the script once per step in one directory, so a later step sees an earlier step's files. */
@@ -62,7 +62,8 @@ describe.skipIf(!sh || !Bun.which("flock"))("front-reload run with sh (fake ngin
       // A worker acknowledges the published generation. The real-nginx pause/race proof lives
       // in spike/review-reload-proof.ts; these cases exercise malformed files and shell exits.
       const wget = path.join(bin, "wget")
-      writeFileSync(wget, `#!/bin/sh\nmarker=$(sed -n 's|^include \\(.*attempts/.*\\.conf\\);$|\\1|p' "$OCD_FRONT_RUN/current.conf")\nsed -n 's|.*return 200 "\\([a-f0-9]* [a-f0-9]* [a-f0-9]*\\)".*|\\1|p' "$marker"\n`)
+      // A `noack` file makes the worker never answer (exit 7 after OCD_FRONT_ACK_SECONDS).
+      writeFileSync(wget, `#!/bin/sh\n[ -e '${path.join(dir, "noack").replaceAll("\\", "/")}' ] && exit 1\nmarker=$(sed -n 's|^include \\(.*attempts/.*\\.conf\\);$|\\1|p' "$OCD_FRONT_RUN/current.conf")\nsed -n 's|.*return 200 "\\([a-f0-9]* [a-f0-9]* [a-f0-9]*\\)".*|\\1|p' "$marker"\n`)
       chmodSync(wget, 0o755)
       return steps.map((opts) => {
         writeFileSync(path.join(gen, "servers.conf"), opts.servers ?? SERVERS)
@@ -71,14 +72,18 @@ describe.skipIf(!sh || !Bun.which("flock"))("front-reload run with sh (fake ngin
         rmSync(calls, { force: true })
         writeFileSync(fake, `#!/bin/sh\necho "$*" >> '${calls.replaceAll("\\", "/")}'\n[ "$1" = "-t" ] && exit ${opts.nginxTest ?? 0}\nexit 0\n`)
         chmodSync(fake, 0o755)
+        rmSync(path.join(dir, "noack"), { force: true })
+        if (opts.ack === false) writeFileSync(path.join(dir, "noack"), "")
         opts.before?.(path.join(dir, "run"))
         const result = Bun.spawnSync([sh!, SCRIPT, ...(opts.args ?? [])], {
-          env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}`, OCD_FRONT_GEN: gen.replaceAll("\\", "/"), OCD_FRONT_RUN: path.join(dir, "run").replaceAll("\\", "/"), OCD_FRONT_HASH: opts.hash ?? HASH },
+          env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}`, OCD_FRONT_GEN: gen.replaceAll("\\", "/"), OCD_FRONT_RUN: path.join(dir, "run").replaceAll("\\", "/"), OCD_FRONT_HASH: opts.hash ?? HASH, OCD_FRONT_ACK_SECONDS: "2" },
         })
         const current = path.join(dir, "run", "current.conf")
         const published = existsSync(current) ? readFileSync(current, "utf8") : undefined
+        const loadedConf = path.join(dir, "run", "loaded.conf")
+        const loaded = existsSync(loadedConf) ? readFileSync(loadedConf, "utf8") : undefined
         const list = (name: string) => (existsSync(path.join(dir, "run", name)) ? readdirSync(path.join(dir, "run", name)).sort() : [])
-        return { code: result.exitCode, stderr: result.stderr.toString(), nginx: existsSync(calls) ? readFileSync(calls, "utf8").trim().split("\n") : [], published, attempts: list("attempts"), generations: list("generations") }
+        return { code: result.exitCode, stderr: result.stderr.toString(), nginx: existsSync(calls) ? readFileSync(calls, "utf8").trim().split("\n") : [], published, loaded, attempts: list("attempts"), generations: list("generations") }
       })
     } finally {
       rmSync(dir, { recursive: true, force: true })
@@ -172,5 +177,44 @@ describe.skipIf(!sh || !Bun.which("flock"))("front-reload run with sh (fake ngin
     expect(next!.generations).toEqual(expect.arrayContaining(generations))
     expect(next!.generations).not.toContain("deadbeef")
     expect(next!.generations).not.toContain(".stage.killed")
+  })
+
+  test("--start and an acknowledged reload record what workers load", () => {
+    const start = run({ auth: authConf(TOKEN), args: ["--start"] })
+    expect(start.loaded).toBe(start.published)
+    const [, reloaded] = runSteps([{ auth: authConf(undefined) }, { auth: authConf(TOKEN) }])
+    expect(reloaded).toMatchObject({ code: 0, loaded: reloaded!.published })
+  })
+
+  test("an unacknowledged reload keeps the old generation workers still serve, however old", () => {
+    const age = (file: string) => utimesSync(file, new Date(Date.now() - 20 * 60_000), new Date(Date.now() - 20 * 60_000))
+    const [served, pending, later] = runSteps([
+      { auth: authConf(undefined) },
+      { auth: authConf(TOKEN), ack: false },
+      {
+        auth: authConf(jwt({ sub: "oid-2" })),
+        nginxTest: 1,
+        before: (runDir) => {
+          for (const sub of ["attempts", "generations"]) for (const name of readdirSync(path.join(runDir, sub))) age(path.join(runDir, sub, name))
+        },
+      },
+    ])
+    const [servedAttempts, servedGenerations] = [[...served!.attempts], [...served!.generations]]
+    expect(pending).toMatchObject({ code: 7, loaded: served!.published })
+    expect(pending!.published).not.toBe(served!.published)
+    expect(later).toMatchObject({ code: 4, published: pending!.published, loaded: served!.published })
+    // Both what workers serve (A) and what current.conf names (B) survive the age-based cleanup.
+    expect(later!.attempts).toEqual(expect.arrayContaining([...servedAttempts, ...pending!.attempts]))
+    expect(later!.generations).toEqual(expect.arrayContaining([...servedGenerations, ...pending!.generations]))
+  })
+
+  test("a restore that fails keeps the refused attempt's marker and says so", () => {
+    const [loaded, refused] = runSteps([{ auth: authConf(undefined) }, { auth: authConf(TOKEN), nginxTest: 1, before: (runDir) => mkdirSync(path.join(runDir, "current.conf.restore")) }])
+    const kept = [...loaded!.attempts]
+    expect(refused).toMatchObject({ code: 4 })
+    expect(refused!.stderr).toContain("could not be restored")
+    expect(refused!.published).not.toBe(loaded!.published)
+    expect(refused!.attempts).toHaveLength(2)
+    expect(refused!.attempts).toEqual(expect.arrayContaining(kept))
   })
 })
