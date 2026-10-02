@@ -40,9 +40,12 @@ export async function fetchModels(api: OpencodeApi, correlationId: string): Prom
   return models.sort()
 }
 
+/** #71 cycle 3: the deadline for reading the box's default model before a send. */
+export const DEFAULT_READ_TIMEOUT_MS = 5000
+
 /** The box config's default model (GET /config `model`), when it is a well-formed synapse/* id. */
-async function fetchDefault(api: OpencodeApi, correlationId: string): Promise<string[]> {
-  const res = await api.call<{ model?: unknown }>({ path: "/config", directory: "/sessions", correlationId })
+async function fetchDefault(api: OpencodeApi, correlationId: string, timeoutMs?: number): Promise<string[]> {
+  const res = await api.call<{ model?: unknown }>({ path: "/config", directory: "/sessions", correlationId, ...(timeoutMs ? { timeoutMs } : {}) })
   if (res.status !== 200) throw new DelegateError("upstream_error", "The delegate server failed to read its default model.", "Retry; if it repeats, run oc_doctor.", `HTTP ${res.status}`)
   const model = res.data?.model
   return typeof model === "string" && MODEL_RE.test(model) && isSynapse(model) ? [model] : []
@@ -52,9 +55,11 @@ async function fetchDefault(api: OpencodeApi, correlationId: string): Promise<st
  * #71 cycle 2: the model to SEND when a session's saved one is not offered: the box config's model,
  * else synapse/auto (an unreadable config never blocks the send). Sent explicitly, because OpenCode
  * otherwise reuses the session's stored model (packages/opencode/src/session/prompt.ts).
+ * Cycle 3: its own short deadline (not the client's 30 s), since every send without a model reads it.
+ * Not cached: the box's default can change when the box restarts with another owner config.
  */
 export async function boxDefault(api: OpencodeApi, correlationId: string): Promise<string> {
-  const found = await fetchDefault(api, correlationId).catch((): string[] => [])
+  const found = await fetchDefault(api, correlationId, DEFAULT_READ_TIMEOUT_MS).catch((): string[] => [])
   return found[0] ?? DEFAULT_MODEL
 }
 

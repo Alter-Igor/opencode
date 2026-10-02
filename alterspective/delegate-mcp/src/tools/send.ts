@@ -40,10 +40,13 @@ export type Sent = { cursor: string; instructions: Instructions; modelFallback?:
  * #71 review cycles 1-2: a session's SAVED model gets the same check as an explicit one. One the
  * sandbox no longer offers (another provider's, from before #71, or a Synapse model since retired)
  * is replaced by the sandbox default, SENT explicitly (leaving `model` out would make OpenCode reuse
- * the session's stored model), and the reason names the model actually sent.
+ * the session's stored model), and the reason names the model actually sent. Every send names a
+ * Synapse model (cycle 3).
  */
 async function savedModel(box: Box, saved: string | undefined, correlationId: string): Promise<{ model?: string; fallback?: string }> {
-  if (!saved || saved === DEFAULT_MODEL) return saved ? { model: saved } : {}
+  // Cycle 3: nothing saved still names a model: OpenCode would otherwise reuse the session's stored one.
+  if (!saved) return { model: await boxDefault(box.api, correlationId) }
+  if (saved === DEFAULT_MODEL) return { model: saved }
   const why =
     parseModel(saved).providerID !== SYNAPSE_PROVIDER ? "is not a Synapse model" : (await fetchModels(box.api, correlationId)).includes(saved) ? undefined : "is no longer offered by the sandbox"
   if (!why) return { model: saved }

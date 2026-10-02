@@ -2,6 +2,7 @@
 // instructions, and the cursor-before-send ordering.
 import { describe, expect, test } from "bun:test"
 import { MAX_INSTRUCTIONS_CHARS } from "../src/tools/core-box.ts"
+import { DEFAULT_READ_TIMEOUT_MS } from "../src/tools/models.ts"
 import { sendTool } from "../src/tools/send.ts"
 import { BASE, SID, data, fakeContext, invoke, okCmd, ours, record, remoteSession, seedState, text, type Fake } from "./tools-core-fixture.ts"
 import type { CommandResult } from "../src/tools/context.ts"
@@ -226,6 +227,33 @@ describe("oc_send", () => {
     expect(data(kept)).not.toHaveProperty("modelFallback")
     const last = f.api.calls.filter((c) => c.path.endsWith("prompt_async")).at(-1)
     expect(last?.body).toMatchObject({ model: { providerID: "synapse", modelID: "qwen/qwen3.8-flash" } })
+  })
+
+  // #71 cycle 3: no saved model and no `model`: the box default is SENT, never left out.
+  test("with no saved model the box default is sent explicitly; an unreadable or slow /config gives synapse/auto", async () => {
+    const f = fakeContext()
+    ready(f)
+    f.api.on("GET /config", { status: 200, data: { model: "synapse/qwen/qwen3.8-flash" } })
+    const first = await send(f)
+    expect(first.isError).toBeUndefined()
+    expect(promptBody(f)?.model).toEqual({ providerID: "synapse", modelID: "qwen/qwen3.8-flash" })
+    expect(data(first)).not.toHaveProperty("modelFallback")
+    const configCall = f.api.calls.find((c) => c.path === "/config")
+    expect(configCall).toBeDefined()
+    const g = fakeContext()
+    ready(g)
+    g.api.on("GET /config", { status: 500 })
+    await send(g)
+    expect(promptBody(g)?.model).toEqual({ providerID: "synapse", modelID: "auto" })
+  })
+
+  test("the /config read for the default has its own short deadline", async () => {
+    const f = fakeContext()
+    ready(f)
+    f.api.on("GET /config", { status: 200, data: { model: "synapse/auto" } })
+    await send(f)
+    expect(f.api.find("GET", "/config")?.timeoutMs).toBe(DEFAULT_READ_TIMEOUT_MS)
+    expect(DEFAULT_READ_TIMEOUT_MS).toBeLessThanOrEqual(5000)
   })
 
   test("a failed prompt_async is upstream_error and does not arm the watchdog", async () => {
