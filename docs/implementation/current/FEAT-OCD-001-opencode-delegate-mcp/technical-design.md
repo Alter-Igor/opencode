@@ -112,7 +112,7 @@ All tools: zod-validated input; short JSON + one-line summary; session text wrap
 | `oc_pending` | `sessionID?` | pending permissions + questions with IDs |
 | `oc_answer` | `requestID`, `kind`, `reply` (`once`/`reject`+`message?`) or `answers[][]` | `ok` (`always` refused) |
 | `oc_abort` | `sessionID` | `ok` |
-| `oc_list_sessions` | `directory?`, `mine?` | sessions + supervisor + state |
+| `oc_list_sessions` | `directory?`, `mine?` | sessions + supervisor + state; `prunedRecords` when it removed this box's host records of sessions proved gone (#53), so it is marked destructive |
 | `oc_post` / `oc_inbox` | `to`, `text`, `wake?` / `cursor?` | agent inbox (§7) |
 | `oc_server_restart` | `confirm`, `force?`, `keystone?` (new box-wide set, saved) | restarted, interrupted bridges, the set it runs with |
 

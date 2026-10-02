@@ -1,6 +1,6 @@
 # #53 — deleted session host records
 
-Base: `f20d17082ec9da05a7e02ac3cf95571f98cdd913`. Worktree: `C:\GitHub\opencode---session-records`.
+Base: `f20d17082ec9da05a7e02ac3cf95571f98cdd913`. Worktree: a dedicated `session-records` worktree.
 
 `oc_list_sessions` previously read records but never removed them. Its newest-200 display and first-20 presence checks also left older records out of maintenance. The source trace confirmed that only failed-start `discard()` called `removeHostState()`.
 
@@ -15,7 +15,7 @@ A direct 404 is only half the deletion proof. A separate box probe must confirm 
 - Expanded tests, PID 104480: 15 pruning tests passed, including changed-record preservation, host links, damaged-page progress, concurrent list calls, and real Git collection after a cached session is deleted. The following typecheck found two fixture-only type errors; both were corrected, and PID 28752 typecheck passed.
 - Real Linux shell proof, PID 75088: absent clone, existing folder, dangling link, missing parent and unreadable parent checks all passed. The initial shell harness omitted `docker run -i`; its empty output failed JSON parsing and is not counted as proof.
 - Independent root source review: no confirmed blocker; requested an actual server test with a missing clone directory before final approval.
-- The same PID 75088 then ran the actual runtime/server proof, exit 0. `GET /session/<id>?directory=<removed-clone>` returned 404, the actual list tool removed its host record, cached collection before clone removal succeeded, and a dangling clone link kept its record. Project `ocd-prune-42b20f6d` was removed with `compose down -v`; a readback found no owned containers. Scratch evidence: `C:\Users\IGORJE~1\AppData\Local\Temp\ocd-prune-live-CYNbqC`. Scripts: `spike/prune-record-proof.ts` and `spike/prune-session-live.ts`.
+- The same PID 75088 then ran the actual runtime/server proof, exit 0. `GET /session/<id>?directory=<removed-clone>` returned 404, the actual list tool removed its host record, cached collection before clone removal succeeded, and a dangling clone link kept its record. Project `ocd-prune-42b20f6d` was removed with `compose down -v`; a readback found no owned containers. Scratch evidence: a local temporary folder (not committed). Scripts: `spike/prune-record-proof.ts` and `spike/prune-session-live.ts`.
 - Root accepted the final source and both proof scripts after reading the API deadline path, parser, list wiring and tests. No remaining actionable finding. The root read the live proof receipts but did not personally rerun them.
 - Full bridge suite: 65 files across 17 serial light-lane jobs, each at most four files. 883 passed / 25 opt-in or platform skips / 0 failed. Per-batch files and PIDs: [session-records-tests.json](session-records-tests.json). The first version-test batch failed because its assertion fixed the old package version; it now uses the same package-version import as PR #61, and its retry passed (PID 7240).
 - Final bridge typecheck: `bun run typecheck`, PID 82480, exit 0. The dedicated root frozen-lockfile install passed (PID 89000). Lint passed (PID 81732): 0 errors / 354 warnings against 353 on the base. The new warning is `consistent-return` in the new `snapshot()` helper; both guard paths return undefined and the success path returns the checked snapshot. Repo-wide typecheck is also enforced by the pre-push hook; its delivery receipt belongs in the PR.
@@ -58,3 +58,37 @@ A separate agent reviewed the two-file code/test diff, the caller and the unchan
 | 17 | 68472 | 11 | 0 |
 
 Final bridge lint exited 0 with 0 errors and 354 warnings, unchanged from the prior run (queue PID 103020). The cursor fix does not change the API or clone absence checks, so the prior live proof remains evidence for those unchanged paths. It was not rerun for this host-only error handling change. No merge, owner-box restart or production change was made.
+
+## PR #63 follow-up: independent review findings
+
+An independent review of head `4dd971a825` found four faults. All four are fixed in this change.
+
+| Finding | Severity | Fault | Fix |
+| --- | --- | --- | --- |
+| 1 | High | All projects under one home share `<home>/workspaces`, but the box and its `sessions` volume come from `OPENCODE_DELEGATE_PROJECT`. A bridge with the same name on another project could see a 404 and an absent clone in its own box and delete the first box's records. | `bindSession` stamps `boxProject` (the compose project) into the record. The sweep skips any record whose `boxProject` differs from its own, including records with none. |
+| 2 | Medium | Removed keys were dropped silently inside a list call marked `destructiveHint: false`. | Each removed key is logged at info level with the bridge logger and returned as `prunedRecords`. The annotation is now `destructiveHint: true`. No test or doc asserted the old value. |
+| 3 | Low | Check then unlink: a writer could rename a new record over the name in between. | The record is renamed to a unique `.pruning` name in the same folder and checked there (bytes, inode, device, mtime, size). On a mismatch it is put back with a hard link, which never replaces a newer record. |
+| 4 | Low | The sweep could pick a session this bridge still tracks in memory. | The list tool passes `ctx.sessions`; tracked sessions are skipped before the checks and again just before the delete. |
+
+Box identity is the project name only. The volume is `<project>_sessions`, so the project names the volume. A recreated volume under the same project has lost the clone anyway. A marker file inside `/sessions` was not added: the box could rewrite it, and it would add a write into the box at bind time.
+
+Tests first. Five new tests were added to `test/workspaces-prune.test.ts`: other project kept, legacy record kept, same project pruned; binding records the project; pruned keys logged and returned, with the annotation; a tracked session kept; a record replaced between the last check and the move restored. Command, from `alterspective/delegate-mcp`:
+
+```text
+bun test --timeout 30000 ./test/workspaces-prune.test.ts
+```
+
+- Before the fix: **16 passed, 5 failed** (the five new tests).
+- After the fix: **21 passed, 0 failed**.
+
+Full checks after the fix, from `alterspective/delegate-mcp`:
+
+```text
+bun test --timeout 30000 ./test/*.test.ts   -> 889 passed, 25 skipped, 0 failed (914 tests, 65 files)
+bun run typecheck                           -> exit 0
+git diff --check                            -> clean
+```
+
+Not run for this change: lint, the live Docker proof and the Gitleaks scan. No box or container was started, stopped or restarted.
+
+Limit: only records bound by 0.1.3 or later, by a bridge with the same fixed name and project, are ever pruned. Records from older bridges and from default random `claude-<hex>` bridge names are kept. So #53 is fixed for new records of fixed-name bridges only.

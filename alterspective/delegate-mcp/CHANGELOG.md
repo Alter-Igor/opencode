@@ -4,6 +4,12 @@
 
 - Prune a deleted session's host record only after its clone is also proved absent. Keep records while a clone or link may hold work.
 - Use a saved cleanup cursor so old records are checked across list calls and bridge restarts.
+- Record which box a session lives in (its compose project) when the session is bound. Prune a record only from that same box. Records from older bridges carry no box name and are kept.
+- Never prune a session the bridge still tracks in memory.
+- Log each removed record and return its key in `prunedRecords`. `oc_list_sessions` is now marked `destructiveHint: true`.
+- Move a record to a private name and check it again before deleting it, so a record rewritten at the last moment is put back.
+
+Only records bound by this version or later, by a bridge with the same fixed name (`OPENCODE_DELEGATE_NAME`) and the same project, are ever pruned. Records from older bridges and from default random `claude-<hex>` names stay on the host.
 
 Tracks [#53](https://github.com/Alter-Igor/opencode/issues/53).
 

@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test"
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { createWorkspaces, type ExecResult } from "../src/supervisor/workspaces.ts"
 import { writeHostState, type HostSessionState } from "../src/supervisor/workspaces-state.ts"
+import { removeUnchanged, snapshotRecord } from "../src/supervisor/workspaces-prune.ts"
+import type { Logger } from "../src/shared/log.ts"
 import { listSessionsTool } from "../src/tools/sessions.ts"
 import { collectTool } from "../src/tools/collect.ts"
 import { BASE, fakeContext, invoke, record } from "./tools-core-fixture.ts"
@@ -29,11 +31,14 @@ function fixture() {
   f.ctx.workspaces = workspaces()
   f.api.on("GET /experimental/session?roots=true&limit=200", { status: 200, data: [] })
   const seed = (n: number, extra: Partial<HostSessionState> = {}) => {
-    const state = { sessionKey: `s-${String(n).padStart(10, "0")}`, sessionID: `ses_${String(n).padStart(18, "0")}`, supervisor: f.ctx.supervisor, hostRepo: "C:\\GitHub\\demo", base: BASE, createdAt: new Date(n * 1000).toISOString(), ...extra }
+    const state = { sessionKey: `s-${String(n).padStart(10, "0")}`, sessionID: `ses_${String(n).padStart(18, "0")}`, supervisor: f.ctx.supervisor, boxProject: f.ctx.config.project, hostRepo: "C:\\GitHub\\demo", base: BASE, createdAt: new Date(n * 1000).toISOString(), ...extra }
     writeHostState(stateDir, state)
     return { state, file: path.join(stateDir, `${state.sessionKey}.json`) }
   }
-  return { ...f, stateDir, workspaces, probe, probes, beforeProbe, seed, list: () => invoke(listSessionsTool, {}, f.ctx) }
+  const logs: Array<{ level: string; msg: string; fields?: Record<string, unknown> }> = []
+  const logger: Logger = { log: (level, _component, msg, fields) => { logs.push({ level, msg, fields }) } }
+  f.ctx.log = logger
+  return { ...f, stateDir, workspaces, probe, probes, beforeProbe, seed, logs, list: () => invoke(listSessionsTool, {}, f.ctx) }
 }
 
 describe("deleted session host records", () => {
@@ -45,6 +50,68 @@ describe("deleted session host records", () => {
     expect(f.probes).toHaveLength(1)
     expect(f.probes[0]?.slice(-2)).toEqual([`/sessions/${s.state.sessionKey}`, "/sessions"])
     expect(f.probes.some((args) => args.includes("rm"))).toBe(false)
+  })
+
+  test("the box that made a record is the only one that may prune it", async () => {
+    const f = fixture()
+    const same = f.seed(1)
+    const otherBox = f.seed(2, { boxProject: "another-box" })
+    const legacy = f.seed(3)
+    const { boxProject: _dropped, ...legacyState } = legacy.state
+    writeFileSync(legacy.file, JSON.stringify(legacyState))
+    await f.list()
+    expect(existsSync(same.file)).toBe(false)
+    expect(existsSync(otherBox.file)).toBe(true)
+    expect(existsSync(legacy.file)).toBe(true)
+    expect(f.probes).toHaveLength(1)
+  })
+
+  test("binding a session records which box it lives in", async () => {
+    const f = fixture()
+    const key = "s-bind-000001"
+    writeHostState(f.stateDir, { sessionKey: key, hostRepo: "C:\\GitHub\\demo", base: BASE, createdAt: new Date(0).toISOString() })
+    await f.ctx.workspaces.bindSession(key, { sessionID: `ses_${"9".repeat(18)}`, supervisor: f.ctx.supervisor, profile: "standard" })
+    expect(JSON.parse(readFileSync(path.join(f.stateDir, `${key}.json`), "utf8")).boxProject).toBe(f.ctx.config.project)
+    expect((await f.ctx.workspaces.sessionState(key))?.boxProject).toBe(f.ctx.config.project)
+  })
+
+  test("pruned records are logged and returned by the list call", async () => {
+    const f = fixture()
+    const s = f.seed(1)
+    const result = await f.list()
+    expect(result.structuredContent?.prunedRecords).toEqual([s.state.sessionKey])
+    expect(f.logs.filter((line) => line.level === "info" && line.fields?.sessionKey === s.state.sessionKey)).toHaveLength(1)
+    expect(listSessionsTool.annotations?.destructiveHint).toBe(true)
+    const kept = f.seed(2)
+    f.probe.result = { code: 45, stdout: "", stderr: "" }
+    const quiet = await f.list()
+    expect(existsSync(kept.file)).toBe(true)
+    expect(quiet.structuredContent?.prunedRecords).toBeUndefined()
+  })
+
+  test("a session this bridge still tracks in memory is never pruned", async () => {
+    const f = fixture()
+    const s = f.seed(1)
+    f.ctx.sessions.set(s.state.sessionID, record({ sessionID: s.state.sessionID, sessionKey: s.state.sessionKey }))
+    await f.list()
+    expect(existsSync(s.file)).toBe(true)
+    expect(f.probes).toHaveLength(0)
+  })
+
+  test("a record replaced between the last check and the move is restored, not deleted", () => {
+    const f = fixture()
+    const s = f.seed(1)
+    const before = snapshotRecord(s.file)
+    if (!before) throw new Error("seed record not readable")
+    const replacement = JSON.stringify({ ...s.state, base: "c".repeat(40) })
+    const tmp = `${s.file}.writer.tmp`
+    const removed = removeUnchanged(s.file, before, () => {
+      writeFileSync(tmp, replacement)
+      renameSync(tmp, s.file)
+    })
+    expect(removed).toBe(false)
+    expect(readFileSync(s.file, "utf8")).toBe(replacement)
+    expect(readdirSync(f.stateDir)).toEqual([path.basename(s.file)])
   })
 
   test("a failed cursor rename still returns completed removals and cleans its temporary file", async () => {

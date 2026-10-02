@@ -74,7 +74,8 @@ export const listSessionsTool = defineTool({
   description:
     "List this bridge's sessions with their state, or (all:true) every top-level session in the sandbox. `mine` comes from the bridge's own host records; `metadataSupervisor` is only what the sandbox claims. Starts the sandbox if it is not running.",
   input: { all: z.boolean().optional().describe("Every session in the sandbox, not just this bridge's. Default false.") },
-  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  // Destructive: it may delete this box's host records of sessions proved gone (#53), listed in `prunedRecords`.
+  annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   async run(args, ctx, correlationId) {
     const box = await ctx.box()
     const [remote, owned] = await Promise.all([listRemote(box, correlationId), ownedIds(ctx)])
@@ -89,16 +90,24 @@ export const listSessionsTool = defineTool({
       checked.set(id, res?.status)
       return res?.status
     }
-    await ctx.workspaces.pruneSessionStates(ctx.supervisor, async (state, timeoutMs) => !remote.some((session) => session.id === state.sessionID) && (await readPresence(state.sessionID, `/sessions/${state.sessionKey}`, timeoutMs)) === 404).catch(() => {
-      ctx.log.log("warn", "tools", "host session cleanup could not complete", { correlationId })
-    })
+    const pruned = await ctx.workspaces
+      .pruneSessionStates(
+        ctx.supervisor,
+        async (state, timeoutMs) => !remote.some((session) => session.id === state.sessionID) && (await readPresence(state.sessionID, `/sessions/${state.sessionKey}`, timeoutMs)) === 404,
+        (sessionID) => ctx.sessions.has(sessionID),
+      )
+      .catch((): string[] => {
+        ctx.log.log("warn", "tools", "host session cleanup could not complete", { correlationId })
+        return []
+      })
+    for (const sessionKey of pruned) ctx.log.log("info", "tools", "removed the host record of a session gone from the sandbox with its clone", { correlationId, sessionKey })
     const rows: Row[] = remote.map((s) => listed(s, owned.has(s.id)))
     const shown = args.all ? rows : rows.filter((r) => r.mine)
     const sessions = await Promise.all(shown.map((row) => (row.mine ? withState(ctx, box, row, correlationId) : row)))
     const absent = [...owned].filter((id) => !remote.some((s) => s.id === id))
     const gaps = absent.length ? await missing(absent, readPresence) : undefined
     const summary = `${sessions.length} session${sessions.length === 1 ? "" : "s"}${args.all ? " in the sandbox" : " of this bridge"}.`
-    return ok(summary, { supervisor: ctx.supervisor, sessions, ...(gaps?.missingFromServer.length ? { missingFromServer: gaps.missingFromServer } : {}), ...(gaps?.unknown.length ? { presenceUnknown: gaps.unknown } : {}) })
+    return ok(summary, { supervisor: ctx.supervisor, sessions, ...(gaps?.missingFromServer.length ? { missingFromServer: gaps.missingFromServer } : {}), ...(gaps?.unknown.length ? { presenceUnknown: gaps.unknown } : {}), ...(pruned.length ? { prunedRecords: pruned } : {}) })
   },
 })
 
