@@ -5,6 +5,7 @@
 // checkPolicy and sendPrompt are shared with oc_post's wake (inbox-tools.ts, W3A-19).
 import { z } from "zod"
 import type { Verdict } from "../shared/contracts.ts"
+import { recordSend } from "../reporting/hooks.ts"
 import { DelegateError } from "../shared/errors.ts"
 import type { Box, SessionRecord, ToolContext } from "./context.ts"
 import { readInstructions, type Instructions } from "./core-box.ts"
@@ -69,10 +70,14 @@ export async function sendPrompt(ctx: ToolContext, box: Box, record: SessionReco
     ...(instructions.system ? { system: instructions.system } : {}),
   }
   const cursor = box.hub.cursor()
+  // #73: the run's start for the task record, taken before the POST (a fast run can settle during it).
+  const sendStartedAt = new Date().toISOString()
   const res = await box.api.call({ method: "POST", path: `/session/${encodeURIComponent(record.sessionID)}/prompt_async`, directory: record.boxPath, body, correlationId: prompt.correlationId })
   if (res.status === 404) throw sessionGone(record.sessionID)
   if (res.status < 200 || res.status >= 300) throw new DelegateError("upstream_error", "The delegate server did not accept the message.", "Check oc_status, then retry.", `HTTP ${res.status}`)
   box.hub.markSent(record.sessionID)
+  // #73: metadata only (the model and agent sent); the prompt text never reaches the record.
+  recordSend(ctx, record, { model, agent, at: sendStartedAt })
   ctx.log.log("info", "tools", "prompt sent", { sessionID: record.sessionID, correlationId: prompt.correlationId, instructions: instructions.files.join(","), instructionsTruncated: instructions.truncated, instructionsFailed: (instructions.failed ?? []).join(","), savedModelFallback: saved.fallback !== undefined })
   return { cursor: formatCursor(cursor), instructions, ...(saved.fallback ? { modelFallback: saved.fallback } : {}) }
 }

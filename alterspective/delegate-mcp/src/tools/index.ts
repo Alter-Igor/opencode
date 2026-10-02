@@ -8,6 +8,7 @@ import { doctorTool } from "./doctor.ts"
 import { interactionTools } from "./interaction.ts"
 import { loginTool } from "./login.ts"
 import { modelsTool } from "./models.ts"
+import { reportTool } from "./report.ts"
 import { restartTool } from "./restart.ts"
 import { resultTool } from "./result.ts"
 import { sendTool } from "./send.ts"
@@ -31,6 +32,7 @@ export const coreTools: AnyTool[] = [
   listSessionsTool,
   closeSessionTool,
   cleanupTool,
+  reportTool,
   restartTool,
 ]
 
