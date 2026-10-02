@@ -457,3 +457,132 @@ describe("SynapseAuthPlugin config hook", () => {
     }
   })
 })
+
+describe("Synapse credential refresh shared by startup and chat", () => {
+  type Harness = {
+    grants: string[]
+    chatAuth: (string | null)[]
+    run: () => Promise<{ config: Promise<void>; chat: () => Promise<void> }>
+    restore: () => void
+  }
+
+  function harness(opts: { save: (body: unknown) => Promise<unknown>; tokenDelayMs?: number; hangToken?: boolean }) {
+    const previousFetch = globalThis.fetch
+    const previousAuth = process.env.OPENCODE_AUTH_CONTENT
+    const nonce = Math.random().toString(36).slice(2)
+    const expired = jwt({ aud: "synapse", exp: Math.floor(Date.now() / 1000) - 60, jti: `old-${nonce}` })
+    const fresh = jwt({ aud: "synapse", exp: Math.floor(Date.now() / 1000) + 3600, jti: `new-${nonce}` })
+    const stored = {
+      type: "api",
+      key: expired,
+      metadata: { refreshToken: `r-1-${nonce}`, expiresAt: String(Date.now() - 1000) },
+    }
+    process.env.OPENCODE_AUTH_CONTENT = JSON.stringify({ synapse: stored })
+    const h: Harness & { fresh: string } = {
+      fresh,
+      grants: [],
+      chatAuth: [],
+      restore: () => {
+        globalThis.fetch = previousFetch
+        if (previousAuth === undefined) delete process.env.OPENCODE_AUTH_CONTENT
+        else process.env.OPENCODE_AUTH_CONTENT = previousAuth
+      },
+      run: async () => {
+        const hooks = await SynapseAuthPlugin(
+          {
+            client: { auth: { set: opts.save } } as never,
+            project: {} as never,
+            directory: "",
+            worktree: "",
+            experimental_workspace: { register() {} },
+            serverUrl: new URL("https://example.com"),
+            $: {} as never,
+          },
+          { tokenUrl: "https://keystone.example.test/token" },
+        )
+        const loaded = await hooks.auth?.loader?.(async () => stored as never, {} as never)
+        const chatFetch = loaded?.fetch as (url: string, init: RequestInit) => Promise<Response>
+        return {
+          config: hooks.config?.(configWithStaleModels()) ?? Promise.resolve(),
+          chat: async () => {
+            await chatFetch(`${BASE}/chat/completions`, {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ model: "auto", messages: [{ role: "user", content: "hi" }] }),
+            })
+          },
+        }
+      },
+    }
+    const stub = async (url: RequestInfo | URL, init?: RequestInit) => {
+      const href = typeof url === "string" ? url : url instanceof URL ? url.href : url.url
+      if (href.endsWith("/token")) {
+        if (opts.hangToken) {
+          return new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () => reject(new Error("token request aborted")))
+          })
+        }
+        h.grants.push(String(new URLSearchParams(String(init?.body)).get("refresh_token")))
+        await new Promise((resolve) => setTimeout(resolve, opts.tokenDelayMs ?? 30))
+        return Response.json({ access_token: fresh, refresh_token: `r-2-${nonce}`, expires_in: 3600 })
+      }
+      if (href.endsWith("/chat/completions")) {
+        h.chatAuth.push(new Headers(init?.headers).get("authorization"))
+        return Response.json({ choices: [{ message: { role: "assistant", content: "ok" } }] })
+      }
+      if (href.endsWith("/models")) {
+        const auth = new Headers(init?.headers).get("authorization")
+        return auth === `Bearer ${fresh}` ? Response.json(LIVE_REPLY) : new Response("unauthorized", { status: 401 })
+      }
+      return previousFetch(url, init)
+    }
+    globalThis.fetch = Object.assign(stub, { preconnect: previousFetch.preconnect })
+    return h
+  }
+
+  test("a chat request during the startup refresh joins it: exactly one refresh grant", async () => {
+    const saved: unknown[] = []
+    const h = harness({ save: async (body) => saved.push(body), tokenDelayMs: 50 })
+    try {
+      const { config, chat } = await h.run()
+      await Promise.all([config, chat()])
+      await chat()
+      expect(h.grants).toHaveLength(1)
+      expect(h.chatAuth).toEqual([`Bearer ${h.fresh}`, `Bearer ${h.fresh}`])
+      expect(saved).toHaveLength(1)
+    } finally {
+      h.restore()
+    }
+  })
+
+  test("a failed save keeps the new token in memory: no second grant with the spent refresh token", async () => {
+    const h = harness({
+      save: async () => {
+        throw new Error("server not ready")
+      },
+    })
+    try {
+      const { config, chat } = await h.run()
+      await config
+      await chat()
+      await chat()
+      expect(h.grants).toHaveLength(1)
+      expect(h.chatAuth).toEqual([`Bearer ${h.fresh}`, `Bearer ${h.fresh}`])
+    } finally {
+      h.restore()
+    }
+  })
+
+  test("an unreachable Keystone does not stall startup past the refresh timeout", async () => {
+    const h = harness({ save: async () => undefined, hangToken: true })
+    try {
+      const { config } = await h.run()
+      const started = Date.now()
+      await config
+      expect(Date.now() - started).toBeLessThan(SYNAPSE_MODELS_TIMEOUT_MS * 2 + 1_000)
+      expect(h.grants).toHaveLength(0)
+    } finally {
+      h.restore()
+    }
+  })
+})

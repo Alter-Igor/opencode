@@ -12,6 +12,12 @@
 // different source, and the delegate box sets that flag while still needing the live
 // Synapse list.
 //
+// Before the fetch, a stored Keystone token that is expired, about to expire, or
+// minted for the MCP audience is refreshed for the `synapse` audience (synapse.ts,
+// resolveSynapseModelsToken). Side effect: an old MCP-audience login is upgraded at
+// startup, so chat then goes over the REST plane (native tool schemas) instead of
+// the MCP bridge.
+//
 // This runs from the Synapse plugin's `config` hook. OPENCODE_DISABLE_DEFAULT_PLUGINS
 // turns all internal plugins off, so with it set nothing here runs: no live list and
 // no `auto`, only what the config file lists.
@@ -65,6 +71,17 @@ export interface SynapseModelsDeps {
 }
 
 export type SynapseModelsResult = "live" | "cache" | "fallback" | "skipped"
+
+/**
+ * An abort signal that fires after `ms` on an ordinary timer. Bun's
+ * `AbortSignal.timeout` does not fire while nothing else holds the event loop
+ * (observed on Bun 1.3.14), so a hung request would never be abandoned.
+ */
+export function timeoutSignal(ms: number): { signal: AbortSignal; clear: () => void } {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(new Error(`timed out after ${ms} ms`)), ms)
+  return { signal: controller.signal, clear: () => clearTimeout(timer) }
+}
 
 export function synapseModelsUrl(baseURL: string): string {
   return `${baseURL.replace(/\/+$/, "")}/models`
@@ -261,13 +278,16 @@ export async function loadSynapseModels(cfg: Config, deps: SynapseModelsDeps): P
       headers.set("x-api-key", token)
     }
 
-    const response = await (deps.fetch ?? fetch)(url, {
-      method: "GET",
-      headers,
-      signal: AbortSignal.timeout(deps.timeoutMs ?? SYNAPSE_MODELS_TIMEOUT_MS),
-    })
-    if (!response.ok) throw new Error(`HTTP ${response.status}`)
-    const live = parseSynapseModelList(await response.json())
+    const timeout = timeoutSignal(deps.timeoutMs ?? SYNAPSE_MODELS_TIMEOUT_MS)
+    let body: unknown
+    try {
+      const response = await (deps.fetch ?? fetch)(url, { method: "GET", headers, signal: timeout.signal })
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      body = await response.json()
+    } finally {
+      timeout.clear()
+    }
+    const live = parseSynapseModelList(body)
     if (Object.keys(live).length === 0) throw new Error("gateway returned no chat models")
 
     provider.models = { ...live, [SYNAPSE_AUTO_MODEL]: auto }
