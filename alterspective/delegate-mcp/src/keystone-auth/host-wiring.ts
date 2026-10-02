@@ -114,6 +114,28 @@ async function connectOnce(api: OpencodeApi, entry: string, log: Logger): Promis
   return after
 }
 
+/** States in which front may still serve the last published bearer (a passing failure, a pending save or publish). */
+const MAYBE_SERVING: ReadonlySet<KsStatus["state"]> = new Set<KsStatus["state"]>(["retrying", "pending_save", "publish_pending"])
+
+/**
+ * PR #69 review (CodeRabbit): front serves the published bearer until it expires, also while a
+ * renewal backs off. So an entry is worth connecting when it is signed in, or in a passing state
+ * with a published, unexpired bearer. needs_sign_in, expired, signed_out and a credential that was
+ * never published are left alone.
+ *
+ * @param status one connection's host state (keystone-auth report)
+ * @param now host clock, epoch ms
+ * @returns whether front can still be serving a valid bearer for it
+ * @throws never
+ * @example bearerStillValid({ ...s, state: "retrying", credential: "published", expiresAt }, Date.now())
+ */
+export function bearerStillValid(status: KsStatus, now: number): boolean {
+  if (status.state === "signed_in") return true
+  if (!MAYBE_SERVING.has(status.state) || status.credential !== "published" || status.expiresAt === undefined) return false
+  const expires = Date.parse(status.expiresAt)
+  return Number.isFinite(expires) && expires > now
+}
+
 /**
  * When this bridge gets a box (first use, or after a restart), connect every chosen entry whose
  * host token is signed in: a renewal that happened while the bridge held no box connected nothing.
@@ -125,7 +147,7 @@ async function connectOnce(api: OpencodeApi, entry: string, log: Logger): Promis
  * @returns entry name → status after the attempt (a failed attempt is "unknown"); never throws
  * @example manager.onBox((box) => void connectSignedIn(ks.status, ids(), box.api, log))
  */
-export async function connectSignedIn(status: (ids: readonly string[]) => Promise<KsStatus[]>, ids: readonly string[], api: OpencodeApi, log: Logger): Promise<Record<string, string>> {
+export async function connectSignedIn(status: (ids: readonly string[]) => Promise<KsStatus[]>, ids: readonly string[], api: OpencodeApi, log: Logger, now: () => number = Date.now): Promise<Record<string, string>> {
   const out: Record<string, string> = {}
   let states: KsStatus[]
   try {
@@ -134,7 +156,8 @@ export async function connectSignedIn(status: (ids: readonly string[]) => Promis
     safeLog(log, "warn", COMPONENT, "keystone states unreadable; box entries not connected", { reason: error instanceof Error ? error.name : "error" })
     return out
   }
-  for (const state of states.filter((s) => s.state === "signed_in")) {
+  const at = now()
+  for (const state of states.filter((s) => bearerStillValid(s, at))) {
     const entry = entryName(state.connection)
     try {
       out[entry] = await ensureEntryConnected(api, entry, log)
