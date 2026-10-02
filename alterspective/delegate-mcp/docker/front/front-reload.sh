@@ -17,25 +17,70 @@ LIVE_URL=http://127.0.0.1:19091/__ocd_generation
 ACK_SECONDS=${OCD_FRONT_ACK_SECONDS:-20}
 case $ACK_SECONDS in '' | *[!0-9]*) ACK_SECONDS=20 ;; esac
 PREVIOUS=
+# Set only by a run that stages a generation; never taken from the caller's environment.
+STAGE=
 
 log() { printf 'front-reload: %s\n' "$*" >&2; }
+
+# The strict two-line include: $1 file, $2 the one variable it may set, $3 its name for messages.
+check_auth() {
+  file=$1 var=$2 name=$3
+  [ -f "$file" ] || { log "$name is missing; not reloading"; return 3; }
+  bytes=$(wc -c < "$file" | tr -d ' ')
+  [ "$bytes" -le "$MAX_BYTES" ] || { log "$name is longer than the bridge ever writes; not reloading"; return 3; }
+  others=$(LC_ALL=C tr -d 'A-Za-z0-9 #()/._$";\n-' < "$file" | wc -c | tr -d ' ')
+  [ "$others" = 0 ] || { log "$name has characters the bridge never writes; not reloading"; return 3; }
+  newlines=$(wc -l < "$file" | tr -d ' ')
+  records=$(awk 'END { print NR }' "$file")
+  [ "$newlines" = 2 ] && [ "$records" = 2 ] || { log "$name is not exactly two lines; not reloading"; return 3; }
+  [ "$(sed -n 1p "$file")" = "$HEADER" ] || { log "$name header is not the bridge's; not reloading"; return 3; }
+  sed -n 2p "$file" | grep -Eqx "set \\\$$var \"(Bearer [A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,})?\";" \
+    || { log "$name does not set only \$$var to \"\" or a bearer token; not reloading"; return 3; }
+}
 
 check() {
   [ -n "${OCD_FRONT_HASH:-}" ] || { log "OCD_FRONT_HASH is not set; not reloading"; return 3; }
   SERVERS_SHA=$(sha256sum "$SERVERS" 2> /dev/null | cut -d' ' -f1)
   [ "$SERVERS_SHA" = "$OCD_FRONT_HASH" ] || { log "servers.conf is not the file front started with (OCD_FRONT_HASH); not reloading (restart the sandbox through the bridge)"; return 3; }
-  [ -f "$AUTH" ] || { log "synapse-auth.conf is missing; not reloading"; return 3; }
-  bytes=$(wc -c < "$AUTH" | tr -d ' ')
-  [ "$bytes" -le "$MAX_BYTES" ] || { log "synapse-auth.conf is longer than the bridge ever writes; not reloading"; return 3; }
-  others=$(LC_ALL=C tr -d 'A-Za-z0-9 #()/._$";\n-' < "$AUTH" | wc -c | tr -d ' ')
-  [ "$others" = 0 ] || { log "synapse-auth.conf has characters the bridge never writes; not reloading"; return 3; }
-  newlines=$(wc -l < "$AUTH" | tr -d ' ')
-  records=$(awk 'END { print NR }' "$AUTH")
-  [ "$newlines" = 2 ] && [ "$records" = 2 ] || { log "synapse-auth.conf is not exactly two lines; not reloading"; return 3; }
-  [ "$(sed -n 1p "$AUTH")" = "$HEADER" ] || { log "synapse-auth.conf header is not the bridge's; not reloading"; return 3; }
-  sed -n 2p "$AUTH" | grep -Eqx 'set \$synapse_auth "(Bearer [A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})?";' \
-    || { log "synapse-auth.conf does not set only \$synapse_auth to \"\" or a bearer token; not reloading"; return 3; }
+  check_auth "$AUTH" synapse_auth synapse-auth.conf || return $?
   AUTH_SHA=$(sha256sum "$AUTH" | cut -d' ' -f1)
+  check_keystone
+}
+
+# #67 step 3 (OCD_KEYSTONE_HOST_AUTH): servers.conf may include one ks-auth-<id>.conf per Keystone
+# connection, each setting only $ks_auth. Only the includes servers.conf names are used. Staging
+# (STAGE set) copies each from the host folder, or writes the empty one when the host has none yet
+# (fail closed: Keystone answers 401), checks it, and lists it with its hash in ks-auth.list; KS_SHA
+# is that list's hash. With --check (no STAGE) the host files that exist are checked in place.
+# servers.conf naming any other file of the host folder is refused: nginx would read it unchecked.
+check_keystone() {
+  KS_SHA=
+  mentions=$(grep -o 'front-gen' "$SERVERS" | wc -l | tr -d ' ')
+  known=$(grep -oE 'include /etc/nginx/front-gen/(synapse-auth|ks-auth-[a-z0-9][a-z0-9-]{0,62})\.conf;' "$SERVERS" | wc -l | tr -d ' ')
+  [ "$mentions" = "$known" ] || { log "servers.conf names a generated file front-reload does not check; not reloading"; return 3; }
+  ids=$(grep -o 'include /etc/nginx/front-gen/ks-auth-[a-z0-9-]*\.conf;' "$SERVERS" | sed 's|^include /etc/nginx/front-gen/ks-auth-\(.*\)\.conf;$|\1|' | LC_ALL=C sort -u)
+  [ -n "$ids" ] || return 0
+  list=
+  for id in $ids; do
+    name=ks-auth-$id.conf
+    if [ -n "${STAGE:-}" ]; then
+      if [ -f "$GEN/$name" ]; then
+        cp "$GEN/$name" "$STAGE/$name" || { log "could not copy $name"; return 3; }
+      else
+        printf '%s\nset $ks_auth "";\n' "$HEADER" > "$STAGE/$name" || return 6
+      fi
+      target=$STAGE/$name
+    else
+      target=$GEN/$name
+      [ -f "$target" ] || continue
+    fi
+    check_auth "$target" ks_auth "$name" || return $?
+    list="$list$name $(sha256sum "$target" | cut -d' ' -f1)
+"
+  done
+  [ -n "${STAGE:-}" ] || return 0
+  printf '%s' "$list" > "$STAGE/ks-auth.list" || return 6
+  KS_SHA=$(sha256sum "$STAGE/ks-auth.list" | cut -d' ' -f1)
 }
 
 snapshot() {
@@ -44,16 +89,20 @@ snapshot() {
   SERVERS=$STAGE/source-servers.conf
   AUTH=$STAGE/synapse-auth.conf
   check || return $?
-  GENERATION=$SERVERS_SHA-$AUTH_SHA
+  GENERATION=$SERVERS_SHA-$AUTH_SHA${KS_SHA:+-$KS_SHA}
+  # Without Keystone includes this is the three-field reply oc_doctor has always parsed.
+  REPLY="$SERVERS_SHA $AUTH_SHA${KS_SHA:+ $KS_SHA}"
   DEST=$RUN/generations/$GENERATION
   # Every include names this immutable generation, never a mutable 'current' directory.
-  sed "s|include /etc/nginx/front-gen/synapse-auth\.conf;|include $DEST/synapse-auth.conf;|g" "$SERVERS" > "$STAGE/servers.conf" || return 6
+  sed -e "s|include /etc/nginx/front-gen/synapse-auth\.conf;|include $DEST/synapse-auth.conf;|g" \
+    -e "s|include /etc/nginx/front-gen/\(ks-auth-[a-z0-9-]*\.conf\);|include $DEST/\1;|g" "$SERVERS" > "$STAGE/servers.conf" || return 6
   # Retries reuse the same content-addressed generation. Never overwrite a file nginx may read.
   if [ -d "$DEST" ]; then
-    cmp -s "$STAGE/source-servers.conf" "$DEST/source-servers.conf" \
-      && cmp -s "$STAGE/synapse-auth.conf" "$DEST/synapse-auth.conf" \
-      && cmp -s "$STAGE/servers.conf" "$DEST/servers.conf" \
-      || { log "the existing generation differs from its content hash"; return 6; }
+    same=yes
+    for name in source-servers.conf synapse-auth.conf servers.conf ${KS_SHA:+ks-auth.list} $(cut -d' ' -f1 "$STAGE/ks-auth.list" 2> /dev/null); do
+      cmp -s "$STAGE/$name" "$DEST/$name" || same=no
+    done
+    [ "$same" = yes ] || { log "the existing generation differs from its content hash"; return 6; }
   else
     mv "$STAGE" "$DEST" || return 6
   fi
@@ -67,7 +116,7 @@ server {
     listen 127.0.0.1:19091;
     server_name localhost;
     access_log off;
-    location = /__ocd_generation { return 200 "$NONCE $SERVERS_SHA $AUTH_SHA"; }
+    location = /__ocd_generation { return 200 "$NONCE $REPLY"; }
     location / { return 404; }
 }
 EOF
@@ -132,7 +181,7 @@ nginx -s reload > /dev/null 2>&1 || { log "nginx -s reload failed"; exit 5; }
 deadline=$(( $(date +%s) + ACK_SECONDS ))
 while [ "$(date +%s)" -lt "$deadline" ]; do
   loaded=$(wget -q -T 1 -O - "$LIVE_URL" 2>/dev/null) || loaded=""
-  if [ "$loaded" = "$NONCE $SERVERS_SHA $AUTH_SHA" ]; then
+  if [ "$loaded" = "$NONCE $REPLY" ]; then
     # The master parses serially. A worker serving this marker proves all earlier parses ended;
     # old workers keep parsed values in memory, not open configuration includes. If the loaded
     # record cannot be written, keep everything: the next run's age-based cleanup still bounds it.
