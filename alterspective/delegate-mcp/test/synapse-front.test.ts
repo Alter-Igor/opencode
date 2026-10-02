@@ -15,6 +15,7 @@ import { liveAuth } from "../src/synapse/index.ts"
 import { SYNAPSE_ROUTES, expectedSynapseLocations, locationLines } from "../src/synapse/front-routes.ts"
 import { synapseLine } from "../src/tools/doctor.ts"
 import { SIGNED_IN, jwt } from "./synapse-fixture.ts"
+import { generationExec } from "./front-generation-fixture.ts"
 
 const TOKEN = jwt({ sub: "oid-1" })
 
@@ -95,27 +96,24 @@ describe("generated front servers", () => {
 
 describe("doctor: front's loaded include and routes", () => {
   const servers = frontServersFor(defaultConfig({}))
-  const dump = (section: string, loadedServers = servers) =>
-    `# configuration file /etc/nginx/nginx.conf:\nhttp {}\n\n# configuration file /etc/nginx/front-gen/servers.conf:\n${loadedServers}\n# configuration file /etc/nginx/front-gen/synapse-auth.conf:\n${section}\n# configuration file /etc/nginx/front/upstream.conf:\nproxy_ssl_server_name on;\n\n`
-  const execWith = (stdout: string, code = 0) => async () => ({ code, stdout, stderr: "" })
   const good = authConf(TOKEN)
 
   test("shape, token presence, same file as this home, model routes only; never the value", async () => {
-    const live = await liveAuth(execWith(dump(good)), "c-front", good)
+    const live = await liveAuth(generationExec(servers, good), "c-front", good)
     expect(live).toEqual({ shapeOk: true, hasToken: true, matchesHost: true, routesOk: true })
     expect(JSON.stringify(live)).not.toContain(TOKEN)
-    expect(await liveAuth(execWith(dump(authConf(undefined))), "c-front", authConf(undefined))).toMatchObject({ shapeOk: true, hasToken: false })
-    expect(await liveAuth(execWith(dump(`${good}return 200;\n`)), "c-front", good)).toMatchObject({ shapeOk: false, hasToken: false, matchesHost: false })
-    expect(await liveAuth(execWith("", 1), "c-front", good)).toHaveProperty("unavailable")
+    expect(await liveAuth(generationExec(servers, authConf(undefined)), "c-front", authConf(undefined))).toMatchObject({ shapeOk: true, hasToken: false })
+    expect(await liveAuth(generationExec(servers, `${good}return 200;\n`), "c-front", good)).toMatchObject({ shapeOk: false, hasToken: false, matchesHost: false })
+    expect(await liveAuth(generationExec(servers, good, ""), "c-front", good)).toHaveProperty("unavailable")
   })
 
   test("L6: front loaded another home's include: not matching", async () => {
-    expect(await liveAuth(execWith(dump(authConf(jwt({ sub: "someone-else" })))), "c-front", good)).toMatchObject({ matchesHost: false })
+    expect(await liveAuth(generationExec(servers, authConf(jwt({ sub: "someone-else" }))), "c-front", good)).toMatchObject({ matchesHost: false })
   })
 
   test("H1: a loaded synapse server that forwards the whole host is caught", async () => {
     const old = servers.replace(/location = \/v1\/models \{/, "location /v1/ {")
-    expect(await liveAuth(execWith(dump(good, old)), "c-front", good)).toMatchObject({ routesOk: false })
+    expect(await liveAuth(generationExec(old, good), "c-front", good)).toMatchObject({ routesOk: false })
   })
 
   test("the doctor line names states, never values", () => {

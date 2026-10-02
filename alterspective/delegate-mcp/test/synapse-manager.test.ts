@@ -6,6 +6,8 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { silentLogger } from "../src/shared/log.ts"
+import { defaultConfig } from "../src/shared/config.ts"
+import { frontServersFor } from "../src/guard/egress.ts"
 import type { Exec } from "../src/supervisor/docker.ts"
 import { nodeLeaseFs } from "../src/supervisor/leases.ts"
 import { nodeProcessProbe } from "../src/supervisor/process.ts"
@@ -13,13 +15,14 @@ import { withStartLock } from "../src/supervisor/start-lock.ts"
 import { authConf, authConfHasToken, authConfPath, ensureAuthConf, isAuthConf, writeAuthConf } from "../src/synapse/auth-conf.ts"
 import { refreshFraction } from "../src/synapse/index.ts"
 import { RETRY_BASE_MS, backoffMs, refreshIfDue } from "../src/synapse/refresh.ts"
-import { LOADED_AUTH_SHA, synapseReport } from "../src/synapse/report.ts"
+import { synapseReport } from "../src/synapse/report.ts"
 import { createHash } from "node:crypto"
 import { synapseLine } from "../src/tools/doctor.ts"
 import { dpapiStore, memoryStore, type PowerShell, type SecretStore } from "../src/synapse/secret-store.ts"
 import { FRONT_RELOAD, adopt, isDue, readState, refreshAt, type SynapseDeps } from "../src/synapse/token-manager.ts"
 import type { Fetch } from "../src/synapse/keystone-token.ts"
 import { jwt } from "./synapse-fixture.ts"
+import { generationExec } from "./front-generation-fixture.ts"
 
 const ACCESS = jwt({ sub: "oid-1", email: "owner@example.test", act: { sub: "service:opencode" } })
 const ok = (refresh = "rt-rotated") => new Response(JSON.stringify({ access_token: ACCESS, refresh_token: refresh, expires_in: 1000 }), { status: 200 })
@@ -30,18 +33,21 @@ function harness(over: Partial<SynapseDeps> = {}) {
   let clock = 1_000_000
   let reply: () => Response = () => ok()
   // front: `front-reload` exits with `docker.reload` (0 reloaded, 3 files changed, 4 nginx -t refused);
-  // `docker inspect` says whether it runs. Like the real script, a reload that works records the
-  // include's sha256 (review N2), which `cat /tmp/front/loaded-auth.sha` then returns.
-  const docker: { reload: number; running: string; loadedSha?: string } = { reload: 0, running: "true" }
+  // The running worker, rather than a written receipt, attests the immutable loaded files.
+  const docker: { reload: number; running: string; loadedSha?: string; loadedAuth?: string } = { reload: 0, running: "true" }
   const exec: Exec = async (argv) => {
     calls.exec.push(argv)
     if (argv.includes(FRONT_RELOAD)) {
-      if (docker.reload === 0) docker.loadedSha = createHash("sha256").update(readFileSync(authConfPath(path.join(home, "front")), "utf8")).digest("hex")
+      if (docker.reload === 0) {
+        docker.loadedAuth = readFileSync(authConfPath(path.join(home, "front")), "utf8")
+        docker.loadedSha = createHash("sha256").update(docker.loadedAuth).digest("hex")
+      }
       return { code: docker.reload, stdout: "", stderr: docker.reload ? "front-reload: refused\n" : "" }
     }
     if (argv.includes("{{.State.Running}}")) return { code: 0, stdout: `${docker.running}\n`, stderr: "" }
-    if (argv.includes(LOADED_AUTH_SHA)) return docker.loadedSha ? { code: 0, stdout: `${docker.loadedSha}\n`, stderr: "" } : { code: 1, stdout: "", stderr: "no such file" }
-    return { code: argv.includes("-T") ? 1 : 0, stdout: "", stderr: "" }
+    if (!docker.loadedSha) return { code: 1, stdout: "", stderr: "no loaded worker" }
+    const servers = frontServersFor(defaultConfig({}))
+    return generationExec(servers, docker.loadedAuth ?? readFileSync(authConfPath(path.join(home, "front")), "utf8"), `${"1".repeat(32)} ${createHash("sha256").update(servers).digest("hex")} ${docker.loadedSha}`)(argv)
   }
   const fetcher: Fetch = async () => {
     calls.fetch++
@@ -302,8 +308,8 @@ describe("refresh-token store", () => {
     }, "win32")
     expect(await broken.read()).toBeUndefined()
     await broken.write("rt")
-    expect(broken.read()).rejects.toThrow("DPAPI")
-    expect(dpapiStore(path.join(dir, "x.dpapi"), async () => "x", "linux").write("rt")).rejects.toThrow("Windows DPAPI")
+    await expect(broken.read()).rejects.toThrow("DPAPI")
+    await expect(dpapiStore(path.join(dir, "x.dpapi"), async () => "x", "linux").write("rt")).rejects.toThrow("Windows DPAPI")
   })
 })
 
@@ -335,17 +341,17 @@ describe("review M1 / M3: the reload goes through front-reload, and its result i
     expect((await readState(h.home))?.lastReload?.result).toBe("front_not_running")
   })
 
-  test("review N2: loaded means front's recorded sha256 equals the host include's; no clock is involved", async () => {
+  test("loaded means the running worker attests the host include's hash; no clock is involved", async () => {
     const h = harness()
     h.docker.reload = 1
     h.docker.running = "false"
     await h.signedIn()
-    // No record (front not running, never reloaded): not loaded, whatever the clocks say.
+    // No worker acknowledgement: not loaded, whatever the clocks say.
     expect((await synapseReport(h.deps, h.deps.exec)).loadedSinceWrite).toBe(false)
-    // front (re)started and its entrypoint recorded THIS include: loaded.
+    // A worker from the restarted front acknowledges THIS include: loaded.
     h.docker.loadedSha = createHash("sha256").update(h.conf()).digest("hex")
     expect((await synapseReport(h.deps, h.deps.exec)).loadedSinceWrite).toBe(true)
-    // It recorded another include (an older token): not loaded. A garbled record counts as none.
+    // It acknowledges another include: not loaded. A garbled response counts as none.
     h.docker.loadedSha = "0".repeat(64)
     expect((await synapseReport(h.deps, h.deps.exec)).loadedSinceWrite).toBe(false)
     h.docker.loadedSha = "not-a-sha"

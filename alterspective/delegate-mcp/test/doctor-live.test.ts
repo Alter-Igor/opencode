@@ -1,19 +1,17 @@
 // R5-05 + R5-01: oc_doctor checks what is RUNNING, not labels and compose text: the servers file
-// nginx loaded in `front` (from `nginx -T`), the live mount modes from `docker inspect`, and the
+// nginx loaded in `front` (attested by a worker), the live mount modes from `docker inspect`, and the
 // MCP sign-ins stored in the box (names only). Each failed check fails closed and says why.
 import { describe, expect, test } from "bun:test"
 import { readFileSync } from "node:fs"
 import path from "node:path"
 import { frontServersFor } from "../src/guard/egress.ts"
 import { defaultConfig } from "../src/shared/config.ts"
-import { checkMounts, frontLiveFrom, serversSection } from "../src/supervisor/front-live.ts"
+import { checkMounts, frontLiveFrom } from "../src/supervisor/front-live.ts"
 import type { LiveChecks } from "../src/supervisor/live.ts"
 import { doctorTool } from "../src/tools/doctor.ts"
 import { data, fakeContext, invoke, text } from "./tools-core-fixture.ts"
 
 const SERVERS = frontServersFor(defaultConfig({}))
-const dump = (servers: string) =>
-  ["# configuration file /etc/nginx/nginx.conf:", "worker_processes 1;", "", "# configuration file /tmp/front/resolver.conf:", "resolver 1.1.1.1;", "", "# configuration file /etc/nginx/front-gen/servers.conf:", `${servers}`, "# configuration file /etc/nginx/front/upstream.conf:", "proxy_ssl_verify on;", ""].join("\n")
 
 const FRONT_OK = [{ Destination: "/etc/nginx/front-gen", RW: false }, { Destination: "/ca/private", RW: true }, { Destination: "/ca/public", RW: true }]
 const BOX_OK = [
@@ -28,18 +26,13 @@ const BOX_OK = [
 const VOLS_OK = { p_data: null, p_sessions: null, "p_handoff-out": null }
 
 describe("front's loaded config (R5-05)", () => {
-  test("the servers.conf section of `nginx -T` is cut out exactly", () => {
-    expect(serversSection(dump(SERVERS))).toBe(SERVERS)
-    expect(serversSection("# configuration file /etc/nginx/nginx.conf:\nx\n")).toBeUndefined()
-  })
-
   test("same file: loaded config matches; another set's file: mismatch with a reason", () => {
-    expect(frontLiveFrom({ dump: dump(SERVERS), expected: SERVERS, frontMounts: FRONT_OK, boxMounts: BOX_OK, boxVolumes: VOLS_OK })).toEqual({ ok: true, loadedConfigMatches: true, mountReadOnly: true, boxMountsOk: true, problems: [] })
+    expect(frontLiveFrom({ loaded: SERVERS, expected: SERVERS, frontMounts: FRONT_OK, boxMounts: BOX_OK, boxVolumes: VOLS_OK })).toEqual({ ok: true, loadedConfigMatches: true, mountReadOnly: true, boxMountsOk: true, problems: [] })
     const other = frontServersFor({ ...defaultConfig({}), keystoneConnections: ["m365"] })
-    const live = frontLiveFrom({ dump: dump(other), expected: SERVERS, frontMounts: FRONT_OK, boxMounts: BOX_OK, boxVolumes: VOLS_OK })
+    const live = frontLiveFrom({ loaded: other, expected: SERVERS, frontMounts: FRONT_OK, boxMounts: BOX_OK, boxVolumes: VOLS_OK })
     expect(live).toMatchObject({ ok: false, loadedConfigMatches: false })
     expect(live.problems.join(" ")).toContain("not the one generated")
-    expect(frontLiveFrom({ dump: undefined, expected: SERVERS, frontMounts: FRONT_OK, boxMounts: BOX_OK, boxVolumes: VOLS_OK })).toMatchObject({ ok: false, loadedConfigMatches: false, problems: [expect.stringContaining("nginx -T")] })
+    expect(frontLiveFrom({ loaded: undefined, expected: SERVERS, frontMounts: FRONT_OK, boxMounts: BOX_OK, boxVolumes: VOLS_OK })).toMatchObject({ ok: false, loadedConfigMatches: false, problems: [expect.stringContaining("running worker")] })
   })
 
   test("live mounts: front's generated folder must be read-only; the box gets exactly its own mounts", () => {
