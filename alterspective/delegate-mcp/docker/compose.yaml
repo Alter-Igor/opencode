@@ -117,6 +117,8 @@ services:
       UV_INSECURE_HOST: pypi-cache
       OPENCODE_DISABLE_MODELS_FETCH: "1"
       OPENCODE_DISABLE_AUTOUPDATE: "1"
+      # The fork's retrospective POST has no authenticated route in the box (#55).
+      OPENCODE_DISABLE_SESSION_RETROSPECTIVES: "1"
       # Design §3: only the read-only profile configures OpenCode. A delegated repo's own
       # .opencode/ (plugins, tools, agents, commands) and opencode.json would otherwise load as
       # code INSIDE the server process. Side effect: OpenCode also stops reading the repo's

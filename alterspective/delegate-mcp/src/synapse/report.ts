@@ -2,7 +2,8 @@
 import { createHash } from "node:crypto"
 import { readFile } from "node:fs/promises"
 import type { Exec } from "../supervisor/docker.ts"
-import { AUTH_FILE_NAME, SYNAPSE_HOST, authConfHasToken, authConfPath, isAuthConf } from "./auth-conf.ts"
+import { readFrontGeneration } from "../supervisor/front-generation.ts"
+import { SYNAPSE_HOST, authConfHasToken, authConfPath, isAuthConf } from "./auth-conf.ts"
 import { expectedSynapseLocations, locationLines } from "./front-routes.ts"
 import { readState, refreshAt, type Reload, type SynapseDeps } from "./token-manager.ts"
 
@@ -41,9 +42,8 @@ export type SynapseReport = {
   /** Review M3: the last reload of front (front-reload's result) and when. */
   lastReload?: { result: Reload; at: string }
   /**
-   * Review M3/N2: front has loaded the include written last: the sha256 front recorded when it
-   * checked and loaded an include (start, or a reload that worked) equals this home's file.
-   * `nginx -T` alone cannot tell: it reads the files on disk.
+   * A running worker serves the hash of an immutable generation whose include equals this home's.
+   * A sent reload signal and `nginx -T` do not establish this.
    */
   loadedSinceWrite: boolean
   live: LiveAuth
@@ -60,7 +60,7 @@ export async function synapseReport(deps: SynapseDeps, exec: Exec): Promise<Syna
   const kind = needsSignIn ? "needs_sign_in" : deps.now() >= state.expiresAt ? "expired" : !hostFile.hasToken ? "include_empty" : "signed_in"
   const live = await liveAuth(exec, deps.frontContainer, conf)
   const liveOk = !("unavailable" in live) && live.shapeOk && live.hasToken && live.matchesHost && live.routesOk
-  const loadedSinceWrite = conf !== "" && (await frontLoadedSha(exec, deps.frontContainer)) === sha(conf)
+  const loadedSinceWrite = conf !== "" && !("unavailable" in live) && live.matchesHost
   return {
     state: kind,
     ...(state?.user ? { user: state.user } : {}),
@@ -79,44 +79,24 @@ export async function synapseReport(deps: SynapseDeps, exec: Exec): Promise<Syna
   }
 }
 
-/**
- * Review N2: front-reload records here (front's tmpfs) the sha256 of the include it checked, at start
- * and after each reload that worked. No clocks: equal to the host file's sha256 means front loaded it.
- */
-export const LOADED_AUTH_SHA = "/tmp/front/loaded-auth.sha"
-
-/** The sha256 front recorded for the include it loaded, or undefined (not running, none recorded, garbled). */
+/** The auth hash a running worker acknowledges, with the immutable file checked against it. */
 export async function frontLoadedSha(exec: Exec, container: string): Promise<string | undefined> {
-  const run = await exec(["docker", "exec", container, "cat", LOADED_AUTH_SHA], { timeoutMs: 20_000 })
-  const value = run.stdout.trim()
-  return run.code === 0 && /^[0-9a-f]{64}$/.test(value) ? value : undefined
+  const generation = await readFrontGeneration(exec, container)
+  return generation ? sha(generation.auth) : undefined
 }
 
 const sha = (text: string) => createHash("sha256").update(text).digest("hex")
-const HEADER = (file: string) => `# configuration file ${file}:\n`
-
-/** One file's text in an `nginx -T` dump (nginx prints each file, then one newline). */
-export function dumpSection(dump: string, file: string): string | undefined {
-  const at = dump.indexOf(HEADER(file))
-  if (at === -1) return undefined
-  const start = at + HEADER(file).length
-  const next = dump.indexOf("\n# configuration file ", start)
-  return next === -1 ? dump.slice(start).replace(/\n$/, "") : dump.slice(start, next)
-}
 
 /** The synapse server block in the loaded servers.conf. */
 function synapseServer(servers: string): string | undefined {
   return [...servers.matchAll(/^server \{\n([\s\S]*?)\n\}$/gm)].map((m) => m[1] ?? "").find((body) => body.includes(`    server_name ${SYNAPSE_HOST};`))
 }
 
-/** The include and the synapse routes as front LOADED them. The include text never leaves this function. */
+/** Inspect the immutable generation acknowledged by a running worker. Never return its token. */
 export async function liveAuth(exec: Exec, container: string, hostConf: string): Promise<LiveAuth> {
-  const dump = await exec(["docker", "exec", container, "nginx", "-T"], { timeoutMs: 20_000 })
-  if (dump.code !== 0) return { unavailable: "front is not running, or `nginx -T` failed" }
-  const text = dump.stdout.replaceAll("\r\n", "\n")
-  const section = dumpSection(text, `/etc/nginx/front-gen/${AUTH_FILE_NAME}`)
-  if (section === undefined) return { unavailable: `front has not loaded ${AUTH_FILE_NAME}` }
-  const server = synapseServer(dumpSection(text, "/etc/nginx/front-gen/servers.conf") ?? "")
+  const generation = await readFrontGeneration(exec, container)
+  if (!generation) return { unavailable: "front's running worker did not attest a readable, matching generation" }
+  const server = synapseServer(generation.servers)
   const routesOk = server !== undefined && JSON.stringify(locationLines(server)) === JSON.stringify(expectedSynapseLocations())
-  return { shapeOk: isAuthConf(section), hasToken: authConfHasToken(section), matchesHost: sha(section) === sha(hostConf), routesOk }
+  return { shapeOk: isAuthConf(generation.auth), hasToken: authConfHasToken(generation.auth), matchesHost: sha(generation.auth) === sha(hostConf), routesOk }
 }

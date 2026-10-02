@@ -6,6 +6,14 @@ import { DelegateError } from "../src/shared/errors.ts"
 import { boxEnvOverride, isReservedBoxEnv } from "../src/supervisor/compose-env.ts"
 
 describe("box env override: reserved names", () => {
+  test("the box disables session retrospectives and cannot replace that setting", async () => {
+    const yaml = Bun.YAML.parse(await Bun.file(path.join(import.meta.dir, "..", "docker", "compose.yaml")).text()) as {
+      services: { box: { environment: Record<string, unknown> } }
+    }
+    expect(yaml.services.box.environment.OPENCODE_DISABLE_SESSION_RETROSPECTIVES).toBe("1")
+    expect(() => boxEnvOverride(["OPENCODE_DISABLE_SESSION_RETROSPECTIVES"])).toThrow(DelegateError)
+  })
+
   test("override refuses names the sandbox sets itself or that are bridge-only secrets (W2C-14)", () => {
     const reserved = [
       "INBOX_ADMIN_TOKEN", "OPENCODE_SERVER_PASSWORD", "OPENCODE_MCP_ALLOW", "OPENCODE_DISABLE_PROJECT_CONFIG", "OCD_INBOX_URL", "OCD_ANYTHING",

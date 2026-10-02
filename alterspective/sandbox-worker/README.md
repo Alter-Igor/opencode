@@ -86,9 +86,11 @@ Containers are named `sbxw-<id>`, labelled `alterspective.sandbox-worker=spike`,
 
 - **The fork writes retrospectives into the workspace.** The observer plugin writes
   `.system_generated/retrospectives/retro-<session>-<ts>.json` into the project directory
-  (`packages/opencode/src/plugin/observer.ts:255-259`), and there is no off switch. Without a guard
-  those files land in the patch. The supervisor adds `.system_generated/` to the clone's
-  `.git/info/exclude`. The same files will appear in any user's repository the fork runs in.
+  (`packages/opencode/src/plugin/observer.ts:255-259`). Without a guard those files land in the
+  patch. The supervisor adds `.system_generated/` to the clone's `.git/info/exclude`. The same files
+  will appear in any user's repository the fork runs in. The image now sets
+  `OPENCODE_DISABLE_SESSION_RETROSPECTIVES=1` (#55), which skips the retrospective file and its
+  unauthenticated POST. Other observer logs still go to `.system_generated/`, so the exclude stays.
 - **First start is fast.** The server listened 1.3 s after the container started, and a plumbing run
   (session, shell probe, prompt, collection) took 10–12 s of wall time.
 - **A missing tool costs many turns.** The bun base image's `node` is a shim that cannot run

@@ -15,4 +15,6 @@
 | [ai-memory.md](ai-memory.md) · [ai-handover.md](ai-handover.md) | For the next session |
 | [evidence/research-findings.md](evidence/research-findings.md) | Code, standards, web research |
 | [evidence/adversarial-review.md](evidence/adversarial-review.md) | Review round 1 + dispositions |
+| [evidence/pr58-fresh-review.md](evidence/pr58-fresh-review.md) | Fresh review of PR #58, findings #59/#60 and validation |
+| [evidence/independent-token-recovery-review.md](evidence/independent-token-recovery-review.md) | Separate review of the token recovery fix |
 | [modules/](modules/) | Per-module docs |

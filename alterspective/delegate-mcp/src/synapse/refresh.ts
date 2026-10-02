@@ -13,9 +13,17 @@ export const RETRY_BASE_MS = 30_000
 export const RETRY_MAX_MS = 10 * 60_000
 
 export const backoffMs = (failures: number) => Math.min(RETRY_MAX_MS, RETRY_BASE_MS * 2 ** Math.max(0, failures - 1))
+/** A transient reload failure is retried after one tick, then doubling, at most 5 min apart. */
+export const RELOAD_RETRY_MAX_MS = 5 * 60_000
+export const reloadBackoffMs = (failures: number) => Math.min(RELOAD_RETRY_MAX_MS, TICK_MS * 2 ** Math.max(0, failures - 1))
 
 const includeHasToken = async (deps: SynapseDeps) => authConfHasToken(await readFile(authConfPath(deps.frontDir), "utf8").catch(() => ""))
 const pastExpiry = (state: TokenState | undefined, now: number) => state !== undefined && now >= state.expiresAt
+/** Only a transient failure (it carries `failures`) is retried on the timer, once its backoff ends. */
+const reloadRetryDue = (state: TokenState | undefined, now: number) => {
+  const last = state?.lastReload
+  return last?.failures !== undefined && now >= last.at + reloadBackoffMs(last.failures)
+}
 
 /**
  * Review L5: signed in, not expired, outside any backoff, yet front's include has no token (it was
@@ -35,7 +43,15 @@ export function refreshIfDue(deps: SynapseDeps, force = false): Promise<Refreshe
 async function refreshLocked(deps: SynapseDeps, force: boolean): Promise<Refreshed> {
   await savePending(deps)
   const state = await readState(deps.home)
-  if (!force && !isDue(state, deps.now(), deps.refreshFraction) && !(await includeLost(deps, state))) return expireIfPast(deps, state)
+  if (!force && !isDue(state, deps.now(), deps.refreshFraction) && !(await includeLost(deps, state))) {
+    const expired = await expireIfPast(deps, state)
+    if (expired.reload || !reloadRetryDue(state, deps.now())) return expired
+    // Publishing the token and loading it are separate steps. Retry a transient load failure with
+    // backoff, without rotating again or waiting until the newly issued token's next renewal point.
+    // front_not_running and config_changed do not clear by themselves: front loads the current
+    // files when it starts, and a changed servers.conf needs a sandbox restart.
+    return { ...expired, reload: await reloadFront(deps) }
+  }
   // N1: another bridge holds the rotated refresh token in memory; the stored one is stale. Wait for it.
   if (!force && pendingElsewhere(deps, state)) return { ...(await expireIfPast(deps, state)), error: "another bridge holds an unsaved refresh token" }
   const stored = await readRefreshToken(deps)
@@ -49,7 +65,7 @@ async function refreshLocked(deps: SynapseDeps, force: boolean): Promise<Refresh
   } catch (error) {
     const reason = isDelegateError(error) ? (error.detail ?? error.message) : "refresh failed"
     if (isDelegateError(error) && error.code === "needs_auth") return failClosed(deps, reason)
-    return retryLater(deps, state, reason)
+    return retryLater(deps, await readState(deps.home), reason)
   }
 }
 
@@ -66,7 +82,7 @@ async function readRefreshToken(deps: SynapseDeps): Promise<{ token: string | un
 /** A passing failure: back off, keep the state signed in, and empty the include only once expired. */
 async function retryLater(deps: SynapseDeps, state: TokenState | undefined, reason: string): Promise<Refreshed> {
   const failures = (state?.failures ?? 0) + 1
-  const next: TokenState = { obtainedAt: state?.obtainedAt ?? 0, expiresAt: state?.expiresAt ?? 0, ...(state?.user ? { user: state.user } : {}), ...(state?.actor ? { actor: state.actor } : {}), ...(state?.includeAt !== undefined ? { includeAt: state.includeAt } : {}), ...(state?.lastReload ? { lastReload: state.lastReload } : {}), lastError: reason.slice(0, 200), failures, retryAt: deps.now() + backoffMs(failures) }
+  const next: TokenState = { ...state, obtainedAt: state?.obtainedAt ?? 0, expiresAt: state?.expiresAt ?? 0, lastError: reason.slice(0, 200), failures, retryAt: deps.now() + backoffMs(failures) }
   await writeState(deps.home, next)
   safeLog(deps.log, "warn", "synapse", "synapse refresh failed; will retry", { reason: reason.slice(0, 200), failures })
   const expired = await expireIfPast(deps, next)

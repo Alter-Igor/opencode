@@ -1,0 +1,48 @@
+name: alterspective-delegate-mcp
+
+# Fork-only (#65): the upstream test jobs need blacksmith runners this fork does not have, so the
+# delegate-mcp bridge gets its own job on GitHub-hosted Linux. This also runs the flock shell tests
+# that skip on Windows. Live tests stay off: they need Docker, Keystone and Synapse.
+on:
+  pull_request:
+    paths:
+      - "alterspective/delegate-mcp/**"
+      - ".github/workflows/alterspective-delegate-mcp.yml"
+  push:
+    branches: [dev]
+    paths:
+      - "alterspective/delegate-mcp/**"
+      - ".github/workflows/alterspective-delegate-mcp.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bridge:
+    if: github.repository == 'Alter-Igor/opencode'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: alterspective/delegate-mcp
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: package.json
+
+      - name: Install
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      # The repo-root bunfig.toml points `bun test` at an empty root, so pass the files explicitly.
+      - name: Test
+        run: bun test --timeout 30000 ./test/*.test.ts
