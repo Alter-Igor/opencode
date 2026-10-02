@@ -10,6 +10,7 @@ import type { BridgeConfig } from "../shared/config.ts"
 import type { Guard, McpEntry } from "../shared/contracts.ts"
 import { CONNECTION_ID, entryName } from "../shared/keystone.ts"
 import { validateEntries } from "../guard/entries.ts"
+import { keystoneHostAuth } from "../guard/egress-identity.ts"
 import { DelegateError, isDelegateError } from "../shared/errors.ts"
 import { invalid, scanProvider, type Json, type JsonObject } from "./profile-scan.ts"
 
@@ -25,6 +26,8 @@ export type ProfileInput = {
   ownerConfigs: string[]
   /** keystoneConnections must be the effective set (shared/config.ts effectiveConfig). */
   config: Pick<BridgeConfig, "keystoneOrigin" | "keystoneConnections" | "boxEnv">
+  /** #67: host-held Keystone tokens (entries carry oauth:false). Default: OCD_KEYSTONE_HOST_AUTH=1. */
+  hostAuth?: boolean
   /** Supplied by MOD-02 (Guard.permissionBaseline); the supervisor does not decide policy. */
   permission: PermissionRule[]
   /** provider id → env name to use as options.apiKey when the owner's entry has no key (must be on boxEnv). */
@@ -183,15 +186,17 @@ function withKeyEnv(id: string, entry: JsonObject, envName: string | undefined, 
  * One `ks-<id>` → `/mcp/c/<id>` entry per chosen Keystone connection, and nothing else (review
  * R4-01: never /mcp/dynamic, which reaches every service on the owner's account). The result is
  * checked by the guard's profile-time allowlist, so a bad entry can never reach the box.
+ * #67 step 4: with host-held tokens (`hostAuth`, OCD_KEYSTONE_HOST_AUTH=1) each entry carries
+ * `oauth: false`: front adds the credential, and the box never runs a Keystone sign-in.
  */
-export function mcpEntries(config: ProfileInput["config"]): JsonObject {
+export function mcpEntries(config: ProfileInput["config"], hostAuth: boolean = keystoneHostAuth()): JsonObject {
   const origin = new URL(config.keystoneOrigin).origin
   const entries: Record<string, McpEntry> = {}
   for (const id of config.keystoneConnections) {
     if (!CONNECTION_ID.test(id)) throw invalid(`The Keystone connection id "${id.slice(0, 40)}" is not valid.`)
-    entries[entryName(id)] = { type: "remote", url: `${origin}/mcp/c/${id}` }
+    entries[entryName(id)] = hostAuth ? { type: "remote", url: `${origin}/mcp/c/${id}`, oauth: false } : { type: "remote", url: `${origin}/mcp/c/${id}` }
   }
-  const verdict = validateEntries(entries, config.keystoneOrigin, config.keystoneConnections)
+  const verdict = validateEntries(entries, config.keystoneOrigin, config.keystoneConnections, hostAuth)
   if (!verdict.ok) throw invalid(`The box's Keystone MCP entries failed the allowlist: ${verdict.reason.slice(0, 200)}`)
   return entries as JsonObject
 }
@@ -252,7 +257,7 @@ export function buildProfile(input: ProfileInput): BuiltProfile {
     $schema: "https://opencode.ai/config.json",
     ...modelFields(owner, providers),
     provider: providers.kept,
-    mcp: mcpEntries(input.config),
+    mcp: mcpEntries(input.config, input.hostAuth ?? keystoneHostAuth()),
     permission: permissionConfig(input.permission),
   }
   const files: Record<string, string> = {

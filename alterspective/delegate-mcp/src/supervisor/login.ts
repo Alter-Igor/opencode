@@ -1,10 +1,13 @@
 // MOD-01 Keystone sign-in relay for one ks-* entry (technical-design §4 "Keystone sign-in"; proven in spike T0.3).
 // The box starts the OAuth flow; the bridge opens the owner's browser, catches the loopback redirect on the
 // host, checks `state`, and relays ONLY the code to the box. The code and the URL query are never logged.
+// #67 step 4: with host-held Keystone tokens (OCD_KEYSTONE_HOST_AUTH=1) this relay is OFF: the box
+// must never hold a Keystone token, so oc_login signs in on the host (keystone-auth signIn) instead.
 import { spawn } from "node:child_process"
 import { randomUUID } from "node:crypto"
 import http from "node:http"
 import { KS_NAME } from "../guard/entries.ts"
+import { keystoneHostAuth } from "../guard/egress-identity.ts"
 import { idOfEntry } from "../shared/keystone.ts"
 import { DelegateError, isDelegateError } from "../shared/errors.ts"
 import { safeLog, silentLogger, type Logger } from "../shared/log.ts"
@@ -38,6 +41,8 @@ export type LoginOptions = {
   logger?: Logger
   /** Ties these log lines to the caller's. Default: a new UUID. */
   correlationId?: string
+  /** Host-held Keystone tokens are on (default: OCD_KEYSTONE_HOST_AUTH=1): the box relay refuses to run. */
+  hostAuth?: boolean
 }
 
 type Received = { code: string | undefined; reply(status: number, text: string): Promise<void> }
@@ -204,6 +209,8 @@ function withCorrelation(logger: Logger, correlationId: string): Logger {
 }
 
 async function signIn(api: OpencodeApi, entry: string, opts: LoginOptions, logger: Logger): Promise<"connected" | "failed"> {
+  if (opts.hostAuth ?? keystoneHostAuth())
+    throw new DelegateError("policy_violation", "Host-held Keystone tokens are on, so the sandbox does not sign in to Keystone itself.", "Use oc_login: it signs in on the host and front adds the token.")
   if (!KS_NAME.test(entry) || entry.length > MAX_ENTRY_LENGTH) {
     throw new DelegateError("invalid_input", "Only ks-* entries can be signed in.", "Pass a ks-<id> server name (lower-case, for example ks-rag-read).")
   }

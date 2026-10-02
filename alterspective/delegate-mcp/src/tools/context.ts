@@ -9,6 +9,7 @@ import type { BridgeInbox } from "../inbox/index.ts"
 import type { DelegateSupervisor, ReplaceOptions } from "../supervisor/lifecycle.ts"
 import type { DelegateWorkspaces } from "../supervisor/workspaces.ts"
 import type { SynapseAuth } from "../synapse/index.ts"
+import type { KeystoneAuth } from "../keystone-auth/index.ts"
 
 /** A session this bridge started: where it lives on the host and in the box. */
 export type SessionRecord = {
@@ -72,6 +73,11 @@ export type ToolContext = {
   sessions: Map<string, SessionRecord>
   /** WS2 (#48): the owner's host-held Synapse token (sign-in, renewal, doctor report). */
   synapse: Pick<SynapseAuth, "signIn" | "status" | "refresh">
+  /**
+   * #67 step 4: the owner's host-held Keystone connection tokens (sign-in, doctor report). Set only
+   * when OCD_KEYSTONE_HOST_AUTH=1; undefined means the box signs in itself (the old flow).
+   */
+  keystone?: Pick<KeystoneAuth, "signIn" | "status">
   /** A fresh correlation id for one tool call (OBS-ID-01). */
   correlationId(): string
 }

@@ -6,6 +6,7 @@ import { effectiveConfig, type BridgeConfig } from "../shared/config.ts"
 import { keystoneIds } from "../shared/keystone.ts"
 import { enforceCeiling } from "../shared/keystone-policy.ts"
 import { frontConfigHash, frontServersFor } from "../guard/egress.ts"
+import { keystoneHostAuth } from "../guard/egress-identity.ts"
 import type { FrontFiles } from "./compose-env.ts"
 import type { SupervisorDeps } from "./lifecycle.ts"
 import { buildProfile, readOwnerConfigs, type BuiltProfile } from "./profile.ts"
@@ -15,6 +16,11 @@ export type Plan = {
   config: BridgeConfig
   built: BuiltProfile
   front: FrontFiles
+  /**
+   * #67 review: the profile hash this plan would have with OCD_KEYSTONE_HOST_AUTH the other way.
+   * A running box with this hash was started by a bridge whose flag differs, and the refusal says so.
+   */
+  otherFlagHash?: string
 }
 
 type PlanDeps = Pick<SupervisorDeps, "config" | "profileFs" | "ownerConfigDir" | "permission" | "keyEnv" | "frontAuth">
@@ -35,6 +41,11 @@ export async function planFor(deps: PlanDeps, keystone?: readonly string[]): Pro
   const config = keystone ? { ...deps.config, keystoneConnections: keystoneIds(keystone) } : effectiveConfig(deps.config)
   enforceCeiling(config.keystoneConnections, deps.config)
   const ownerConfigs = await readOwnerConfigs(deps.profileFs, deps.ownerConfigDir)
-  const built = buildProfile({ ownerConfigs, config, permission: deps.permission, keyEnv: deps.keyEnv, frontAuth: deps.frontAuth })
-  return { config, built, front: frontFilesFor(config) }
+  const input = { ownerConfigs, config, permission: deps.permission, keyEnv: deps.keyEnv, frontAuth: deps.frontAuth }
+  const hostAuth = keystoneHostAuth()
+  const built = buildProfile({ ...input, hostAuth })
+  // With no Keystone entry chosen the flag changes nothing in the profile: both hashes are equal,
+  // and a matching box must never be read as a flag mismatch (review cycle 2, High).
+  const other = buildProfile({ ...input, hostAuth: !hostAuth }).hash
+  return { config, built, front: frontFilesFor(config), ...(other !== built.hash ? { otherFlagHash: other } : {}) }
 }

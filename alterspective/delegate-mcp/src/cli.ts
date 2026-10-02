@@ -118,7 +118,10 @@ async function runMcp(channels: boolean): Promise<number> {
   runtime.ctx.log.log("info", "cli", "MCP server listening on stdio", { bridge: runtime.name, channels })
   // WS2 (#48): renew the owner's Synapse token on the host while this bridge runs.
   const stopRefresh = runtime.synapse?.start() ?? (() => {})
+  // #67 step 4: with OCD_KEYSTONE_HOST_AUTH=1, renew the owner's Keystone connection tokens too.
+  const stopKeystone = runtime.keystone?.start() ?? (() => {})
   const reason = await stopped
+  stopKeystone()
   stopRefresh()
   await close().catch(() => undefined)
   await runtime.shutdown(reason)

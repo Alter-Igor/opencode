@@ -8,7 +8,7 @@ import path from "node:path"
 import { createHub, type DelegateHub } from "./events/index.ts"
 import { createGuard } from "./guard/index.ts"
 import { cachedTarget, createInbox, inboxTargetFromDocker } from "./inbox/index.ts"
-import { defaultConfig, type BridgeConfig } from "./shared/config.ts"
+import { currentKeystone, defaultConfig, frontDir, type BridgeConfig } from "./shared/config.ts"
 import { DelegateError } from "./shared/errors.ts"
 import { createLogger, safeLog, type Logger } from "./shared/log.ts"
 import { createApi, type ApiTarget, type OpencodeApi } from "./shared/opencode-api.ts"
@@ -18,6 +18,10 @@ import { createSupervisor, defaultSupervisorDeps, type DelegateSupervisor, type 
 import { login } from "./supervisor/login.ts"
 import { createWorkspaces } from "./supervisor/workspaces.ts"
 import { createSynapseAuth, type SynapseAuth } from "./synapse/index.ts"
+import { reloadFront } from "./synapse/token-manager.ts"
+import { keystoneHostAuth } from "./guard/egress-identity.ts"
+import { createKeystoneAuth, type KeystoneAuth } from "./keystone-auth/index.ts"
+import { connectSignedIn, createKsPublisher, ensureEntryConnected, startReconnectLoop } from "./keystone-auth/host-wiring.ts"
 import { cleanEnv, runCommand } from "./supervisor/workspaces-exec.ts"
 import type { Box, CommandRunner, RestartedBox, SessionRecord, ToolContext } from "./tools/context.ts"
 
@@ -199,7 +203,8 @@ function lazySupervisor(make: () => Promise<DelegateSupervisor>): DelegateSuperv
   }
 }
 
-export type Runtime = { ctx: ToolContext; versionInfo: VersionInfo; name: string; synapse?: Pick<SynapseAuth, "start">; shutdown(reason: string): Promise<void> }
+/** `keystone` is present only with OCD_KEYSTONE_HOST_AUTH=1 (#67 step 4): start() runs its renewal loop. */
+export type Runtime = { ctx: ToolContext; versionInfo: VersionInfo; name: string; synapse?: Pick<SynapseAuth, "start">; keystone?: { start(): () => void }; shutdown(reason: string): Promise<void> }
 
 export type RuntimeOptions = { env?: NodeJS.ProcessEnv; config?: BridgeConfig; log?: Logger; version?: VersionInfo }
 
@@ -237,6 +242,10 @@ export async function createRuntime(options: RuntimeOptions = {}): Promise<Runti
   const inboxTarget = cachedTarget(() => inboxTargetFromDocker(bunExec, config))
   const container = containerName(config)
   const synapse = createSynapseAuth(config, env, log)
+  // The same source as the profile, guard, front generator and supervisor (process.env).
+  const keystone = keystoneHostAuth() ? hostKeystone(config, env, log, synapse, () => manager.peek()) : undefined
+  // A renewal while this bridge held no box connected nothing: connect signed-in entries on each new box.
+  if (keystone) manager.onBox((box) => void connectSignedIn((ids) => keystone.status(ids), currentKeystone(config).connections, box.api, log))
   const ctx: ToolContext = {
     config,
     supervisor: `supervisor:${name}`,
@@ -259,10 +268,51 @@ export async function createRuntime(options: RuntimeOptions = {}): Promise<Runti
     hostExec: (argv, timeoutMs) => hostRunner(argv, timeoutMs ?? 60_000),
     sessions,
     synapse,
+    ...(keystone ? { keystone } : {}),
     correlationId: () => randomUUID(),
   }
-  log.log("info", "runtime", "bridge created", { bridge: name, bridgeId, version: versionInfo.version, roots: config.roots.length })
-  return { ctx, versionInfo, name, synapse, shutdown: shutdownOnce(manager, supervisorService, log) }
+  log.log("info", "runtime", "bridge created", { bridge: name, bridgeId, version: versionInfo.version, roots: config.roots.length, keystoneHostAuth: keystone !== undefined })
+  return {
+    ctx,
+    versionInfo,
+    name,
+    synapse,
+    // The renewal loop reads the chosen set on every tick (a set change needs no restart of the loop).
+    // The reconnect loop: each bridge reconnects signed-in entries on the box IT holds, so a token
+    // renewed by another bridge sharing the box still gets its entries connected here.
+    ...(keystone ? { keystone: { start: () => startHostKeystone(keystone, config, log, () => manager.peek()?.api) } } : {}),
+    shutdown: shutdownOnce(manager, supervisorService, log),
+  }
+}
+
+/** Start the renewal loop and the reconnect loop; the returned function stops both. */
+function startHostKeystone(keystone: KeystoneAuth, config: BridgeConfig, log: Logger, heldApi: () => OpencodeApi | undefined): () => void {
+  const ids = () => currentKeystone(config).connections
+  const stopRenewal = keystone.start(ids)
+  const stopReconnect = startReconnectLoop(heldApi, (chosen) => keystone.status(chosen), ids, log)
+  return () => {
+    stopReconnect()
+    stopRenewal()
+  }
+}
+
+/**
+ * #67 step 4: the host Keystone token manager, publishing through front. `publish` runs while the
+ * manager holds the shared lock (synapse/lock.ts), so it writes the include and reloads front with
+ * the Synapse reload, which never takes that lock (it is not re-entrant). The box entry is then
+ * connected on the box this bridge already holds; the box is never started for it.
+ */
+export function hostKeystone(config: BridgeConfig, env: NodeJS.ProcessEnv, log: Logger, synapse: Pick<SynapseAuth, "deps">, heldBox: () => Box | undefined): KeystoneAuth {
+  const publish = createKsPublisher({
+    frontDir: frontDir(config),
+    reload: () => reloadFront(synapse.deps, { record: false, component: "keystone-auth" }),
+    connect: async (entry) => {
+      const box = heldBox()
+      return box ? ensureEntryConnected(box.api, entry, log) : "not_running"
+    },
+    log,
+  })
+  return createKeystoneAuth(config, env, log, publish)
 }
 
 /**
