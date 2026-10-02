@@ -55,7 +55,8 @@ check() {
 # servers.conf naming any other file of the host folder is refused: nginx would read it unchecked.
 check_keystone() {
   KS_SHA=
-  mentions=$(grep -o 'front-gen' "$SERVERS" | wc -l | tr -d ' ')
+  # The full folder prefix, never the bare name: a connection id may itself contain `front-gen`.
+  mentions=$(grep -o '/etc/nginx/front-gen/' "$SERVERS" | wc -l | tr -d ' ')
   known=$(grep -oE 'include /etc/nginx/front-gen/(synapse-auth|ks-auth-[a-z0-9][a-z0-9-]{0,62})\.conf;' "$SERVERS" | wc -l | tr -d ' ')
   [ "$mentions" = "$known" ] || { log "servers.conf names a generated file front-reload does not check; not reloading"; return 3; }
   ids=$(grep -o 'include /etc/nginx/front-gen/ks-auth-[a-z0-9-]*\.conf;' "$SERVERS" | sed 's|^include /etc/nginx/front-gen/ks-auth-\(.*\)\.conf;$|\1|' | LC_ALL=C sort -u)

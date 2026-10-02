@@ -307,6 +307,15 @@ describe.skipIf(!sh || !Bun.which("flock"))("front-reload run with sh (fake ngin
     }
   })
 
+  test("a connection id containing `front-gen` reloads fine (review cycle 1: no double count)", () => {
+    const servers = KS_SERVERS.replaceAll("github", "my-front-gen")
+    const result = run({ servers, hash: sha(servers), auth: authConf(undefined), ks: { "my-front-gen": authConf(KS_TOKEN, KS_AUTH_VAR) } })
+    expect(result).toMatchObject({ code: 0, nginx: ["-t -q", "-s reload"] })
+    expect(result.destFiles).toContain("ks-auth-my-front-gen.conf")
+    expect(result.destText["servers.conf"]).toContain(`include ${result.dest}/ks-auth-my-front-gen.conf;`)
+    expect(run({ servers, hash: sha(servers), auth: authConf(undefined), args: ["--start"] })).toMatchObject({ code: 0 })
+  })
+
   test("servers.conf naming any other generated file is refused (nginx would read the host folder directly)", () => {
     const odd = KS_SERVERS.replace("ks-auth-github.conf", "ks-auth-GitHub.conf")
     expect(run({ servers: odd, hash: sha(odd), auth: authConf(undefined) })).toMatchObject({ code: 3, nginx: [] })

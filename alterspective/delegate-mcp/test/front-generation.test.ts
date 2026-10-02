@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test"
 import { createHash } from "node:crypto"
 import { FRONT_GENERATIONS, FRONT_GENERATION_URL, KS_AUTH_LIST, readFrontGeneration } from "../src/supervisor/front-generation.ts"
+import { KS_AUTH_VAR, authConf } from "../src/synapse/auth-conf.ts"
 import { generationExec } from "./front-generation-fixture.ts"
+import { jwt } from "./synapse-fixture.ts"
 
 describe("the running front generation", () => {
   test("uses a worker response and verifies both immutable file hashes", async () => {
@@ -27,7 +29,20 @@ describe("the running front generation with Keystone includes (#67 step 3)", () 
 
   test("a fourth hash names the ks-auth.list; each include is read and verified against it", async () => {
     const generation = await readFrontGeneration(generationExec("servers\n", "auth\n", undefined, KS), "front")
-    expect(generation).toEqual({ servers: "servers\n", auth: "auth\n", keystone: [{ id: "github", text: "ks github\n" }, { id: "rag-read", text: "ks rag\n" }] })
+    expect(generation).toEqual({ servers: "servers\n", auth: "auth\n", keystone: [{ id: "github", shape: false, token: false }, { id: "rag-read", shape: false, token: false }] })
+  })
+
+  test("review cycle 1: states only per include (shape, token present), never the token text", async () => {
+    const token = jwt({ sub: "oid-1", aud: "https://identity.alterspective.com.au/mcp/c/rag-read" })
+    const files = { "rag-read": authConf(token, KS_AUTH_VAR), github: authConf(undefined, KS_AUTH_VAR), seqlogs: authConf(token) }
+    const generation = await readFrontGeneration(generationExec("servers\n", "auth\n", undefined, files), "front")
+    expect(generation?.keystone).toEqual([
+      { id: "github", shape: true, token: false },
+      { id: "rag-read", shape: true, token: true },
+      { id: "seqlogs", shape: false, token: false },
+    ])
+    expect(JSON.stringify(generation)).not.toContain(token)
+    expect(JSON.stringify(generation)).not.toContain(token.split(".")[1]!)
   })
 
   test("the three-hash reply (flag off) still parses, with no keystone field", async () => {

@@ -7,14 +7,18 @@
 // sorted by id). Without Keystone includes the reply keeps its three fields.
 import { createHash } from "node:crypto"
 import { CONNECTION_ID } from "../shared/keystone.ts"
+import { KS_AUTH_VAR, authConfHasToken, isAuthConf } from "../synapse/auth-conf.ts"
 import type { Exec } from "./docker.ts"
 
 export const FRONT_GENERATION_URL = "http://127.0.0.1:19091/__ocd_generation"
 export const FRONT_GENERATIONS = "/tmp/front/generations"
 /** The list front-reload writes into a generation that has Keystone includes. */
 export const KS_AUTH_LIST = "ks-auth.list"
-/** One loaded Keystone include: the connection id and the file text (it may carry a token: never log it). */
-export type FrontKeystoneAuth = { id: string; text: string }
+/**
+ * One loaded Keystone include, as states only (like the Synapse live check): `shape` is the strict
+ * $ks_auth file, `token` that it carries a bearer token. The file text (the token) is never returned.
+ */
+export type FrontKeystoneAuth = { id: string; shape: boolean; token: boolean }
 /** `keystone` is present only when the loaded generation has Keystone includes. */
 export type FrontGeneration = { servers: string; auth: string; keystone?: FrontKeystoneAuth[] }
 
@@ -53,7 +57,7 @@ async function readKeystone(cat: Cat, listSha: string): Promise<FrontKeystoneAut
   for (const [index, entry] of entries.entries()) {
     const file = files[index]!
     if (file.code !== 0 || sha(file.stdout) !== entry.sha) return undefined
-    out.push({ id: entry.id, text: file.stdout })
+    out.push({ id: entry.id, shape: isAuthConf(file.stdout, KS_AUTH_VAR), token: authConfHasToken(file.stdout, KS_AUTH_VAR) })
   }
   return out
 }
