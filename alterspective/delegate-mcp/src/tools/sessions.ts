@@ -8,6 +8,7 @@
 // of the box-wide set (oc_server_restart {keystone} sets that, and front enforces it).
 import { z } from "zod"
 import { SESSION_SUPERVISOR_KEY } from "../inbox/index.ts"
+import { recordStart } from "../reporting/hooks.ts"
 import { currentKeystone } from "../shared/config.ts"
 import { DelegateError } from "../shared/errors.ts"
 import { CONNECTION_ID, MAX_CONNECTIONS, keystoneIds } from "../shared/keystone.ts"
@@ -97,6 +98,7 @@ export const startSessionTool = defineTool({
     const record = await startIn(ctx, box, { ...args, keystone }, ws, correlationId)
     ctx.sessions.set(record.sessionID, record)
     box.hub.track(record.sessionID, ws.boxPath)
+    await recordStart(ctx, record)
     return ok(`Session ${record.sessionID} started on ${ws.branch}. Next: oc_send, then oc_wait.`, {
       sessionID: record.sessionID, sessionKey: ws.sessionKey, branch: ws.branch, boxPath: ws.boxPath, hostRepo: ws.hostRepo, profile: record.profile, base: ws.base,
       ...(keystone ? { keystone } : {}),

@@ -2,6 +2,7 @@
 // Event summaries are bridge words (contracts.ts HubEvent); anything the box supplied is only
 // ever returned under `untrusted`.
 import { z } from "zod"
+import { recordStates, type ObservedState } from "../reporting/hooks.ts"
 import type { HubEvent, SessionView, WaitUntil } from "../shared/contracts.ts"
 import type { Box, ToolContext } from "./context.ts"
 import { cursorSchema, formatCursor, ownSession, parseCursor, sessionIdSchema } from "./core-session.ts"
@@ -62,13 +63,24 @@ function timedOut(timeoutSec: number, next: string, events: ReturnType<typeof sh
   return ok(`No matching state after ${timeoutSec} s: ${list}.${advice}`, { still_running: running, next, events, views: states })
 }
 
+/** #73: the states this wait already has (state events in order, then the views), for the task records. */
+function observed(events: readonly HubEvent[], views: readonly SessionView[]): ObservedState[] {
+  const fromEvents = events.flatMap((e) => (e.sessionID && e.state ? [{ sessionID: e.sessionID, state: e.state, at: e.at }] : []))
+  return [...fromEvents, ...views.map((v) => ({ sessionID: v.sessionID, state: v.state, at: v.since, ...(v.lastError ? { lastError: v.lastError } : {}) }))]
+}
+
 async function waitOn(ctx: ToolContext, box: Box, args: WaitArgs) {
   const timeoutSec = args.timeoutSec ?? DEFAULT_WAIT_SEC
   const result = await box.hub.wait({ sessionIDs: args.sessionIDs, until: args.until ?? DEFAULT_UNTIL, timeoutMs: timeoutSec * 1000, cursor: parseCursor(args.cursor) })
   if (ctx.peekBox() !== box) return hubChanged(ctx, args)
   const page = capEvents(result.events, formatCursor(result.next), 100)
-  if (result.timedOut) return timedOut(timeoutSec, page.next, page.events, await Promise.all(args.sessionIDs.map((id) => box.hub.view(id))))
+  if (result.timedOut) {
+    const states = await Promise.all(args.sessionIDs.map((id) => box.hub.view(id)))
+    await recordStates(ctx, observed(result.events, states))
+    return timedOut(timeoutSec, page.next, page.events, states)
+  }
   const views = result.views ?? []
+  await recordStates(ctx, observed(result.events, views))
   const matched = [...page.events.filter((e) => e.state).map((e) => `${e.sessionID ?? "?"} ${e.state}`), ...views.map((v) => `${v.sessionID} ${v.state}`)]
   return ok(`Done waiting: ${matched.join("; ") || "matching event"}.`, { still_running: false, next: page.next, events: page.events, views, ...(page.more ? { more: true } : {}) })
 }
