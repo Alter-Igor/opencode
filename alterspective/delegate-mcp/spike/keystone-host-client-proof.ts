@@ -56,7 +56,9 @@ report("withoutBearer", await mcpTools())
 
 // 2. Discovery, as the box's MCP client does it.
 const prm = await discoverOAuthProtectedResourceMetadata(resource)
-report("protectedResource", { resource: prm.resource, authorizationServers: prm.authorization_servers })
+report("protectedResource", { resource: prm.resource, authorizationServers: prm.authorization_servers, scopes: prm.scopes_supported })
+// The box's SDK asks for the resource's advertised scopes (auth.js: scope || scopes_supported); do the same.
+const scope = prm.scopes_supported?.join(" ")
 const issuer = new URL(prm.authorization_servers?.[0] ?? ORIGIN)
 const metadata = await discoverAuthorizationServerMetadata(issuer)
 if (!metadata) throw new Error("no authorization server metadata")
@@ -67,13 +69,14 @@ if (process.argv.includes("--discover-only")) process.exit(0)
 // 3. Dynamic registration as a NEW public client with the loopback redirect (the open question).
 const clientInformation = await registerClient(issuer, {
   metadata,
-  clientMetadata: { redirect_uris: [redirect], client_name: "OpenCode delegate host (spike)", grant_types: ["authorization_code", "refresh_token"], response_types: ["code"], token_endpoint_auth_method: "none" },
+  clientMetadata: { redirect_uris: [redirect], client_name: "OpenCode delegate host (spike)", grant_types: ["authorization_code", "refresh_token"], response_types: ["code"], token_endpoint_auth_method: "none", ...(scope ? { scope } : {}) },
+  ...(scope ? { scope } : {}),
 })
 report("registered", { clientIdPrefix: clientInformation.client_id.slice(0, 8), authMethod: clientInformation.token_endpoint_auth_method ?? "unspecified" })
 
 // 4. Owner consent in the browser; the code comes back to the loopback listener.
 const state = randomBytes(16).toString("hex")
-const { authorizationUrl, codeVerifier } = await startAuthorization(issuer, { metadata, clientInformation, redirectUrl: redirect, state, resource })
+const { authorizationUrl, codeVerifier } = await startAuthorization(issuer, { metadata, clientInformation, redirectUrl: redirect, state, resource, scope })
 const code = await new Promise<string>((resolve, reject) => {
   const timer = setTimeout(() => (server.close(), reject(new Error("no sign-in within 5 minutes"))), 5 * 60_000)
   const server = createServer((req, res) => {
@@ -82,7 +85,7 @@ const code = await new Promise<string>((resolve, reject) => {
     const done = (status: number, text: string) => (res.writeHead(status, { "content-type": "text/plain" }).end(text), clearTimeout(timer), server.close())
     if (url.searchParams.get("state") !== state) return done(400, "state mismatch"), reject(new Error("state mismatch"))
     const error = url.searchParams.get("error")
-    if (error) return done(400, "sign-in refused"), reject(new Error(`sign-in refused: ${error}`))
+    if (error) return done(400, "sign-in refused"), reject(new Error(`sign-in refused: ${error} (${(url.searchParams.get("error_description") ?? "").slice(0, 200)})`))
     done(200, "Signed in. You can close this tab.")
     resolve(url.searchParams.get("code") ?? "")
   })
