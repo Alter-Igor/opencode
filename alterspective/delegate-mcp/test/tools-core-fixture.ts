@@ -178,6 +178,14 @@ function fakeServices(f: Fake): Pick<ToolContext, "supervisorService" | "workspa
         f.discarded.push(key)
         f.states.delete(key)
       },
+      // #72: tests of oc_close_session / oc_cleanup use the real workspaces (tools-close.test.ts).
+      inspectClose: async () => {
+        throw new Error("not used: tools-close.test.ts uses real workspaces")
+      },
+      closeSession: async () => {
+        throw new Error("not used: tools-close.test.ts uses real workspaces")
+      },
+      closeCandidates: async () => ({ states: [], legacy: 0, otherBox: 0 }),
     },
   }
 }

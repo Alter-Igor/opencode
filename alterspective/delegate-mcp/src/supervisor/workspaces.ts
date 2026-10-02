@@ -21,12 +21,14 @@ import { copyOutBundle, dockerTarSource, type TarSource } from "./workspaces-cop
 import { assertRegularFile, DEFAULT_MAX_BUNDLE_BYTES, planOutBundle, randomNonce, removeQuietly, reserveInBundle } from "./workspaces-handoff.ts"
 import { bindHostState, COMMIT_ID, listHostStates, readHostState, removeHostState, SESSION_KEY, writeHostState, type HostSessionState, type SessionBinding } from "./workspaces-state.ts"
 import { createSessionPruner, type MissingSession } from "./workspaces-prune.ts"
+import { closeCandidates, closeSession, inspectClose, type CloseCandidates, type CloseDeps, type CloseOptions, type CloseOutcome, type CloseOwner, type ClosePlan, type SessionRemoval } from "./workspaces-close.ts"
 
 export { canonicalPath, cleanEnv, isUnder, parseSubst, runCommand, TIMEOUT_CODE, type Exec, type ExecOptions, type ExecResult } from "./workspaces-exec.ts"
 export { isHostExecutableMode, isHostExecutablePath, parseRawDiff, scriptsChanged, type RawEntry } from "./workspaces-detect.ts"
 export { DEFAULT_MAX_BUNDLE_BYTES, HANDOFF_IN, HANDOFF_OUT } from "./workspaces-handoff.ts"
 export { TAR_SLACK_BYTES, type TarSource, type TarStream } from "./workspaces-copyout.ts"
 
+export type { CloseCandidates, CloseOptions, CloseOutcome, CloseOwner, ClosePlan, SessionRemoval } from "./workspaces-close.ts"
 export { AGENT_RE, COMMIT_ID, MODEL_RE, SESSION_ID_RE, SESSION_KEY, SUPERVISOR_RE, type HostSessionState, type SessionBinding, type SessionProfile } from "./workspaces-state.ts"
 /** bundle, clone and fetch: whole repositories. */
 export const LONG_TIMEOUT_MS = 10 * 60_000
@@ -289,6 +291,12 @@ export type DelegateWorkspaces = Omit<Workspaces, "open" | "collect"> & {
   pruneSessionStates(supervisor: string, missing: MissingSession, tracked?: (sessionID: string) => boolean): Promise<string[]>
   /** Best effort (W3A-14): remove the box clone and the host record of a session that never started. Never throws. */
   discard(sessionKey: string): Promise<void>
+  /** #72: what closing this bridge's session would remove and lose. Reads only. */
+  inspectClose(sessionKey: string, owner: CloseOwner, options: Pick<CloseOptions, "deleteBranch">): Promise<ClosePlan>
+  /** #72: close one of this bridge's sessions (workspaces-close.ts); `deleteSession` removes the OpenCode session. */
+  closeSession(sessionKey: string, owner: CloseOwner, options: CloseOptions, deleteSession: () => Promise<SessionRemoval>): Promise<CloseOutcome>
+  /** #72: this bridge's records of this box created before `before`, oldest first. Reads only. */
+  closeCandidates(supervisor: string, before: Date, limit: number): Promise<CloseCandidates>
 }
 
 /** Anything that is not a DelegateError yet becomes one; its text goes to detail only. */
@@ -333,6 +341,7 @@ export function createWorkspaces(options: WorkspacesOptions): DelegateWorkspaces
   // #53: the host records folder is shared by every project under one home; the record names its box.
   const boxProject = options.config.project
   const pruneSessionStates = createSessionPruner({ stateDir: ctx.stateDir, boxSessions: ctx.boxSessions, box: ctx.box, boxProject, timeoutMs: ctx.timeouts.short })
+  const closeDeps: CloseDeps = { stateDir: ctx.stateDir, boxSessions: ctx.boxSessions, boxProject, host: ctx.host, box: ctx.box, timeoutMs: ctx.timeouts.short, resolveRepo: (hostRepo) => resolveRepo(ctx, hostRepo) }
   // Session keys are logged (they are the owner's own labels); repo paths go only to failure detail.
   return {
     open: (hostRepo: string, sessionKey: string, call?: CallOptions) =>
@@ -345,5 +354,9 @@ export function createWorkspaces(options: WorkspacesOptions): DelegateWorkspaces
     listSessionStates: async () => listHostStates(ctx.stateDir),
     pruneSessionStates,
     discard: (key) => discard(ctx, key),
+    inspectClose: (key, owner, options) => traced(logger, "inspectClose", undefined, { sessionKey: key }, () => inspectClose(closeDeps, key, owner, options), (p) => ({ safe: p.safe, uncollectedCommits: p.uncollectedCommits })),
+    closeSession: (key, owner, options, deleteSession) =>
+      traced(logger, "closeSession", undefined, { sessionKey: key }, () => closeSession(closeDeps, key, owner, options, deleteSession), (o) => ({ closed: o.closed, clone: o.clone, branch: o.branch, record: o.record, uncollectedCommits: o.uncollectedCommits })),
+    closeCandidates: async (supervisor, before, limit) => closeCandidates(closeDeps, supervisor, before, limit),
   }
 }

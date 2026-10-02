@@ -1,6 +1,7 @@
 // MOD-04 tool list: the core tools (Wave 3 core build) plus the interaction tools (oc_pending,
 // oc_answer, oc_post, oc_inbox — Wave 3 interaction build). server.ts registers `allTools`.
 import type { z } from "zod"
+import { cleanupTool, closeSessionTool } from "./close-session.ts"
 import { collectTool } from "./collect.ts"
 import type { ToolSpec } from "./define.ts"
 import { doctorTool } from "./doctor.ts"
@@ -28,6 +29,8 @@ export const coreTools: AnyTool[] = [
   collectTool,
   abortTool,
   listSessionsTool,
+  closeSessionTool,
+  cleanupTool,
   restartTool,
 ]
 
