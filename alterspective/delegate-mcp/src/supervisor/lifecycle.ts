@@ -18,13 +18,14 @@ import { FRONT_SERVERS_NAME } from "../guard/egress.ts"
 import { emptyUnchosenKsAuthConf, ensureAuthConf, ensureKsAuthConf } from "../synapse/auth-conf.ts"
 import { KEYSTONE_HOST_AUTH_ENV, keystoneHostAuth } from "../guard/egress-identity.ts"
 import { SYNAPSE_LOCK_WAIT_MS } from "../synapse/lock.ts"
+import type { RegisteredModels } from "../synapse/models.ts"
 import { INSPECT_ENV, MCP_ALLOW_ENV, approvedValues, boxEnvOverride, composeDownEnv, composeEnv, siblingContainers } from "./compose-env.ts"
 import { LABEL, dockerArgs, imageExists, inspectBox, redactAll, requireDocker, type BoxInspect, type Exec, type ExecResult } from "./docker.ts"
 import { waitHealthy } from "./health.ts"
 import { pruneSignIns, verifyLive } from "./live.ts"
 import type { LeaseFs } from "./leases.ts"
 import type { ProcessProbe } from "./process.ts"
-import { planFor, type Plan } from "./plan.ts"
+import { planFor, withSynapseModels, type Plan } from "./plan.ts"
 import { fsFailure, writeProfile, type PermissionRule, type ProfileFs } from "./profile.ts"
 import { createContext, lockOptions, traced, withLease, type Run } from "./run.ts"
 import { withStartLock, type Every } from "./start-lock.ts"
@@ -51,6 +52,8 @@ export type SupervisorDeps = {
   keyEnv?: Record<string, string>
   /** WS2 (#48): providers whose credential front sets (profile.ts frontAuth). */
   frontAuth?: string[]
+  /** #71: the models registered in Synapse, read at each box start (src/synapse/models.ts). Unset: `auto` only. */
+  registeredModels?: () => Promise<RegisteredModels>
   hostEnv: NodeJS.ProcessEnv
   exec: Exec
   profileFs: ProfileFs
@@ -219,9 +222,11 @@ export function upFailure(result: ExecResult, secrets: string[]): DelegateError 
   return new DelegateError("server_down", "The sandbox failed to start.", "Run oc_doctor; check Docker Desktop.", detail)
 }
 
-async function start(run: Run, plan: Plan): Promise<ApiTarget> {
+async function start(run: Run, planned: Plan): Promise<ApiTarget> {
   const { deps } = run
   return withLease(run, async () => {
+    // #71: the models registered in Synapse now (never throws; `auto` only when unreadable).
+    const plan = await withSynapseModels(deps, planned, run.note)
     await prepareFiles(run, plan)
     const password = deps.randomPassword()
     const port = await deps.freePort()
@@ -255,7 +260,10 @@ async function prepareHost(run: Run): Promise<void> {
 /** This bridge's plan (profile, policy, front config) for `keystone`, or for the saved / default set. */
 async function plan(run: Run, keystone?: readonly string[]): Promise<Plan> {
   const made = await planFor(run.deps, keystone)
-  if (made.built.dropped.length) run.note("warn", "providers left out of the box profile", { dropped: made.built.dropped.map((d) => d.provider).join(",") })
+  // #71 review cycle 1: model / small_model drops depend on the registered list, which only a start
+  // reads; withSynapseModels reports them there, once. Here the plan has `auto` only.
+  const left = made.built.dropped.filter((d) => d.provider !== "model" && d.provider !== "small_model")
+  if (left.length) run.note("warn", "providers left out of the box profile", { dropped: left.map((d) => d.provider).join(",") })
   return made
 }
 

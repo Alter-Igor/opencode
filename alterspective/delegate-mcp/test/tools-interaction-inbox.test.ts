@@ -55,6 +55,20 @@ describe("oc_post", () => {
     expect(f.hub.marked).toEqual([SES_A])
   })
 
+  // #71 cycle 3: a wake names a Synapse model too (no saved model: the box default), so OpenCode
+  // never reuses a session's stored pre-#71 model.
+  test("a wake sends the box default model explicitly (GET /config, else synapse/auto)", async () => {
+    const f = withPrompt(fixture([record(SES_A, DIR_A)]))
+    f.api.route("GET", "/config", { status: 200, data: { model: "synapse/qwen/qwen3.8-flash" } })
+    const c = await client(f)
+    await c.call("oc_post", { to: `session:${SES_A}`, text: "go", wake: true })
+    expect(f.api.posts()[0]?.body).toMatchObject({ model: { providerID: "synapse", modelID: "qwen/qwen3.8-flash" } })
+    const g = withPrompt(fixture([record(SES_A, DIR_A)]))
+    const d = await client(g)
+    await d.call("oc_post", { to: `session:${SES_A}`, text: "go", wake: true })
+    expect(g.api.posts()[0]?.body).toMatchObject({ model: { providerID: "synapse", modelID: "auto" } })
+  })
+
   test("never wakes a session this bridge did not start, and posts nothing then", async () => {
     const f = withPrompt(fixture([record(SES_A, DIR_A)]))
     // The box knows SES_OTHER, but its metadata names another supervisor.

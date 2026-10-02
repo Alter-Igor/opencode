@@ -77,7 +77,7 @@ export const startSessionTool = defineTool({
     directory: z.string().min(1).max(1024).describe("The owner's repository (a folder under the allowed roots, e.g. C:\\GitHub\\my-repo)."),
     title: z.string().max(200).optional(),
     agent: agentSchema.optional().describe("OpenCode agent for the session, e.g. build (default) or plan."),
-    model: modelSchema.optional().describe("Default model for this session's sends, as provider/model."),
+    model: modelSchema.optional().describe("Default model for this session's sends: a Synapse model from oc_list_models (synapse/<id>). Default: the sandbox's default, synapse/auto."),
     profile: z.enum(["standard", "readonly"]).optional().describe("Permission profile. readonly denies edits and asks before any shell command. Default standard."),
     allowShared: z.boolean().optional().describe("Allow this session while another one of ours is still working in the same repo (each has its own copy)."),
     keystone: z

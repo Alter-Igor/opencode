@@ -48,6 +48,15 @@ export function parseModel(value: string): { providerID: string; modelID: string
   return { providerID: value.slice(0, slash), modelID: value.slice(slash + 1) }
 }
 
+/**
+ * #71: Synapse is the box's only provider (enabled_providers: ["synapse"]), so a model of any other
+ * provider is refused with a clear error rather than failing inside the box.
+ */
+export function requireSynapseModel(model: string): void {
+  if (parseModel(model).providerID === "synapse") return
+  throw new DelegateError("invalid_input", "The sandbox offers only Synapse models (synapse/<id>).", "Call oc_list_models and pick one of its ids, for example synapse/auto (the default).")
+}
+
 export function formatCursor(cursor: Cursor): string {
   return `${cursor.epoch}.${cursor.seq}`
 }

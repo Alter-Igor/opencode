@@ -150,7 +150,7 @@ describe("the box holds no Synapse credential", () => {
 
   test("the compose child never gets a Synapse key, even when the host has one", () => {
     const config = defaultConfig({ OPENCODE_DELEGATE_HOME: os.tmpdir() })
-    const built = { files: {}, hash: "h", providers: [], dropped: [] }
+    const built = { files: {}, hash: "h", providers: [], dropped: [], offered: [], request: { settings: {} } }
     const env = composeEnv({ config, hostEnv: { PATH: "p", SYNAPSE_API_KEY: "host-key" }, image: "img", opencodeVersion: "1" }, { built, port: 1, password: "pw", front: { servers: "", hash: "f" } })
     expect(Object.keys(env).filter((name) => /SYNAPSE/i.test(name))).toEqual([])
     expect(Object.values(env)).not.toContain("host-key")
