@@ -136,6 +136,19 @@ describe("parseSynapseModelList", () => {
     expect(models["bare-model"].limit).toEqual({ context: SYNAPSE_DEFAULT_CONTEXT, output: SYNAPSE_DEFAULT_OUTPUT })
   })
 
+  test("#80: drops models Synapse marks capabilities.tools false; tools absent or true is kept", () => {
+    const models = parseSynapseModelList({
+      object: "list",
+      data: [
+        { id: "claude-opus-5", capabilities: { ops: ["chat"], tools: true } },
+        { id: "gemini-3.1-flash-image", capabilities: { ops: ["chat"], tools: false } },
+        { id: "qwen/qwen3.8-flash", capabilities: { ops: ["chat"] } },
+        { id: "no-caps" },
+      ],
+    })
+    expect(Object.keys(models).sort()).toEqual(["claude-opus-5", "no-caps", "qwen/qwen3.8-flash"])
+  })
+
   test("returns an empty record for a reply that is not a model list", () => {
     expect(parseSynapseModelList({ error: "nope" })).toEqual({})
     expect(parseSynapseModelList(null)).toEqual({})

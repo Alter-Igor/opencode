@@ -74,7 +74,7 @@ describe("normalise", () => {
     const odd = unwrap(JSON.stringify({ payload: { type: "session.status", properties: { sessionID: "ses_1", status: { type: "weird" } } } }))
     expect(odd && normalise(odd)).toEqual({ kind: "ignored", type: "session.status" })
     const error = unwrap(JSON.stringify({ payload: { type: "session.error", properties: { sessionID: "ses_1", error: { name: "MessageAbortedError", data: { message: "x" } } } } }))
-    expect(error && normalise(error)).toEqual({ kind: "error", sessionID: "ses_1", name: "MessageAbortedError", aborted: true })
+    expect(error && normalise(error)).toEqual({ kind: "error", sessionID: "ses_1", name: "MessageAbortedError", aborted: true, code: "aborted", detail: "x" })
   })
 
   const wire = (type: string, properties: Record<string, unknown>, directory?: string) => {

@@ -27,6 +27,7 @@ export function shapeEvent(e: HubEvent) {
     ...(e.state ? { state: e.state } : {}),
     summary: e.summary,
     ...(e.requestID ? { requestID: e.requestID } : {}),
+    ...(e.code ? { code: e.code } : {}),
     ...(e.untrusted !== undefined ? { untrusted: untrusted(e.untrusted, 2000) } : {}),
   }
 }

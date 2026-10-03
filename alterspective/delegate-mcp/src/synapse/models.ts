@@ -9,7 +9,9 @@
 //
 // `auto` is Synapse's routing alias: Synapse does not list it, so it is always added, first.
 // Entries Synapse marks as not chat-capable (embed, rerank or image only) are left out: an
-// OpenCode session cannot use them. contextWindow / maxOutput become the model's limit.
+// OpenCode session cannot use them. So are entries marked capabilities.tools false (#80,
+// Synapse#1813): OpenCode always sends tools, so they would always fail. Absent or true keeps the
+// entry. contextWindow / maxOutput become the model's limit.
 //
 // Any failure (no token yet, HTTP error, bad body, timeout) gives `auto` only and a reason: the box
 // still starts, with Synapse's own routing. The owner's static model list is never a fallback (it
@@ -135,7 +137,7 @@ function parseEntries(text: string): Entry[] | undefined {
   return data.flatMap((item: unknown): Entry[] => {
     if (!isRecord(item) || typeof item.id !== "string") return []
     const limit = positiveInt(item.contextWindow) && positiveInt(item.maxOutput) ? { context: item.contextWindow, output: item.maxOutput } : undefined
-    return [{ id: item.id, chat: chatCapable(item.capabilities), ...(limit ? { limit } : {}) }]
+    return [{ id: item.id, chat: chatCapable(item.capabilities) && toolCapable(item.capabilities), ...(limit ? { limit } : {}) }]
   })
 }
 
@@ -143,6 +145,11 @@ function parseEntries(text: string): Entry[] | undefined {
 function chatCapable(capabilities: unknown): boolean {
   const ops = isRecord(capabilities) ? capabilities.ops : undefined
   return !Array.isArray(ops) || ops.length === 0 || ops.includes("chat")
+}
+
+/** #80: capabilities.tools false means the model cannot take tool calls. Absent or true: kept. */
+function toolCapable(capabilities: unknown): boolean {
+  return !isRecord(capabilities) || capabilities.tools !== false
 }
 
 const positiveInt = (value: unknown): value is number => typeof value === "number" && Number.isInteger(value) && value > 0

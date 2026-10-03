@@ -56,12 +56,15 @@ export function statusEvent(change: Change, cause?: string): HubEventInput {
 
 type Specific = Extract<Raw, { kind: "error" | "permission.asked" | "question.asked" | "text.final" | "todo" }>
 
-function specific(raw: Specific, id: string): Pick<HubEventInput, "type" | "summary" | "untrusted" | "requestID"> {
+function specific(raw: Specific, id: string): Pick<HubEventInput, "type" | "summary" | "untrusted" | "requestID" | "code"> {
   switch (raw.kind) {
     case "error": {
       const label = errorLabel(raw.name)
-      const named = label === raw.name ? {} : { untrusted: untrusted(`error name: ${raw.name}`) }
-      return { type: "error", summary: raw.aborted ? `session ${id} was aborted` : `session ${id} reported an error: ${label}`, ...named }
+      // #80: the code is a bridge word (SESSION_ERROR_CODES); the provider message is box text, so untrusted only.
+      const code = raw.code && raw.code !== "aborted" ? ` (${raw.code})` : ""
+      const lines = [...(label === raw.name ? [] : [`error name: ${raw.name}`]), ...(raw.detail ? [`message: ${raw.detail}`] : [])]
+      const extra = lines.length ? { untrusted: untrusted(lines.join("\n")) } : {}
+      return { type: "error", summary: raw.aborted ? `session ${id} was aborted` : `session ${id} reported an error: ${label}${code}`, ...(raw.code ? { code: raw.code } : {}), ...extra }
     }
     case "permission.asked": {
       const patterns = `${raw.patterns} pattern${raw.patterns === 1 ? "" : "s"}`

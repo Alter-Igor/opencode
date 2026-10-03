@@ -9,6 +9,13 @@ import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { INJECTED_LEARNINGS_LIMIT, learningStorePaths, sessionObserver, sanitizeJsonSchemaForOpenAI } from "./observer"
 import { EscalationTracker, declaredTier, classifyFailure, malformedToolCallFromEvent } from "./synapse-escalation"
 import {
+  SYNAPSE_AUTO_ROUTE,
+  pinnedFallbackEnabled,
+  pinnedFallbackNotice,
+  pinnedModelFallback,
+  type PinnedFallbackEvent,
+} from "./synapse-fallback"
+import {
   createSynapseModelsFailureLogger,
   loadSynapseModels,
   readStoredSynapseCredential,
@@ -24,6 +31,8 @@ export const KEYSTONE_AUTHORIZE = `${KEYSTONE_ISSUER}/api/oauth/authorize`
 export const KEYSTONE_TOKEN = `${KEYSTONE_ISSUER}/api/oidc/token`
 export const SYNAPSE_DEFAULT_INFERENCE_URL = "https://synapse2-api.alterspective.com.au/v1"
 export const SYNAPSE_RESOURCE = "https://synapse-mcp.alterspective.com.au/mcp"
+/** #80: the MCP bridge path's fallback model: Synapse's own routing, still local-only. */
+export const SYNAPSE_MCP_FALLBACK_MODEL = SYNAPSE_AUTO_ROUTE
 // /v1 inference and /mcp both admit a token minted for the `synapse` app audience
 // (ADR-0076 pass-through). A resource-URI audience is rejected by /v1, which is why
 // the fork previously fell back to the MCP bridge (which cannot carry tool schemas).
@@ -750,6 +759,10 @@ interface SynapsePluginOptions {
   audience?: string
   /** How long a chat request waits for a token refresh. Default SYNAPSE_CHAT_REFRESH_WAIT_MS. */
   refreshWaitMs?: number
+  /** #80: resend a failed pinned-model request once with `auto`. Default: on unless OPENCODE_SYNAPSE_PINNED_FALLBACK=0. */
+  pinnedFallback?: boolean
+  /** #80: tell the person a pinned model fell back to `auto`. Default: a TUI toast when the client has one. */
+  notify?: (message: string) => void
 }
 
 export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePluginOptions): Promise<Hooks> {
@@ -761,6 +774,20 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
   let bridgeMode = false
   // Where this instance's model list comes from; set by the config hook.
   let modelsTarget: SynapseModelsTarget | undefined
+
+  // #80: log the pinned-model fallback (no token, no message text) and tell the person.
+  function reportPinnedFallback(event: PinnedFallbackEvent): void {
+    sessionObserver.logDiagnostic(
+      { timestamp: new Date().toISOString(), type: "FALLBACK_TRIGGERED", details: { ...event } },
+      input.directory,
+    )
+    const message = pinnedFallbackNotice(event)
+    try {
+      if (options?.notify) return options.notify(message)
+      const toast = input.client?.tui?.showToast?.({ body: { title: "Synapse", message, variant: "warning" } })
+      void Promise.resolve(toast).catch(() => undefined)
+    } catch {}
+  }
 
   async function saveSynapseCredential(cred: NonNullable<SynapseCredentialState["latest"]>): Promise<void> {
     try {
@@ -1013,17 +1040,18 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                       timestamp: new Date().toISOString(),
                       type: "FALLBACK_TRIGGERED",
                       details: {
-                        reason: "Cloud provider credit/rate limit detected — switching to Synapse On-Premises",
+                        reason: "Synapse MCP chat failed (credit, rate limit or error) — retrying once with Synapse auto, local-only",
                         initialModel: requestBodyJson?.model,
+                        fallbackModel: SYNAPSE_MCP_FALLBACK_MODEL,
                       },
                     },
                     input.directory,
                   )
 
-                  // Automatic Fallback to Synapse On-Premises ($0 cost)
+                  // #80: fall back to Synapse's own routing (`auto`), kept local-only.
                   chatArgs = {
                     messages: normalizedMessages,
-                    model: "qwen/qwen3-coder-next",
+                    model: SYNAPSE_MCP_FALLBACK_MODEL,
                     privacyTier: "local-only",
                     taskType: "code",
                     ...(typeof requestBodyJson?.max_tokens === "number"
@@ -1127,7 +1155,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
 
 
                   if (fallbackApplied) {
-                    parsedContent = `[Notice: Cloud provider limit reached. Seamlessly switched to Synapse On-Premises ($0 cost).]\n\n${parsedContent}`
+                    parsedContent = `[Notice: the requested model was unavailable. Switched to Synapse auto (local-only).]\n\n${parsedContent}`
                   }
 
                   sessionObserver.logDiagnostic(
@@ -1359,10 +1387,27 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
               )
             }
 
-            const response = await fetch(requestInput, { ...init, body: sanitizedBody, headers }).catch((err: unknown) => {
+            let response = await fetch(requestInput, { ...init, body: sanitizedBody, headers }).catch((err: unknown) => {
               escalations.recordFailure(sessionKey, "provider-error")
               throw err
             })
+            // #80: a pinned model that cannot serve this request is resent ONCE with `auto`
+            // (same body and headers, so local-only stays local-only).
+            if (!response.ok) {
+              const fallback = await pinnedModelFallback({
+                model: requestBodyJson?.model,
+                body: sanitizedBody,
+                headers,
+                response,
+                enabled: options?.pinnedFallback ?? pinnedFallbackEnabled(),
+                signal: init?.signal,
+                resend: (body) => fetch(requestInput, { ...init, body, headers }),
+              })
+              if (fallback.event) {
+                reportPinnedFallback(fallback.event)
+                response = fallback.response
+              }
+            }
             if (response.ok) {
               // A 200 with empty content must not clear the failure streak (AIESC-02).
               // SSE streams are consumed downstream by the SDK; only buffered JSON bodies are checked here.
