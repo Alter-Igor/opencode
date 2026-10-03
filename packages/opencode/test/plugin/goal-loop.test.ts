@@ -81,6 +81,24 @@ describe("parseGoalArgs", () => {
     })
   })
 
+  test("keeps quotes in the goal text and unquotes only option values", () => {
+    expect(
+      parseGoalArgs(`set the "state" field to 'done' --check "bun test" --record 'runs/r1/state.json'`),
+    ).toMatchObject({
+      action: "start",
+      goal: `set the "state" field to 'done'`,
+      check: "bun test",
+      record: "runs/r1/state.json",
+    })
+  })
+
+  test("a quoted --word is goal text, not an option", () => {
+    expect(parseGoalArgs(`explain "--force" in the README --check "bun test"`)).toMatchObject({
+      action: "start",
+      goal: `explain "--force" in the README`,
+    })
+  })
+
   test("reads the control words", () => {
     expect(parseGoalArgs("stop")).toEqual({ action: "stop" })
     expect(parseGoalArgs(" Status ")).toEqual({ action: "status" })

@@ -71,28 +71,30 @@ export type CheckRunner = (input: { command: string; cwd: string; timeoutSeconds
 export const GOAL_USAGE =
   '/goal <what done looks like> --check "<command that exits 0 when done>" [--turns N] [--minutes N] [--timeout SECONDS] [--record <portable state.json>]  |  /goal status  |  /goal stop  |  /goal resume'
 
+// `raw` is the token as typed, quotes included; `value` drops one pair of surrounding quotes.
 function tokens(text: string) {
-  return [...text.matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)].map((m) => m[1] ?? m[2] ?? m[3])
+  return [...text.matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)].map((m) => ({ raw: m[0], value: m[1] ?? m[2] ?? m[3] }))
 }
 
 export function parseGoalArgs(text: string): GoalArgs {
   const words = tokens(text.trim())
-  const word = words.length === 1 ? words[0].toLowerCase() : ""
+  const word = words.length === 1 ? words[0].raw.toLowerCase() : ""
   if (word === "stop" || word === "status" || word === "resume") return { action: word }
 
   const flags: Record<string, string> = {}
   const rest: string[] = []
   for (let i = 0; i < words.length; i++) {
-    if (!words[i].startsWith("--")) {
-      rest.push(words[i])
+    // Goal words keep their quotes; only option values are unquoted. A quoted "--x" is goal text.
+    if (!words[i].raw.startsWith("--")) {
+      rest.push(words[i].raw)
       continue
     }
-    const name = words[i].slice(2)
+    const name = words[i].raw.slice(2)
     if (!["check", "record", "turns", "minutes", "timeout"].includes(name))
       return { action: "error", message: `Unknown option --${name}.` }
-    if (i + 1 >= words.length || words[i + 1].startsWith("--"))
+    if (i + 1 >= words.length || words[i + 1].raw.startsWith("--"))
       return { action: "error", message: `--${name} needs a value.` }
-    flags[name] = words[++i]
+    flags[name] = words[++i].value
   }
 
   const number = (name: string, fallback: number) => {
