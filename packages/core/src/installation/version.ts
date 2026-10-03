@@ -8,8 +8,9 @@ declare global {
 }
 
 // Fork-only (#87): a source run (opencodealt) builds its label from the package version and
-// the checkout's commit, plus when that commit landed in this checkout. It reads the git files
-// directly, so startup spawns nothing. A compiled build shows the version it was built with.
+// the checkout's commit, plus when that commit landed in this checkout (from the reflog). It
+// reads the git files directly, so startup spawns nothing. A compiled build shows the version
+// it was built with.
 export function sourceVersion(root = fileURLToPath(new URL("../../../..", import.meta.url))) {
   const read = (file: string) => (existsSync(file) ? readFileSync(file, "utf8").trim() : undefined)
   const version = JSON.parse(read(path.join(root, "packages", "core", "package.json")) ?? "{}").version
@@ -30,11 +31,18 @@ export function sourceVersion(root = fileURLToPath(new URL("../../../..", import
           ?.split("\n")
           .find((line) => line.endsWith(` ${ref}`))
           ?.split(" ")[0]
-  const landed = statSync(refFile ?? path.join(ref ? common : gitDir, ref ? "packed-refs" : "HEAD"), {
-    throwIfNoEntry: false,
-  })?.mtime
+  // The reflog's last line records when this ref (or a detached HEAD) moved to its commit.
+  // File times are not used: packed-refs changes whenever git packs any ref.
+  const entry = [gitDir, common]
+    .map((dir) => read(path.join(dir, "logs", ref ?? "HEAD")))
+    .find((log) => log !== undefined)
+    ?.split("\n")
+    .at(-1)
+    ?.match(/^[0-9a-f]{40} ([0-9a-f]{40}) .*> (\d+) [+-]\d{4}\t/)
   const label = `${version ?? "local"}-alt`
-  if (!sha || !/^[0-9a-f]{40}$/.test(sha) || !landed) return label
+  if (!sha || !/^[0-9a-f]{40}$/.test(sha)) return label
+  if (!entry || entry[1] !== sha) return `${label} [${sha.slice(0, 10)}]`
+  const landed = new Date(Number(entry[2]) * 1000)
   const pad = (value: number) => String(value).padStart(2, "0")
   const time = `${landed.getFullYear()}-${pad(landed.getMonth() + 1)}-${pad(landed.getDate())} ${pad(landed.getHours())}:${pad(landed.getMinutes())}`
   return `${label} [${sha.slice(0, 10)} ${time}]`
