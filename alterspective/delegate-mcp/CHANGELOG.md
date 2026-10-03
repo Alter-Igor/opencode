@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.1 — 2026-10-03
+
+**Failed models are explained, and models without tool support are hidden (#80).**
+
+- `oc_result` returns `errorCode` and `errorUntrusted` for a failed model, instead of only `UnknownError`. `oc_wait` / `oc_events` error events carry the same `code`. Codes: `budget_exhausted`, `rate_limited`, `no_tool_support`, `model_not_found`, `auth`, `context_overflow`, `content_filter`, `output_length`, `aborted`, `other`. The provider's message is untrusted text, scrubbed of secrets before it is cut to 500 characters.
+- Models that Synapse marks `capabilities.tools: false` are left out of the box's list.
+- The fork's Synapse plugin, which runs on the owner's machine and not in the box, now falls back once to `auto` when a pinned model cannot serve a request. See the fork `AGENTS.md`.
+
 ## 0.2.0 — 2026-10-03
 
 **Synapse only (#71).** The box uses only Synapse, with `synapse/auto` as the default. This is an owner rule, not a setting.
