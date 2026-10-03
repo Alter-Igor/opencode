@@ -112,6 +112,9 @@ export function parseSynapseModelList(body: unknown): Record<string, SynapseMode
     if (!isRecord(item) || typeof item.id !== "string" || item.id === "") continue
     const caps = isRecord(item.capabilities) ? item.capabilities : undefined
     if (caps && Array.isArray(caps.ops) && !caps.ops.includes("chat")) continue
+    // #80: OpenCode always sends tools, so a model Synapse marks as unable to use them
+    // (Synapse#1813) would always fail. Absent or true keeps the model.
+    if (caps && caps.tools === false) continue
     models[item.id] = modelFromItem(item)
   }
   return models

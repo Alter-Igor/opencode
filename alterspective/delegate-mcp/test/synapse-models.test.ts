@@ -72,6 +72,22 @@ describe("registeredModels (#71)", () => {
     })
   })
 
+  test("#80: entries Synapse marks capabilities.tools false are left out; tools absent or true is kept", async () => {
+    await withFront(TOKEN, async (frontDir) => {
+      const body = {
+        object: "list",
+        data: [
+          { id: "claude-opus-5", capabilities: { ops: ["chat"], tools: true } },
+          { id: "gemini-3.1-flash-image", capabilities: { ops: ["chat"], tools: false } },
+          { id: "qwen/qwen3.8-flash", capabilities: { ops: ["chat"] } },
+          { id: "no-caps" },
+        ],
+      }
+      const got = await registeredModels({ frontDir, fetch: fakeFetch(() => new Response(JSON.stringify(body), { status: 200 })) })
+      expect(got.models).toEqual(["auto", "claude-opus-5", "no-caps", "qwen/qwen3.8-flash"])
+    })
+  })
+
   test("no include, or an include without a token: fallback to auto, and Synapse is not called", async () => {
     for (const token of [undefined, null] as const) {
       await withFront(token === null ? undefined : token, async (frontDir) => {

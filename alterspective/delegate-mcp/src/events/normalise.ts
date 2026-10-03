@@ -3,6 +3,8 @@
 // Only fields the hub needs survive; everything else (and every unknown type) is dropped here, so
 // no other module touches the untyped payload. Session text is kept only for the final text part.
 
+import { sessionErrorCode, sessionErrorDetail, type SessionErrorCode } from "../shared/session-error.ts"
+
 export type Wrapper = { directory?: string; type: string; props: Obj }
 
 type Obj = Record<string, unknown>
@@ -11,7 +13,7 @@ export type Raw =
   | { kind: "connected" }
   | { kind: "heartbeat" }
   | { kind: "status"; sessionID: string; status: "idle" | "busy" | "retry"; attempt?: number }
-  | { kind: "error"; sessionID?: string; name: string; aborted: boolean }
+  | { kind: "error"; sessionID?: string; name: string; aborted: boolean; code?: SessionErrorCode; detail?: string }
   | { kind: "permission.asked"; sessionID: string; requestID: string; permission: string; patterns: number }
   | { kind: "permission.replied"; sessionID: string; requestID: string; reply: string }
   | { kind: "question.asked"; sessionID: string; requestID: string; count: number }
@@ -65,7 +67,9 @@ function status(p: Obj): Raw | undefined {
 
 function error(p: Obj): Raw {
   const name = str(obj(p.error).name) ?? "UnknownError"
-  return { kind: "error", sessionID: str(p.sessionID), name, aborted: name === "MessageAbortedError" }
+  // #80: a known code and the provider message (scrubbed, capped), so a failed model is not just "UnknownError".
+  const detail = sessionErrorDetail(p.error)
+  return { kind: "error", sessionID: str(p.sessionID), name, aborted: name === "MessageAbortedError", code: sessionErrorCode(p.error), ...(detail ? { detail } : {}) }
 }
 
 function permission(type: string, p: Obj): Raw | undefined {

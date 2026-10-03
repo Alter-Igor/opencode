@@ -90,6 +90,8 @@ export type HubEvent = {
   untrusted?: string
   /** Request id for permission/question events (answer with oc_answer). Always matches ^(per|que)_[A-Za-z0-9]{1,36}$. */
   requestID?: string
+  /** Additive (#80): for error events, why the session failed, from the bridge's known set (session-error.ts), else "other". */
+  code?: string
 }
 
 /**
