@@ -154,7 +154,7 @@ The box uses only Synapse. This is an owner rule, not a setting.
 
 ### Failed models
 
-When a session's model fails, `oc_result` returns `error` (OpenCode's error name), `errorCode` and `errorUntrusted`. Error events from `oc_wait` and `oc_events` carry the same `code`, the summary names it, and the provider's message is under `untrusted`.
+When a session's model fails, `oc_result` returns `error` (OpenCode's error name) and `errorCode`, plus `errorUntrusted` when the provider sent a message. Error events from `oc_wait` and `oc_events` carry the same `code`, the summary names it, and the provider's message is under `untrusted`.
 
 | `errorCode` | Meaning | What to do |
 |---|---|---|

@@ -64,7 +64,23 @@ const NO_TOOL_SUPPORT =
  * Synapse's model-missing replies: 404 `model_not_available` ("No available instance serves
  * model ...", "Model ... is not available to this caller") without the tool wording above.
  */
-const MODEL_NOT_AVAILABLE = /model_not_found|model_unavailable|model_not_available|no available instance serves model/i
+const MODEL_NOT_AVAILABLE_CODES = new Set(["model_not_found", "model_unavailable", "model_not_available"])
+/** Message wording that names the model as unavailable; any other text mentioning the codes does not count. */
+const MODEL_NOT_AVAILABLE_TEXT = /no available instance serves model/i
+
+/**
+ * The structured error code of an error body: `error.code` or a top-level `code`. A body that
+ * is not JSON (an MCP tool error string) is searched for a `"code": "..."` pair instead.
+ */
+export function errorCodeOf(body: string): string | undefined {
+  try {
+    const value: any = JSON.parse(body)
+    const code = value?.error?.code ?? value?.code
+    return typeof code === "string" ? code : undefined
+  } catch {
+    return /"code"\s*:\s*"([A-Za-z0-9_.-]+)"/.exec(body)?.[1]
+  }
+}
 /**
  * The caller declined model substitution (Synapse authorization-guard: "This request declined
  * model substitution, so ... could not be served by ..."). Falling back to `auto` would override
@@ -180,7 +196,8 @@ export function classifyModelUnusable(status: number, body: string): PinnedFallb
   if (status === 402 || BUDGET_CODE.test(body)) return "budget"
   if (BUDGET_WORDS.test(body) && AVAILABILITY.test(body)) return "budget"
   if (status === 429 || /rate_limited/i.test(body)) return "rate-limited"
-  if (MODEL_NOT_AVAILABLE.test(body)) return "model-unavailable"
+  const code = errorCodeOf(body)
+  if ((code !== undefined && MODEL_NOT_AVAILABLE_CODES.has(code)) || MODEL_NOT_AVAILABLE_TEXT.test(body)) return "model-unavailable"
   // A plain route-not-found 404 is not about the model, so `auto` would not help.
   if (status === 404 && MODEL_MISSING.test(body) && !ROUTE_MISSING.test(body)) return "model-unavailable"
   return undefined

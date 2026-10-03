@@ -682,3 +682,15 @@ describe("cycle 3: model_not_available labels and declined substitution", () => 
     }
   })
 })
+
+describe("PR review: model-unavailable codes come from the error code field", () => {
+  test("a 400 whose message only mentions a model-unavailable code does not fall back", () => {
+    const body = JSON.stringify({ error: { code: "invalid_request", message: "Unknown field model_not_available" } })
+    expect(classifyModelUnusable(400, body)).toBeUndefined()
+  })
+  test("the code field still counts, at the top level or under error, and in a non-JSON MCP error string", () => {
+    expect(classifyModelUnusable(404, JSON.stringify({ code: "model_not_available" }))).toBe("model-unavailable")
+    expect(classifyModelUnusable(404, JSON.stringify({ error: { code: "model_unavailable" } }))).toBe("model-unavailable")
+    expect(classifyModelUnusable(404, 'tool error: {"code": "model_not_available", "message": "gone"}')).toBe("model-unavailable")
+  })
+})
