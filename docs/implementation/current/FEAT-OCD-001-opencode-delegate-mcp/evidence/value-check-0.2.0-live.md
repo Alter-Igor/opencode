@@ -34,7 +34,15 @@ PR review also found that the script's wait loop read the new cursor from the wr
 
 `opencode models` from this checkout (`packages/opencode`, `bun run src/index.ts models`) lists 9 models, all from the `synapse` provider: `synapse/auto` and the same 8 as above. No other provider appears.
 
-This shows the owner's config offers only Synapse. It does **not** prove the plugin loaded the list live: the owner's config already names those 8 models, and no `synapse-models.json` cache was found in OpenCode's state folder. The likely reason is that the stored Synapse sign-in had expired. By design (#74), startup then uses the configured list and never renews a sign-in. The cache is written after the next chat renews the token. **Not verified live.**
+This shows the owner's config offers only Synapse. On its own it did not prove the plugin loaded the list live: the owner's config already names those 8 models, and no `synapse-models.json` cache was in OpenCode's state folder yet.
+
+**Verified live later the same day (2026-10-03, UTC 01:49–01:51).** The check used the owner's `opencodealt`, which runs this checkout on `dev` at `20fcf451d5`:
+
+1. **Why there was no cache:** the stored Synapse credential's `expiresAt` was 2026-10-02 14:03 UTC, so it had expired. Startup made no request and used the configured list, as designed. There was no `FALLBACK_TRIGGERED` entry, so no fetch had failed.
+2. **One chat renewed the sign-in:** `opencodealt run "Reply with the single word OK." -m synapse/auto`. The new `expiresAt` is 02:49:40 UTC. In the same second the plugin wrote `synapse-models.json` (`savedAt` 01:49:40 UTC) with the 8 models Synapse lists. The file holds no token-like text.
+3. **Next startup:** with a valid sign-in, `opencodealt models synapse` fetched live and rewrote the cache (`savedAt` 01:50:48 UTC). It listed 9 models (the 8 plus `auto`), all `synapse`.
+
+#74 is closed with this evidence. No token value was printed or recorded.
 
 ## How the run went
 
@@ -51,5 +59,4 @@ Each stopped run left at most one session open. The next run closed it first (`a
 
 - Which model Synapse picked behind `synapse/auto` (follow-up #76).
 - `oc_cleanup` with a real stale session (no session of this bridge was older than 14 days). The dry run's own logic is covered by the unit tests.
-- The fork plugin's live fetch (#74): see above. It is covered by its unit tests.
 - Older records from other bridges (31) are left as they are, by design.
