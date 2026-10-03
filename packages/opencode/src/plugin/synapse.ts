@@ -12,13 +12,16 @@ import {
   PinnedFallbackMemory,
   SYNAPSE_AUTO_ROUTE,
   classifyModelUnusable,
+  isEventStream,
   isPinnedModel,
   mcpToolErrorText,
   pinnedFallbackEnabled,
   pinnedFallbackNotice,
   pinnedModelFallback,
+  peekSseError,
   withAutoModel,
   type PinnedFallbackEvent,
+  type StreamError,
 } from "./synapse-fallback"
 import {
   createSynapseModelsFailureLogger,
@@ -770,6 +773,8 @@ interface SynapsePluginOptions {
   notify?: (message: string) => void
   /** #80: per-session memory of failed pinned models (process memory, ~10 min TTL). Injectable for tests. */
   fallbackMemory?: PinnedFallbackMemory
+  /** #80 follow-up: bounds for peeking at a stream's first event. Default 64 KB and 15 s. */
+  ssePeek?: { maxBytes?: number; timeoutMs?: number }
 }
 
 export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePluginOptions): Promise<Hooks> {
@@ -1424,7 +1429,15 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
             // #80: a pinned model that cannot serve this request is resent ONCE with `auto`
             // (same body and headers, so local-only stays local-only).
             let pinnedFailure: { status: number; statusText: string; errorBody: string } | undefined
-            if (!response.ok && sentModel === pinnedModel) {
+            // #80 follow-up: with stream:true the failure comes as the first event of an HTTP 200
+            // stream. Peek at that event only (bounded); the stream is handed on byte for byte.
+            let streamError: StreamError | undefined
+            if (response.ok && sentModel === pinnedModel && pinnedFallbackOn && isPinnedModel(pinnedModel) && isEventStream(response)) {
+              const peek = await peekSseError(response, { ...options?.ssePeek, signal: init?.signal })
+              response = peek.response
+              streamError = peek.error
+            }
+            if ((!response.ok || streamError) && sentModel === pinnedModel) {
               const failed = response
               const fallback = await pinnedModelFallback({
                 model: pinnedModel,
@@ -1434,11 +1447,16 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                 enabled: pinnedFallbackOn,
                 signal: init?.signal,
                 resend: (body) => fetch(requestInput, { ...init, body, headers }),
+                streamError,
               })
               if (fallback.event) {
                 fallbackMemory.markFailed(sessionKey, fallback.event.originalModel)
                 if (fallbackMemory.shouldReport(sessionKey, fallback.event.originalModel)) reportPinnedFallback(fallback.event)
-                pinnedFailure = { status: failed.status, statusText: failed.statusText, errorBody: fallback.originalErrorBody ?? "" }
+                pinnedFailure = {
+                  status: streamError?.status ?? failed.status,
+                  statusText: streamError ? "error event in stream" : failed.statusText,
+                  errorBody: fallback.originalErrorBody ?? "",
+                }
                 response = fallback.response
                 sentModel = SYNAPSE_AUTO_ROUTE
               }

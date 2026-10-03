@@ -134,9 +134,8 @@ class SessionObserverManager {
       } catch {}
     }
     try {
-      const homeDir = process.env.USERPROFILE || process.env.HOME || ""
-      if (homeDir) {
-        const centralLogDir = path.join(homeDir, ".local", "share", "opencode", "log")
+      const centralLogDir = diagnosticsLogDir()
+      if (centralLogDir) {
         await fs.mkdir(centralLogDir, { recursive: true })
         await fs.appendFile(path.join(centralLogDir, "diagnostics.log"), logLine, "utf8")
       }
@@ -480,6 +479,17 @@ class SessionObserverManager {
 
 /** How many of the most-recent rules are injected into a session system prompt. */
 export const INJECTED_LEARNINGS_LIMIT = 5
+
+/**
+ * Where the machine-wide diagnostics.log goes: OPENCODE_DIAGNOSTICS_DIR, else
+ * <home>/.local/share/opencode/log. OPENCODE_TEST_HOME wins over the real home, as in core's
+ * Global.Path.home, so a test run never writes to the person's real log (#80 follow-up).
+ */
+export function diagnosticsLogDir(): string | undefined {
+  if (process.env.OPENCODE_DIAGNOSTICS_DIR) return process.env.OPENCODE_DIAGNOSTICS_DIR
+  const homeDir = process.env.OPENCODE_TEST_HOME || process.env.USERPROFILE || process.env.HOME || ""
+  return homeDir ? path.join(homeDir, ".local", "share", "opencode", "log") : undefined
+}
 
 /** The two on-disk rule stores: global (whole machine) and this project. */
 export function learningStorePaths(workspaceDir?: string): { global?: string; project?: string } {
