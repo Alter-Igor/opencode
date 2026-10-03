@@ -22,6 +22,8 @@ describe("sessionErrorCode (#80)", () => {
     expect(sessionErrorCode({ name: "ProviderAuthError", data: { message: "bad key" } })).toBe("auth")
     expect(sessionErrorCode({ name: "ContextOverflowError", data: {} })).toBe("context_overflow")
     expect(sessionErrorCode({ name: "MessageAbortedError" })).toBe("aborted")
+    expect(sessionErrorCode({ name: "APIError", data: { message: "context_length_exceeded: insufficient context window" } })).toBe("context_overflow")
+    expect(sessionErrorCode({ name: "APIError", data: { message: "insufficient credit", statusCode: 401 } })).toBe("auth")
     expect(sessionErrorCode({ name: "UnknownError", data: { message: "something odd" } })).toBe("other")
     expect(sessionErrorCode(undefined)).toBe("other")
     for (const code of ["budget_exhausted", "rate_limited", "no_tool_support", "model_not_found", "auth", "other"]) expect(SESSION_ERROR_CODES as readonly string[]).toContain(code)

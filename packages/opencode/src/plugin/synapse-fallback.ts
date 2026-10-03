@@ -40,6 +40,106 @@ export function isPinnedModel(model: unknown): model is string {
 const CONTEXT_OR_VALIDATION =
   /context_length_exceeded|context[ _]window|maximum context|too many tokens|prompt is too long|context_overflow/i
 
+/** Codes that always mean the model's credit or budget is spent. */
+const BUDGET_CODE = /budget_exhausted|insufficient_quota/i
+/** Words that mean "out of credit" only next to a 402, a budget code or availability wording. */
+const BUDGET_WORDS = /\b(credit|insufficient|balance)\b/i
+/** Wording that says the model (not the request) is unavailable. */
+const AVAILABILITY = /not available|unavailable|no (eligible|available|healthy) (provider|endpoint|rung)s?/i
+/** A 404 that points at the model, not at the route. */
+const MODEL_MISSING = /no endpoints found|model_not_found|model_unavailable|\bmodel\b[^\n]{0,120}\bnot found\b|\brungs?\b/i
+
+/** The same JSON body with `model: "auto"`; every other field is kept. Undefined when it is not a JSON object. */
+export function withAutoModel(body: unknown): string | undefined {
+  if (typeof body !== "string") return undefined
+  try {
+    const value: unknown = JSON.parse(body)
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined
+    return JSON.stringify({ ...(value as Record<string, unknown>), model: SYNAPSE_AUTO_ROUTE })
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The error text of a Synapse MCP chat reply (JSON or SSE `data:` lines) that carries a tool
+ * error, else undefined. A normal reply is never classified, whatever words it contains.
+ */
+export function mcpToolErrorText(rawText: string): string | undefined {
+  for (const chunk of rawText.split(/(?:^|\n)data:\s*/g)) {
+    if (!chunk.trim()) continue
+    let data: any
+    try {
+      data = JSON.parse(chunk.trim())
+    } catch {
+      continue
+    }
+    if (!(data?.isError || data?.result?.isError || data?.result?.structuredContent?.error || data?.error)) continue
+    const error = data.result?.structuredContent?.error ?? data.error ?? data.result?.content?.[0]?.text
+    return typeof error === "string" ? error : JSON.stringify(error ?? "")
+  }
+  return undefined
+}
+
+/** How long a failed pinned model is skipped (straight to `auto`) for one session. */
+export const PINNED_FAILURE_TTL_MS = 10 * 60_000
+const MEMORY_MAX_ENTRIES = 1000
+
+/**
+ * Per-session memory of pinned models that just failed, in process memory only. While a model
+ * is marked, the next steps go straight to `auto`; the mark expires after `ttlMs`. The person is
+ * told (and the fallback logged) once per session and model.
+ */
+export class PinnedFallbackMemory {
+  private readonly failed = new Map<string, number>()
+  private readonly reported = new Set<string>()
+  private readonly ttlMs: number
+  private readonly now: () => number
+
+  constructor(options: { ttlMs?: number; now?: () => number } = {}) {
+    this.ttlMs = options.ttlMs ?? PINNED_FAILURE_TTL_MS
+    this.now = options.now ?? Date.now
+  }
+
+  private static key(session: string, model: string): string {
+    return JSON.stringify([session, model])
+  }
+
+  isFailed(session: string, model: string): boolean {
+    const key = PinnedFallbackMemory.key(session, model)
+    const until = this.failed.get(key)
+    if (until === undefined) return false
+    if (until > this.now()) return true
+    this.failed.delete(key)
+    return false
+  }
+
+  markFailed(session: string, model: string): void {
+    const key = PinnedFallbackMemory.key(session, model)
+    const now = this.now()
+    this.failed.delete(key)
+    this.failed.set(key, now + this.ttlMs)
+    for (const [k, until] of this.failed) if (until <= now) this.failed.delete(k)
+    while (this.failed.size > MEMORY_MAX_ENTRIES) {
+      const oldest = this.failed.keys().next().value
+      if (oldest === undefined) break
+      this.failed.delete(oldest)
+    }
+  }
+
+  /** True the first time only, per session and model. */
+  shouldReport(session: string, model: string): boolean {
+    const key = PinnedFallbackMemory.key(session, model)
+    if (this.reported.has(key)) return false
+    this.reported.add(key)
+    if (this.reported.size > MEMORY_MAX_ENTRIES) {
+      const oldest = this.reported.values().next().value
+      if (oldest !== undefined) this.reported.delete(oldest)
+    }
+    return true
+  }
+}
+
 /** Why the model cannot serve this request, or undefined when `auto` would not help. */
 export function classifyModelUnusable(status: number, body: string): PinnedFallbackReason | undefined {
   if (status === 401 || status === 403) return undefined
@@ -49,9 +149,12 @@ export function classifyModelUnusable(status: number, body: string): PinnedFallb
   }
   // Synapse#1813: the unmet-capability refusal names the capability it could not meet.
   if (/(unmet|unsupported|missing)[ _-]?capabilit/i.test(body) && /\btools?\b/i.test(body)) return "no-tool-support"
-  if (status === 402 || /budget_exhausted|insufficient|credit/i.test(body)) return "budget"
+  if (status === 402 || BUDGET_CODE.test(body)) return "budget"
+  if (BUDGET_WORDS.test(body) && AVAILABILITY.test(body)) return "budget"
   if (status === 429 || /rate_limited/i.test(body)) return "rate-limited"
-  if (status === 404 || /model_not_found|model_unavailable/i.test(body)) return "model-unavailable"
+  if (/model_not_found|model_unavailable/i.test(body)) return "model-unavailable"
+  // A plain route-not-found 404 is not about the model, so `auto` would not help.
+  if (status === 404 && MODEL_MISSING.test(body)) return "model-unavailable"
   return undefined
 }
 
@@ -75,7 +178,7 @@ export interface PinnedFallbackInput {
  */
 export async function pinnedModelFallback(
   input: PinnedFallbackInput,
-): Promise<{ response: Response; event?: PinnedFallbackEvent }> {
+): Promise<{ response: Response; event?: PinnedFallbackEvent; originalErrorBody?: string }> {
   const { response } = input
   if (!input.enabled || response.ok || !isPinnedModel(input.model) || typeof input.body !== "string") {
     return { response }
@@ -90,18 +193,12 @@ export async function pinnedModelFallback(
   const reason = classifyModelUnusable(response.status, errorBody)
   if (!reason) return { response }
 
-  let parsed: Record<string, unknown>
-  try {
-    const value: unknown = JSON.parse(input.body)
-    if (typeof value !== "object" || value === null || Array.isArray(value)) return { response }
-    parsed = value as Record<string, unknown>
-  } catch {
-    return { response }
-  }
+  const autoBody = withAutoModel(input.body)
+  if (!autoBody) return { response }
 
   let fallback: Response
   try {
-    fallback = await input.resend(JSON.stringify({ ...parsed, model: SYNAPSE_AUTO_ROUTE }))
+    fallback = await input.resend(autoBody)
   } catch {
     return { response }
   }
@@ -110,6 +207,7 @@ export async function pinnedModelFallback(
   const servedModel = fallback.headers.get("x-synapse-served-model") ?? undefined
   return {
     response: fallback,
+    originalErrorBody: errorBody,
     event: {
       originalModel: input.model,
       reason,

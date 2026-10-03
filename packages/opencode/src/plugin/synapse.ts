@@ -9,10 +9,15 @@ import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { INJECTED_LEARNINGS_LIMIT, learningStorePaths, sessionObserver, sanitizeJsonSchemaForOpenAI } from "./observer"
 import { EscalationTracker, declaredTier, classifyFailure, malformedToolCallFromEvent } from "./synapse-escalation"
 import {
+  PinnedFallbackMemory,
   SYNAPSE_AUTO_ROUTE,
+  classifyModelUnusable,
+  isPinnedModel,
+  mcpToolErrorText,
   pinnedFallbackEnabled,
   pinnedFallbackNotice,
   pinnedModelFallback,
+  withAutoModel,
   type PinnedFallbackEvent,
 } from "./synapse-fallback"
 import {
@@ -763,6 +768,8 @@ interface SynapsePluginOptions {
   pinnedFallback?: boolean
   /** #80: tell the person a pinned model fell back to `auto`. Default: a TUI toast when the client has one. */
   notify?: (message: string) => void
+  /** #80: per-session memory of failed pinned models (process memory, ~10 min TTL). Injectable for tests. */
+  fallbackMemory?: PinnedFallbackMemory
 }
 
 export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePluginOptions): Promise<Hooks> {
@@ -775,7 +782,11 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
   // Where this instance's model list comes from; set by the config hook.
   let modelsTarget: SynapseModelsTarget | undefined
 
+  // #80: failed pinned models per session, so later steps skip them until the mark expires.
+  const fallbackMemory = options?.fallbackMemory ?? new PinnedFallbackMemory()
+
   // #80: log the pinned-model fallback (no token, no message text) and tell the person.
+  // Callers report once per session and model (fallbackMemory.shouldReport).
   function reportPinnedFallback(event: PinnedFallbackEvent): void {
     sessionObserver.logDiagnostic(
       { timestamp: new Date().toISOString(), type: "FALLBACK_TRIGGERED", details: { ...event } },
@@ -949,6 +960,8 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
             let sanitizedBody = init?.body
             // AIESC-02: escalation is observer-owned; key by session when known.
             const sessionKey = new Headers(init?.headers as HeadersInit).get("x-opencode-session") || input.directory
+            // #80: resend a failed pinned-model request once with `auto` (opt out: OPENCODE_SYNAPSE_PINNED_FALLBACK=0).
+            const pinnedFallbackOn = options?.pinnedFallback ?? pinnedFallbackEnabled()
             if (typeof init?.body === "string") {
               try {
                 requestBodyJson = JSON.parse(init.body)
@@ -1025,47 +1038,52 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                     : {}),
                 }
 
+                // #80: the fallback is Synapse's own routing (`auto`), kept local-only.
+                const autoChatArgs = (): Record<string, any> => ({
+                  messages: normalizedMessages,
+                  model: SYNAPSE_MCP_FALLBACK_MODEL,
+                  privacyTier: "local-only",
+                  taskType: "code",
+                  ...(typeof requestBodyJson?.max_tokens === "number"
+                    ? { maxTokens: requestBodyJson.max_tokens }
+                    : {}),
+                })
+                const mcpModel: unknown = requestBodyJson?.model
+                const mcpPinned = isPinnedModel(mcpModel) && pinnedFallbackOn
+                // Shown inline once per session and model, alongside the one toast.
+                let fallbackApplied = false
+
+                // A pinned model that failed in this session lately goes straight to `auto`.
+                if (mcpPinned && fallbackMemory.isFailed(sessionKey, mcpModel)) chatArgs = autoChatArgs()
+
                 let mcpRes = await callMcp(chatArgs)
                 let rawText = mcpRes.ok ? await mcpRes.text() : ""
 
-                const isCreditOrRateError = (text: string, status: number) => {
-                  if (status === 402 || status === 429 || status === 503) return true
-                  return /quota|credit|rate_limit|exceeded|balance|payment|insufficient/i.test(text)
-                }
-
-                let fallbackApplied = false
-                if (!mcpRes.ok || isCreditOrRateError(rawText, mcpRes.status)) {
-                  sessionObserver.logDiagnostic(
-                    {
-                      timestamp: new Date().toISOString(),
-                      type: "FALLBACK_TRIGGERED",
-                      details: {
-                        reason: "Synapse MCP chat failed (credit, rate limit or error) — retrying once with Synapse auto, local-only",
-                        initialModel: requestBodyJson?.model,
+                // The same classifier as the REST path. Never for 401/403 or an `auto` request;
+                // a 200 counts only when it carries a tool error, never for words in a reply.
+                if (mcpPinned && chatArgs.model === mcpModel) {
+                  const errorText = mcpRes.ok ? mcpToolErrorText(rawText) : await mcpRes.clone().text().catch(() => "")
+                  const reason =
+                    errorText === undefined ? undefined : classifyModelUnusable(mcpRes.ok ? 0 : mcpRes.status, errorText)
+                  if (reason && !init?.signal?.aborted) {
+                    chatArgs = autoChatArgs()
+                    const fallbackRes = await callMcp(chatArgs)
+                    const fallbackText = fallbackRes.ok ? await fallbackRes.text() : ""
+                    fallbackMemory.markFailed(sessionKey, mcpModel)
+                    if (fallbackMemory.shouldReport(sessionKey, mcpModel)) {
+                      reportPinnedFallback({
+                        originalModel: mcpModel,
+                        reason,
+                        status: mcpRes.status,
                         fallbackModel: SYNAPSE_MCP_FALLBACK_MODEL,
-                      },
-                    },
-                    input.directory,
-                  )
-
-                  // #80: fall back to Synapse's own routing (`auto`), kept local-only.
-                  chatArgs = {
-                    messages: normalizedMessages,
-                    model: SYNAPSE_MCP_FALLBACK_MODEL,
-                    privacyTier: "local-only",
-                    taskType: "code",
-                    ...(typeof requestBodyJson?.max_tokens === "number"
-                      ? { maxTokens: requestBodyJson.max_tokens }
-                      : {}),
-                  }
-
-                  const fallbackRes = await callMcp(chatArgs)
-                  if (fallbackRes.ok) {
-                    const fallbackText = await fallbackRes.text()
-                    if (!isCreditOrRateError(fallbackText, fallbackRes.status)) {
+                        fallbackStatus: fallbackRes.status,
+                        localOnly: true,
+                      })
+                      fallbackApplied = fallbackRes.ok
+                    }
+                    if (fallbackRes.ok) {
                       mcpRes = fallbackRes
                       rawText = fallbackText
-                      fallbackApplied = true
                     }
                   }
                 }
@@ -1387,25 +1405,42 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
               )
             }
 
+            // #80: a pinned model that failed in this session lately goes straight to `auto`
+            // (no failed attempt first) until its mark expires.
+            const pinnedModel: unknown = requestBodyJson?.model
+            let sentModel: unknown = pinnedModel
+            if (pinnedFallbackOn && isPinnedModel(pinnedModel) && fallbackMemory.isFailed(sessionKey, pinnedModel)) {
+              const autoBody = withAutoModel(sanitizedBody)
+              if (autoBody) {
+                sanitizedBody = autoBody
+                sentModel = SYNAPSE_AUTO_ROUTE
+              }
+            }
+
             let response = await fetch(requestInput, { ...init, body: sanitizedBody, headers }).catch((err: unknown) => {
               escalations.recordFailure(sessionKey, "provider-error")
               throw err
             })
             // #80: a pinned model that cannot serve this request is resent ONCE with `auto`
             // (same body and headers, so local-only stays local-only).
-            if (!response.ok) {
+            let pinnedFailure: { status: number; statusText: string; errorBody: string } | undefined
+            if (!response.ok && sentModel === pinnedModel) {
+              const failed = response
               const fallback = await pinnedModelFallback({
-                model: requestBodyJson?.model,
+                model: pinnedModel,
                 body: sanitizedBody,
                 headers,
                 response,
-                enabled: options?.pinnedFallback ?? pinnedFallbackEnabled(),
+                enabled: pinnedFallbackOn,
                 signal: init?.signal,
                 resend: (body) => fetch(requestInput, { ...init, body, headers }),
               })
               if (fallback.event) {
-                reportPinnedFallback(fallback.event)
+                fallbackMemory.markFailed(sessionKey, fallback.event.originalModel)
+                if (fallbackMemory.shouldReport(sessionKey, fallback.event.originalModel)) reportPinnedFallback(fallback.event)
+                pinnedFailure = { status: failed.status, statusText: failed.statusText, errorBody: fallback.originalErrorBody ?? "" }
                 response = fallback.response
+                sentModel = SYNAPSE_AUTO_ROUTE
               }
             }
             if (response.ok) {
@@ -1431,6 +1466,23 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                 const cloned = response.clone()
                 errorBody = await cloned.text()
               } catch {}
+              // #80: the pinned model failed and `auto` failed too: log both, each under its own model.
+              if (pinnedFailure) {
+                sessionObserver.logDiagnostic(
+                  {
+                    timestamp: new Date().toISOString(),
+                    type: "INFERENCE_ERROR",
+                    error: `HTTP ${pinnedFailure.status}: ${pinnedFailure.errorBody || pinnedFailure.statusText}`,
+                    details: {
+                      status: pinnedFailure.status,
+                      statusText: pinnedFailure.statusText,
+                      errorBody: pinnedFailure.errorBody,
+                      model: pinnedModel,
+                    },
+                  },
+                  input.directory,
+                )
+              }
               sessionObserver.logDiagnostic(
                 {
                   timestamp: new Date().toISOString(),
@@ -1440,7 +1492,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                     status: response.status,
                     statusText: response.statusText,
                     errorBody,
-                    model: requestBodyJson?.model,
+                    model: sentModel,
                     requestPreview: requestBodyJson ? JSON.stringify(requestBodyJson).slice(0, 1000) : undefined,
                   },
                 },

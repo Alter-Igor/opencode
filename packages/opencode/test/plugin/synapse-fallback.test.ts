@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test"
 import {
   PINNED_FALLBACK_ENV,
+  PinnedFallbackMemory,
   classifyModelUnusable,
+  mcpToolErrorText,
   pinnedFallbackEnabled,
   pinnedModelFallback,
 } from "../../src/plugin/synapse-fallback"
@@ -32,7 +34,10 @@ describe("classifyModelUnusable (#80)", () => {
     expect(classifyModelUnusable(403, "insufficient credit")).toBeUndefined()
     expect(classifyModelUnusable(400, "No endpoints found that support tool use")).toBe("no-tool-support")
     expect(classifyModelUnusable(422, '{"error":{"code":"unmet_capability","capability":"tools"}}')).toBe("no-tool-support")
-    expect(classifyModelUnusable(404, "")).toBe("model-unavailable")
+    expect(classifyModelUnusable(400, '{"error":{"code":"insufficient_quota"}}')).toBe("budget")
+    expect(classifyModelUnusable(503, "model is unavailable: insufficient credit")).toBe("budget")
+    expect(classifyModelUnusable(404, "No endpoints found for claude-opus-5")).toBe("model-unavailable")
+    expect(classifyModelUnusable(404, "The model claude-opus-5 was not found")).toBe("model-unavailable")
     expect(classifyModelUnusable(400, '{"error":{"code":"model_not_found"}}')).toBe("model-unavailable")
     expect(classifyModelUnusable(429, "")).toBe("rate-limited")
     expect(classifyModelUnusable(503, '{"error":{"code":"rate_limited"}}')).toBe("rate-limited")
@@ -44,6 +49,38 @@ describe("classifyModelUnusable (#80)", () => {
     expect(classifyModelUnusable(400, '{"error":{"code":"context_length_exceeded","message":"insufficient context"}}')).toBeUndefined()
     expect(classifyModelUnusable(400, '{"error":{"message":"messages: required"}}')).toBeUndefined()
     expect(classifyModelUnusable(500, "internal error")).toBeUndefined()
+  })
+
+  test("credit words without a 402, a budget code or availability wording, and a route 404, do not fall back", () => {
+    expect(classifyModelUnusable(400, '{"error":{"message":"insufficient arguments for tool call"}}')).toBeUndefined()
+    expect(classifyModelUnusable(400, "credit card field is invalid")).toBeUndefined()
+    expect(classifyModelUnusable(500, "balance check failed")).toBeUndefined()
+    expect(classifyModelUnusable(404, "")).toBeUndefined()
+    expect(classifyModelUnusable(404, "Cannot POST /v1/chat/completionz")).toBeUndefined()
+    expect(classifyModelUnusable(404, '{"error":"Not Found"}')).toBeUndefined()
+  })
+})
+
+describe("PinnedFallbackMemory (#80)", () => {
+  test("a failed model is marked per session and model, and the mark expires after the TTL", () => {
+    let now = 1_000
+    const memory = new PinnedFallbackMemory({ ttlMs: 600_000, now: () => now })
+    memory.markFailed("ses_a", "claude-opus-5")
+    expect(memory.isFailed("ses_a", "claude-opus-5")).toBe(true)
+    expect(memory.isFailed("ses_b", "claude-opus-5")).toBe(false)
+    expect(memory.isFailed("ses_a", "qwen/qwen3.8-flash")).toBe(false)
+    now += 600_001
+    expect(memory.isFailed("ses_a", "claude-opus-5")).toBe(false)
+    expect(memory.shouldReport("ses_a", "claude-opus-5")).toBe(true)
+    expect(memory.shouldReport("ses_a", "claude-opus-5")).toBe(false)
+    expect(memory.shouldReport("ses_b", "claude-opus-5")).toBe(true)
+  })
+})
+
+describe("mcpToolErrorText (#80)", () => {
+  test("only a tool error is returned; reply words never are", () => {
+    expect(mcpToolErrorText('data: {"result":{"structuredContent":{"content":"payment balance exceeded"}}}')).toBeUndefined()
+    expect(mcpToolErrorText('{"result":{"isError":true,"content":[{"type":"text","text":"budget_exhausted"}]}}')).toBe("budget_exhausted")
   })
 })
 
@@ -277,6 +314,229 @@ describe("Synapse MCP bridge fallback (#80)", () => {
       // Module-wide telemetry: do not leak this test's served model into other tests.
       setLatestSynapseServing(undefined)
       globalThis.fetch = previousFetch
+    }
+  })
+})
+
+type Step = { url: string; body: Record<string, any>; headers: Headers }
+
+/** One plugin instance over several steps, with a stubbed fetch and an injectable fallback memory. */
+async function harness(opts: {
+  reply: (step: Step, n: number) => Response
+  memory?: PinnedFallbackMemory
+  token?: string
+}) {
+  const previousFetch = globalThis.fetch
+  const previousEnv = process.env[PINNED_FALLBACK_ENV]
+  delete process.env[PINNED_FALLBACK_ENV]
+  const seen: Step[] = []
+  const notices: string[] = []
+  const stub = async (url: RequestInfo | URL, init?: RequestInit) => {
+    const href = typeof url === "string" ? url : url instanceof URL ? url.href : url.url
+    if (!href.endsWith("/chat/completions") && !href.startsWith("https://synapse-mcp.alterspective.com.au/mcp")) {
+      return previousFetch(url, init)
+    }
+    const step = { url: href, body: JSON.parse(String(init?.body)), headers: new Headers(init?.headers) }
+    seen.push(step)
+    return opts.reply(step, seen.length)
+  }
+  globalThis.fetch = Object.assign(stub, { preconnect: previousFetch.preconnect })
+  const hooks = await SynapseAuthPlugin(
+    {
+      client: {} as never,
+      project: {} as never,
+      directory: "",
+      worktree: "",
+      experimental_workspace: { register() {} },
+      serverUrl: new URL("https://example.com"),
+      $: {} as never,
+    },
+    { inferenceUrl: BASE, fallbackMemory: opts.memory, notify: (m) => notices.push(m) },
+  )
+  const token = opts.token ?? API_KEY
+  const stored = { type: "api", key: token, metadata: { expiresAt: String(Date.now() + 3_600_000) } }
+  const loaded = await hooks.auth?.loader?.(async () => stored as never, {} as never)
+  const chatFetch = loaded?.fetch as (u: string, i: RequestInit) => Promise<Response>
+  const chat = (body: Record<string, unknown>, headers: Record<string, string> = {}) =>
+    chatFetch(`${BASE}/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-opencode-session": "ses_fallback", ...headers },
+      body: JSON.stringify(body),
+    })
+  const restore = () => {
+    setLatestSynapseServing(undefined)
+    globalThis.fetch = previousFetch
+    if (previousEnv === undefined) delete process.env[PINNED_FALLBACK_ENV]
+    else process.env[PINNED_FALLBACK_ENV] = previousEnv
+  }
+  return { chat, seen, notices, restore }
+}
+
+const messages = [{ role: "user", content: "hi" }]
+const fallbackCount = () =>
+  sessionObserver.getDiagnosticLogs().filter((e) => e.type === "FALLBACK_TRIGGERED" && e.details?.reason).length
+
+describe("failed pinned models are remembered per session (#80)", () => {
+  test("a second step skips the failed model, it is retried after the TTL, and there is one toast and one log", async () => {
+    let now = 5_000
+    const memory = new PinnedFallbackMemory({ ttlMs: 600_000, now: () => now })
+    const h = await harness({
+      memory,
+      reply: (step) => (step.body.model === "auto" ? okReply() : errorReply(429, { error: { code: "rate_limited" } })),
+    })
+    try {
+      const logsBefore = fallbackCount()
+      expect((await h.chat({ model: "claude-opus-5", messages })).status).toBe(200)
+      expect(h.seen.map((s) => s.body.model)).toEqual(["claude-opus-5", "auto"])
+      expect((await h.chat({ model: "claude-opus-5", messages })).status).toBe(200)
+      expect(h.seen.map((s) => s.body.model)).toEqual(["claude-opus-5", "auto", "auto"])
+      now += 600_001
+      expect((await h.chat({ model: "claude-opus-5", messages })).status).toBe(200)
+      expect(h.seen.map((s) => s.body.model)).toEqual(["claude-opus-5", "auto", "auto", "claude-opus-5", "auto"])
+      expect(h.notices).toHaveLength(1)
+      expect(fallbackCount()).toBe(logsBefore + 1)
+    } finally {
+      h.restore()
+    }
+  })
+
+  test("another session still tries the pinned model first", async () => {
+    const h = await harness({
+      memory: new PinnedFallbackMemory(),
+      reply: (step) => (step.body.model === "auto" ? okReply() : errorReply(402, "")),
+    })
+    try {
+      await h.chat({ model: "claude-opus-5", messages })
+      await h.chat({ model: "claude-opus-5", messages }, { "x-opencode-session": "ses_other" })
+      expect(h.seen.map((s) => s.body.model)).toEqual(["claude-opus-5", "auto", "claude-opus-5", "auto"])
+      expect(h.notices).toHaveLength(2)
+    } finally {
+      h.restore()
+    }
+  })
+})
+
+describe("REST fallback keeps the request intact (#80)", () => {
+  test("a streaming request falls back to a streaming auto reply; stream, tools and temperature are resent unchanged", async () => {
+    const sse = 'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n'
+    const h = await harness({
+      memory: new PinnedFallbackMemory(),
+      reply: (step) =>
+        step.body.model === "auto"
+          ? new Response(sse, {
+              status: 200,
+              headers: { "content-type": "text/event-stream", "x-synapse-served-model": "qwen/qwen3.8-flash" },
+            })
+          : errorReply(402, { error: { code: "budget_exhausted" } }),
+    })
+    try {
+      const tools = [{ type: "function", function: { name: "read", parameters: { type: "object", properties: {} } } }]
+      const body = { model: "claude-opus-5", messages, stream: true, tools, temperature: 0.2, max_tokens: 64 }
+      const response = await h.chat(body)
+      expect(response.status).toBe(200)
+      expect(response.headers.get("content-type")).toContain("text/event-stream")
+      expect(await response.text()).toBe(sse)
+      expect(h.seen).toHaveLength(2)
+      const { model: first, ...firstRest } = h.seen[0].body
+      const { model: second, ...secondRest } = h.seen[1].body
+      expect([first, second]).toEqual(["claude-opus-5", "auto"])
+      expect(secondRest).toEqual(firstRest)
+      expect(secondRest).toMatchObject({ stream: true, tools, temperature: 0.2, max_tokens: 64 })
+    } finally {
+      h.restore()
+    }
+  })
+
+  test("when auto fails too, both errors are logged, each under its own model", async () => {
+    const h = await harness({
+      memory: new PinnedFallbackMemory(),
+      reply: (step) =>
+        step.body.model === "auto"
+          ? errorReply(429, { error: { code: "rate_limited", message: "auto busy" } })
+          : errorReply(402, { error: { code: "budget_exhausted" } }),
+    })
+    try {
+      const response = await h.chat({ model: "claude-opus-5", messages })
+      expect(response.status).toBe(429)
+      const errors = sessionObserver
+        .getDiagnosticLogs()
+        .filter((e) => e.type === "INFERENCE_ERROR")
+        .slice(0, 2)
+      expect(errors.map((e) => [e.details?.model, e.details?.status])).toEqual([
+        ["auto", 429],
+        ["claude-opus-5", 402],
+      ])
+      expect(h.seen).toHaveLength(2)
+    } finally {
+      h.restore()
+    }
+  })
+})
+
+describe("Synapse MCP bridge trigger (#80)", () => {
+  const header = Buffer.from(JSON.stringify({ alg: "none" })).toString("base64url")
+  const payload = Buffer.from(
+    JSON.stringify({ aud: "https://synapse-mcp.alterspective.com.au/mcp", exp: Math.floor(Date.now() / 1000) + 3600 }),
+  ).toString("base64url")
+  const jwt = `${header}.${payload}.sig`
+  const isMcp = (s: Step) => s.url.startsWith("https://synapse-mcp.alterspective.com.au/mcp")
+  const mcpModels = (seen: Step[]) => seen.filter(isMcp).map((s) => s.body.params.arguments.model ?? "(none)")
+  const mcpOk = (content: string) =>
+    new Response(JSON.stringify({ result: { structuredContent: { content, servedModel: "qwen/qwen3.8-flash" } } }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    })
+
+  test("a 200 reply that mentions payment, balance or exceeded is not a failure", async () => {
+    const h = await harness({
+      token: jwt,
+      memory: new PinnedFallbackMemory(),
+      reply: () => mcpOk("the payment balance was exceeded last month"),
+    })
+    try {
+      expect((await h.chat({ model: "claude-opus-5", messages })).status).toBe(200)
+      expect(mcpModels(h.seen)).toEqual(["claude-opus-5"])
+      expect(h.notices).toHaveLength(0)
+    } finally {
+      h.restore()
+    }
+  })
+
+  test("401 and an auto request make no MCP fallback", async () => {
+    const h = await harness({
+      token: jwt,
+      memory: new PinnedFallbackMemory(),
+      reply: (step) =>
+        isMcp(step)
+          ? new Response("unauthorized", { status: step.body.params.arguments.model ? 401 : 402 })
+          : okReply(),
+    })
+    try {
+      await h.chat({ model: "claude-opus-5", messages })
+      await h.chat({ model: "auto", messages })
+      expect(mcpModels(h.seen)).toEqual(["claude-opus-5", "(none)"])
+      expect(h.notices).toHaveLength(0)
+    } finally {
+      h.restore()
+    }
+  })
+
+  test("a budget failure falls back to auto once, is remembered, and is shown once", async () => {
+    const h = await harness({
+      token: jwt,
+      memory: new PinnedFallbackMemory(),
+      reply: (step) =>
+        step.body.params.arguments.model === "auto" ? mcpOk("hello") : new Response("payment required", { status: 402 }),
+    })
+    try {
+      expect((await h.chat({ model: "claude-opus-5", messages })).status).toBe(200)
+      expect((await h.chat({ model: "claude-opus-5", messages })).status).toBe(200)
+      expect(mcpModels(h.seen)).toEqual(["claude-opus-5", "auto", "auto"])
+      const autoCalls = h.seen.filter(isMcp).filter((s) => s.body.params.arguments.model === "auto")
+      expect(autoCalls.every((s) => s.body.params.arguments.privacyTier === "local-only")).toBe(true)
+      expect(h.notices).toHaveLength(1)
+    } finally {
+      h.restore()
     }
   })
 })

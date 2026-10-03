@@ -56,12 +56,14 @@ export function noToolSupport(message: string): boolean {
 export function sessionErrorCode(error: unknown): SessionErrorCode {
   const { name, message = "", status } = parts(error)
   if (name && BY_NAME[name]) return BY_NAME[name]
+  // Same order as the plugin (synapse-fallback.ts): auth and context before budget words.
+  if (status === 401 || status === 403) return "auth"
+  if (/context_length_exceeded|context window|maximum context/i.test(message)) return "context_overflow"
   if (noToolSupport(message)) return "no_tool_support"
   if (status === 402 || /budget_exhausted|insufficient|credit/i.test(message)) return "budget_exhausted"
   if (status === 429 || /rate_limited|rate limit/i.test(message)) return "rate_limited"
   if (status === 404 || /model_not_found|model_unavailable|model not found/i.test(message)) return "model_not_found"
-  if (status === 401 || status === 403 || /unauthori[sz]ed|forbidden/i.test(message)) return "auth"
-  if (/context_length_exceeded|context window|maximum context/i.test(message)) return "context_overflow"
+  if (/unauthori[sz]ed|forbidden/i.test(message)) return "auth"
   return "other"
 }
 
