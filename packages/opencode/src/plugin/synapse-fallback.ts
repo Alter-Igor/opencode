@@ -46,8 +46,20 @@ const BUDGET_CODE = /budget_exhausted|insufficient_quota/i
 const BUDGET_WORDS = /\b(credit|insufficient|balance)\b/i
 /** Wording that says the model (not the request) is unavailable. */
 const AVAILABILITY = /not available|unavailable|no (eligible|available|healthy) (provider|endpoint|rung)s?/i
-/** A 404 that points at the model, not at the route. */
-const MODEL_MISSING = /no endpoints found|model_not_found|model_unavailable|\bmodel\b[^\n]{0,120}\bnot found\b|\brungs?\b/i
+/**
+ * A 404 that points at the model, not at the route. "model ... not found" must say "model" within
+ * a short span, and a body that talks about a route or path is never read as a missing model:
+ * a typo in the URL must not send every request to `auto`.
+ */
+const MODEL_MISSING = /no endpoints found|model_not_found|model_unavailable|\bmodel\b[^\n]{0,60}\bnot found\b|\brungs?\b/i
+const ROUTE_MISSING = /\b(route|path|url)\b|cannot (get|post|put)\b/i
+/**
+ * The model cannot take tool calls. Synapse #1815 answers 404 `model_not_available` with "No
+ * available model can serve this request's required capability: tool calling ... or send the
+ * request without tools". Its wording may still change, so the code OR either phrase matches.
+ */
+const NO_TOOL_SUPPORT =
+  /no endpoints found that support tool use|does not support (tools|tool use|function calling)|model_not_available|required capability:\s*tool calling|without tools/i
 
 /** The same JSON body with `model: "auto"`; every other field is kept. Undefined when it is not a JSON object. */
 export function withAutoModel(body: unknown): string | undefined {
@@ -92,7 +104,8 @@ const MEMORY_MAX_ENTRIES = 1000
  */
 export class PinnedFallbackMemory {
   private readonly failed = new Map<string, number>()
-  private readonly reported = new Set<string>()
+  /** When each session and model may be reported again: the same TTL as its failure mark. */
+  private readonly reported = new Map<string, number>()
   private readonly ttlMs: number
   private readonly now: () => number
 
@@ -120,6 +133,7 @@ export class PinnedFallbackMemory {
     this.failed.delete(key)
     this.failed.set(key, now + this.ttlMs)
     for (const [k, until] of this.failed) if (until <= now) this.failed.delete(k)
+    for (const [k, until] of this.reported) if (until <= now) this.reported.delete(k)
     while (this.failed.size > MEMORY_MAX_ENTRIES) {
       const oldest = this.failed.keys().next().value
       if (oldest === undefined) break
@@ -127,14 +141,18 @@ export class PinnedFallbackMemory {
     }
   }
 
-  /** True the first time only, per session and model. */
+  /** True once per session and model until the TTL passes; a failure after that is reported again. */
   shouldReport(session: string, model: string): boolean {
     const key = PinnedFallbackMemory.key(session, model)
-    if (this.reported.has(key)) return false
-    this.reported.add(key)
-    if (this.reported.size > MEMORY_MAX_ENTRIES) {
-      const oldest = this.reported.values().next().value
-      if (oldest !== undefined) this.reported.delete(oldest)
+    const now = this.now()
+    const until = this.reported.get(key)
+    if (until !== undefined && until > now) return false
+    this.reported.delete(key)
+    this.reported.set(key, now + this.ttlMs)
+    while (this.reported.size > MEMORY_MAX_ENTRIES) {
+      const oldest = this.reported.keys().next().value
+      if (oldest === undefined) break
+      this.reported.delete(oldest)
     }
     return true
   }
@@ -144,9 +162,7 @@ export class PinnedFallbackMemory {
 export function classifyModelUnusable(status: number, body: string): PinnedFallbackReason | undefined {
   if (status === 401 || status === 403) return undefined
   if (CONTEXT_OR_VALIDATION.test(body)) return undefined
-  if (/no endpoints found that support tool use|does not support (tools|tool use|function calling)/i.test(body)) {
-    return "no-tool-support"
-  }
+  if (NO_TOOL_SUPPORT.test(body)) return "no-tool-support"
   // Synapse#1813: the unmet-capability refusal names the capability it could not meet.
   if (/(unmet|unsupported|missing)[ _-]?capabilit/i.test(body) && /\btools?\b/i.test(body)) return "no-tool-support"
   if (status === 402 || BUDGET_CODE.test(body)) return "budget"
@@ -154,7 +170,7 @@ export function classifyModelUnusable(status: number, body: string): PinnedFallb
   if (status === 429 || /rate_limited/i.test(body)) return "rate-limited"
   if (/model_not_found|model_unavailable/i.test(body)) return "model-unavailable"
   // A plain route-not-found 404 is not about the model, so `auto` would not help.
-  if (status === 404 && MODEL_MISSING.test(body)) return "model-unavailable"
+  if (status === 404 && MODEL_MISSING.test(body) && !ROUTE_MISSING.test(body)) return "model-unavailable"
   return undefined
 }
 

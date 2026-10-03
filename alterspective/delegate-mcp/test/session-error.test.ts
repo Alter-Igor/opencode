@@ -22,6 +22,9 @@ describe("sessionErrorCode (#80)", () => {
     expect(sessionErrorCode({ name: "ProviderAuthError", data: { message: "bad key" } })).toBe("auth")
     expect(sessionErrorCode({ name: "ContextOverflowError", data: {} })).toBe("context_overflow")
     expect(sessionErrorCode({ name: "MessageAbortedError" })).toBe("aborted")
+    // Synapse #1815: 404 model_not_available for a model without tool calling.
+    expect(sessionErrorCode({ name: "APIError", data: { message: "No available model can serve this request's required capability: tool calling (the request carries tools)… or send the request without tools.", statusCode: 404 } })).toBe("no_tool_support")
+    expect(sessionErrorCode({ name: "APIError", data: { message: '{"error":{"code":"model_not_available"}}', statusCode: 404 } })).toBe("no_tool_support")
     expect(sessionErrorCode({ name: "APIError", data: { message: "context_length_exceeded: insufficient context window" } })).toBe("context_overflow")
     expect(sessionErrorCode({ name: "APIError", data: { message: "insufficient credit", statusCode: 401 } })).toBe("auth")
     expect(sessionErrorCode({ name: "UnknownError", data: { message: "something odd" } })).toBe("other")

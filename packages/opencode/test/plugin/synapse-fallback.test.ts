@@ -377,7 +377,7 @@ const fallbackCount = () =>
   sessionObserver.getDiagnosticLogs().filter((e) => e.type === "FALLBACK_TRIGGERED" && e.details?.reason).length
 
 describe("failed pinned models are remembered per session (#80)", () => {
-  test("a second step skips the failed model, it is retried after the TTL, and there is one toast and one log", async () => {
+  test("a second step skips the failed model, it is retried after the TTL, and there is one toast and one log per mark", async () => {
     let now = 5_000
     const memory = new PinnedFallbackMemory({ ttlMs: 600_000, now: () => now })
     const h = await harness({
@@ -393,8 +393,9 @@ describe("failed pinned models are remembered per session (#80)", () => {
       now += 600_001
       expect((await h.chat({ model: "claude-opus-5", messages })).status).toBe(200)
       expect(h.seen.map((s) => s.body.model)).toEqual(["claude-opus-5", "auto", "auto", "claude-opus-5", "auto"])
-      expect(h.notices).toHaveLength(1)
-      expect(fallbackCount()).toBe(logsBefore + 1)
+      // One toast and one log while the mark lasts; a new failure after the TTL is reported again (cycle 2).
+      expect(h.notices).toHaveLength(2)
+      expect(fallbackCount()).toBe(logsBefore + 2)
     } finally {
       h.restore()
     }
@@ -538,5 +539,95 @@ describe("Synapse MCP bridge trigger (#80)", () => {
     } finally {
       h.restore()
     }
+  })
+})
+
+// Synapse #1815 (decide.ts on the Synapse PR branch): the exact refusal for a model without tool calling.
+const SYNAPSE_1815_MESSAGE =
+  "No available model can serve this request's required capability: tool calling (the request carries tools)… or send the request without tools."
+
+describe("Synapse #1815 tool-capability refusal (#80 cycle 2)", () => {
+  test("the code envelope, the message alone and the bare code are all no-tool-support", () => {
+    const envelope = JSON.stringify({ error: { code: "model_not_available", message: SYNAPSE_1815_MESSAGE } })
+    expect(classifyModelUnusable(404, envelope)).toBe("no-tool-support")
+    expect(classifyModelUnusable(404, SYNAPSE_1815_MESSAGE)).toBe("no-tool-support")
+    expect(classifyModelUnusable(404, '{"error":{"code":"model_not_available"}}')).toBe("no-tool-support")
+    expect(classifyModelUnusable(400, "required capability: tool calling")).toBe("no-tool-support")
+    expect(classifyModelUnusable(400, "retry, or send the request without tools")).toBe("no-tool-support")
+  })
+
+  test("the REST path falls back to auto on the #1815 404", async () => {
+    const h = await harness({
+      memory: new PinnedFallbackMemory(),
+      reply: (step) =>
+        step.body.model === "auto"
+          ? okReply()
+          : errorReply(404, { error: { code: "model_not_available", message: SYNAPSE_1815_MESSAGE } }),
+    })
+    try {
+      expect((await h.chat({ model: "gemini-3.1-flash-image", messages, tools: [] })).status).toBe(200)
+      expect(h.seen.map((s) => s.body.model)).toEqual(["gemini-3.1-flash-image", "auto"])
+      expect(h.notices[0]).toContain("cannot use tools")
+    } finally {
+      h.restore()
+    }
+  })
+
+  const header = Buffer.from(JSON.stringify({ alg: "none" })).toString("base64url")
+  const payload = Buffer.from(
+    JSON.stringify({ aud: "https://synapse-mcp.alterspective.com.au/mcp", exp: Math.floor(Date.now() / 1000) + 3600 }),
+  ).toString("base64url")
+  const jwt = `${header}.${payload}.sig`
+  const isMcp = (s: Step) => s.url.startsWith("https://synapse-mcp.alterspective.com.au/mcp")
+  const mcpOk = () =>
+    new Response(JSON.stringify({ result: { structuredContent: { content: "hello", servedModel: "qwen/qwen3.8-flash" } } }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    })
+
+  test("the MCP path falls back to auto on the #1815 refusal, as an HTTP 404 or as a tool error", async () => {
+    for (const refusal of [
+      () => errorReply(404, { error: { code: "model_not_available", message: SYNAPSE_1815_MESSAGE } }),
+      () =>
+        new Response(JSON.stringify({ result: { isError: true, content: [{ type: "text", text: SYNAPSE_1815_MESSAGE }] } }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    ]) {
+      const h = await harness({
+        token: jwt,
+        memory: new PinnedFallbackMemory(),
+        reply: (step) => (isMcp(step) && step.body.params.arguments.model === "auto" ? mcpOk() : refusal()),
+      })
+      try {
+        expect((await h.chat({ model: "gemini-3.1-flash-image", messages })).status).toBe(200)
+        expect(h.seen.filter(isMcp).map((s) => s.body.params.arguments.model)).toEqual(["gemini-3.1-flash-image", "auto"])
+        expect(h.notices).toHaveLength(1)
+        expect(h.notices[0]).toContain("cannot use tools")
+      } finally {
+        h.restore()
+      }
+    }
+  })
+})
+
+describe("cycle 2: report expiry and model-404 wording", () => {
+  test("a failure after the TTL is reported again", () => {
+    let now = 0
+    const memory = new PinnedFallbackMemory({ ttlMs: 600_000, now: () => now })
+    memory.markFailed("ses_a", "claude-opus-5")
+    expect(memory.shouldReport("ses_a", "claude-opus-5")).toBe(true)
+    expect(memory.shouldReport("ses_a", "claude-opus-5")).toBe(false)
+    now += 600_001
+    memory.markFailed("ses_a", "claude-opus-5")
+    expect(memory.shouldReport("ses_a", "claude-opus-5")).toBe(true)
+    expect(memory.shouldReport("ses_a", "claude-opus-5")).toBe(false)
+  })
+
+  test("a 404 'model ... not found' falls back; a 404 about a route or path does not", () => {
+    expect(classifyModelUnusable(404, '{"error":"model claude-opus-5 not found"}')).toBe("model-unavailable")
+    expect(classifyModelUnusable(404, "Route POST /v1/chat/completionz not found")).toBeUndefined()
+    expect(classifyModelUnusable(404, "The model field was read, but the path /v2/chat was not found")).toBeUndefined()
+    expect(classifyModelUnusable(404, "not found")).toBeUndefined()
   })
 })

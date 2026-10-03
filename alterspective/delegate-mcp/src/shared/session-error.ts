@@ -46,9 +46,13 @@ function parts(error: unknown): { name?: string; message?: string; status?: numb
   }
 }
 
-/** "No endpoints found that support tool use", or Synapse's unmet-capability refusal naming tools (Synapse#1813). */
+/**
+ * "No endpoints found that support tool use", Synapse #1815's 404 `model_not_available` ("...
+ * required capability: tool calling ... or send the request without tools"; code OR either phrase,
+ * as its wording may still change), or an unmet-capability refusal naming tools (Synapse#1813).
+ */
 export function noToolSupport(message: string): boolean {
-  if (/no endpoints found that support tool use|does not support (tools|tool use|function calling)/i.test(message)) return true
+  if (/no endpoints found that support tool use|does not support (tools|tool use|function calling)|model_not_available|required capability:\s*tool calling|without tools/i.test(message)) return true
   return /(unmet|unsupported|missing)[ _-]?capabilit/i.test(message) && /\btools?\b/i.test(message)
 }
 
