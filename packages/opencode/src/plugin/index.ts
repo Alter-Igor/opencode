@@ -22,6 +22,7 @@ import { DigitalOceanAuthPlugin } from "./digitalocean"
 import { XaiAuthPlugin } from "./xai"
 import { SynapseAuthPlugin } from "./synapse"
 import { CerebrasPlugin } from "./cerebras"
+import { GoalLoopPlugin } from "./goal-loop"
 import { SnowflakeCortexAuthPlugin } from "./snowflake-cortex"
 import { Effect, Layer, Context } from "effect"
 import { EffectBridge } from "@/effect/bridge"
@@ -84,6 +85,8 @@ function internalPlugins(flags: RuntimeFlags.Info): PluginInstance[] {
     XaiAuthPlugin,
     SynapseAuthPlugin,
     CerebrasPlugin,
+    // Fork-only (#84): inert until a person runs /goal.
+    GoalLoopPlugin,
   ]
 }
 
