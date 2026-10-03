@@ -307,21 +307,22 @@ export async function GoalLoopPlugin(
   }
 
   const onIdle = async (sessionID: string) => {
-    const state = await load(sessionID)
-    if (!state || state.status !== "active") return
+    const started = await load(sessionID)
+    if (!started || started.status !== "active") return
 
     const messages = await input.client.session.messages({ path: { id: sessionID } })
     const turn = readLastTurn(messages.data ?? [])
     if (turn.pause) {
-      await save({ ...state, status: "paused", reason: turn.pause })
-      await notify(state, `Paused: ${turn.pause}. Type /goal resume to carry on, or /goal stop.`, "warning")
+      await save({ ...started, status: "paused", reason: turn.pause })
+      await notify(started, `Paused: ${turn.pause}. Type /goal resume to carry on, or /goal stop.`, "warning")
       return
     }
 
-    const [checked, recorded] = await Promise.all([check(state), record(state)])
-    // The person may have stopped or paused the loop while the check ran.
-    const latest = await load(sessionID)
-    if (!latest || latest.status !== "active" || latest.startedAt !== state.startedAt) return
+    const [checked, recorded] = await Promise.all([check(started), record(started)])
+    // Decide and save from the state as it is now: the person may have stopped, paused,
+    // resumed or restarted the loop while the check ran.
+    const state = await load(sessionID)
+    if (!state || state.status !== "active" || state.startedAt !== started.startedAt) return
 
     const step = decideGoalStep(state, { now: now(), check: checked, record: recorded })
     if (step.kind === "stop") {

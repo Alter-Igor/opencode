@@ -351,6 +351,24 @@ describe("GoalLoopPlugin", () => {
     expect((await load()).status).toBe("stopped")
   })
 
+  test("a state change saved while the check runs is what the loop decides from", async () => {
+    const hooks = await plugin()
+    await run(hooks, 'parser tests pass --check "bun test"')
+    const changing = GoalLoopPlugin({ client, directory: dir } as unknown as PluginInput, {
+      stateDir: dir,
+      now: () => 1_000,
+      runCheck: async () => {
+        await fs.writeFile(path.join(dir, `${SESSION}.json`), JSON.stringify({ ...(await load()), maxTurns: 0 }))
+        return { code: 1, output: "x" }
+      },
+    })
+    await idle(await changing)
+    expect(prompts).toHaveLength(1)
+    expect(prompts[0].body.noReply).toBe(true)
+    expect(await load()).toMatchObject({ status: "stopped", maxTurns: 0 })
+    expect((await load()).reason).toStartWith("BUDGET_EXHAUSTED")
+  })
+
   test("idle does nothing when no loop is active", async () => {
     await idle(await plugin())
     expect(prompts).toHaveLength(0)
