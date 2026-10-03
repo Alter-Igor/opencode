@@ -369,6 +369,33 @@ describe("GoalLoopPlugin", () => {
     expect((await load()).reason).toStartWith("BUDGET_EXHAUSTED")
   })
 
+  test("/goal stop that lands as the check finishes wins over the continue prompt", async () => {
+    let calls = 0
+    let stopping: Promise<void> | undefined
+    const hooks: Awaited<ReturnType<typeof plugin>> = await GoalLoopPlugin(
+      { client, directory: dir } as unknown as PluginInput,
+      {
+        stateDir: dir,
+        now: () => 1_000,
+        runCheck: async () => {
+          calls++
+          if (calls === 1) return { code: 1, output: "baseline" }
+          // Fire stop without awaiting it, then let the check finish straight away.
+          stopping = hooks["command.execute.before"]?.(
+            { command: "goal", sessionID: SESSION, arguments: "stop" },
+            { parts: [{ type: "text", text: "" }] as unknown as Part[] },
+          )
+          return { code: 1, output: "x" }
+        },
+      },
+    )
+    await run(hooks, 'parser tests pass --check "bun test"')
+    await idle(hooks)
+    await stopping
+    expect(prompts).toHaveLength(0)
+    expect((await load()).status).toBe("stopped")
+  })
+
   test("idle does nothing when no loop is active", async () => {
     await idle(await plugin())
     expect(prompts).toHaveLength(0)

@@ -239,6 +239,17 @@ export async function GoalLoopPlugin(
   const load = (sessionID: string) =>
     Filesystem.readJson<GoalState>(file(sessionID)).catch((): GoalState | undefined => undefined)
   const save = (state: GoalState) => Filesystem.writeJson(file(state.sessionID), state)
+  // Every read-decide-write of a session's loop runs one at a time, so `/goal stop` and a
+  // finishing check cannot interleave. The check itself runs outside the lock.
+  const locks = new Map<string, Promise<unknown>>()
+  const exclusive = <T>(sessionID: string, fn: () => Promise<T>) => {
+    const run = (locks.get(sessionID) ?? Promise.resolve()).then(fn, fn)
+    locks.set(
+      sessionID,
+      run.catch(() => undefined),
+    )
+    return run
+  }
 
   const runCheck =
     options?.runCheck ??
@@ -313,47 +324,54 @@ export async function GoalLoopPlugin(
     const messages = await input.client.session.messages({ path: { id: sessionID } })
     const turn = readLastTurn(messages.data ?? [])
     if (turn.pause) {
-      await save({ ...started, status: "paused", reason: turn.pause })
-      await notify(started, `Paused: ${turn.pause}. Type /goal resume to carry on, or /goal stop.`, "warning")
+      const reason = turn.pause
+      await exclusive(sessionID, async () => {
+        const state = await load(sessionID)
+        if (!state || state.status !== "active" || state.startedAt !== started.startedAt) return
+        await save({ ...state, status: "paused", reason })
+        await notify(state, `Paused: ${reason}. Type /goal resume to carry on, or /goal stop.`, "warning")
+      })
       return
     }
 
     const [checked, recorded] = await Promise.all([check(started), record(started)])
     // Decide and save from the state as it is now: the person may have stopped, paused,
     // resumed or restarted the loop while the check ran.
-    const state = await load(sessionID)
-    if (!state || state.status !== "active" || state.startedAt !== started.startedAt) return
+    await exclusive(sessionID, async () => {
+      const state = await load(sessionID)
+      if (!state || state.status !== "active" || state.startedAt !== started.startedAt) return
 
-    const step = decideGoalStep(state, { now: now(), check: checked, record: recorded })
-    if (step.kind === "stop") {
-      await save({ ...state, status: "stopped", reason: `${step.outcome}: ${step.detail}` })
-      await notify(
-        state,
-        `${step.outcome}: ${step.detail} after ${state.turns} extra prompt(s).`,
-        step.outcome === "GOAL_MET" ? "success" : "warning",
-      )
-      return
-    }
-    if (step.kind === "pause") {
-      await save({ ...state, status: "paused", reason: step.reason })
-      await notify(state, `Paused: ${step.reason}. Type /goal resume to carry on, or /goal stop.`, "warning")
-      return
-    }
+      const step = decideGoalStep(state, { now: now(), check: checked, record: recorded })
+      if (step.kind === "stop") {
+        await save({ ...state, status: "stopped", reason: `${step.outcome}: ${step.detail}` })
+        await notify(
+          state,
+          `${step.outcome}: ${step.detail} after ${state.turns} extra prompt(s).`,
+          step.outcome === "GOAL_MET" ? "success" : "warning",
+        )
+        return
+      }
+      if (step.kind === "pause") {
+        await save({ ...state, status: "paused", reason: step.reason })
+        await notify(state, `Paused: ${step.reason}. Type /goal resume to carry on, or /goal stop.`, "warning")
+        return
+      }
 
-    const next: GoalState = {
-      ...state,
-      turns: state.turns + 1,
-      repeats: step.failure !== undefined && step.failure === state.lastFailure ? state.repeats + 1 : 0,
-      lastFailure: step.failure,
-    }
-    await save(next)
-    const user = messages.data?.findLast((m) => m.info.role === "user")?.info
-    await input.client.session.promptAsync({
-      path: { id: sessionID },
-      body: {
-        ...(user?.role === "user" ? { agent: user.agent, model: user.model } : {}),
-        parts: [{ type: "text", text: continuePrompt(next, { check: checked, record: recorded?.state }) }],
-      },
+      const next: GoalState = {
+        ...state,
+        turns: state.turns + 1,
+        repeats: step.failure !== undefined && step.failure === state.lastFailure ? state.repeats + 1 : 0,
+        lastFailure: step.failure,
+      }
+      await save(next)
+      const user = messages.data?.findLast((m) => m.info.role === "user")?.info
+      await input.client.session.promptAsync({
+        path: { id: sessionID },
+        body: {
+          ...(user?.role === "user" ? { agent: user.agent, model: user.model } : {}),
+          parts: [{ type: "text", text: continuePrompt(next, { check: checked, record: recorded?.state }) }],
+        },
+      })
     })
   }
 
@@ -375,7 +393,7 @@ export async function GoalLoopPlugin(
     },
     "command.execute.before": async (hook, output) => {
       if (!owned || hook.command !== GOAL_COMMAND) return
-      const reply = await (async () => {
+      const reply = await exclusive(hook.sessionID, async () => {
         const args = parseGoalArgs(hook.arguments)
         const current = await load(hook.sessionID)
         if (args.action === "error")
@@ -428,7 +446,7 @@ export async function GoalLoopPlugin(
               ]
             : []),
         ].join("\n")
-      })()
+      })
       // The caller keeps its own reference to `parts`, so change the part in place.
       const text = output.parts.find((part) => part.type === "text")
       if (text?.type === "text") text.text = reply
@@ -443,13 +461,15 @@ export async function GoalLoopPlugin(
       if (busy.has(sessionID)) return
       busy.add(sessionID)
       await onIdle(sessionID)
-        .catch(async (error) => {
-          const state = await load(sessionID)
-          if (!state || state.status !== "active") return
-          const reason = `the loop hit an error (${error instanceof Error ? error.message : String(error)})`
-          await save({ ...state, status: "paused", reason })
-          await notify(state, `Paused: ${reason}.`, "error")
-        })
+        .catch((error) =>
+          exclusive(sessionID, async () => {
+            const state = await load(sessionID)
+            if (!state || state.status !== "active") return
+            const reason = `the loop hit an error (${error instanceof Error ? error.message : String(error)})`
+            await save({ ...state, status: "paused", reason })
+            await notify(state, `Paused: ${reason}.`, "error")
+          }),
+        )
         .finally(() => busy.delete(sessionID))
     },
   }
