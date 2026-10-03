@@ -69,4 +69,12 @@ OpenCode `1.18.31` from this branch, `opencode serve`, model `synapse/auto`, a s
 | Keep going | `ses_efe738172ffeeGKKRsZKjcRtNI` | A gate that passes on its 3rd run. Run 2 failed, the plugin sent one keep-going prompt (agent `build`, model `auto`), the model worked again, run 3 passed: `GOAL_MET after 1 extra prompt(s)`. |
 | Budget | `ses_efe716e08ffeA3FK61ldr7M2GI` | `--turns 1` with a gate that needs 9 runs. One keep-going prompt, then `BUDGET_EXHAUSTED: used all 1 turns`. The gate counter read 4, not 3: the transcript shows the model ran the gate once itself with its shell tool. |
 
-Not checked live: the TUI toast, `/goal stop` while a check is running (unit test only), and `--record`.
+After merge, from the main checkout at `32ba864fe5`:
+
+| Scenario | Session | Result |
+|---|---|---|
+| Fix failing tests again | `ses_efe2f8703ffe3REg1YHAwqxY5Z` | `GOAL_MET`; `/goal status` answered with the stopped state. |
+| `/goal stop` during a check | `ses_efe2df9c3ffegErICPgQdElLWk` | Stop sent straight after the first turn, while the loop's own check ran. Loop `CANCELLED: stopped by the user`, no further prompt. |
+| `--record`, no `--check` | `ses_efe23afefffe8JYcdjWl64Dnr8` | `state.json` started `ACTIVE`; the model did the work and set it to `READY_FOR_REVIEW`; the loop stopped with `READY_FOR_REVIEW: the portable record reached READY_FOR_REVIEW`. This run also found #86 (quote marks dropped from the goal text). |
+
+Not checked live: the TUI toast, the `PAUSED` and unreadable-record paths (unit tests only), and two processes serving one session. Full record: `Lab/AI/goal-runtime-adapters/opencode-fork-goal-loop-live.md` in the knowledge base.
