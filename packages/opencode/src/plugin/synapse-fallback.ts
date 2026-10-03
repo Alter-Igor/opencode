@@ -56,10 +56,21 @@ const ROUTE_MISSING = /\b(route|path|url)\b|cannot (get|post|put)\b/i
 /**
  * The model cannot take tool calls. Synapse #1815 answers 404 `model_not_available` with "No
  * available model can serve this request's required capability: tool calling ... or send the
- * request without tools". Its wording may still change, so the code OR either phrase matches.
+ * request without tools". Its wording may still change, so either phrase matches.
  */
 const NO_TOOL_SUPPORT =
-  /no endpoints found that support tool use|does not support (tools|tool use|function calling)|model_not_available|required capability:\s*tool calling|without tools/i
+  /no endpoints found that support tool use|does not support (tools|tool use|function calling)|required capability:\s*tool calling|without tools/i
+/**
+ * Synapse's model-missing replies: 404 `model_not_available` ("No available instance serves
+ * model ...", "Model ... is not available to this caller") without the tool wording above.
+ */
+const MODEL_NOT_AVAILABLE = /model_not_found|model_unavailable|model_not_available|no available instance serves model/i
+/**
+ * The caller declined model substitution (Synapse authorization-guard: "This request declined
+ * model substitution, so ... could not be served by ..."). Falling back to `auto` would override
+ * that choice, so it never falls back.
+ */
+const SUBSTITUTION_DECLINED = /declined model substitution/i
 
 /** The same JSON body with `model: "auto"`; every other field is kept. Undefined when it is not a JSON object. */
 export function withAutoModel(body: unknown): string | undefined {
@@ -161,6 +172,7 @@ export class PinnedFallbackMemory {
 /** Why the model cannot serve this request, or undefined when `auto` would not help. */
 export function classifyModelUnusable(status: number, body: string): PinnedFallbackReason | undefined {
   if (status === 401 || status === 403) return undefined
+  if (SUBSTITUTION_DECLINED.test(body)) return undefined
   if (CONTEXT_OR_VALIDATION.test(body)) return undefined
   if (NO_TOOL_SUPPORT.test(body)) return "no-tool-support"
   // Synapse#1813: the unmet-capability refusal names the capability it could not meet.
@@ -168,7 +180,7 @@ export function classifyModelUnusable(status: number, body: string): PinnedFallb
   if (status === 402 || BUDGET_CODE.test(body)) return "budget"
   if (BUDGET_WORDS.test(body) && AVAILABILITY.test(body)) return "budget"
   if (status === 429 || /rate_limited/i.test(body)) return "rate-limited"
-  if (/model_not_found|model_unavailable/i.test(body)) return "model-unavailable"
+  if (MODEL_NOT_AVAILABLE.test(body)) return "model-unavailable"
   // A plain route-not-found 404 is not about the model, so `auto` would not help.
   if (status === 404 && MODEL_MISSING.test(body) && !ROUTE_MISSING.test(body)) return "model-unavailable"
   return undefined

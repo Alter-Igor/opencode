@@ -551,7 +551,8 @@ describe("Synapse #1815 tool-capability refusal (#80 cycle 2)", () => {
     const envelope = JSON.stringify({ error: { code: "model_not_available", message: SYNAPSE_1815_MESSAGE } })
     expect(classifyModelUnusable(404, envelope)).toBe("no-tool-support")
     expect(classifyModelUnusable(404, SYNAPSE_1815_MESSAGE)).toBe("no-tool-support")
-    expect(classifyModelUnusable(404, '{"error":{"code":"model_not_available"}}')).toBe("no-tool-support")
+    // The bare code is also Synapse's model-missing reply, so without the tool wording it is model-unavailable (cycle 3).
+    expect(classifyModelUnusable(404, '{"error":{"code":"model_not_available"}}')).toBe("model-unavailable")
     expect(classifyModelUnusable(400, "required capability: tool calling")).toBe("no-tool-support")
     expect(classifyModelUnusable(400, "retry, or send the request without tools")).toBe("no-tool-support")
   })
@@ -629,5 +630,55 @@ describe("cycle 2: report expiry and model-404 wording", () => {
     expect(classifyModelUnusable(404, "Route POST /v1/chat/completionz not found")).toBeUndefined()
     expect(classifyModelUnusable(404, "The model field was read, but the path /v2/chat was not found")).toBeUndefined()
     expect(classifyModelUnusable(404, "not found")).toBeUndefined()
+  })
+})
+
+// Synapse's model-missing reply and its no-substitution refusal (decide.ts, authorization-guard.ts).
+const MODEL_MISSING_ENVELOPE = JSON.stringify({
+  error: { code: "model_not_available", message: 'No available instance serves model "claude-opus-5".' },
+})
+const SUBSTITUTION_DECLINED_ENVELOPE = JSON.stringify({
+  error: {
+    code: "model_not_available",
+    message: 'This request declined model substitution, so "claude-opus-5" could not be served by "qwen/qwen3.8-flash".',
+  },
+})
+
+describe("cycle 3: model_not_available labels and declined substitution", () => {
+  test("a model-missing 404 is model-unavailable unless the tool wording is present", () => {
+    expect(classifyModelUnusable(404, MODEL_MISSING_ENVELOPE)).toBe("model-unavailable")
+    expect(classifyModelUnusable(404, 'No available instance serves model "claude-opus-5".')).toBe("model-unavailable")
+    expect(classifyModelUnusable(404, '{"error":{"code":"model_not_available","message":"Model \\"x\\" is not available to this caller."}}')).toBe(
+      "model-unavailable",
+    )
+    expect(classifyModelUnusable(404, JSON.stringify({ error: { code: "model_not_available", message: SYNAPSE_1815_MESSAGE } }))).toBe(
+      "no-tool-support",
+    )
+  })
+
+  test("a declined model substitution never falls back", () => {
+    expect(classifyModelUnusable(404, SUBSTITUTION_DECLINED_ENVELOPE)).toBeUndefined()
+  })
+
+  test("the REST path labels the model-missing toast 'not available', and leaves a declined substitution alone", async () => {
+    const h = await harness({
+      memory: new PinnedFallbackMemory(),
+      reply: (step) => {
+        if (step.body.model === "auto") return okReply()
+        return errorReply(404, step.body.model === "claude-opus-5" ? MODEL_MISSING_ENVELOPE : SUBSTITUTION_DECLINED_ENVELOPE)
+      },
+    })
+    try {
+      expect((await h.chat({ model: "claude-opus-5", messages })).status).toBe(200)
+      expect(h.notices).toHaveLength(1)
+      expect(h.notices[0]).toContain("not available")
+      expect(h.notices[0]).not.toContain("tools")
+      const declined = await h.chat({ model: "gpt-pinned-strict", messages })
+      expect(declined.status).toBe(404)
+      expect(h.seen.map((s) => s.body.model)).toEqual(["claude-opus-5", "auto", "gpt-pinned-strict"])
+      expect(h.notices).toHaveLength(1)
+    } finally {
+      h.restore()
+    }
   })
 })

@@ -47,12 +47,13 @@ function parts(error: unknown): { name?: string; message?: string; status?: numb
 }
 
 /**
- * "No endpoints found that support tool use", Synapse #1815's 404 `model_not_available` ("...
- * required capability: tool calling ... or send the request without tools"; code OR either phrase,
- * as its wording may still change), or an unmet-capability refusal naming tools (Synapse#1813).
+ * "No endpoints found that support tool use", Synapse #1815's refusal ("... required capability:
+ * tool calling ... or send the request without tools"; either phrase, as its wording may still
+ * change), or an unmet-capability refusal naming tools (Synapse#1813). The code
+ * `model_not_available` alone is not enough: Synapse also uses it for a missing model.
  */
 export function noToolSupport(message: string): boolean {
-  if (/no endpoints found that support tool use|does not support (tools|tool use|function calling)|model_not_available|required capability:\s*tool calling|without tools/i.test(message)) return true
+  if (/no endpoints found that support tool use|does not support (tools|tool use|function calling)|required capability:\s*tool calling|without tools/i.test(message)) return true
   return /(unmet|unsupported|missing)[ _-]?capabilit/i.test(message) && /\btools?\b/i.test(message)
 }
 
@@ -66,7 +67,7 @@ export function sessionErrorCode(error: unknown): SessionErrorCode {
   if (noToolSupport(message)) return "no_tool_support"
   if (status === 402 || /budget_exhausted|insufficient|credit/i.test(message)) return "budget_exhausted"
   if (status === 429 || /rate_limited|rate limit/i.test(message)) return "rate_limited"
-  if (status === 404 || /model_not_found|model_unavailable|model not found/i.test(message)) return "model_not_found"
+  if (status === 404 || /model_not_found|model_unavailable|model_not_available|model not found/i.test(message)) return "model_not_found"
   if (/unauthori[sz]ed|forbidden/i.test(message)) return "auth"
   return "other"
 }
@@ -75,7 +76,7 @@ export function sessionErrorCode(error: unknown): SessionErrorCode {
 export function sessionErrorDetail(error: unknown): string | undefined {
   const { message } = parts(error)
   if (message === undefined) return undefined
-  const visible = stripUnsafe(message)
-  const cut = visible.length > SESSION_ERROR_MESSAGE_MAX ? visible.slice(0, SESSION_ERROR_MESSAGE_MAX) + "…" : visible
-  return scrub(cut, { keepIds: true })
+  // Scrub the whole message first: a cut that splits a token would leave a fragment scrub() no longer matches.
+  const scrubbed = scrub(stripUnsafe(message), { keepIds: true })
+  return scrubbed.length > SESSION_ERROR_MESSAGE_MAX ? scrubbed.slice(0, SESSION_ERROR_MESSAGE_MAX) + "…" : scrubbed
 }
