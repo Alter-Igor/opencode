@@ -435,6 +435,8 @@ describe("Synapse credential refresh (chat only; startup never refreshes)", () =
     expiresIn?: number
     refreshWaitMs?: number
     refreshLock?: SynapseRefreshLock
+    /** Use the plugin's real machine-wide file lock. Other tests use an in-process pass-through. */
+    realLock?: boolean
   }
 
   function harness(opts: Opts) {
@@ -495,7 +497,7 @@ describe("Synapse credential refresh (chat only; startup never refreshes)", () =
           serverUrl: new URL("https://example.com"),
           $: {} as never,
         },
-        { tokenUrl: "https://keystone.example.test/token", refreshWaitMs: opts.refreshWaitMs, refreshLock: opts.refreshLock },
+        { tokenUrl: "https://keystone.example.test/token", refreshWaitMs: opts.refreshWaitMs, refreshLock: opts.realLock ? undefined : (opts.refreshLock ?? ((fn) => fn())) },
       )
       const cfg = configWithStaleModels()
       await hooks.config?.(cfg)
@@ -601,8 +603,11 @@ describe("Synapse credential refresh (chat only; startup never refreshes)", () =
       await chat()
       // The second wait also gives up, so that request uses the newest token held in memory.
       expect(h.chatAuth[1]).toBe(`Bearer ${h.issued[0]}`)
-      // The second grant waits for the machine-wide refresh lock (#75), so poll instead of a fixed sleep.
-      for (let i = 0; i < 100 && h.grants.length < 2; i++) await settle(30)
+      // Poll until the second grant has answered (a grant is recorded when it starts, its token
+      // when it ends). Ending earlier would leave it running into the next test, which shares
+      // the process-wide refresh state.
+      for (let i = 0; i < 100 && h.issued.length < 2; i++) await settle(30)
+      await settle(30)
       expect(h.grants).toEqual(["r-1", "r-2"])
     } finally {
       h.restore()
@@ -610,7 +615,7 @@ describe("Synapse credential refresh (chat only; startup never refreshes)", () =
   })
 
   test("#75: another process refreshed while this one waited for the lock: its token is used, with no grant", async () => {
-    const h = harness({ refreshWaitMs: 5_000 })
+    const h = harness({ refreshWaitMs: 5_000, realLock: true })
     // Hold the real machine-wide lock, as the other process would during its refresh.
     const held = await Flock.acquire(synapseRefreshLockKey())
     let released = false
