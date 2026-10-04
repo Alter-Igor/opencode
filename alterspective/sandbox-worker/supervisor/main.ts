@@ -4,7 +4,7 @@
 import { $ } from "bun"
 import path from "path"
 import { PRIVACY_TIER, PRIVACY_TIER_ENV, renderConfig, type Manifest } from "./config"
-import { resolveModelPolicy } from "./policy"
+import { parseResolveBody } from "./policy"
 
 const fail = (message: string): never => {
   console.error(`[sbxw] ${message}`)
@@ -20,8 +20,9 @@ const password = process.env.SBXW_SERVER_PASSWORD ?? fail("SBXW_SERVER_PASSWORD 
 const configDir = process.env.OPENCODE_CONFIG_DIR ?? "/run/sbxw/config"
 const repoDir = "/work/repo"
 
-// #102: read once at task start and frozen for the task. Any failure means `auto`, local-only.
-const policy = await resolveModelPolicy({ request: manifest.policy, token: process.env.SBXW_POLICY_TOKEN })
+// #102: svc-coding-agent resolved and froze this for the task; the box makes no policy call and
+// holds no CAS credential. Missing or unusable means `auto`, local-only.
+const policy = parseResolveBody(manifest.modelPolicy)
 console.log(
   policy.source === "cas"
     ? `[sbxw] model policy: CAS version ${policy.effectivePolicyVersion}, models ${policy.modelIds.join(", ")}`
@@ -66,7 +67,7 @@ await Bun.write(
 
 const hostname = manifest.listen?.hostname ?? "127.0.0.1"
 const port = manifest.listen?.port ?? 4096
-const { SBXW_SERVER_PASSWORD: _drop, SBXW_MANIFEST: _manifest, SBXW_POLICY_TOKEN: _policyToken, ...env } = process.env
+const { SBXW_SERVER_PASSWORD: _drop, SBXW_MANIFEST: _manifest, ...env } = process.env
 console.log(`[sbxw] task ${manifest.taskId}: base ${baseSha || "(empty repo)"}, serving on ${hostname}:${port}`)
 
 // The Synapse plugin reads its base URL from SYNAPSE_BASE_URL and its key from stored auth;

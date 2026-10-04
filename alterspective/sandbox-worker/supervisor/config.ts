@@ -5,8 +5,11 @@ export type Manifest = {
   taskId: string
   /** Where Synapse calls go. The model ids are not here: they come from the policy (#102). */
   model: { baseURL: string; headers?: Record<string, string> }
-  /** #102: where the supervisor reads the CAS AI-roles policy. Absent ⇒ fail closed to `auto`. */
-  policy?: { url: string; repo: string; taskType?: string }
+  /**
+   * #102: the CAS AI-roles resolve answer for this task (`{ cell, effectivePolicyVersion }`), resolved
+   * and frozen by svc-coding-agent and passed through verbatim. Absent or unusable ⇒ `auto`, local-only.
+   */
+  modelPolicy?: unknown
   repo?: { bundle: string; ref?: string }
   permission?: Record<string, unknown>
   listen?: { hostname?: string; port?: number }

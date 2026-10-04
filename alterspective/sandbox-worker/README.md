@@ -15,7 +15,7 @@ two do not share files, image names, container names or ports.
 | `Dockerfile.dockerignore` | The build context filter for this Dockerfile. The root `.dockerignore` is left alone. |
 | `supervisor/main.ts` | Container entry point. Reads the manifest, writes the managed OpenCode config, clones the repository from a git bundle into `/work/repo`, and starts `opencode serve`. |
 | `supervisor/config.ts` | Renders the managed OpenCode config from the manifest and the model ids. Pure, so it is unit tested in `test/`. |
-| `supervisor/policy.ts` | Reads the model ids from the CAS AI-roles policy at task start (#102), failing closed to `auto` + `local-only`. Unit tested in `test/`. |
+| `supervisor/policy.ts` | Checks the CAS AI-roles answer passed in the manifest (#102), failing closed to `auto` + `local-only`. Unit tested in `test/`. |
 | `test/` | Unit tests: `bun test` from this folder. `bun run test:fast` at the repo root runs a changed test file here; it does not map a changed `supervisor/` file to its tests, so run `bun test` here after a supervisor change. |
 | `plugins/env-scrub.ts` | Blanks the server password and model key in every shell the agent runs. |
 | `driver/run-task.ts` | Stands in for CAS. Runs one task end to end and writes `runs/<taskId>/result.json` and `change.patch`. |
@@ -32,9 +32,7 @@ Driver flags:
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--policy-url` | none | CAS base URL for the AI-roles policy. Without it (or `--policy-repo`) the task runs on `auto`, `local-only` |
-| `--policy-repo` | none | `owner/repo` the policy is resolved for |
-| `--task-type` | none | Optional task type for the policy lookup |
+| `--model-policy` | none | A saved CAS resolve answer (JSON file), passed as `manifest.modelPolicy`. Without it the task runs on `auto`, `local-only` |
 | `--base-url` | Synapse v2 `/v1` | OpenAI-compatible base URL |
 | `--timeout-min` | `30` | Aborts the session after this long |
 | `--keep` | off | Leaves the container running for inspection |
@@ -48,7 +46,7 @@ Containers are named `sbxw-<id>`, labelled `alterspective.sandbox-worker=spike`,
 {
   "taskId": "sbxw-…",
   "model": { "baseURL": "https://…/v1", "headers": { "x-task-type": "code" } },
-  "policy": { "url": "https://<cas>", "repo": "owner/repo", "taskType": "optional" },
+  "modelPolicy": { "cell": { "modelIds": ["…"] }, "effectivePolicyVersion": "…" },
   "repo": { "bundle": "/run/sbxw/input/repo.bundle", "ref": "optional" },
   "permission": { "*": "allow", "external_directory": "deny" },
   "listen": { "hostname": "127.0.0.1", "port": 4096 }
@@ -57,23 +55,30 @@ Containers are named `sbxw-<id>`, labelled `alterspective.sandbox-worker=spike`,
 
 ## Model policy (#102)
 
-The model ids are never in the image or the manifest. At task start the supervisor calls CAS
-`GET /api/v1/ai-roles/resolve?role=developer&repo=<owner/repo>[&taskType=…]` once (CAS ADR-042
-decision 7; the contract is proposed in CAS #1674 and not built yet). A bearer token, if needed,
-comes from `SBXW_POLICY_TOKEN`, which `opencode serve` never sees.
+The model ids are never in the image. They come from CAS **Admin → AI roles** (CAS ADR-042
+decision 7). The sandbox does not fetch them:
 
-- **Good answer** (`{ cell: { modelIds, residency, privacyTier }, effectivePolicyVersion }`): the
-  `synapse` provider gets those models, strongest last. The last one is the main model, the first
-  the small model, and the provider `whitelist` hides every other live Synapse model. No `modelIds`
-  in the cell means Synapse `auto`.
-- **Anything else** (no `policy` in the manifest, CAS unreachable, a timeout after 5 s, a non-2xx
-  status, or a body that does not parse): `auto` with `x-privacy-tier: local-only`, so Synapse
-  keeps the task on-prem. Nothing is hard-coded.
-- The result, with `effectivePolicyVersion` or the fallback reason, is written to
-  `/run/sbxw/state.json` and frozen for the task.
-- The tier stays `local-only` whatever the cell says (#101). If a cell names a cloud model, the
-  request asks Synapse for that model at `local-only`. We expect Synapse to refuse it, and then the
-  fork's pinned-model fallback (#80) resends with `auto`. Not checked live yet.
+1. svc-coding-agent calls CAS `GET /api/v1/ai-roles/resolve?role=developer&repo=<owner/repo>[&taskType=…]`
+   (contract proposed in CAS #1674, not built yet) with its own Keystone credential, caches the
+   answer for at most 5 minutes, and freezes it for the task.
+2. It passes that answer verbatim as `manifest.modelPolicy`. The box holds no CAS credential and
+   makes no policy call (ADR-037 decision 1, kept by ADR-042). A test checks there is no `fetch(`
+   or policy token in the supervisor.
+3. The supervisor checks it:
+   - **Good answer** (`{ cell: { modelIds, residency, privacyTier }, effectivePolicyVersion }`): the
+     `synapse` provider gets those models, strongest last. The last one is the main model, the
+     first the small model, and the provider `whitelist` hides every other live Synapse model. No
+     `modelIds` in the cell means Synapse `auto`.
+   - **Missing or unusable:** `auto` with `x-privacy-tier: local-only`, so Synapse keeps the task
+     on-prem. Nothing is hard-coded. CAS being unreachable is the service's case to handle
+     (ADR-042: no cached value means `local-only` with the on-prem default). It arrives here as a
+     missing `modelPolicy`.
+4. The result, with `effectivePolicyVersion` or the fallback reason, is written to
+   `/run/sbxw/state.json`.
+
+The tier stays `local-only` whatever the cell says (#101). If a cell names a cloud model, the
+request asks Synapse for that model at `local-only`. We expect Synapse to refuse it, and then the
+fork's pinned-model fallback (#80) resends with `auto`. Not checked live yet.
 
 ## What protects what, honestly
 
