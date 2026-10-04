@@ -3,8 +3,13 @@
 // requests by rule, and collects the patch, tokens and cost as JSON.
 //
 //   SBXW_MODEL_KEY=<named spike key> bun alterspective/sandbox-worker/driver/run-task.ts \
-//     --repo C:\path\to\repo --task "Add a test for foo" [--model auto] [--base-url https://…/v1] \
-//     [--timeout-min 30] [--keep]
+//     --repo C:\path\to\repo --task "Add a test for foo" [--base-url https://…/v1] \
+//     [--model-policy resolved.json] [--on-prem-default qwen3.8-27b-dflash2] [--timeout-min 30] [--keep]
+//
+// The models come from the CAS AI-roles policy (#102), not from a flag. In production
+// svc-coding-agent resolves it (CAS #1674) and puts the answer in the manifest; here
+// --model-policy passes a saved resolve answer (`{ cell, effectivePolicyVersion }`). Without it the
+// supervisor fails closed to Synapse `auto` with x-privacy-tier: local-only.
 //
 // The model key is passed to the container in this spike only. Phase 2 replaces it with the
 // gateway, and the sandbox then holds no key (ADR-037 decision 1).
@@ -18,7 +23,8 @@ const { values: args } = parseArgs({
   options: {
     repo: { type: "string" },
     task: { type: "string" },
-    model: { type: "string", default: "auto" },
+    "model-policy": { type: "string" },
+    "on-prem-default": { type: "string" },
     "base-url": { type: "string", default: "https://synapse2-api.alterspective.com.au/v1" },
     image: { type: "string", default: "opencodealt-sandbox-worker:spike" },
     "timeout-min": { type: "string", default: "30" },
@@ -53,7 +59,12 @@ log(`bundled ${args.repo} at ${baseSha}`)
 
 const manifest = {
   taskId,
-  model: { baseURL: args["base-url"], id: args.model, headers: { "x-task-type": "code" } },
+  model: {
+    baseURL: args["base-url"],
+    headers: { "x-task-type": "code" },
+    ...(args["on-prem-default"] ? { onPremDefault: args["on-prem-default"].split(",").map((id) => id.trim()) } : {}),
+  },
+  ...(args["model-policy"] ? { modelPolicy: await Bun.file(args["model-policy"]).json() } : {}),
   repo: { bundle: "/run/sbxw/input/repo.bundle" },
   // Spike only: the server listens on all container interfaces so the host can reach it through
   // a loopback-only published port. Phase 2 keeps it on 127.0.0.1 and uses the outbound link.
@@ -247,7 +258,10 @@ async function drive() {
     envScrub,
     decisions,
     errors,
-    model: manifest.model.id,
+    // #102: the policy the supervisor actually applied (models, version or fallback reason).
+    modelPolicy: await run(["docker", "exec", taskId, "cat", "/run/sbxw/state.json"])
+      .then((text) => JSON.parse(text).modelPolicy ?? null)
+      .catch((error: unknown) => ({ unreadable: String(error) })),
   }
   await Bun.write(path.join(runDir, "result.json"), JSON.stringify(result, null, 2))
   console.log(JSON.stringify(result, null, 2))
