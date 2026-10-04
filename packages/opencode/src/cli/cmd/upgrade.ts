@@ -17,7 +17,7 @@ export const UpgradeCommand = {
         alias: "m",
         describe: "installation method to use",
         type: "string",
-        choices: ["curl", "npm", "pnpm", "bun", "brew", "choco", "scoop"],
+        choices: ["curl", "npm", "pnpm", "bun", "brew", "choco", "scoop", "aio"],
       })
   },
   handler: async (args: { target?: string; method?: string }) => {
@@ -43,7 +43,14 @@ export const UpgradeCommand = {
       }
     }
     prompts.log.info("Using method: " + method)
-    const target = args.target ? args.target.replace(/^v/, "") : await Installation.latest()
+    const target = args.target ? args.target.replace(/^v/, "") : await Installation.latest().catch(() => undefined)
+    // Fork-only (#90): an opencodealt build with no published release yet must not crash here.
+    if (!target) {
+      prompts.log.error("Could not find the latest release. Check your network, or pass a version.")
+      process.exitCode = 1
+      prompts.outro("Done")
+      return
+    }
 
     if (InstallationVersion === target) {
       prompts.log.warn(`opencode upgrade skipped: ${target} is already installed`)
