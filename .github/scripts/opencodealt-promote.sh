@@ -51,6 +51,16 @@ else
     say "Waiting: newest edge $tag is ${age_hours}h old; it needs $(( SOAK_DAYS * 24 ))h with no newer edge. Stable stays $stable."
     exit 0
   fi
+  # Never let the automatic path move stable backwards (only a manual TAG may roll back).
+  if [ "$stable" != "none" ] && [ "$stable" != "null" ]; then
+    stable_v="${stable#"$PREFIX"}"
+    edge_v="${tag#"$PREFIX"}"
+    highest="$(printf '%s\n%s\n' "$stable_v" "$edge_v" | sort -V | tail -n 1)"
+    if [ "$edge_v" = "$stable_v" ] || [ "$highest" != "$edge_v" ]; then
+      say "Nothing to do: edge $tag is not newer than stable $stable."
+      exit 0
+    fi
+  fi
   candidate="$tag"
   why="soaked ${age_hours}h with no newer edge build and no release-hold"
 fi

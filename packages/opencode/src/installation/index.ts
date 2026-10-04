@@ -226,11 +226,15 @@ const layer: Layer.Layer<Service, never, HttpClient.HttpClient | AppProcess.Serv
 
         if (detectedMethod === "aio") {
           // #97: an edge install looks at every release, pre-releases included.
+          // If that lookup fails, fall back to the stable (Latest) check below.
           if (readOpencodealtChannel() === "edge") {
-            const listed = yield* httpOk.execute(
-              HttpClientRequest.get(OPENCODEALT_RELEASES_URL).pipe(HttpClientRequest.acceptJson),
-            )
-            const newest = newestOpencodealtVersion(yield* HttpClientResponse.schemaBodyJson(GitHubReleaseList)(listed))
+            const newest = yield* httpOk
+              .execute(HttpClientRequest.get(OPENCODEALT_RELEASES_URL).pipe(HttpClientRequest.acceptJson))
+              .pipe(
+                Effect.flatMap(HttpClientResponse.schemaBodyJson(GitHubReleaseList)),
+                Effect.map(newestOpencodealtVersion),
+                Effect.catch(() => Effect.succeed(undefined)),
+              )
             if (newest) return newest
           }
           const response = yield* httpOk.execute(

@@ -265,6 +265,25 @@ describe("installation", () => {
       }),
     )
 
+    testEffect(
+      testLayer((request) =>
+        request.url === OPENCODEALT_RELEASES_URL
+          ? new Response("not found", { status: 404 })
+          : jsonResponse({ tag_name: "opencodealt-v1.18.31-alt.2" }),
+      ),
+    ).effect("an edge install falls back to the stable release when the list lookup fails", () =>
+      Effect.gen(function* () {
+        const before = process.env["OPENCODEALT_RELEASE_CHANNEL"]
+        process.env["OPENCODEALT_RELEASE_CHANNEL"] = "edge"
+        try {
+          expect(yield* Installation.use.latest("aio")).toBe("1.18.31-alt.2")
+        } finally {
+          if (before === undefined) delete process.env["OPENCODEALT_RELEASE_CHANNEL"]
+          else process.env["OPENCODEALT_RELEASE_CHANNEL"] = before
+        }
+      }),
+    )
+
     test("reads the channel AI Office wrote next to bin, defaulting to stable", () => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "oca-channel-"))
       const exe = path.join(root, "bin", "opencodealt.exe")
