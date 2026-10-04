@@ -1,4 +1,4 @@
-import { describe, expect } from "bun:test"
+import { describe, expect, test } from "bun:test"
 import { makeGlobalNode } from "@opencode-ai/core/effect/app-node"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
@@ -9,6 +9,7 @@ import { Installation } from "../../src/installation"
 import { InstallationChannel } from "@opencode-ai/core/installation/version"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { testEffect } from "../lib/effect"
+import { OPENCODEALT_LATEST_RELEASE_URL, opencodealtVersion } from "../../src/installation/opencodealt"
 
 const encoder = new TextEncoder()
 
@@ -179,6 +180,58 @@ describe("installation", () => {
         expect(result).toBe("2.1.0")
       }),
     )
+  })
+
+  // Fork-only (#90): opencodealt release builds update through AI Office, never upstream.
+  describe("opencodealt", () => {
+    const aioCalls: string[] = []
+    testEffect(
+      testLayer((request) => {
+        aioCalls.push(request.url)
+        return jsonResponse({ tag_name: "opencodealt-v1.18.31-alt.7" })
+      }),
+    ).effect("reads the latest opencodealt release, not upstream", () =>
+      Effect.gen(function* () {
+        const result = yield* Installation.use.latest("aio")
+        expect(result).toBe("1.18.31-alt.7")
+        expect(aioCalls).toEqual([OPENCODEALT_LATEST_RELEASE_URL])
+      }),
+    )
+
+    const spawned: string[][] = []
+    testEffect(
+      testLayer(
+        () => jsonResponse({}),
+        (cmd, args) => {
+          spawned.push([cmd, ...args])
+          return "installed"
+        },
+      ),
+    ).effect("updates by running aio opencode install", () =>
+      Effect.gen(function* () {
+        yield* Installation.use.upgrade("aio", "1.18.31-alt.8")
+        expect(spawned[0]).toEqual(["aio", "opencode", "install"])
+        expect(spawned.some(([cmd]) => cmd === "npm" || cmd === "bash" || cmd === "sh")).toBe(false)
+      }),
+    )
+
+    testEffect(
+      testLayer(
+        () => jsonResponse({}),
+        (cmd) => (cmd === "aio" ? { code: 1, stderr: "token=secret" } : ""),
+      ),
+    ).effect("tells the person to run AI Office when the update fails", () =>
+      Effect.gen(function* () {
+        const error = yield* Effect.flip(Installation.use.upgrade("aio", "1.18.31-alt.8"))
+        expect(error.stderr).toBe("opencodealt updates through AI Office. Run: aio opencode install")
+        expect(error.stderr).not.toContain("secret")
+      }),
+    )
+
+    test("turns a release tag into a version", () => {
+      expect(opencodealtVersion("opencodealt-v1.18.31-alt.7")).toBe("1.18.31-alt.7")
+      expect(opencodealtVersion("v2.0.0")).toBe("2.0.0")
+    })
   })
 
   describe("upgrade", () => {
