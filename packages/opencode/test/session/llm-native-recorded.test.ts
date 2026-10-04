@@ -282,7 +282,7 @@ function recordedNativeLLMLayer(scenario: RecordedScenario) {
     : HttpRecorder.http(scenario.cassette, { directory: FIXTURES_DIR, metadata, redact })
   return AppNodeBuilder.build(LayerNode.group([Provider.node, LLM.node]), [
     [LayerNodePlatform.requestExecutor, RequestExecutor.layer.pipe(Layer.provide(recordedHttp))],
-    [RuntimeFlags.node, RuntimeFlags.layer({ experimentalNativeLlm: true })],
+    [RuntimeFlags.node, RuntimeFlags.layer({ experimentalNativeLlm: true, disableForkPlugins: true })],
     ...(auth ? ([[Auth.node, auth]] as const) : []),
   ])
 }

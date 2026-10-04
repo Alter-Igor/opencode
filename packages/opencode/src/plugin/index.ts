@@ -84,8 +84,15 @@ function internalPlugins(flags: RuntimeFlags.Info): PluginInstance[] {
     DigitalOceanAuthPlugin,
     SnowflakeCortexAuthPlugin,
     XaiAuthPlugin,
-    SynapseAuthPlugin,
     CerebrasPlugin,
+    ...(flags.disableForkPlugins ? [] : forkPlugins()),
+  ]
+}
+
+/** Fork-only built-in plugins. OPENCODE_DISABLE_FORK_PLUGINS leaves them out (#95). */
+function forkPlugins(): PluginInstance[] {
+  return [
+    SynapseAuthPlugin,
     // Fork-only (#84): inert until a person runs /goal.
     GoalLoopPlugin,
     // Fork-only (#90): /docs and the "our docs, not upstream's" system line.

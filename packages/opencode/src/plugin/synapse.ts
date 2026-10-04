@@ -1768,9 +1768,15 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
       headerOutput.headers["x-opencode-session"] = headerInput.sessionID
     },
     "tool.execute.after": async (toolInput, output) => {
-      sessionObserver.onToolAfter(toolInput.sessionID, toolInput.callID, toolInput.tool, output.output)
+      // #95: core calls this hook with no output when a tool fails (a failed subtask, for one).
+      // Reading output.output then threw inside the failure path and lost the error metadata.
+      sessionObserver.onToolAfter(toolInput.sessionID, toolInput.callID, toolInput.tool, output?.output)
     },
     "experimental.chat.system.transform": async (_input, output) => {
+      // #95: these instructions are about Synapse (its gateway, on-prem tools and text tool-call
+      // protocol). The plugin is registered for every session, so without this guard they were
+      // pasted into OpenAI, Anthropic and other providers' prompts too.
+      if (_input.model?.providerID !== "synapse") return
       const recentLearnings = await sessionObserver.getRecentLearnings(INJECTED_LEARNINGS_LIMIT, input.directory)
       if (escalations.atCap(_input.sessionID ?? input.directory)) {
         output.system.push(
@@ -1828,7 +1834,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
       // vLLM rejects a second system message. The fetch wrapper's normalizeSystemMessages
       // only runs when a `synapse` auth entry is stored; a config/env apiKey (the delegate box)
       // skips the loader entirely. Fold here so every auth path sends one system message.
-      if (_input.model?.providerID === "synapse") foldSystemBlocks(output.system)
+      foldSystemBlocks(output.system)
     },
     tool: {
       synapse_record_learning: tool({

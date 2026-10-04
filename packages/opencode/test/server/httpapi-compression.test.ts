@@ -95,9 +95,10 @@ describe("HttpApi compression", () => {
     })
 
     test("when the response body is below the 1024-byte threshold", async () => {
-      // A bare config produces a tiny response (~few hundred bytes).
+      // A new project has no sessions, so the list is tiny. (/config was used before, but the
+      // fork's built-in plugins add commands that push a bare config past 1024 bytes: #95.)
       await using tmp = await tmpdir({ config: { formatter: false, lsp: false } })
-      const response = await app().request("/config", {
+      const response = await app().request("/session", {
         headers: { "x-opencode-directory": tmp.path, "accept-encoding": "gzip" },
       })
       expect(response.status).toBe(200)
