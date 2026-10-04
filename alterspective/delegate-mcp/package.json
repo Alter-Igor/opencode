@@ -1,6 +1,6 @@
 {
   "name": "@alterspective/opencode-delegate",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "type": "module",
   "description": "Local stdio MCP bridge that lets AI clients delegate coding work to sandboxed OpenCode sessions (FEAT-OCD-001).",

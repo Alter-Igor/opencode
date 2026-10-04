@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.2 — 2026-10-04
+
+**A rotated Synapse refresh token is never lost (#68).**
+
+- When Keystone answers a refresh with a new refresh token but an access token the bridge cannot use (already expired, for example because the PC clock runs fast; nearly expired; an unknown shape; or missing), the bridge now keeps the new refresh token. Before, it threw it away, the next retry spent the old one, and the owner had to sign in to Synapse again.
+- Nothing is published in that case: the include keeps the last good token, and the refresh is retried with backoff using the kept token. If the token store cannot be written, the token is held in memory and blocks other bridges, as for any rotation.
+- The kept token never appears in an error, a log line or `oc_doctor`.
+- The fork's Synapse plugin (owner's machine, not the box) now refreshes under a machine-wide lock, so two OpenCode processes no longer spend the same refresh token (#75). See the fork `AGENTS.md`.
+
 ## 0.2.1 — 2026-10-03
 
 **Failed models are explained, and models without tool support are hidden (#80).**

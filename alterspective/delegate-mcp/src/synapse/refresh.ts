@@ -6,8 +6,8 @@ import { readFile } from "node:fs/promises"
 import { isDelegateError } from "../shared/errors.ts"
 import { safeLog } from "../shared/log.ts"
 import { authConfHasToken, authConfPath, writeAuthConf } from "./auth-conf.ts"
-import { refreshSynapse } from "./keystone-token.ts"
-import { TICK_MS, adopt, currentPending, failClosed, isDue, pendingElsewhere, readState, reloadFront, savePending, writeState, type Refreshed, type SynapseDeps, type TokenState } from "./token-manager.ts"
+import { refreshSynapse, rotatedRefreshToken } from "./keystone-token.ts"
+import { TICK_MS, adopt, currentPending, failClosed, isDue, keepRotated, pendingElsewhere, readState, reloadFront, savePending, writeState, type Refreshed, type SynapseDeps, type TokenState } from "./token-manager.ts"
 
 export const RETRY_BASE_MS = 30_000
 export const RETRY_MAX_MS = 10 * 60_000
@@ -65,6 +65,10 @@ async function refreshLocked(deps: SynapseDeps, force: boolean): Promise<Refresh
   } catch (error) {
     const reason = isDelegateError(error) ? (error.detail ?? error.message) : "refresh failed"
     if (isDelegateError(error) && error.code === "needs_auth") return failClosed(deps, reason)
+    // #68: Keystone rotated, but the access token is unusable. Keep the rotated refresh token
+    // (the stored one is spent), publish nothing, and retry with the kept token later.
+    const rotated = rotatedRefreshToken(error)
+    if (rotated) await keepRotated(deps, rotated)
     return retryLater(deps, await readState(deps.home), reason)
   }
 }

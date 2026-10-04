@@ -6,6 +6,8 @@ import * as fs from "fs/promises"
 import open from "open"
 import { OauthCallbackPage } from "@opencode-ai/core/oauth/page"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
+import { Global } from "@opencode-ai/core/global"
+import { Flock } from "@opencode-ai/core/util/flock"
 import { INJECTED_LEARNINGS_LIMIT, learningStorePaths, sessionObserver, sanitizeJsonSchemaForOpenAI } from "./observer"
 import { EscalationTracker, declaredTier, classifyFailure, malformedToolCallFromEvent } from "./synapse-escalation"
 import {
@@ -328,6 +330,9 @@ export async function exchangeCodeForTokens(
   }
 }
 
+/** A Keystone refresh call gives up after this, so it never holds the refresh lock for long (#75). */
+export const KEYSTONE_REFRESH_TIMEOUT_MS = 30_000
+
 export async function refreshKeystoneToken(
   input: {
     clientId: string
@@ -348,6 +353,8 @@ export async function refreshKeystoneToken(
   const response = await fetcher(endpoint, {
     method: "POST",
     redirect: "error",
+    // #75: the refresh runs under a lock other OpenCode processes wait on; a hung call must end.
+    signal: AbortSignal.timeout(KEYSTONE_REFRESH_TIMEOUT_MS),
     headers: {
       "Content-Type": "application/x-www-form-urlencoded",
       Accept: "application/json",
@@ -709,9 +716,24 @@ interface SynapseCredentialState {
 
 // Process-wide, because every plugin instance shares the one stored `synapse`
 // credential and a Keystone refresh token can be used only once: a reuse revokes the
-// whole login. The single-flight guard is per process only; two OpenCode processes
-// refreshing at the same moment can still race (as before #74).
+// whole login. Inside a process the single-flight guard below holds; across processes
+// (a TUI plus `opencode serve`, or two TUIs) the file lock does (#75).
 const synapseCredentialState: SynapseCredentialState = { replaced: new Set(), saveFailureLogged: false }
+
+/** Runs `fn` while holding the refresh lock. Injectable so tests can observe or replace it. */
+export type SynapseRefreshLock = <T>(fn: () => Promise<T>) => Promise<T>
+
+/** How long a refresh waits for another process's refresh before it gives up (the chat keeps its old token). */
+export const SYNAPSE_REFRESH_LOCK_TIMEOUT_MS = 60_000
+
+/** The lock key: one per credential file, shared by every OpenCode process on this machine. */
+export function synapseRefreshLockKey(file: string = path.join(Global.Path.data, "auth.json")): string {
+  return `synapse-refresh:${file}`
+}
+
+/** #75: the machine-wide lock around the refresh grant (a lock directory under the OpenCode state folder). */
+export const synapseRefreshFileLock: SynapseRefreshLock = (fn) =>
+  Flock.withLock(synapseRefreshLockKey(), fn, { timeoutMs: SYNAPSE_REFRESH_LOCK_TIMEOUT_MS })
 
 /**
  * The credential to use: the newest refreshed one in memory, unless the stored one
@@ -767,6 +789,8 @@ interface SynapsePluginOptions {
   audience?: string
   /** How long a chat request waits for a token refresh. Default SYNAPSE_CHAT_REFRESH_WAIT_MS. */
   refreshWaitMs?: number
+  /** #75: the cross-process lock around a refresh. Default synapseRefreshFileLock. */
+  refreshLock?: SynapseRefreshLock
   /** #80: resend a failed pinned-model request once with `auto`. Default: on unless OPENCODE_SYNAPSE_PINNED_FALLBACK=0. */
   pinnedFallback?: boolean
   /** #80: tell the person a pinned model fell back to `auto`. Default: a TUI toast when the client has one. */
@@ -835,10 +859,11 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
     }
   }
 
-  // One Keystone refresh at a time per process (refresh tokens are single-use). The
-  // grant is never aborted: its new credential is held in memory, the replaced
-  // tokens are remembered, the save is tracked in synapseCredentialState.save, and
-  // the model-list cache is updated in the background.
+  // One Keystone refresh at a time per process (refresh tokens are single-use), and one
+  // at a time across processes through the file lock (#75). The grant is never aborted by
+  // the chat's wait: its new credential is held in memory, the replaced tokens are
+  // remembered, it is saved before the lock is released, and the model-list cache is
+  // updated in the background.
   function refreshSynapseCredential(cred: {
     token: string
     clientId?: string
@@ -846,31 +871,9 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
     clientSecret?: string
   }): Promise<string | undefined> {
     if (synapseCredentialState.refresh) return synapseCredentialState.refresh
-    const clientId = cred.clientId || "ai-office-cli"
     const run = async (): Promise<string | undefined> => {
       try {
-        const tokens = await refreshKeystoneToken({
-          clientId,
-          refreshToken: cred.refreshToken,
-          clientSecret: cred.clientSecret || process.env[CLIENT_SECRET_ENV] || "",
-          tokenUrl: options?.tokenUrl,
-          audience,
-        })
-        const latest = {
-          token: tokens.access_token,
-          refreshToken: tokens.refresh_token || cred.refreshToken,
-          expiresAt: Date.now() + (tokens.expires_in ?? 3600) * 1000,
-          clientId,
-          clientSecret: cred.clientSecret,
-        }
-        synapseCredentialState.replaced.add(cred.token)
-        if (latest.refreshToken !== cred.refreshToken) synapseCredentialState.replaced.add(cred.refreshToken)
-        synapseCredentialState.latest = latest
-        synapseCredentialState.save = saveSynapseCredential(latest)
-        if (modelsTarget) {
-          void updateSynapseModelsCache({ target: modelsTarget, token: latest.token, userAgent })
-        }
-        return tokens.access_token
+        return await (options?.refreshLock ?? synapseRefreshFileLock)(() => refreshLocked(cred))
       } catch {
         return undefined
       } finally {
@@ -880,6 +883,58 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
     const pending = run()
     synapseCredentialState.refresh = pending
     return pending
+  }
+
+  // Call only while holding the refresh lock.
+  async function refreshLocked(cred: {
+    token: string
+    clientId?: string
+    refreshToken: string
+    clientSecret?: string
+  }): Promise<string | undefined> {
+    const { replaced } = synapseCredentialState
+    // #75: another process may have refreshed while this one waited for the lock. Its rotated
+    // refresh token is now the only valid one: spending ours would make Keystone revoke the login.
+    const stored = await readStoredSynapseCredential().catch(() => undefined)
+    const newer =
+      stored?.refreshToken && stored.refreshToken !== cred.refreshToken && !replaced.has(stored.refreshToken)
+        ? { ...stored, refreshToken: stored.refreshToken }
+        : undefined
+    if (newer && !synapseModelsToken(newer).expired) {
+      // Use it as it is. Marking ours as replaced makes the stored credential win from now on.
+      replaced.add(cred.token)
+      replaced.add(cred.refreshToken)
+      return newer.token
+    }
+    const source = newer ?? cred
+    const clientId = source.clientId || cred.clientId || "ai-office-cli"
+    const clientSecret = source.clientSecret || cred.clientSecret
+    const tokens = await refreshKeystoneToken({
+      clientId,
+      refreshToken: source.refreshToken,
+      clientSecret: clientSecret || process.env[CLIENT_SECRET_ENV] || "",
+      tokenUrl: options?.tokenUrl,
+      audience,
+    })
+    const latest = {
+      token: tokens.access_token,
+      refreshToken: tokens.refresh_token || source.refreshToken,
+      expiresAt: Date.now() + (tokens.expires_in ?? 3600) * 1000,
+      clientId,
+      clientSecret,
+    }
+    for (const spent of [cred, source]) {
+      replaced.add(spent.token)
+      if (latest.refreshToken !== spent.refreshToken) replaced.add(spent.refreshToken)
+    }
+    synapseCredentialState.latest = latest
+    synapseCredentialState.save = saveSynapseCredential(latest)
+    // #75: saved before the lock is released, so the next process reads the rotated token.
+    await synapseCredentialState.save
+    if (modelsTarget) {
+      void updateSynapseModelsCache({ target: modelsTarget, token: latest.token, userAgent })
+    }
+    return tokens.access_token
   }
 
   return {

@@ -158,12 +158,7 @@ async function notReloaded(deps: Pick<SynapseDeps, "exec" | "frontContainer">, c
  */
 export async function adopt(deps: SynapseDeps, tokens: TokenSet): Promise<Reload> {
   const now = deps.now()
-  if (tokens.refreshToken) {
-    const previous = await readState(deps.home)
-    deps.memory.pendingRefresh = { token: tokens.refreshToken, obtainedAt: previous?.obtainedAt ?? now, unpublishedAt: now }
-    // A new owner sign-in also replaces a failed-closed state. Its new token is retryable.
-    await savePending(deps, { ...(previous ?? { obtainedAt: now, expiresAt: 0 }), needsSignIn: undefined })
-  }
+  if (tokens.refreshToken) await keepRotated(deps, tokens.refreshToken)
   await writeAuthConf(deps.frontDir, tokens.accessToken)
   const claims = jwtClaims(tokens.accessToken) ?? {}
   const act = claims.act && typeof claims.act === "object" ? (claims.act as Record<string, unknown>).sub : undefined
@@ -176,6 +171,19 @@ export async function adopt(deps: SynapseDeps, tokens: TokenSet): Promise<Reload
     await savePending(deps)
   }
   return reloadFront(deps)
+}
+
+/**
+ * Keep a rotated refresh token (call under the lock): save it now, or hold it in memory as
+ * unpublished so the next tick retries the save and refreshes with it, never with the spent one.
+ * Used by `adopt` and, for #68, when Keystone rotated but its access token cannot be used.
+ */
+export async function keepRotated(deps: SynapseDeps, refreshToken: string): Promise<void> {
+  const now = deps.now()
+  const previous = await readState(deps.home)
+  deps.memory.pendingRefresh = { token: refreshToken, obtainedAt: previous?.obtainedAt ?? now, unpublishedAt: now }
+  // A new owner sign-in also replaces a failed-closed state. Its new token is retryable.
+  await savePending(deps, { ...(previous ?? { obtainedAt: now, expiresAt: 0 }), needsSignIn: undefined })
 }
 
 /** This bridge's pending token, if it still belongs to the token set in force (N1); else it is dropped. */
