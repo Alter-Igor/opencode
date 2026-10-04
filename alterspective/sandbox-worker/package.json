@@ -1,0 +1,10 @@
+{
+  "name": "@alterspective/opencode-sandbox-worker",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Sandbox worker for the optional CAS opencodealt engine (FEAT-CAS-012). Unit tests only; the image is built from the Dockerfile.",
+  "scripts": {
+    "test": "bun test"
+  }
+}
