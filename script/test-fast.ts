@@ -99,7 +99,7 @@ function mapToTests(pkg: string, rel: string): string[] {
     if (testDir === "." && testName.startsWith(name)) return true
     // A direct import of the changed module, with or without its extension.
     const source = readFileSync(path.join(root, pkg, test), "utf8")
-    return source.includes(`src/${module}"`) || source.includes(`src/${module}.ts"`) || source.includes(`src/${module}.tsx"`)
+    return ["", ".ts", ".tsx"].some((ext) => [`"`, `'`].some((quote) => source.includes(`src/${module}${ext}${quote}`)))
   })
 }
 
