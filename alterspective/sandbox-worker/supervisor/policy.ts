@@ -55,7 +55,7 @@ export function parseResolveBody(body: unknown, onPremDefault?: unknown): ModelP
     return fallback("bad model policy: no effectivePolicyVersion")
   }
   const cell = record.cell === undefined ? record : record.cell
-  if (!cell || typeof cell !== "object") return fallback("bad model policy: cell is not an object")
+  if (!cell || typeof cell !== "object" || Array.isArray(cell)) return fallback("bad model policy: cell is not an object")
   const { modelIds, residency, privacyTier } = cell as Record<string, unknown>
   let ids: string[] = []
   if (modelIds !== undefined && !(Array.isArray(modelIds) && modelIds.length === 0)) {
@@ -65,8 +65,9 @@ export function parseResolveBody(body: unknown, onPremDefault?: unknown): ModelP
   }
   return {
     source: "cas",
-    // No role pin in the policy ("today's model selection applies") means Synapse routing.
-    modelIds: ids.length ? ids : [FALLBACK_MODEL],
+    // No role pin (modelIds missing or empty; CAS treats both as `[]`, "today's model selection
+    // applies") means the service's selection: its on-prem default, else Synapse routing.
+    modelIds: ids.length ? ids : (fallbackIds ?? [FALLBACK_MODEL]),
     effectivePolicyVersion: String(version),
     ...(typeof residency === "string" ? { residency } : {}),
     ...(typeof privacyTier === "string" ? { privacyTier } : {}),

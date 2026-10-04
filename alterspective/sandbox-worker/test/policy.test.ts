@@ -52,6 +52,7 @@ describe("parseResolveBody: the resolve answer passed in the manifest (#102)", (
     ["no version", { cell: { modelIds: ["m1"] } }],
     ["a blank version", { cell: { modelIds: ["m1"] }, effectivePolicyVersion: " " }],
     ["a cell that is not an object", { cell: "x", effectivePolicyVersion: "v" }],
+    ["a cell that is an array", { cell: [], effectivePolicyVersion: "v" }],
     ["modelIds not an array", { cell: { modelIds: "m1" }, effectivePolicyVersion: "v" }],
     ["a blank model id", { cell: { modelIds: ["m1", " "] }, effectivePolicyVersion: "v" }],
     ["a model id with a space", { cell: { modelIds: ["m 1"] }, effectivePolicyVersion: "v" }],
@@ -78,6 +79,23 @@ describe("fallback to the service's on-prem default (#102, svc-coding-agent#4)",
 
   test("a bad policy uses the on-prem default too", () => {
     expect(parseResolveBody({ cell: { modelIds: [1] }, effectivePolicyVersion: "v" }, onPrem)).toMatchObject({
+      source: "fallback",
+      modelIds: ["qwen3.8-27b-dflash2"],
+    })
+  })
+
+  test("no role pin (modelIds missing or empty) uses the on-prem default, still from CAS", () => {
+    for (const cell of [{}, { modelIds: [] }]) {
+      expect(parseResolveBody({ cell, effectivePolicyVersion: "v9" }, onPrem)).toEqual({
+        source: "cas",
+        modelIds: ["qwen3.8-27b-dflash2"],
+        effectivePolicyVersion: "v9",
+      })
+    }
+  })
+
+  test("an array cell falls back to the on-prem default", () => {
+    expect(parseResolveBody({ cell: [], effectivePolicyVersion: "v" }, onPrem)).toMatchObject({
       source: "fallback",
       modelIds: ["qwen3.8-27b-dflash2"],
     })

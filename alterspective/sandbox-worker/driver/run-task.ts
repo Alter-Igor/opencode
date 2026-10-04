@@ -258,7 +258,10 @@ async function drive() {
     envScrub,
     decisions,
     errors,
-    model: manifest.model.id,
+    // #102: the policy the supervisor actually applied (models, version or fallback reason).
+    modelPolicy: await run(["docker", "exec", taskId, "cat", "/run/sbxw/state.json"])
+      .then((text) => JSON.parse(text).modelPolicy ?? null)
+      .catch((error: unknown) => ({ unreadable: String(error) })),
   }
   await Bun.write(path.join(runDir, "result.json"), JSON.stringify(result, null, 2))
   console.log(JSON.stringify(result, null, 2))

@@ -69,7 +69,8 @@ decision 7). The sandbox does not fetch them:
    - **Good answer** (`{ cell: { modelIds, residency, privacyTier }, effectivePolicyVersion }`): the
      `synapse` provider gets those models, strongest last. The last one is the main model, the
      first the small model, and the provider `whitelist` hides every other live Synapse model. No
-     `modelIds` in the cell means Synapse `auto`.
+     role pin (`modelIds` missing or empty, which CAS treats the same) means the service's
+     selection: `model.onPremDefault`, else Synapse `auto`.
    - **Missing or unusable:** the service's configured on-prem default (`model.onPremDefault`),
      else `auto`, always with `x-privacy-tier: local-only`, so Synapse keeps the task on-prem.
      Nothing is hard-coded in the box. The service should always send its default: plain `auto`
