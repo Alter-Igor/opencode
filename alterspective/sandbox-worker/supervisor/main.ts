@@ -4,6 +4,7 @@
 import { $ } from "bun"
 import path from "path"
 import { PRIVACY_TIER, PRIVACY_TIER_ENV, renderConfig, type Manifest } from "./config"
+import { checkBundleFile, checkTree } from "./bundle"
 import { parseResolveBody } from "./policy"
 
 const fail = (message: string): never => {
@@ -17,6 +18,8 @@ if (!manifest.model?.baseURL) fail("manifest.model.baseURL is required")
 // Never run the server unauthenticated, even bound to loopback.
 const password = process.env.SBXW_SERVER_PASSWORD ?? fail("SBXW_SERVER_PASSWORD is not set")
 
+// #108: the fork commit this image was built from (Dockerfile `GIT_SHA` build argument).
+const buildSha = process.env.SBXW_BUILD_SHA || "unknown"
 const configDir = process.env.OPENCODE_CONFIG_DIR ?? "/run/sbxw/config"
 const repoDir = "/work/repo"
 
@@ -37,9 +40,21 @@ await Bun.write(path.join(configDir, ".gitignore"), "node_modules\npackage.json\
 await Bun.write(path.join(configDir, "plugins", "env-scrub.ts"), Bun.file("/opt/sbxw/plugins/env-scrub.ts"))
 
 // Work inside the box on its own clone; never a bind mount of the host's repository.
+// #108: a bundle that does not match what the service sent is refused before anything is served.
+const verified = { sha256: false, tree: false }
 if (manifest.repo?.bundle) {
+  if (manifest.repo.sha256) {
+    const check = await checkBundleFile(manifest.repo.bundle, manifest.repo.sha256)
+    if (!check.ok) fail(`refusing to start: ${check.reason}`)
+    verified.sha256 = true
+  }
   await $`git clone --quiet ${manifest.repo.bundle} ${repoDir}`
   if (manifest.repo.ref) await $`git -C ${repoDir} checkout --quiet ${manifest.repo.ref}`
+  if (manifest.repo.treeSha) {
+    const check = await checkTree(repoDir, manifest.repo.treeSha)
+    if (!check.ok) fail(`refusing to start: ${check.reason}`)
+    verified.tree = true
+  }
 } else {
   await $`mkdir -p ${repoDir}`
   await $`git -C ${repoDir} init --quiet`
@@ -56,7 +71,9 @@ await Bun.write(
   "/run/sbxw/state.json",
   JSON.stringify({
     taskId: manifest.taskId,
+    buildSha,
     repoDir,
+    bundleVerified: verified,
     baseSha: baseSha || null,
     startedAt: new Date().toISOString(),
     // #102: which policy this task ran under (ADR-042: effectivePolicyVersion frozen at task start).
@@ -68,7 +85,11 @@ await Bun.write(
 const hostname = manifest.listen?.hostname ?? "127.0.0.1"
 const port = manifest.listen?.port ?? 4096
 const { SBXW_SERVER_PASSWORD: _drop, SBXW_MANIFEST: _manifest, ...env } = process.env
-console.log(`[sbxw] task ${manifest.taskId}: base ${baseSha || "(empty repo)"}, serving on ${hostname}:${port}`)
+console.log(
+  `[sbxw] task ${manifest.taskId}: build ${buildSha}, base ${baseSha || "(empty repo)"}, ` +
+    `bundle sha256 ${verified.sha256 ? "verified" : "not checked"}, tree ${verified.tree ? "verified" : "not checked"}, ` +
+    `serving on ${hostname}:${port}`,
+)
 
 // The Synapse plugin reads its base URL from SYNAPSE_BASE_URL and its key from stored auth;
 // OPENCODE_AUTH_CONTENT supplies that auth without writing a file. Spike only: Phase 2 points

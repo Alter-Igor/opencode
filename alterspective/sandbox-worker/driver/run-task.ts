@@ -18,6 +18,7 @@ import path from "path"
 import { chmod, rm } from "fs/promises"
 import { randomBytes } from "crypto"
 import { createOpencodeClient } from "../../../packages/sdk/js/src/v2/client"
+import { sha256File } from "../supervisor/bundle"
 
 const { values: args } = parseArgs({
   options: {
@@ -55,7 +56,10 @@ await run(["git", "-C", args.repo, "bundle", "create", bundle, "HEAD"])
 await chmod(runDir, 0o755)
 await chmod(bundle, 0o644)
 const baseSha = (await run(["git", "-C", args.repo, "rev-parse", "HEAD"])).trim()
-log(`bundled ${args.repo} at ${baseSha}`)
+// #108: the box refuses to start unless the bundle and its tree match these.
+const bundleSha256 = await sha256File(bundle)
+const treeSha = (await run(["git", "-C", args.repo, "rev-parse", "HEAD^{tree}"])).trim()
+log(`bundled ${args.repo} at ${baseSha} (tree ${treeSha}, bundle sha256 ${bundleSha256})`)
 
 const manifest = {
   taskId,
@@ -65,7 +69,7 @@ const manifest = {
     ...(args["on-prem-default"] ? { onPremDefault: args["on-prem-default"].split(",").map((id) => id.trim()) } : {}),
   },
   ...(args["model-policy"] ? { modelPolicy: await Bun.file(args["model-policy"]).json() } : {}),
-  repo: { bundle: "/run/sbxw/input/repo.bundle" },
+  repo: { bundle: "/run/sbxw/input/repo.bundle", sha256: bundleSha256, treeSha },
   // Spike only: the server listens on all container interfaces so the host can reach it through
   // a loopback-only published port. Phase 2 keeps it on 127.0.0.1 and uses the outbound link.
   listen: { hostname: "0.0.0.0", port: 4096 },
