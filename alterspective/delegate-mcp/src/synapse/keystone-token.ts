@@ -26,6 +26,28 @@ export const MIN_LIFETIME_SEC = 60
 export type TokenSet = { accessToken: string; refreshToken?: string; expiresInSec: number }
 export type Fetch = (input: string, init: RequestInit) => Promise<Response>
 
+/**
+ * #68: Keystone answered 2xx but the access token cannot be used (no token, already expired, or a
+ * shape the bridge does not recognise). Keystone has still spent the refresh token it was given, so
+ * the rotated one in the reply must be kept before anything else, or the next retry is refused.
+ * The token is kept in a side table, not on the error, so no log, inspector or serialiser can show
+ * it (Bun's inspector prints private fields too). Read it with `rotatedRefreshToken(error)`.
+ */
+export class UnusableTokenError extends DelegateError {
+  constructor(refreshToken: string | undefined, message: string, action: string, detail: string) {
+    super("upstream_error", message, action, detail)
+    this.name = "UnusableTokenError"
+    if (refreshToken) rotatedTokens.set(this, refreshToken)
+  }
+}
+
+const rotatedTokens = new WeakMap<UnusableTokenError, string>()
+
+/** The rotated refresh token an unusable reply carried, or undefined (any other error, or none came back). */
+export function rotatedRefreshToken(error: unknown): string | undefined {
+  return error instanceof UnusableTokenError ? rotatedTokens.get(error) : undefined
+}
+
 /** Decoded JWT payload (not verified: Keystone verifies it on the exchange). */
 export function jwtClaims(token: string): Record<string, unknown> | undefined {
   const part = token.split(".")[1]
@@ -75,12 +97,16 @@ async function tokenCall(fetcher: Fetch, origin: string, body: URLSearchParams, 
   if (!response) throw new DelegateError("upstream_error", `Keystone could not be reached for the Synapse token ${step}.`, "Check the network, then retry.", `${step}: fetch failed`)
   const json = (await response.json().catch(() => ({}))) as { access_token?: unknown; refresh_token?: unknown; expires_in?: unknown; error?: unknown }
   const code = typeof json.error === "string" && ERROR_CODE.test(json.error) ? json.error : "unknown"
-  if (!response.ok || typeof json.access_token !== "string") throw tokenError(step, response.status, code)
+  if (!response.ok) throw tokenError(step, response.status, code)
+  // #68: read the rotated refresh token before any check on the access token can fail.
+  const refreshToken = typeof json.refresh_token === "string" && json.refresh_token ? json.refresh_token : undefined
+  if (typeof json.access_token !== "string" || !json.access_token)
+    throw new UnusableTokenError(refreshToken, `Keystone returned no Synapse token for the ${step}.`, "Retry later; run oc_doctor.", `${step}: HTTP ${response.status} no access_token`)
   const lifetime = lifetimeSec(json.access_token, typeof json.expires_in === "number" && json.expires_in > 0 ? json.expires_in : 3600)
   // Review N3: a token that is already (nearly) expired is a passing upstream fault: retry, never adopt.
-  if (lifetime <= MIN_LIFETIME_SEC) throw new DelegateError("upstream_error", "Keystone returned a Synapse token that is already expired.", "Retry later; check the PC's clock; run oc_doctor.", `${step}: lifetime ${lifetime}s`)
-  if (!isTokenShape(json.access_token)) throw new DelegateError("upstream_error", "Keystone returned a Synapse token the bridge does not recognise.", "Run oc_login {server: \"synapse\"} again.", `${step}: token shape`)
-  return { accessToken: json.access_token, ...(typeof json.refresh_token === "string" && json.refresh_token ? { refreshToken: json.refresh_token } : {}), expiresInSec: lifetime }
+  if (lifetime <= MIN_LIFETIME_SEC) throw new UnusableTokenError(refreshToken, "Keystone returned a Synapse token that is already expired.", "Retry later; check the PC's clock; run oc_doctor.", `${step}: lifetime ${lifetime}s`)
+  if (!isTokenShape(json.access_token)) throw new UnusableTokenError(refreshToken, "Keystone returned a Synapse token the bridge does not recognise.", "Run oc_login {server: \"synapse\"} again.", `${step}: token shape`)
+  return { accessToken: json.access_token, ...(refreshToken ? { refreshToken } : {}), expiresInSec: lifetime }
 }
 
 /** min(expires_in, the JWT's own `exp`) (review L4): never trust the token past either. */

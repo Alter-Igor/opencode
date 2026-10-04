@@ -17,7 +17,8 @@ import {
   type SynapseModelsFetch,
   type SynapseModelsLogEvent,
 } from "../../src/plugin/synapse-models"
-import { SynapseAuthPlugin, synapseModelsToken } from "../../src/plugin/synapse"
+import { SynapseAuthPlugin, synapseModelsToken, synapseRefreshLockKey, type SynapseRefreshLock } from "../../src/plugin/synapse"
+import { Flock } from "@opencode-ai/core/util/flock"
 import * as fs from "fs/promises"
 import * as os from "os"
 import * as path from "path"
@@ -433,6 +434,7 @@ describe("Synapse credential refresh (chat only; startup never refreshes)", () =
     tokenDelayMs?: number
     expiresIn?: number
     refreshWaitMs?: number
+    refreshLock?: SynapseRefreshLock
   }
 
   function harness(opts: Opts) {
@@ -493,7 +495,7 @@ describe("Synapse credential refresh (chat only; startup never refreshes)", () =
           serverUrl: new URL("https://example.com"),
           $: {} as never,
         },
-        { tokenUrl: "https://keystone.example.test/token", refreshWaitMs: opts.refreshWaitMs },
+        { tokenUrl: "https://keystone.example.test/token", refreshWaitMs: opts.refreshWaitMs, refreshLock: opts.refreshLock },
       )
       const cfg = configWithStaleModels()
       await hooks.config?.(cfg)
@@ -515,7 +517,16 @@ describe("Synapse credential refresh (chat only; startup never refreshes)", () =
       if (previousAuth === undefined) delete process.env.OPENCODE_AUTH_CONTENT
       else process.env.OPENCODE_AUTH_CONTENT = previousAuth
     }
-    return { old, grants, issued, chatAuth, modelsAuth, tokenCalls, start, restore }
+    // #75: what another OpenCode process leaves in the credential file after its own refresh.
+    const otherProcessRotated = (opts2: { expired: boolean }) => {
+      const exp = Math.floor(Date.now() / 1000) + (opts2.expired ? -60 : 3600)
+      const access = jwt({ aud: "synapse", exp, jti: `other-${nonce}` })
+      process.env.OPENCODE_AUTH_CONTENT = JSON.stringify({
+        synapse: { type: "api", key: access, metadata: { refreshToken: `r-9-${nonce}`, expiresAt: String(exp * 1000) } },
+      })
+      return access
+    }
+    return { old, grants, issued, chatAuth, modelsAuth, tokenCalls, start, restore, otherProcessRotated }
   }
 
   const settle = (ms = 30) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -590,8 +601,92 @@ describe("Synapse credential refresh (chat only; startup never refreshes)", () =
       await chat()
       // The second wait also gives up, so that request uses the newest token held in memory.
       expect(h.chatAuth[1]).toBe(`Bearer ${h.issued[0]}`)
-      await settle(250)
+      // The second grant waits for the machine-wide refresh lock (#75), so poll instead of a fixed sleep.
+      for (let i = 0; i < 100 && h.grants.length < 2; i++) await settle(30)
       expect(h.grants).toEqual(["r-1", "r-2"])
+    } finally {
+      h.restore()
+    }
+  })
+
+  test("#75: another process refreshed while this one waited for the lock: its token is used, with no grant", async () => {
+    const h = harness({ refreshWaitMs: 5_000 })
+    // Hold the real machine-wide lock, as the other process would during its refresh.
+    const held = await Flock.acquire(synapseRefreshLockKey())
+    let released = false
+    try {
+      const { chat } = await h.start()
+      const sent = chat()
+      await settle(100)
+      expect(h.tokenCalls).toHaveLength(0)
+      const theirs = h.otherProcessRotated({ expired: false })
+      await held.release()
+      released = true
+      await sent
+      expect(h.grants).toEqual([])
+      expect(h.chatAuth).toEqual([`Bearer ${theirs}`])
+    } finally {
+      if (!released) await held.release()
+      h.restore()
+    }
+  })
+
+  test("#75: the other process's token is also expiring: the grant spends its refresh token, never ours", async () => {
+    let theirs = ""
+    const h = harness({
+      refreshLock: async (fn) => {
+        theirs = h.otherProcessRotated({ expired: true })
+        return fn()
+      },
+    })
+    try {
+      const { chat } = await h.start()
+      await chat()
+      expect(theirs).not.toBe("")
+      expect(h.grants).toEqual(["r-9"])
+      expect(h.chatAuth).toEqual([`Bearer ${h.issued[0]}`])
+    } finally {
+      h.restore()
+    }
+  })
+
+  test("#75: the rotated token is saved before the lock is released", async () => {
+    const events: string[] = []
+    const h = harness({
+      save: async () => {
+        await settle(20)
+        events.push("saved")
+      },
+      refreshLock: async (fn) => {
+        events.push("locked")
+        try {
+          return await fn()
+        } finally {
+          events.push("released")
+        }
+      },
+    })
+    try {
+      const { chat } = await h.start()
+      await chat()
+      expect(h.grants).toEqual(["r-1"])
+      expect(events).toEqual(["locked", "saved", "released"])
+    } finally {
+      h.restore()
+    }
+  })
+
+  test("#75: when the lock cannot be taken the chat goes ahead with its token and nothing is spent", async () => {
+    const h = harness({
+      refreshLock: async () => {
+        throw new Error("Timed out waiting for lock")
+      },
+    })
+    try {
+      const { chat } = await h.start()
+      await chat()
+      expect(h.grants).toEqual([])
+      expect(h.chatAuth).toEqual([`Bearer ${h.old}`])
     } finally {
       h.restore()
     }
