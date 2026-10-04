@@ -50,15 +50,19 @@ const run = async (cmd: string[], env?: Record<string, string>) => {
 }
 
 await Bun.write(path.join(runDir, ".keep"), "")
+// #108: pin one commit for the bundle and its tree. git refuses to bundle a bare SHA, so bundle
+// HEAD and then check the bundle's HEAD is the commit read first; stop if HEAD moved in between.
+const baseSha = (await run(["git", "-C", args.repo, "rev-parse", "HEAD"])).trim()
 await run(["git", "-C", args.repo, "bundle", "create", bundle, "HEAD"])
+const bundledHead = (await run(["git", "bundle", "list-heads", bundle, "HEAD"])).trim().split(/\s+/)[0]
+if (bundledHead !== baseSha) throw new Error(`HEAD moved while bundling (${baseSha} -> ${bundledHead}); run again`)
 // The container runs as uid 10001 and mounts runDir read-only; a restrictive host umask must not
 // stop it reading the bundle. (No effect on Windows hosts.)
 await chmod(runDir, 0o755)
 await chmod(bundle, 0o644)
-const baseSha = (await run(["git", "-C", args.repo, "rev-parse", "HEAD"])).trim()
 // #108: the box refuses to start unless the bundle and its tree match these.
 const bundleSha256 = await sha256File(bundle)
-const treeSha = (await run(["git", "-C", args.repo, "rev-parse", "HEAD^{tree}"])).trim()
+const treeSha = (await run(["git", "-C", args.repo, "rev-parse", `${baseSha}^{tree}`])).trim()
 log(`bundled ${args.repo} at ${baseSha} (tree ${treeSha}, bundle sha256 ${bundleSha256})`)
 
 const manifest = {
