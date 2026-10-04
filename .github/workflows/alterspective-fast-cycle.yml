@@ -1,0 +1,61 @@
+name: alterspective-fast-cycle
+
+# Fork-only (#93, KB playbook AIPB-008). The upstream `test` jobs need Blacksmith runners this fork
+# does not have, so they never start. Two tiers on GitHub-hosted Linux instead:
+#   fast — every PR: oxlint plus only the tests mapped to the changed files (script/test-fast.ts),
+#          then the opencode typecheck. Agents wait on this one.
+#   full — every PR and every push to dev: the whole packages/opencode suite on Linux. `integrate`
+#          reads this result before a merge instead of a slow, noisy local Windows run.
+# A merge queue would run `full` speculatively before landing, but merge queues need an
+# organisation-owned repository and this fork is user-owned.
+on:
+  pull_request:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fast:
+    if: github.repository == 'Alter-Igor/opencode' && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0 # the fast tier diffs against the PR base
+
+      - name: Setup Bun
+        uses: ./.github/actions/setup-bun
+
+      - name: Fast tier (lint + mapped tests)
+        run: bun run test:fast --base origin/${{ github.base_ref }}
+
+      - name: Typecheck opencode
+        working-directory: packages/opencode
+        run: bun run typecheck
+
+  full:
+    if: github.repository == 'Alter-Igor/opencode'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Setup Bun
+        uses: ./.github/actions/setup-bun
+
+      - name: Configure git identity
+        run: |
+          git config --global user.email "bot@opencode.ai"
+          git config --global user.name "opencode"
+
+      - name: Full opencode suite
+        working-directory: packages/opencode
+        run: bun test --timeout 30000 --only-failures
