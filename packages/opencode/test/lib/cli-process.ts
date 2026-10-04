@@ -25,6 +25,7 @@ import { AppProcess } from "@opencode-ai/core/process"
 import { Deferred, Duration, Effect, Layer, Queue, Schedule, Scope, Stream } from "effect"
 import { FetchHttpClient, HttpClient } from "effect/unstable/http"
 import { ChildProcess } from "effect/unstable/process"
+import os from "node:os"
 import path from "node:path"
 import { TestLLMServer } from "./llm-server"
 import { testProviderConfig } from "./test-provider"
@@ -58,6 +59,40 @@ function forkStderrDrain(stream: ReadableStream<Uint8Array>, into: string[]) {
     ),
   )
 }
+
+// Fork-only (#100): at most this many short-lived CLI children run at once, across every fixture
+// in the process. `cliIt.concurrent` otherwise starts one cold `bun run src/index.ts` per test at
+// the same time; on a 4-vCPU GitHub runner ten of them took 13-15 s each instead of about 2 s, so
+// the timing-sensitive tests in test/cli/run/run-process.test.ts hit their limits. Waiting for a
+// slot does not count towards `durationMs` or the per-spawn timeout. Override with
+// OPENCODE_TEST_CLI_CONCURRENCY.
+export const cliConcurrency =
+  Number(process.env.OPENCODE_TEST_CLI_CONCURRENCY) || Math.max(2, Math.floor(os.availableParallelism() / 2))
+const cliSlots = (() => {
+  let active = 0
+  const waiting: Array<() => void> = []
+  return {
+    acquire: () =>
+      new Promise<void>((resolve) => {
+        if (active < cliConcurrency) {
+          active++
+          return resolve()
+        }
+        waiting.push(() => {
+          active++
+          resolve()
+        })
+      }),
+    release: () => {
+      active--
+      waiting.shift()?.()
+    },
+  }
+})()
+const cliSlot = Effect.acquireRelease(
+  Effect.promise(() => cliSlots.acquire()),
+  () => Effect.sync(() => cliSlots.release()),
+)
 
 function isolatedEnv(home: string, configJson: string): Record<string, string> {
   return {
@@ -205,6 +240,11 @@ export function withCliFixture<A, E>(
     const env = isolatedEnv(home, configJson)
 
     const spawn = Effect.fn("opencode.spawn")(function* (args: string[], opts?: SpawnOpts) {
+      // #100: hold a slot for the child's whole life; released when the spawn ends.
+      return yield* Effect.scoped(Effect.flatMap(cliSlot, () => spawnNow(args, opts)))
+    })
+
+    const spawnNow = Effect.fn("opencode.spawnNow")(function* (args: string[], opts?: SpawnOpts) {
       const start = Date.now()
       const timeoutMs = opts?.timeoutMs ?? 30_000
       // stdin: "ignore" so the child doesn't see a piped stdin and block
@@ -279,6 +319,8 @@ export function withCliFixture<A, E>(
     }
 
     const startRun = Effect.fn("opencode.startRun")(function* (message: string, opts?: RunOpts) {
+      // #100: released when the caller's scope closes, after the child is killed.
+      yield* cliSlot
       const start = Date.now()
       const options = runOpts(opts)
       const proc = yield* Effect.acquireRelease(
