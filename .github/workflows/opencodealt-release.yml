@@ -1,11 +1,19 @@
 name: opencodealt-release
 
-# Fork-only (#90): builds opencodealt.exe (Windows x64) and publishes it as a GitHub release.
-# AI Office (`aio opencode install`) downloads the latest release and checks the .sha256.
+# Fork-only (#90, #97): builds opencodealt.exe (Windows x64) and publishes it as an EDGE release
+# (a GitHub pre-release) on every code merge to dev. opencodealt-promote.yml later marks a soaked
+# edge release as stable (GitHub "Latest"). AI Office installs stable by default
+# (`aio opencode install`) and the newest edge with `aio opencode install --edge`; both check the .sha256.
 # The build runs on Windows so build.ts can build and smoke-test the native binary (--single).
 # The binary is not code-signed: this fork has no signing certificate.
 
 on:
+  push:
+    branches: [dev]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - ".github/ISSUE_TEMPLATE/**"
   workflow_dispatch:
     inputs:
       ref:
@@ -16,6 +24,8 @@ on:
 permissions:
   contents: write
 
+# One build at a time. A merge that lands while a build runs waits; if several land, only the
+# newest waiting one is built (GitHub keeps one pending run per group).
 concurrency:
   group: opencodealt-release
   cancel-in-progress: false
@@ -27,7 +37,7 @@ jobs:
     steps:
       - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ inputs.ref || github.sha }}
           # The publish step gets GH_TOKEN explicitly; keep the write token away from install/build scripts.
           persist-credentials: false
 
@@ -65,7 +75,7 @@ jobs:
           [IO.File]::WriteAllText("$PWD/release/opencodealt-windows-x64.zip.sha256", "$hash  opencodealt-windows-x64.zip`n")
           Get-Content release/opencodealt-windows-x64.zip.sha256
 
-      - name: Publish release
+      - name: Publish edge release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -78,5 +88,6 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --target "$SHA" \
             --title "opencodealt ${VERSION}" \
-            --latest \
-            --notes "opencodealt ${VERSION}, built from ${SHA}. Install or update with \`aio opencode install\` (AI Office). User guide: https://aio.alterspective.com.au/app/ai-os/opencodealt"
+            --prerelease \
+            --latest=false \
+            --notes "Edge build of opencodealt ${VERSION}, from ${SHA}. Try it with \`aio opencode install --edge\` (AI Office). It becomes stable on its own after a 3-day soak if no newer edge build lands and no issue labelled \`release-hold\` is open. User guide: https://aio.alterspective.com.au/app/ai-os/opencodealt"
