@@ -14,7 +14,8 @@ two do not share files, image names, container names or ports.
 | `Dockerfile` | Builds the fork into a single Linux binary. Adds git, gh and ripgrep. Runs as non-root user `agent` (uid 10001). |
 | `Dockerfile.dockerignore` | The build context filter for this Dockerfile. The root `.dockerignore` is left alone. |
 | `supervisor/main.ts` | Container entry point. Reads the manifest, writes the managed OpenCode config, clones the repository from a git bundle into `/work/repo`, and starts `opencode serve`. |
-| `supervisor/config.ts` | Renders the managed OpenCode config from the manifest. Pure, so it is unit tested in `test/`. |
+| `supervisor/config.ts` | Renders the managed OpenCode config from the manifest and the model ids. Pure, so it is unit tested in `test/`. |
+| `supervisor/policy.ts` | Checks the CAS AI-roles answer passed in the manifest (#102), failing closed to `auto` + `local-only`. Unit tested in `test/`. |
 | `test/` | Unit tests: `bun test` from this folder. `bun run test:fast` at the repo root runs a changed test file here; it does not map a changed `supervisor/` file to its tests, so run `bun test` here after a supervisor change. |
 | `plugins/env-scrub.ts` | Blanks the server password and model key in every shell the agent runs. |
 | `driver/run-task.ts` | Stands in for CAS. Runs one task end to end and writes `runs/<taskId>/result.json` and `change.patch`. |
@@ -31,7 +32,8 @@ Driver flags:
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--model` | `auto` | Model id sent to the model route |
+| `--model-policy` | none | A saved CAS resolve answer (JSON file), passed as `manifest.modelPolicy`. Without it the task runs on the on-prem default, else `auto`, `local-only` |
+| `--on-prem-default` | none | Comma-separated on-prem default model ids (strongest last), passed as `manifest.model.onPremDefault` |
 | `--base-url` | Synapse v2 `/v1` | OpenAI-compatible base URL |
 | `--timeout-min` | `30` | Aborts the session after this long |
 | `--keep` | off | Leaves the container running for inspection |
@@ -44,12 +46,44 @@ Containers are named `sbxw-<id>`, labelled `alterspective.sandbox-worker=spike`,
 ```json
 {
   "taskId": "sbxw-…",
-  "model": { "baseURL": "https://…/v1", "id": "auto", "headers": { "x-task-type": "code" } },
+  "model": { "baseURL": "https://…/v1", "headers": { "x-task-type": "code" }, "onPremDefault": ["qwen3.8-27b-dflash2"] },
+  "modelPolicy": { "cell": { "modelIds": ["…"] }, "effectivePolicyVersion": "…" },
   "repo": { "bundle": "/run/sbxw/input/repo.bundle", "ref": "optional" },
   "permission": { "*": "allow", "external_directory": "deny" },
   "listen": { "hostname": "127.0.0.1", "port": 4096 }
 }
 ```
+
+## Model policy (#102)
+
+The model ids are never in the image. They come from CAS **Admin → AI roles** (CAS ADR-042
+decision 7). The sandbox does not fetch them:
+
+1. svc-coding-agent calls CAS `GET /api/v1/ai-roles/resolve?role=developer&repo=<owner/repo>[&taskType=…]`
+   (contract proposed in CAS #1674, not built yet) with its own Keystone credential, caches the
+   answer for at most 5 minutes, and freezes it for the task.
+2. It passes that answer verbatim as `manifest.modelPolicy`. The box holds no CAS credential and
+   makes no policy call (ADR-037 decision 1, kept by ADR-042). A test checks there is no `fetch(`
+   or policy token in the supervisor.
+3. The supervisor checks it:
+   - **Good answer** (`{ cell: { modelIds, residency, privacyTier }, effectivePolicyVersion }`): the
+     `synapse` provider gets those models, strongest last. The last one is the main model, the
+     first the small model, and the provider `whitelist` hides every other live Synapse model. No
+     role pin (`modelIds` missing or empty, which CAS treats the same) means the service's
+     selection: `model.onPremDefault`, else Synapse `auto`.
+   - **Missing or unusable:** the service's configured on-prem default (`model.onPremDefault`),
+     else `auto`, always with `x-privacy-tier: local-only`, so Synapse keeps the task on-prem.
+     Nothing is hard-coded in the box. The service should always send its default: plain `auto`
+     may route to an on-prem model that failed the svc-coding-agent#4 quality gate
+     (`ornith-1.0-35b`, 67%; `qwen3.8-27b-dflash2` passed with 87%). CAS being unreachable is the service's case to handle
+     (ADR-042: no cached value means `local-only` with the on-prem default). It arrives here as a
+     missing `modelPolicy`.
+4. The result, with `effectivePolicyVersion` or the fallback reason, is written to
+   `/run/sbxw/state.json`.
+
+The tier stays `local-only` whatever the cell says (#101). If a cell names a cloud model, the
+request asks Synapse for that model at `local-only`. We expect Synapse to refuse it, and then the
+fork's pinned-model fallback (#80) resends with `auto`. Not checked live yet.
 
 ## What protects what, honestly
 
@@ -61,6 +95,9 @@ Containers are named `sbxw-<id>`, labelled `alterspective.sandbox-worker=spike`,
   never replies `always`. Questions are refused, because there is no human in the spike loop.
 - **The env scrub is hygiene, not a boundary.** The agent's shell runs as the same user as the
   server, so it can still read the server's environment through `/proc`.
+- **The model whitelist is a convenience, not a boundary.** The gateway is meant to enforce the
+  resolved cell server-side (ADR-042). Until then, the box can only be trusted to stay on-prem
+  because of the `local-only` tier.
 - **Model calls stay on-prem (#101).** The `synapse` provider always sends `x-privacy-tier: local-only`, set after the manifest headers, so a manifest cannot remove or widen it. The supervisor also sets `SYNAPSE_PRIVACY_TIER=local-only` for `opencode serve`, so the fork's Synapse plugin puts the tier on every Synapse call it makes (chat, model list, MCP bridge, `synapse_buddy_review`). CAS ADR-042 requires this for the opencodealt engine.
 - **The repository config cannot steer the agent.** `OPENCODE_DISABLE_PROJECT_CONFIG=1` stops the
   repository's own `opencode.json` and `.opencode/` from loading. The only config is the one the

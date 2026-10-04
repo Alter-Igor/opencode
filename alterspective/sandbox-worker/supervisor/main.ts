@@ -4,6 +4,7 @@
 import { $ } from "bun"
 import path from "path"
 import { PRIVACY_TIER, PRIVACY_TIER_ENV, renderConfig, type Manifest } from "./config"
+import { parseResolveBody } from "./policy"
 
 const fail = (message: string): never => {
   console.error(`[sbxw] ${message}`)
@@ -12,14 +13,22 @@ const fail = (message: string): never => {
 
 const manifest: Manifest = JSON.parse(process.env.SBXW_MANIFEST ?? fail("SBXW_MANIFEST is not set"))
 if (!manifest.taskId) fail("manifest.taskId is required")
-if (!manifest.model?.baseURL || !manifest.model?.id) fail("manifest.model.baseURL and manifest.model.id are required")
+if (!manifest.model?.baseURL) fail("manifest.model.baseURL is required")
 // Never run the server unauthenticated, even bound to loopback.
 const password = process.env.SBXW_SERVER_PASSWORD ?? fail("SBXW_SERVER_PASSWORD is not set")
 
 const configDir = process.env.OPENCODE_CONFIG_DIR ?? "/run/sbxw/config"
 const repoDir = "/work/repo"
 
-const config = renderConfig(manifest)
+// #102: svc-coding-agent resolved and froze this for the task; the box makes no policy call and
+// holds no CAS credential. Missing or unusable means `auto`, local-only.
+const policy = parseResolveBody(manifest.modelPolicy, manifest.model.onPremDefault)
+console.log(
+  policy.source === "cas"
+    ? `[sbxw] model policy: CAS version ${policy.effectivePolicyVersion}, models ${policy.modelIds.join(", ")}`
+    : `[sbxw] model policy: fallback (${policy.reason}), models ${policy.modelIds.join(", ")}, ${PRIVACY_TIER}`,
+)
+const config = renderConfig(manifest, policy.modelIds)
 
 await $`mkdir -p ${path.join(configDir, "plugins")} ${process.env.XDG_CONFIG_HOME ?? "/run/sbxw/xdg-config"}`
 await Bun.write(path.join(configDir, "opencode.json"), JSON.stringify(config, null, 2))
@@ -45,7 +54,15 @@ const baseSha = (await $`git -C ${repoDir} rev-parse --verify --quiet HEAD`.noth
 
 await Bun.write(
   "/run/sbxw/state.json",
-  JSON.stringify({ taskId: manifest.taskId, repoDir, baseSha: baseSha || null, startedAt: new Date().toISOString() }),
+  JSON.stringify({
+    taskId: manifest.taskId,
+    repoDir,
+    baseSha: baseSha || null,
+    startedAt: new Date().toISOString(),
+    // #102: which policy this task ran under (ADR-042: effectivePolicyVersion frozen at task start).
+    modelPolicy: policy,
+    privacyTier: PRIVACY_TIER,
+  }),
 )
 
 const hostname = manifest.listen?.hostname ?? "127.0.0.1"
