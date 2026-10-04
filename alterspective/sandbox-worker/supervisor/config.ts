@@ -4,10 +4,19 @@
 export type Manifest = {
   taskId: string
   /** Where Synapse calls go. The model ids are not here: they come from the policy (#102). */
-  model: { baseURL: string; headers?: Record<string, string> }
+  model: {
+    baseURL: string
+    headers?: Record<string, string>
+    /**
+     * #102: the service's configured on-prem default model ids (strongest last), used only when
+     * `modelPolicy` is missing or unusable. Absent too ⇒ Synapse `auto`. Always local-only (#101).
+     */
+    onPremDefault?: string[]
+  }
   /**
    * #102: the CAS AI-roles resolve answer for this task (`{ cell, effectivePolicyVersion }`), resolved
-   * and frozen by svc-coding-agent and passed through verbatim. Absent or unusable ⇒ `auto`, local-only.
+   * and frozen by svc-coding-agent and passed through verbatim. Absent or unusable ⇒ `model.onPremDefault`,
+   * else `auto`; always local-only.
    */
   modelPolicy?: unknown
   repo?: { bundle: string; ref?: string }

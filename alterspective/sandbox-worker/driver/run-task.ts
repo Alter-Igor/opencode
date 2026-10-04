@@ -4,7 +4,7 @@
 //
 //   SBXW_MODEL_KEY=<named spike key> bun alterspective/sandbox-worker/driver/run-task.ts \
 //     --repo C:\path\to\repo --task "Add a test for foo" [--base-url https://…/v1] \
-//     [--model-policy resolved.json] [--timeout-min 30] [--keep]
+//     [--model-policy resolved.json] [--on-prem-default qwen3.8-27b-dflash2] [--timeout-min 30] [--keep]
 //
 // The models come from the CAS AI-roles policy (#102), not from a flag. In production
 // svc-coding-agent resolves it (CAS #1674) and puts the answer in the manifest; here
@@ -24,6 +24,7 @@ const { values: args } = parseArgs({
     repo: { type: "string" },
     task: { type: "string" },
     "model-policy": { type: "string" },
+    "on-prem-default": { type: "string" },
     "base-url": { type: "string", default: "https://synapse2-api.alterspective.com.au/v1" },
     image: { type: "string", default: "opencodealt-sandbox-worker:spike" },
     "timeout-min": { type: "string", default: "30" },
@@ -58,7 +59,11 @@ log(`bundled ${args.repo} at ${baseSha}`)
 
 const manifest = {
   taskId,
-  model: { baseURL: args["base-url"], headers: { "x-task-type": "code" } },
+  model: {
+    baseURL: args["base-url"],
+    headers: { "x-task-type": "code" },
+    ...(args["on-prem-default"] ? { onPremDefault: args["on-prem-default"].split(",").map((id) => id.trim()) } : {}),
+  },
   ...(args["model-policy"] ? { modelPolicy: await Bun.file(args["model-policy"]).json() } : {}),
   repo: { bundle: "/run/sbxw/input/repo.bundle" },
   // Spike only: the server listens on all container interfaces so the host can reach it through

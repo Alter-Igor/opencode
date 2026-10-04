@@ -65,6 +65,39 @@ describe("parseResolveBody: the resolve answer passed in the manifest (#102)", (
   }
 })
 
+describe("fallback to the service's on-prem default (#102, svc-coding-agent#4)", () => {
+  const onPrem = ["qwen3.8-27b-dflash2"]
+
+  test("a missing policy uses the on-prem default instead of auto", () => {
+    expect(parseResolveBody(undefined, onPrem)).toEqual({
+      source: "fallback",
+      modelIds: ["qwen3.8-27b-dflash2"],
+      reason: "no model policy in the manifest; using the on-prem default",
+    })
+  })
+
+  test("a bad policy uses the on-prem default too", () => {
+    expect(parseResolveBody({ cell: { modelIds: [1] }, effectivePolicyVersion: "v" }, onPrem)).toMatchObject({
+      source: "fallback",
+      modelIds: ["qwen3.8-27b-dflash2"],
+    })
+  })
+
+  test("a good policy wins over the on-prem default", () => {
+    expect(parseResolveBody(good, onPrem)).toMatchObject({ source: "cas", modelIds: good.cell.modelIds })
+  })
+
+  test("an unusable on-prem default is ignored: auto", () => {
+    for (const bad of [[], [""], ["a b"], "qwen", [1], Array.from({ length: 21 }, (_, i) => `m${i}`)]) {
+      expect(parseResolveBody(undefined, bad)).toEqual({
+        source: "fallback",
+        modelIds: ["auto"],
+        reason: "no model policy in the manifest",
+      })
+    }
+  })
+})
+
 describe("the sandbox holds no CAS credential (#102, ADR-037 decision 1)", () => {
   const read = (rel: string) => readFileSync(path.join(import.meta.dir, "..", rel), "utf8")
 

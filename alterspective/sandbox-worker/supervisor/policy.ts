@@ -7,8 +7,12 @@
 // as `manifest.modelPolicy`. The sandbox therefore holds no CAS credential (ADR-037 decision 1,
 // kept by ADR-042) and makes no policy call of its own.
 //
-// Fails closed: a missing or unusable `modelPolicy` means Synapse `auto` with the `local-only`
-// tier (#101), which Synapse routes to on-prem models only.
+// Fails closed, always at the `local-only` tier (#101), which Synapse routes to on-prem models only:
+// a missing or unusable `modelPolicy` uses the service's configured on-prem default
+// (`manifest.model.onPremDefault`, ADR-042 "local-only with the on-prem default") when one is
+// given, else Synapse `auto`. Plain `auto` may route to an on-prem model that failed the
+// svc-coding-agent#4 quality gate, so the service should always send its default. If that model is
+// not served, the fork's pinned-model fallback (#80) resends with `auto`.
 
 /** Synapse's own routing. With `x-privacy-tier: local-only` it stays on-prem. */
 export const FALLBACK_MODEL = "auto"
@@ -23,15 +27,26 @@ export type ModelPolicy =
       residency?: string
       privacyTier?: string
     }
-  | { source: "fallback"; modelIds: [typeof FALLBACK_MODEL]; reason: string }
+  | { source: "fallback"; modelIds: string[]; reason: string }
 
-const fallback = (reason: string): ModelPolicy => ({ source: "fallback", modelIds: [FALLBACK_MODEL], reason })
+/** A usable model id list: 1..20 non-blank ids with no whitespace. Undefined otherwise. */
+function modelIdList(value: unknown): string[] | undefined {
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_MODEL_IDS) return undefined
+  if (!value.every((id) => typeof id === "string" && id.trim() && !/\s/.test(id.trim()))) return undefined
+  return value.map((id: string) => id.trim())
+}
 
 /**
  * Reads a CAS resolve answer, as passed through in the manifest: `{ cell, effectivePolicyVersion }`
  * (or the cell's fields at the top level). Anything unusable fails closed with a reason.
  */
-export function parseResolveBody(body: unknown): ModelPolicy {
+export function parseResolveBody(body: unknown, onPremDefault?: unknown): ModelPolicy {
+  const fallbackIds = modelIdList(onPremDefault)
+  const fallback = (reason: string): ModelPolicy => ({
+    source: "fallback",
+    modelIds: fallbackIds ?? [FALLBACK_MODEL],
+    reason: fallbackIds ? `${reason}; using the on-prem default` : reason,
+  })
   if (body === undefined || body === null) return fallback("no model policy in the manifest")
   if (typeof body !== "object") return fallback("bad model policy: not an object")
   const record = body as Record<string, unknown>
@@ -43,12 +58,10 @@ export function parseResolveBody(body: unknown): ModelPolicy {
   if (!cell || typeof cell !== "object") return fallback("bad model policy: cell is not an object")
   const { modelIds, residency, privacyTier } = cell as Record<string, unknown>
   let ids: string[] = []
-  if (modelIds !== undefined) {
-    if (!Array.isArray(modelIds) || modelIds.length > MAX_MODEL_IDS) return fallback("bad model policy: modelIds")
-    if (!modelIds.every((id) => typeof id === "string" && id.trim() && !/\s/.test(id.trim()))) {
-      return fallback("bad model policy: modelIds")
-    }
-    ids = modelIds.map((id: string) => id.trim())
+  if (modelIds !== undefined && !(Array.isArray(modelIds) && modelIds.length === 0)) {
+    const parsed = modelIdList(modelIds)
+    if (!parsed) return fallback("bad model policy: modelIds")
+    ids = parsed
   }
   return {
     source: "cas",

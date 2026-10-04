@@ -22,11 +22,11 @@ const repoDir = "/work/repo"
 
 // #102: svc-coding-agent resolved and froze this for the task; the box makes no policy call and
 // holds no CAS credential. Missing or unusable means `auto`, local-only.
-const policy = parseResolveBody(manifest.modelPolicy)
+const policy = parseResolveBody(manifest.modelPolicy, manifest.model.onPremDefault)
 console.log(
   policy.source === "cas"
     ? `[sbxw] model policy: CAS version ${policy.effectivePolicyVersion}, models ${policy.modelIds.join(", ")}`
-    : `[sbxw] model policy: fallback (${policy.reason}), models auto, ${PRIVACY_TIER}`,
+    : `[sbxw] model policy: fallback (${policy.reason}), models ${policy.modelIds.join(", ")}, ${PRIVACY_TIER}`,
 )
 const config = renderConfig(manifest, policy.modelIds)
 

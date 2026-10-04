@@ -32,7 +32,8 @@ Driver flags:
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--model-policy` | none | A saved CAS resolve answer (JSON file), passed as `manifest.modelPolicy`. Without it the task runs on `auto`, `local-only` |
+| `--model-policy` | none | A saved CAS resolve answer (JSON file), passed as `manifest.modelPolicy`. Without it the task runs on the on-prem default, else `auto`, `local-only` |
+| `--on-prem-default` | none | Comma-separated on-prem default model ids (strongest last), passed as `manifest.model.onPremDefault` |
 | `--base-url` | Synapse v2 `/v1` | OpenAI-compatible base URL |
 | `--timeout-min` | `30` | Aborts the session after this long |
 | `--keep` | off | Leaves the container running for inspection |
@@ -45,7 +46,7 @@ Containers are named `sbxw-<id>`, labelled `alterspective.sandbox-worker=spike`,
 ```json
 {
   "taskId": "sbxw-…",
-  "model": { "baseURL": "https://…/v1", "headers": { "x-task-type": "code" } },
+  "model": { "baseURL": "https://…/v1", "headers": { "x-task-type": "code" }, "onPremDefault": ["qwen3.8-27b-dflash2"] },
   "modelPolicy": { "cell": { "modelIds": ["…"] }, "effectivePolicyVersion": "…" },
   "repo": { "bundle": "/run/sbxw/input/repo.bundle", "ref": "optional" },
   "permission": { "*": "allow", "external_directory": "deny" },
@@ -69,8 +70,11 @@ decision 7). The sandbox does not fetch them:
      `synapse` provider gets those models, strongest last. The last one is the main model, the
      first the small model, and the provider `whitelist` hides every other live Synapse model. No
      `modelIds` in the cell means Synapse `auto`.
-   - **Missing or unusable:** `auto` with `x-privacy-tier: local-only`, so Synapse keeps the task
-     on-prem. Nothing is hard-coded. CAS being unreachable is the service's case to handle
+   - **Missing or unusable:** the service's configured on-prem default (`model.onPremDefault`),
+     else `auto`, always with `x-privacy-tier: local-only`, so Synapse keeps the task on-prem.
+     Nothing is hard-coded in the box. The service should always send its default: plain `auto`
+     may route to an on-prem model that failed the svc-coding-agent#4 quality gate
+     (`ornith-1.0-35b`, 67%; `qwen3.8-27b-dflash2` passed with 87%). CAS being unreachable is the service's case to handle
      (ADR-042: no cached value means `local-only` with the on-prem default). It arrives here as a
      missing `modelPolicy`.
 4. The result, with `effectivePolicyVersion` or the fallback reason, is written to
