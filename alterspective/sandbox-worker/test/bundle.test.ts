@@ -52,6 +52,12 @@ describe("checkBundleFile (#108)", () => {
     expect(await checkBundleFile(bundle, "abc")).toEqual({ ok: false, reason: "repo.sha256 is not a 64-character hex SHA-256" })
   })
 
+  test("a value that is not a string (null, a number) is refused, not thrown", async () => {
+    for (const value of [null, 42, {}]) {
+      expect(await checkBundleFile(bundle, value)).toEqual({ ok: false, reason: "repo.sha256 is not a string" })
+    }
+  })
+
   test("a missing bundle file is refused", async () => {
     expect(await checkBundleFile(path.join(dir, "missing.bundle"), "0".repeat(64))).toEqual({
       ok: false,
@@ -79,6 +85,12 @@ describe("checkTree (#108)", () => {
 
   test("a malformed expected tree is refused", async () => {
     expect(await checkTree(dir, "not-a-sha")).toEqual({ ok: false, reason: "repo.treeSha is not a git object id" })
+  })
+
+  test("a tree value that is not a string is refused, not thrown", async () => {
+    for (const value of [null, 42]) {
+      expect(await checkTree(dir, value)).toEqual({ ok: false, reason: "repo.treeSha is not a string" })
+    }
   })
 
   test("an empty repository is refused", async () => {

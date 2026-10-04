@@ -17,7 +17,8 @@ export async function sha256File(file: string): Promise<string> {
 }
 
 /** Checks the bundle file before it is cloned. */
-export async function checkBundleFile(file: string, expectedSha256: string): Promise<BundleCheck> {
+export async function checkBundleFile(file: string, expectedSha256: unknown): Promise<BundleCheck> {
+  if (typeof expectedSha256 !== "string") return { ok: false, reason: "repo.sha256 is not a string" }
   const expected = expectedSha256.trim().toLowerCase()
   if (!HEX64.test(expected)) return { ok: false, reason: "repo.sha256 is not a 64-character hex SHA-256" }
   const actual = await sha256File(file).catch(() => undefined)
@@ -27,7 +28,8 @@ export async function checkBundleFile(file: string, expectedSha256: string): Pro
 }
 
 /** Checks the tree of the commit checked out in `repoDir` after the clone. */
-export async function checkTree(repoDir: string, expectedTree: string): Promise<BundleCheck> {
+export async function checkTree(repoDir: string, expectedTree: unknown): Promise<BundleCheck> {
+  if (typeof expectedTree !== "string") return { ok: false, reason: "repo.treeSha is not a string" }
   const expected = expectedTree.trim().toLowerCase()
   if (!OBJECT_ID.test(expected)) return { ok: false, reason: "repo.treeSha is not a git object id" }
   const actual = (await $`git -C ${repoDir} rev-parse --verify --quiet HEAD^{tree}`.nothrow().quiet().text()).trim()
