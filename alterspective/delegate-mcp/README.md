@@ -13,7 +13,7 @@ The box sets `OPENCODE_DISABLE_SESSION_RETROSPECTIVES=1`. The fork's observer sk
 **What the box stops.**
 
 - Reaching any host except three: Keystone (`identity.alterspective.com.au`), the Synapse model gateway (`synapse2-api.alterspective.com.au`), and read-only npm and PyPI caches.
-- Using any Keystone service you did not choose. On Keystone, the box reaches only the chosen connections (`/mcp/c/<id>`) and the sign-in paths they need. Everything else gets `403` from the front proxy: `/mcp/dynamic` (every service on your account), `/api/mcp`, and every other connection.
+- Using any Keystone service you did not choose. On Keystone, the box reaches only the chosen connections (`/mcp/c/<id>`) and the sign-in paths they need. Everything else gets `403` from the front proxy: `/mcp/dynamic` (every service on your account), `/api/mcp`, and every other connection. The exception is the `dynamic` connection, if you choose it: it reaches `/mcp/dynamic` only through the delegation gate (see "Full delegation (dynamic)").
 - Seeing your Windows account, your saved logins, or your repos' `.git` folders. The box gets a copy of a repo, not the repo.
 - Publishing packages. The caches are read-only.
 
@@ -86,6 +86,34 @@ The box can use only the Keystone connections you choose. The default set is `ra
 **High-risk connections.** One connection can relay to many services. In this estate, `cas` runs agents that read your mail, Teams chats and calendar; a `keystone-admin`-backed connection reaches the Keystone admin tools (`execute-tool`, `mint-impersonation-token`, `create-api-key`); `vault*` serves secrets. `oc_doctor` warns when an id starting with `cas`, `vault`, `keystone-admin`, `m365`, `monday`, `hubspot`, `stripe`, `xero` or `sharedo` is in the allowed list or the set. Allow one only for a job that needs it, and take it out after.
 
 **Old sign-ins are removed, not revoked.** When an entry leaves the set, the bridge deletes its stored sign-in from the box (names only are logged, and listed by `oc_doctor` under `live.signIns.removedBefore` with the client id). Keystone's revocation endpoint only revokes device-grant tokens, so the bridge cannot revoke these. Revoke them yourself in Keystone by client id (`revoke-oauth-tokens`).
+
+## Full delegation (dynamic)
+
+Issue #104, owner decision 2026-10-04: a delegated task can use the same Keystone tools you can, so a sub-agent can do what its caller does. This replaces the earlier rule "never `/mcp/dynamic`" (R4-01) for the boxes that choose it.
+
+```
+box (no tokens) --> front (adds your dynamic token) --> mcp-gate (profile + approvals) --> Keystone /mcp/dynamic
+```
+
+- **Discovery, not a long tool list.** The box gets one entry, `ks-dynamic`, with Keystone's four search-first tools (`search-tools`, `get-tool-schema`, `execute-tool`), exactly what your own agents use. It finds tools as it needs them.
+- **The delegation gate** (`mcp-gate/`, a small container on your PC) sits between front and Keystone. The box cannot reach it directly or go around it: the box is not on the gate's network, and front sends only `/mcp/dynamic` there. The gate:
+  - refuses tools the profile hides, and removes them from search results;
+  - makes **risky tools wait for an approval**: anything that may send data out, change something or run code (send mail, post, create, delete, execute code). The risk words are copied from CAS (`src/core/domain/tool-risk.ts`). A name with no read verb counts as a change (fail closed);
+  - never logs your token or a call's arguments.
+- **Approvals.** A held call returns at once with "needs approval `apr_...`". `oc_pending` lists it (kind `approval`, box-wide, the call details under `untrusted`). `oc_answer {requestID: "apr_...", kind: "approval", reply: "once"}` lets **that exact call** (same tool, same arguments) run once when the agent retries it within 30 minutes; `reply: "reject"` refuses it. `always` is refused. Approvals live in the gate's memory: a restart forgets them.
+- **The profile** (optional, yours): `OPENCODE_DELEGATE_DYNAMIC_PROFILE` in this MCP server's env, JSON with CAS's field names. A profile only narrows; empty means every tool, risky ones asked first.
+
+  ```json
+  {"allowedToolPatterns": ["github__*", "rag-read__*"], "deniedToolPatterns": ["github__delete_*"], "approvalRequiredToolPatterns": ["github__merge_*"], "approvals": "risky"}
+  ```
+
+  `approvals: "listed"` asks only for the listed patterns. Patterns are CAS's (`*` = any run). Tool names are Keystone's `<namespace>__<tool>`. A damaged profile stops the start; it never falls back to "everything". A changed profile restarts the box on its next use.
+- **Turn it on:**
+  1. host-held tokens must be on (`OCD_KEYSTONE_HOST_AUTH=1`): with tokens in the box, in-box code could skip the gate, so the bridge refuses `dynamic` without it;
+  2. add `dynamic` to `OPENCODE_DELEGATE_KEYSTONE_ALLOWED`, then restart the MCP client;
+  3. `oc_server_restart {confirm: true, keystone: ["dynamic"]}` (or with your other ids), then `oc_login` for `ks-dynamic`.
+- `oc_doctor` shows `gate` (reachable, profile, how many calls wait) and always flags `dynamic` as high risk.
+- **What it does not stop:** a tool the profile allows and the risk words read as a read runs without asking. Keystone's own per-service tool policy (`require_approval`, `deny`) is still applied after the gate, and every call is audited under your name.
 
 ## Host-held Keystone tokens (off by default)
 

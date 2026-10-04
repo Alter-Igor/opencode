@@ -7,6 +7,9 @@ import { DEFAULT_KEYSTONE, connectionPathPattern, readKeystoneSet, type Keystone
 import { CEILING_ENV, DEFAULT_TOOL_DENY, TOOL_DENY_ENV, enforceCeiling, envList } from "./keystone-policy.ts"
 import { DelegateError } from "./errors.ts"
 
+/** #104: the owner's delegation profile for /mcp/dynamic (launch env; see BridgeConfig.dynamicProfile). */
+export const DYNAMIC_PROFILE_ENV = "OPENCODE_DELEGATE_DYNAMIC_PROFILE"
+
 export type BridgeConfig = {
   /** Host folder for lock-free state: logs, hand-off bundles, profile. Never mounted rw into the box except `handoff`. */
   home: string
@@ -26,6 +29,12 @@ export type BridgeConfig = {
   keystoneAllowed?: string[]
   /** `ks-<id>_<tool>` names denied in the box profile and every session (R5-02; convenience, not a wall). */
   keystoneToolDeny: string[]
+  /**
+   * #104: the delegation profile the gate enforces on /mcp/dynamic (JSON, mcp-gate/src/policy.ts),
+   * from OPENCODE_DELEGATE_DYNAMIC_PROFILE at bridge start, never from a tool call. Empty: the
+   * default profile (every tool the owner can reach; risky tools wait for an approval).
+   */
+  dynamicProfile: string
   /** Hosts the front proxy serves, each with one fixed upstream (exact names). */
   egressHosts: string[]
   /**
@@ -49,6 +58,7 @@ export function defaultConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfi
     keystoneConnections: keystone ?? [...DEFAULT_KEYSTONE],
     ...(allowed ? { keystoneAllowed: allowed } : {}),
     keystoneToolDeny: envList(env[TOOL_DENY_ENV]) ?? [...DEFAULT_TOOL_DENY],
+    dynamicProfile: (env[DYNAMIC_PROFILE_ENV] ?? "").trim(),
     egressHosts: ["identity.alterspective.com.au", "synapse2-api.alterspective.com.au"],
     boxEnv: [],
     project: projectName(env.OPENCODE_DELEGATE_PROJECT),

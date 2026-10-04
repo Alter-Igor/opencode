@@ -9,6 +9,7 @@ import type { McpStatus, OpencodeApi } from "../shared/opencode-api.ts"
 import { KS_NAME } from "../guard/entries.ts"
 import { checkEgress, egressInput, type EgressCheck } from "../guard/egress-check.ts"
 import { currentKeystone, effectiveConfig } from "../shared/config.ts"
+import { DYNAMIC_ID } from "../shared/keystone.ts"
 import { reconnectTick } from "../keystone-auth/host-wiring.ts"
 import type { ToolContext } from "./context.ts"
 import { defineTool } from "./define.ts"
@@ -185,6 +186,23 @@ export function synapseLine(report: SynapseReport): string {
   return ` Synapse: signed in${report.user ? ` as ${report.user}` : ""}${report.actor ? ` via ${report.actor}` : ""}, token until ${report.expiresAt}, renews from ${report.refreshAt}; ${live}${loaded}.`
 }
 
+/**
+ * #104: the delegation gate, when the dynamic connection is chosen. Its admin API must answer with
+ * the per-start token; the waiting approvals are counted (never their content). Not chosen: not checked.
+ */
+async function gateReport(ctx: ToolContext, connections: readonly string[], running: boolean): Promise<{ ok: boolean; line: string; report: Record<string, unknown> }> {
+  if (!connections.includes(DYNAMIC_ID)) return { ok: true, line: "", report: { used: false } }
+  const profile = ctx.config.dynamicProfile === "" ? "default (every tool; risky tools wait for approval)" : "custom (OPENCODE_DELEGATE_DYNAMIC_PROFILE)"
+  if (!running || ctx.gate === undefined) return { ok: false, line: " Delegation gate: not checked (the sandbox is not running).", report: { used: true, profile, reachable: false } }
+  try {
+    const waiting = (await ctx.gate.pending()).length
+    return { ok: true, line: ` Delegation gate: ok, profile ${profile}, ${waiting} call(s) waiting for approval.`, report: { used: true, profile, reachable: true, waitingApprovals: waiting } }
+  } catch (error) {
+    const reason = error instanceof Error ? error.message.slice(0, 200) : "unreachable"
+    return { ok: false, line: ` Delegation gate: NOT reachable (${reason}).`, report: { used: true, profile, reachable: false, reason } }
+  }
+}
+
 export const doctorTool = defineTool({
   name: "oc_doctor",
   title: "Check the OpenCode sandbox",
@@ -198,11 +216,13 @@ export const doctorTool = defineTool({
     const egress = egressFor(ctx, keystone)
     const synapse = await ctx.synapse.status()
     const keystoneAuth = await keystoneAuthReport(ctx, keystone, live)
-    const verified = isVerified(status, mcp, verdict) && egress.ok && keystoneEntriesOk(keystone) && live?.ok === true && synapse.ok && (!keystoneAuth.enabled || keystoneAuth.ok)
-    return ok(`${summaryOf(status, mcp, verdict, verified)} ${keystoneLine(keystone)}.${keystoneEntriesHint(keystone, ctx.keystone !== undefined)}${egressSummary(egress)}${liveSummary(live, keystoneAuth.enabled)}${synapseLine(synapse)}${keystoneAuthLine(keystoneAuth)}`, {
+    const gate = await gateReport(ctx, "connections" in keystone ? keystone.connections : [], status.state === "running")
+    const verified = isVerified(status, mcp, verdict) && egress.ok && keystoneEntriesOk(keystone) && live?.ok === true && synapse.ok && (!keystoneAuth.enabled || keystoneAuth.ok) && gate.ok
+    return ok(`${summaryOf(status, mcp, verdict, verified)} ${keystoneLine(keystone)}.${keystoneEntriesHint(keystone, ctx.keystone !== undefined)}${egressSummary(egress)}${liveSummary(live, keystoneAuth.enabled)}${synapseLine(synapse)}${keystoneAuthLine(keystoneAuth)}${gate.line}`, {
       verified,
       synapse,
       keystoneAuth,
+      gate: gate.report,
       bridge: { name: ctx.supervisor.replace(/^supervisor:/, ""), supervisor: ctx.supervisor, bridgeId: ctx.bridgeId, version: ctx.version, holdsBox: held, sessions: ctx.sessions.size },
       isolation: { level: "S", source: "configuration" },
       box: boxReport(status),

@@ -272,7 +272,8 @@ describe("compose wiring for the inbox", () => {
     const anchor = yaml.slice(yaml.indexOf("x-hardened:"), yaml.indexOf("\nservices:"))
     expect(anchor).toMatch(/logging:\n {4}driver: local\n {4}options:\n {6}max-size: "10m"\n {6}max-file: "3"/)
     const services = yaml.slice(yaml.indexOf("\nservices:")).split(/\n {2}(?=[a-z-]+:\n)/).slice(1)
-    expect(services.length).toBe(7)
+    // #104 added mcp-gate and gate-mcp-admin.
+    expect(services.length).toBe(9)
     for (const service of services) expect(service).toContain("<<: *hardened")
   })
 })

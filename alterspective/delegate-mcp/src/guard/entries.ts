@@ -7,7 +7,7 @@
 // connection's credential, so the box must NOT run its own OAuth: every entry must carry exactly
 // `oauth: false` (the fork accepts it since step 2). With the flag off, `oauth: false` stays refused.
 import type { McpEntry, Verdict } from "../shared/contracts.ts"
-import { idOfEntry } from "../shared/keystone.ts"
+import { DYNAMIC_ID, idOfEntry, keystonePath } from "../shared/keystone.ts"
 import { keystoneHostAuth } from "./egress-identity.ts"
 
 /** Entry names the bridge accepts, both in the profile and in GET /mcp: `ks-` + a connection id. */
@@ -56,8 +56,8 @@ function checkUrl(raw: unknown, origin: string, id: string): Check {
   if (url.protocol !== "https:" || url.origin !== origin) return `origin ${url.origin} is not ${origin}`
   // The parsed pathname is already normalised (".." and "%2e%2e" resolved) — that is what the
   // transport will request, so that is what is tested.
-  // Exact equality: one entry, one connection. /mcp/dynamic and any other Keystone path are refused.
-  if (url.pathname !== `/mcp/c/${id}`) return `path ${url.pathname} is not /mcp/c/${id}`
+  // Exact equality: one entry, one connection (#104: ks-dynamic -> /mcp/dynamic). Any other path is refused.
+  if (url.pathname !== keystonePath(id)) return `path ${url.pathname} is not ${keystonePath(id)}`
   return undefined
 }
 
@@ -70,6 +70,8 @@ function checkEntry(name: string, entry: unknown, origin: string, allowed: Reado
   if (id === undefined) return "name must be ks-<connection id> (^ks-[a-z0-9][a-z0-9-]{0,62}$)"
   if (!allowed.has(id)) return `connection ${id} is not in the chosen Keystone set`
   if (!isRecord(entry)) return "entry must be an object"
+  // #104: /mcp/dynamic only with host-held tokens. With box-held tokens in-box code could skip the gate.
+  if (id === DYNAMIC_ID && !hostAuth) return "the dynamic connection needs host-held Keystone tokens (OCD_KEYSTONE_HOST_AUTH=1)"
   return checkKeys(entry) ?? (hostAuth ? checkHostOAuth(entry.oauth) : checkOAuth(entry.oauth)) ?? checkUrl(entry.url, origin, id)
 }
 

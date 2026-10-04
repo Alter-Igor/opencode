@@ -8,6 +8,7 @@ import path from "node:path"
 import { createHub, type DelegateHub } from "./events/index.ts"
 import { createGuard } from "./guard/index.ts"
 import { cachedTarget, createInbox, inboxTargetFromDocker } from "./inbox/index.ts"
+import { createGateApprovals, gateTargetFromDocker } from "./gate/client.ts"
 import { flushReports } from "./reporting/hooks.ts"
 import { currentKeystone, defaultConfig, frontDir, type BridgeConfig } from "./shared/config.ts"
 import { DelegateError } from "./shared/errors.ts"
@@ -241,6 +242,7 @@ export async function createRuntime(options: RuntimeOptions = {}): Promise<Runti
   const supervisorService = supervisorFor(config, bridgeId, log, () => manager.box())
   const manager = createBoxManager({ supervisor: supervisorService, sessions, log })
   const inboxTarget = cachedTarget(() => inboxTargetFromDocker(bunExec, config))
+  const gateTarget = cachedTarget(() => gateTargetFromDocker(bunExec, config))
   const container = containerName(config)
   const synapse = createSynapseAuth(config, env, log)
   // The same source as the profile, guard, front generator and supervisor (process.env).
@@ -257,11 +259,13 @@ export async function createRuntime(options: RuntimeOptions = {}): Promise<Runti
     supervisorService,
     workspaces: createWorkspaces({ config, container, logger: log }),
     inbox: createInbox({ supervisor: `supervisor:${name}`, target: inboxTarget.target, invalidate: inboxTarget.invalidate }),
+    gate: createGateApprovals({ target: gateTarget.target, invalidate: gateTarget.invalidate }),
     box: () => manager.box(),
     peekBox: () => manager.peek(),
     apiFor: (target) => createApi(target),
     restartBox: async (options) => {
       inboxTarget.invalidate()
+      gateTarget.invalidate()
       return manager.restart(options)
     },
     onBox: (listener) => manager.onBox(listener),

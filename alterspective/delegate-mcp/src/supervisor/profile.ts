@@ -18,7 +18,7 @@ import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import path from "node:path"
 import type { BridgeConfig } from "../shared/config.ts"
 import type { Guard, McpEntry } from "../shared/contracts.ts"
-import { CONNECTION_ID, entryName } from "../shared/keystone.ts"
+import { CONNECTION_ID, entryName, keystonePath } from "../shared/keystone.ts"
 import { validateEntries } from "../guard/entries.ts"
 import { keystoneHostAuth } from "../guard/egress-identity.ts"
 import { DelegateError, isDelegateError } from "../shared/errors.ts"
@@ -266,7 +266,7 @@ export function mcpEntries(config: ProfileInput["config"], hostAuth: boolean = k
   const entries: Record<string, McpEntry> = {}
   for (const id of config.keystoneConnections) {
     if (!CONNECTION_ID.test(id)) throw invalid(`The Keystone connection id "${id.slice(0, 40)}" is not valid.`)
-    entries[entryName(id)] = hostAuth ? { type: "remote", url: `${origin}/mcp/c/${id}`, oauth: false } : { type: "remote", url: `${origin}/mcp/c/${id}` }
+    entries[entryName(id)] = hostAuth ? { type: "remote", url: `${origin}${keystonePath(id)}`, oauth: false } : { type: "remote", url: `${origin}${keystonePath(id)}` }
   }
   const verdict = validateEntries(entries, config.keystoneOrigin, config.keystoneConnections, hostAuth)
   if (!verdict.ok) throw invalid(`The box's Keystone MCP entries failed the allowlist: ${verdict.reason.slice(0, 200)}`)

@@ -1,7 +1,8 @@
-// The Keystone services the box may use (owner decision 2026-10-01, review R4-01): only chosen
-// connections, picked at runtime. Each id is a Keystone connection reached at /mcp/c/<id>; the box
-// never gets /mcp/dynamic, which would relay to every service on the owner's account (m365 mail,
-// monday execute_code, ...).
+// The Keystone services the box may use, picked at runtime. Each id is a Keystone connection reached
+// at /mcp/c/<id>. The reserved id `dynamic` (#104, owner decision 2026-10-04, replacing R4-01's "never
+// /mcp/dynamic") is Keystone /mcp/dynamic: every service on the owner's account, through search-first
+// discovery. The box reaches it ONLY through the delegation gate (mcp-gate), which applies the
+// delegation profile and makes risky tools wait for an approval, and only with host-held tokens.
 //
 // The box-wide set is saved in the bridge home (keystone.json) by oc_server_restart {keystone}, so
 // later bridges and restarts reuse it. Without a saved set the config default applies. The set is
@@ -27,6 +28,11 @@ export const KEYSTONE_FILE = "keystone.json"
 
 export type KeystoneSource = "saved" | "default"
 export type KeystoneSet = { connections: string[]; source: KeystoneSource }
+
+/** #104: the reserved connection id for Keystone /mcp/dynamic (reached through the delegation gate). */
+export const DYNAMIC_ID = "dynamic"
+/** The Keystone path of a connection id: /mcp/dynamic for DYNAMIC_ID, else /mcp/c/<id>. */
+export const keystonePath = (id: string) => (id === DYNAMIC_ID ? "/mcp/dynamic" : `/mcp/c/${id}`)
 
 /** The profile entry name for a connection id. */
 export const entryName = (id: string) => `ks-${id}`
@@ -57,10 +63,10 @@ export function keystoneIds(ids: readonly unknown[]): string[] {
 /** Regex metacharacters escaped. Valid ids have none; this keeps a future id rule change from widening the pattern. */
 export const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")
 
-/** `^/mcp/c/(a|b)$` for the ids; undefined for none, so nothing at all can match. */
+/** `^(/mcp/c/a|/mcp/c/b)$` for the ids (`/mcp/dynamic` for DYNAMIC_ID); undefined for none, so nothing at all can match. */
 export function connectionPathPattern(ids: readonly string[]): string | undefined {
   if (ids.length === 0) return undefined
-  return `^/mcp/c/(${keystoneIds(ids).map(escapeRegExp).join("|")})$`
+  return `^(${keystoneIds(ids).map((id) => escapeRegExp(keystonePath(id))).join("|")})$`
 }
 
 const keystoneFile = (home: string) => path.join(home, KEYSTONE_FILE)

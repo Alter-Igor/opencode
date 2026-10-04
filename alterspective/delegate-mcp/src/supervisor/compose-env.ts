@@ -2,7 +2,8 @@
 // the bridge's memory and in this child env (and so the container). It is never written to a
 // file or logged. Box env vars are listed in the override file by NAME only.
 import path from "node:path"
-import { frontDir, mcpAllowPolicy, type BridgeConfig } from "../shared/config.ts"
+import { DYNAMIC_PROFILE_ENV, frontDir, mcpAllowPolicy, type BridgeConfig } from "../shared/config.ts"
+import { parseProfile } from "../../mcp-gate/src/policy.ts"
 import { DelegateError } from "../shared/errors.ts"
 import { synapseLockFile } from "../synapse/lock.ts"
 import { childEnv } from "./docker.ts"
@@ -24,6 +25,16 @@ export const INBOX_ADMIN_TOKEN_ENV = "INBOX_ADMIN_TOKEN"
 /** Label on the inbox container: the 127.0.0.1 host port of its admin routes (published by gate-admin, W2C-05, R3-02). */
 export const INBOX_PORT_LABEL = "com.alterspective.opencode-delegate.inbox-port"
 export type InboxStart = { port: number; token: string }
+/**
+ * #104 delegation gate admin token: per box start, like the inbox's, on the mcp-gate container only,
+ * read back by other bridges with `docker inspect <project>-mcp-gate`. Never written to a file or logged.
+ */
+export const GATE_ADMIN_TOKEN_ENV = "GATE_ADMIN_TOKEN"
+/** The delegation profile the gate enforces (mcp-gate/src/policy.ts), from the owner's launch env. */
+export const GATE_PROFILE_ENV = "GATE_PROFILE"
+/** Label on the gate container: the 127.0.0.1 host port of its admin routes (published by gate-mcp-admin). */
+export const GATE_ADMIN_PORT_LABEL = "com.alterspective.opencode-delegate.gate-admin-port"
+export type GateStart = { port: number; token: string; profile: string }
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
 
 export function paths(config: BridgeConfig) {
@@ -50,7 +61,7 @@ export function containerName(config: Pick<BridgeConfig, "project">): string {
  * `${OCD_IMAGE}-<service>` and its container `<project>-<service>` carries the image label, so a
  * running set built from another checkout is caught on reuse.
  */
-export const SIBLING_SERVICES = ["front", "npm-cache", "pypi-cache", "inbox"] as const
+export const SIBLING_SERVICES = ["front", "npm-cache", "pypi-cache", "inbox", "mcp-gate"] as const
 
 export function siblingContainers(config: Pick<BridgeConfig, "project">): Array<{ service: string; container: string }> {
   return SIBLING_SERVICES.map((service) => ({ service, container: `${containerName(config)}-${service}` }))
@@ -65,7 +76,7 @@ export function siblingContainers(config: Pick<BridgeConfig, "project">): Array<
  */
 /** TLS trust settings: the box trusts front's internal CA only, and nothing may turn checks off (R3-01). */
 const TLS_TRUST_ENV = ["NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO", "GIT_SSL_NO_VERIFY", "REQUESTS_CA_BUNDLE", "NODE_TLS_REJECT_UNAUTHORIZED"]
-const RESERVED_EXACT = new Set(["INBOX_ADMIN_TOKEN", "HOME", "PATH", "BUN_CONFIG_REGISTRY", ...TLS_TRUST_ENV])
+const RESERVED_EXACT = new Set(["INBOX_ADMIN_TOKEN", "GATE_ADMIN_TOKEN", "GATE_PROFILE", "HOME", "PATH", "BUN_CONFIG_REGISTRY", ...TLS_TRUST_ENV])
 const RESERVED_PREFIX = ["OCD_", "OPENCODE_", "INBOX_", "XDG_", "NPM_CONFIG_", "PIP_", "UV_"]
 const RESERVED_SUFFIX = ["_PROXY"]
 
@@ -123,6 +134,7 @@ export function composeDownEnv(inputs: ComposeInputs): Record<string, string> {
     OCD_PROFILE_HASH: "down",
     OCD_PORT: "0",
     OCD_INBOX_PORT: "0",
+    OCD_GATE_ADMIN_PORT: "0",
     OCD_CONTAINER: containerName(inputs.config),
     OCD_PROFILE_DIR: dirs.profile,
     OCD_HANDOFF_DIR: dirs.handoff,
@@ -133,7 +145,7 @@ export function composeDownEnv(inputs: ComposeInputs): Record<string, string> {
 }
 
 /** What one `up` is started with. `front` is the generated servers file for the same Keystone set as the policy. */
-export type StartValues = { built: BuiltProfile; port: number; password: string; front: FrontFiles; inbox?: InboxStart }
+export type StartValues = { built: BuiltProfile; port: number; password: string; front: FrontFiles; inbox?: InboxStart; gate?: GateStart }
 
 /**
  * Env of the `docker compose up` child: CLI essentials + OCD_* + password + approved keys (+ inbox port/token).
@@ -142,6 +154,9 @@ export type StartValues = { built: BuiltProfile; port: number; password: string;
 export function composeEnv(inputs: ComposeInputs, start: StartValues): Record<string, string> {
   const dirs = paths(inputs.config)
   const inboxEnv: Record<string, string> = start.inbox ? { OCD_INBOX_PORT: String(start.inbox.port), [INBOX_ADMIN_TOKEN_ENV]: start.inbox.token } : {}
+  const gateEnv: Record<string, string> = start.gate
+    ? { OCD_GATE_ADMIN_PORT: String(start.gate.port), [GATE_ADMIN_TOKEN_ENV]: start.gate.token, [GATE_PROFILE_ENV]: start.gate.profile }
+    : { OCD_GATE_ADMIN_PORT: "0" }
   return childEnv(inputs.hostEnv, {
     ...approvedValues(inputs),
     OCD_IMAGE: inputs.image,
@@ -157,5 +172,25 @@ export function composeEnv(inputs: ComposeInputs, start: StartValues): Record<st
     [MCP_ALLOW_ENV]: mcpAllowPolicy(inputs.config),
     [PASSWORD_ENV]: start.password,
     ...inboxEnv,
+    ...gateEnv,
   })
+}
+
+/**
+ * #104: the owner's delegation profile for the gate, checked with the gate's own parser so a typo
+ * fails here (profile_invalid) instead of in a container that refuses to start. Never widened: a
+ * bad profile stops the start, it never falls back to the default.
+ */
+export function dynamicProfileFor(config: Pick<BridgeConfig, "dynamicProfile">): string {
+  try {
+    parseProfile(config.dynamicProfile)
+  } catch (error) {
+    throw new DelegateError(
+      "profile_invalid",
+      `The delegation profile (${DYNAMIC_PROFILE_ENV}) is not valid, so the sandbox was not started.`,
+      `Fix ${DYNAMIC_PROFILE_ENV} in this MCP server's env (JSON with allowedToolPatterns, deniedToolPatterns, approvalRequiredToolPatterns, approvals), then restart the MCP client.`,
+      (error as Error).message.slice(0, 200),
+    )
+  }
+  return config.dynamicProfile
 }

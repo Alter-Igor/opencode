@@ -22,7 +22,9 @@ export const TOOL_DENY_ENV = "OPENCODE_DELEGATE_KEYSTONE_TOOL_DENY"
 /** Bounded like the set itself, with room for the owner's wider choices. */
 export const MAX_CEILING = 100
 
-export const HIGH_RISK_PREFIXES = ["cas", "vault", "keystone-admin", "m365", "monday", "hubspot", "stripe", "xero", "sharedo"] as const
+// #104: `dynamic` reaches every service on the owner's account (gated by the delegation profile and
+// approvals, but still the widest reach there is), so it is always flagged.
+export const HIGH_RISK_PREFIXES = ["cas", "vault", "keystone-admin", "m365", "monday", "hubspot", "stripe", "xero", "sharedo", "dynamic"] as const
 
 /**
  * OpenCode MCP tool ids are `<entry>_<tool>` (packages/opencode/src/mcp/catalog.ts toolName).
