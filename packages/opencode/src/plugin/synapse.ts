@@ -47,19 +47,23 @@ export const SYNAPSE_PRIVACY_TIER_ENV = "SYNAPSE_PRIVACY_TIER"
 export type SynapsePrivacyTier = "local-only"
 
 /**
- * #101: the privacy tier forced on every Synapse call, or undefined when none is set.
- * Only `local-only` exists here. Any other non-empty value is treated as `local-only`, so a
- * typo narrows routing and never widens it.
+ * #101: the privacy tier forced on every Synapse call, or undefined when the variable is unset or
+ * empty. Only `local-only` exists here. Any other non-empty value, even spaces only, is treated as
+ * `local-only`, so a typo narrows routing and never widens it.
  */
 export function forcedPrivacyTier(env: Record<string, string | undefined> = process.env): SynapsePrivacyTier | undefined {
-  return env[SYNAPSE_PRIVACY_TIER_ENV]?.trim() ? "local-only" : undefined
+  return env[SYNAPSE_PRIVACY_TIER_ENV] ? "local-only" : undefined
 }
 
 /** #101: put the forced tier on the `synapse` provider's headers, replacing any other value. */
 export function applyPrivacyTierHeader(cfg: { provider?: Record<string, any> }, tier: SynapsePrivacyTier): void {
   const provider = cfg.provider?.synapse
   if (!provider) return
-  provider.options = { ...provider.options, headers: { ...provider.options?.headers, "x-privacy-tier": tier } }
+  // Header names are case-insensitive: drop every spelling, or a fetch would send both values.
+  const headers = Object.fromEntries(
+    Object.entries(provider.options?.headers ?? {}).filter(([name]) => name.toLowerCase() !== "x-privacy-tier"),
+  )
+  provider.options = { ...provider.options, headers: { ...headers, "x-privacy-tier": tier } }
 }
 // /v1 inference and /mcp both admit a token minted for the `synapse` app audience
 // (ADR-0076 pass-through). A resource-URI audience is rejected by /v1, which is why
