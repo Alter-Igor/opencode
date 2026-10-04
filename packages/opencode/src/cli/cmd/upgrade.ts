@@ -47,6 +47,7 @@ export const UpgradeCommand = {
     // Fork-only (#90): an opencodealt build with no published release yet must not crash here.
     if (!target) {
       prompts.log.error("Could not find the latest release. Check your network, or pass a version.")
+      process.exitCode = 1
       prompts.outro("Done")
       return
     }

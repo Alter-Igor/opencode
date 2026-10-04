@@ -28,6 +28,8 @@ jobs:
       - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
         with:
           ref: ${{ inputs.ref }}
+          # The publish step gets GH_TOKEN explicitly; keep the write token away from install/build scripts.
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-bun
 
