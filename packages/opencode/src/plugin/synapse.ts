@@ -1,6 +1,5 @@
 import { tool, type Hooks, type PluginInput } from "@opencode-ai/plugin"
 import { createServer } from "http"
-import * as os from "os"
 import * as path from "path"
 import * as fs from "fs/promises"
 import open from "open"
@@ -1976,7 +1975,8 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
 
           let token = ""
           try {
-            const homedir = os.homedir()
+            // Global.Path.home is os.homedir() unless OPENCODE_TEST_HOME is set (tests).
+            const homedir = Global.Path.home
             const authPath = path.join(homedir, ".local", "share", "opencode", "auth.json")
             const authContent = JSON.parse(await fs.readFile(authPath, "utf8"))
             token = authContent.synapse?.key || authContent.synapse?.access_token || ""

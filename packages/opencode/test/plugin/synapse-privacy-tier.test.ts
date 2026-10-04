@@ -149,16 +149,14 @@ describe("every Synapse call carries the forced tier (#101)", () => {
   })
 
   test("synapse_buddy_review: the MCP chat call asks for local-only", async () => {
-    // The tool reads its token from <home>/.local/share/opencode/auth.json, so point the home
-    // directory at a temp folder for this test only.
+    // The tool reads its token from <home>/.local/share/opencode/auth.json. OPENCODE_TEST_HOME
+    // moves that home (Bun's os.homedir() ignores HOME on Linux).
     const home = await fs.mkdtemp(path.join(os.tmpdir(), "oc-privacy-tier-"))
-    const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE }
-    process.env.HOME = home
-    process.env.USERPROFILE = home
+    const saved = { OPENCODE_TEST_HOME: process.env.OPENCODE_TEST_HOME }
+    process.env.OPENCODE_TEST_HOME = home
     try {
       await fs.mkdir(path.join(home, ".local", "share", "opencode"), { recursive: true })
       await fs.writeFile(path.join(home, ".local", "share", "opencode", "auth.json"), JSON.stringify({ synapse: { key: API_KEY } }))
-      expect(os.homedir()).toBe(home)
       const calls = await capture(async () => {
         const hooks = await SynapseAuthPlugin(pluginInput, { inferenceUrl: BASE })
         const review = hooks.tool?.synapse_buddy_review
