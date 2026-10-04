@@ -27,7 +27,8 @@ export async function upgrade() {
 
   const kind = Installation.getReleaseType(InstallationVersion, latest)
 
-  if (config.autoupdate === "notify" || kind !== "patch") {
+  // Fork-only (#90): an opencodealt build only notifies; the person chooses to run AI Office.
+  if (config.autoupdate === "notify" || kind !== "patch" || method === "aio") {
     GlobalBus.emit("event", {
       directory: "global",
       payload: {

@@ -23,6 +23,7 @@ import { XaiAuthPlugin } from "./xai"
 import { SynapseAuthPlugin } from "./synapse"
 import { CerebrasPlugin } from "./cerebras"
 import { GoalLoopPlugin } from "./goal-loop"
+import { OpencodealtDocsPlugin } from "./opencodealt-docs"
 import { SnowflakeCortexAuthPlugin } from "./snowflake-cortex"
 import { Effect, Layer, Context } from "effect"
 import { EffectBridge } from "@/effect/bridge"
@@ -87,6 +88,8 @@ function internalPlugins(flags: RuntimeFlags.Info): PluginInstance[] {
     CerebrasPlugin,
     // Fork-only (#84): inert until a person runs /goal.
     GoalLoopPlugin,
+    // Fork-only (#90): /docs and the "our docs, not upstream's" system line.
+    OpencodealtDocsPlugin,
   ]
 }
 
@@ -321,4 +324,3 @@ export const node = LayerNode.make({
 })
 
 export * as Plugin from "."
-
