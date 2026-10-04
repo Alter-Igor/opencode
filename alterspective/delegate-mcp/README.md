@@ -95,7 +95,7 @@ Issue #104, owner decision 2026-10-04: a delegated task can use the same Keyston
 box (no tokens) --> front (adds your dynamic token) --> mcp-gate (profile + approvals) --> Keystone /mcp/dynamic
 ```
 
-- **Discovery, not a long tool list.** The box gets one entry, `ks-dynamic`, with Keystone's four search-first tools (`search-tools`, `get-tool-schema`, `execute-tool`), exactly what your own agents use. It finds tools as it needs them.
+- **Discovery, not a long tool list.** The box gets one entry, `ks-dynamic`, with Keystone's three search-first tools (`search-tools`, `get-tool-schema`, `execute-tool`), exactly what your own agents use. It finds tools as it needs them.
 - **The delegation gate** (`mcp-gate/`, a small container on your PC) sits between front and Keystone. The box cannot reach it directly or go around it: the box is not on the gate's network, and front sends only `/mcp/dynamic` there. The gate:
   - refuses tools the profile hides, and removes them from search results;
   - makes **risky tools wait for an approval**: anything that may send data out, change something or run code (send mail, post, create, delete, execute code). The risk words are copied from CAS (`src/core/domain/tool-risk.ts`). A name with no read verb counts as a change (fail closed);

@@ -9,7 +9,7 @@ import { mkdir, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { removeLegacyOut, sweepOutBundles } from "./handoff-hygiene.ts"
 import { mcpAllowPolicy, type BridgeConfig } from "../shared/config.ts"
-import { saveKeystoneSet } from "../shared/keystone.ts"
+import { DYNAMIC_ID, saveKeystoneSet } from "../shared/keystone.ts"
 import type { Supervisor } from "../shared/contracts.ts"
 import { DelegateError, isDelegateError } from "../shared/errors.ts"
 import type { Logger } from "../shared/log.ts"
@@ -237,7 +237,9 @@ async function start(run: Run, planned: Plan): Promise<ApiTarget> {
     // One retry, like the inbox port: a loop would never end with a port source that repeats itself.
     const firstGatePort = await deps.freePort()
     const gatePort = firstGatePort === port || firstGatePort === inbox.port ? await deps.freePort() : firstGatePort
-    const gate = { port: gatePort, token: deps.randomPassword(), profile: dynamicProfileFor(plan.config) }
+    // The profile matters only to a box that uses dynamic: a bad one must not stop any other box (review).
+    const profile = plan.config.keystoneConnections.includes(DYNAMIC_ID) ? dynamicProfileFor(plan.config) : ""
+    const gate = { port: gatePort, token: deps.randomPassword(), profile }
     const build = !(await imageExists(deps.exec, deps.image))
     run.note("info", "starting sandbox", { image: deps.image, build, port, inboxPort: inbox.port, profileHash: plan.built.hash.slice(0, 12), keystone: plan.config.keystoneConnections.join(",") })
     const env = composeEnv({ ...deps, config: plan.config }, { built: plan.built, port, password, inbox, gate, front: plan.front })
