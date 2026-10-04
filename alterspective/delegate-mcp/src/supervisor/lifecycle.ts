@@ -234,8 +234,9 @@ async function start(run: Run, planned: Plan): Promise<ApiTarget> {
     const inboxPort = await deps.freePort()
     const inbox = { port: inboxPort === port ? await deps.freePort() : inboxPort, token: deps.randomPassword() }
     // #104: the delegation gate's admin port and token, per start like the inbox's.
-    let gatePort = await deps.freePort()
-    while (gatePort === port || gatePort === inbox.port) gatePort = await deps.freePort()
+    // One retry, like the inbox port: a loop would never end with a port source that repeats itself.
+    const firstGatePort = await deps.freePort()
+    const gatePort = firstGatePort === port || firstGatePort === inbox.port ? await deps.freePort() : firstGatePort
     const gate = { port: gatePort, token: deps.randomPassword(), profile: dynamicProfileFor(plan.config) }
     const build = !(await imageExists(deps.exec, deps.image))
     run.note("info", "starting sandbox", { image: deps.image, build, port, inboxPort: inbox.port, profileHash: plan.built.hash.slice(0, 12), keystone: plan.config.keystoneConnections.join(",") })

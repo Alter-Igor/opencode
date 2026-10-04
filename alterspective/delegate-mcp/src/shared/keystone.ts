@@ -63,10 +63,18 @@ export function keystoneIds(ids: readonly unknown[]): string[] {
 /** Regex metacharacters escaped. Valid ids have none; this keeps a future id rule change from widening the pattern. */
 export const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")
 
-/** `^(/mcp/c/a|/mcp/c/b)$` for the ids (`/mcp/dynamic` for DYNAMIC_ID); undefined for none, so nothing at all can match. */
+/**
+ * `^/mcp/c/(a|b)$` for the ids; undefined for none, so nothing at all can match. With DYNAMIC_ID
+ * (#104) the pattern also allows exactly `/mcp/dynamic`: `^(/mcp/c/(a|b)|/mcp/dynamic)$`. Without it
+ * the pattern is unchanged, so an upgrade does not restart a box that does not use dynamic.
+ */
 export function connectionPathPattern(ids: readonly string[]): string | undefined {
   if (ids.length === 0) return undefined
-  return `^(${keystoneIds(ids).map((id) => escapeRegExp(keystonePath(id))).join("|")})$`
+  const valid = keystoneIds(ids)
+  const pinned = valid.filter((id) => id !== DYNAMIC_ID)
+  const pinnedPattern = pinned.length === 0 ? undefined : `/mcp/c/(${pinned.map(escapeRegExp).join("|")})`
+  if (!valid.includes(DYNAMIC_ID)) return `^${pinnedPattern}$`
+  return pinnedPattern === undefined ? "^/mcp/dynamic$" : `^(${pinnedPattern}|/mcp/dynamic)$`
 }
 
 const keystoneFile = (home: string) => path.join(home, KEYSTONE_FILE)

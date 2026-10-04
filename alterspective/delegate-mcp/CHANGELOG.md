@@ -8,7 +8,6 @@
 - New container `mcp-gate`: applies the owner's delegation profile (`OPENCODE_DELEGATE_DYNAMIC_PROFILE`, CAS field names) and makes risky tools wait for an approval. The box cannot reach it except through front's `/mcp/dynamic`.
 - `oc_pending` lists held calls as `approval` items; `oc_answer` approves (`once`) or refuses (`reject`) them. An approval runs the same call once.
 - `oc_doctor` reports the gate and flags `dynamic` as high risk.
-- The MCP allow policy now writes each connection's full path (`^(\/mcp\/c\/a|...)$`), so the box restarts once after the upgrade.
 
 ## 0.2.2 — 2026-10-04
 

@@ -34,7 +34,7 @@ describe("the reserved dynamic connection", () => {
     expect(pattern.test("/mcp/dynamic")).toBe(true)
     expect(pattern.test("/mcp/c/github")).toBe(true)
     expect(pattern.test("/mcp/c/dynamic")).toBe(false)
-    expect(JSON.parse(mcpAllowPolicy({ keystoneOrigin: ORIGIN, keystoneConnections: [DYNAMIC_ID] })).remote[0].path).toBe(String.raw`^(\/mcp\/dynamic)$`)
+    expect(JSON.parse(mcpAllowPolicy({ keystoneOrigin: ORIGIN, keystoneConnections: [DYNAMIC_ID] })).remote[0].path).toBe("^/mcp/dynamic$")
   })
 
   test("a ks-dynamic entry is valid only with host-held tokens and only at /mcp/dynamic", () => {
