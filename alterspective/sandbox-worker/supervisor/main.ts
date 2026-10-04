@@ -3,14 +3,7 @@
 // bundle, and runs `opencode serve`. Phase 2 adds the outbound control link to the gateway.
 import { $ } from "bun"
 import path from "path"
-
-type Manifest = {
-  taskId: string
-  model: { baseURL: string; id: string; headers?: Record<string, string> }
-  repo?: { bundle: string; ref?: string }
-  permission?: Record<string, unknown>
-  listen?: { hostname?: string; port?: number }
-}
+import { PRIVACY_TIER, PRIVACY_TIER_ENV, renderConfig, type Manifest } from "./config"
 
 const fail = (message: string): never => {
   console.error(`[sbxw] ${message}`)
@@ -26,29 +19,7 @@ const password = process.env.SBXW_SERVER_PASSWORD ?? fail("SBXW_SERVER_PASSWORD 
 const configDir = process.env.OPENCODE_CONFIG_DIR ?? "/run/sbxw/config"
 const repoDir = "/work/repo"
 
-// One provider, one model, nothing else enabled. The model is fixed by the manifest, which
-// CAS derives from its policy decision; the agent cannot pick another provider.
-// The provider id is `synapse` so the fork's built-in Synapse plugin wraps every request: it
-// merges system messages into one leading message (on-prem backends reject any other shape,
-// "System message must be at the beginning.") and recovers text-form tool calls.
-const config = {
-  $schema: "https://opencode.ai/config.json",
-  model: `synapse/${manifest.model.id}`,
-  small_model: `synapse/${manifest.model.id}`,
-  enabled_providers: ["synapse"],
-  provider: {
-    synapse: {
-      npm: "@ai-sdk/openai-compatible",
-      name: "Sandbox model route",
-      options: { headers: manifest.model.headers ?? {} },
-      models: { [manifest.model.id]: { name: manifest.model.id } },
-    },
-  },
-  // In-box permissions are a convenience, not the security boundary (ADR-037 decision 3).
-  permission: manifest.permission ?? { "*": "allow", external_directory: "deny" },
-  autoupdate: false,
-  share: "disabled",
-}
+const config = renderConfig(manifest)
 
 await $`mkdir -p ${path.join(configDir, "plugins")} ${process.env.XDG_CONFIG_HOME ?? "/run/sbxw/xdg-config"}`
 await Bun.write(path.join(configDir, "opencode.json"), JSON.stringify(config, null, 2))
@@ -92,6 +63,8 @@ const child = Bun.spawn(["opencode", "serve", "--hostname", hostname, "--port", 
     ...env,
     OPENCODE_SERVER_PASSWORD: password,
     SYNAPSE_BASE_URL: manifest.model.baseURL,
+    // #101: the Synapse plugin adds the tier to every Synapse call, not only the chat route.
+    [PRIVACY_TIER_ENV]: PRIVACY_TIER,
     OPENCODE_AUTH_CONTENT: JSON.stringify(auth),
   },
   stdio: ["ignore", "inherit", "inherit"],

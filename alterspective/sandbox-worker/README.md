@@ -14,6 +14,8 @@ two do not share files, image names, container names or ports.
 | `Dockerfile` | Builds the fork into a single Linux binary. Adds git, gh and ripgrep. Runs as non-root user `agent` (uid 10001). |
 | `Dockerfile.dockerignore` | The build context filter for this Dockerfile. The root `.dockerignore` is left alone. |
 | `supervisor/main.ts` | Container entry point. Reads the manifest, writes the managed OpenCode config, clones the repository from a git bundle into `/work/repo`, and starts `opencode serve`. |
+| `supervisor/config.ts` | Renders the managed OpenCode config from the manifest. Pure, so it is unit tested in `test/`. |
+| `test/` | Unit tests: `bun test` from this folder. `bun run test:fast` at the repo root runs a changed test file here; it does not map a changed `supervisor/` file to its tests, so run `bun test` here after a supervisor change. |
 | `plugins/env-scrub.ts` | Blanks the server password and model key in every shell the agent runs. |
 | `driver/run-task.ts` | Stands in for CAS. Runs one task end to end and writes `runs/<taskId>/result.json` and `change.patch`. |
 
@@ -59,6 +61,7 @@ Containers are named `sbxw-<id>`, labelled `alterspective.sandbox-worker=spike`,
   never replies `always`. Questions are refused, because there is no human in the spike loop.
 - **The env scrub is hygiene, not a boundary.** The agent's shell runs as the same user as the
   server, so it can still read the server's environment through `/proc`.
+- **Model calls stay on-prem (#101).** The `synapse` provider always sends `x-privacy-tier: local-only`, set after the manifest headers, so a manifest cannot remove or widen it. The supervisor also sets `SYNAPSE_PRIVACY_TIER=local-only` for `opencode serve`, so the fork's Synapse plugin puts the tier on every Synapse call it makes (chat, model list, MCP bridge, `synapse_buddy_review`). CAS ADR-042 requires this for the opencodealt engine.
 - **The repository config cannot steer the agent.** `OPENCODE_DISABLE_PROJECT_CONFIG=1` stops the
   repository's own `opencode.json` and `.opencode/` from loading. The only config is the one the
   supervisor writes.
