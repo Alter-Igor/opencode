@@ -36,6 +36,19 @@ describe("supervisor: start and reuse", () => {
     expect(status).toMatchObject({ state: "running", startedBy: "this-bridge", health: "healthy", policyVerified: true, imageMatches: true, imageTag: IMAGE })
   })
 
+  test("#104: the gate gets an admin port and token; a bad delegation profile does not stop a box without dynamic", async () => {
+    await writeOwner()
+    const calls: Call[] = []
+    const base = deps(fakeDocker({ running: false, labels: {}, env: [] }, calls))
+    const sup = supervisor({ ...base, config: { ...base.config, dynamicProfile: '{"not":"valid"}' } })
+    await sup.ensure()
+    const up = calls.find((c) => c.argv.includes("up"))!
+    expect(Number(up.env!.OCD_GATE_ADMIN_PORT)).toBeGreaterThan(0)
+    expect(up.env!.GATE_ADMIN_TOKEN?.length).toBeGreaterThan(0)
+    // dynamic is not chosen, so the profile is not passed (nor checked).
+    expect(up.env!.GATE_PROFILE).toBe("")
+  })
+
   test("--build is passed only when the image is missing", async () => {
     const calls: Call[] = []
     await supervisor(deps(fakeDocker({ running: false, labels: {}, env: [] }, calls, { imageMissing: true }))).ensure()

@@ -53,9 +53,18 @@ describe("R3-02: the box has no path to the inbox admin API", () => {
     expect(services["gate-admin"]!.ports).toEqual(["127.0.0.1:${OCD_INBOX_PORT}:8081"])
   })
 
-  test("only the inbox and gate-admin are on `admin`", () => {
+  test("only the inbox, the delegation gate and their admin gates are on `admin`", () => {
     const onAdmin = Object.entries(services).filter(([, s]) => networksOf(s).includes("admin")).map(([name]) => name)
-    expect(onAdmin.sort()).toEqual(["gate-admin", "inbox"])
+    expect(onAdmin.sort()).toEqual(["gate-admin", "gate-mcp-admin", "inbox", "mcp-gate"])
+  })
+
+  test("#104: the box is not on `gatenet` or `admin`, so it cannot reach the delegation gate or skip it", () => {
+    expect(networksOf(services.box!)).toEqual(["sealed"])
+    const onGatenet = Object.entries(services).filter(([, s]) => networksOf(s).includes("gatenet")).map(([name]) => name)
+    expect(onGatenet.sort()).toEqual(["front", "mcp-gate"])
+    // The gate's admin token and profile are named on the gate only, never on the box.
+    expect(Object.keys(services["mcp-gate"]!.environment ?? {})).toContain("GATE_ADMIN_TOKEN")
+    expect(Object.keys(services.box!.environment ?? {}).filter((name) => name.startsWith("GATE_"))).toEqual([])
   })
 })
 
@@ -69,9 +78,9 @@ describe("R3-01: the box's only way out is `front`", () => {
     expect(SIBLING_SERVICES as readonly string[]).not.toContain("egress")
   })
 
-  test("front's `sealed` aliases are exactly config.egressHosts, and it is on `sealed` + `outside`", () => {
+  test("front's `sealed` aliases are exactly config.egressHosts, and it is on `sealed` + `gatenet` + `outside`", () => {
     const networks = services.front!.networks as Record<string, { aliases?: string[] } | null>
-    expect(Object.keys(networks)).toEqual(["sealed", "outside"])
+    expect(Object.keys(networks)).toEqual(["sealed", "gatenet", "outside"])
     expect(networks.sealed?.aliases).toEqual(hosts)
   })
 

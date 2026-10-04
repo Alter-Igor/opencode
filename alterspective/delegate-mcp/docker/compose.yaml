@@ -24,6 +24,10 @@ networks:
   # is on holds a path to the admin routes (test/egress-compose.test.ts).
   admin:
     internal: true
+  # #104: front <-> mcp-gate only. The box is NOT on it, so the box cannot reach the gate (or skip
+  # it): its /mcp/dynamic traffic goes box -> front (adds the owner's token) -> mcp-gate -> Keystone.
+  gatenet:
+    internal: true
   outside: {}
 
 volumes:
@@ -212,6 +216,7 @@ services:
         aliases:
           - identity.alterspective.com.au
           - synapse2-api.alterspective.com.au
+      gatenet: {}
       outside: {}
     # Binds :443 as uid 101 with no capabilities: this sysctl is per network namespace, so it
     # changes nothing outside this container.
@@ -239,6 +244,61 @@ services:
     mem_limit: 128m
     memswap_limit: 128m
     cpus: 1
+
+  # #104 delegation gate (mcp-gate/): the only way to Keystone /mcp/dynamic. front sends the box's
+  # /mcp/dynamic calls here with the owner's token; the gate applies the delegation profile
+  # (GATE_PROFILE) and the approval fence, then calls Keystone itself over verified TLS (`outside`).
+  # - Front listener :8090 on `gatenet` (front only; the box is not on that network).
+  # - Admin listener :8091, bound to its `admin` address (alias mcp-gate-admin, which exists only on
+  #   that network). gate-mcp-admin publishes it on host 127.0.0.1:${OCD_GATE_ADMIN_PORT}; bridges
+  #   call it with GATE_ADMIN_TOKEN (by NAME only, set on THIS service only, never on the box).
+  # It always runs (small); it is idle unless the `dynamic` connection is chosen.
+  mcp-gate:
+    <<: *hardened
+    build: ../mcp-gate
+    image: ${OCD_IMAGE}-mcp-gate
+    container_name: ${OCD_CONTAINER:-opencode-delegate}-mcp-gate
+    labels:
+      com.alterspective.opencode-delegate.image: ${OCD_IMAGE}
+      com.alterspective.opencode-delegate.gate-admin-port: ${OCD_GATE_ADMIN_PORT:?OCD_GATE_ADMIN_PORT is set by the bridge}
+    networks:
+      # The front listener binds its `gatenet` address only (alias mcp-gate-front, which exists only
+      # on that network), so nothing on `outside` or `admin` can call it.
+      gatenet:
+        aliases: [mcp-gate-front]
+      outside: {}
+      admin:
+        aliases: [mcp-gate-admin]
+    restart: unless-stopped
+    tmpfs: ["/tmp:mode=1777,nosuid,nodev,noexec"]
+    environment:
+      GATE_PORT: "8090"
+      GATE_HOST: mcp-gate-front
+      GATE_ADMIN_PORT: "8091"
+      GATE_ADMIN_HOST: mcp-gate-admin
+      GATE_UPSTREAM: https://identity.alterspective.com.au/mcp/dynamic
+      GATE_ADMIN_TOKEN:
+      GATE_PROFILE:
+    pids_limit: 64
+    mem_limit: 256m
+    memswap_limit: 256m
+    cpus: 0.5
+
+  # Publishes the gate's admin API on the host loopback only (like gate-admin for the inbox).
+  gate-mcp-admin:
+    <<: *hardened
+    image: alpine/socat:1.8.1.3@sha256:5ffbd6ae916cbad86a58fabe0d6d5a6fd5c2b47ddf031e82996baac9300e732f
+    container_name: ${OCD_CONTAINER:-opencode-delegate}-gate-mcp-admin
+    user: "65534:65534"
+    command: ["TCP-LISTEN:8091,fork,reuseaddr", "TCP:mcp-gate-admin:8091"]
+    networks: [admin, outside]
+    ports: ["127.0.0.1:${OCD_GATE_ADMIN_PORT}:8091"]
+    restart: unless-stopped
+    pids_limit: 64
+    mem_limit: 64m
+    memswap_limit: 64m
+    cpus: 0.5
+    depends_on: [mcp-gate]
 
   # Read-only pull-through package caches (owned by MOD-02, docker/caches).
   npm-cache:
