@@ -20,11 +20,24 @@
 
 This repo's `.opencode/` folder (CAS bridge tools, project MCP list, project plugins) loads only when opencodealt runs inside a clone of this repo.
 
-## How to release
+## Channels (#97)
 
-1. Merge to `dev`.
-2. Actions → `opencodealt-release` → Run workflow (default ref `dev`).
-3. Check the release has both files, then run `aio opencode install` on a test machine.
+| Channel | What it is | Who gets it |
+|---|---|---|
+| **edge** | Every code merge to `dev` builds and publishes a GitHub **pre-release** (`opencodealt-release.yml`; docs-only changes are skipped). | People who chose `aio opencode install --edge` |
+| **stable** | An edge release promoted to a normal release marked **Latest**. Same files, no rebuild. | Everyone else (the default) |
+
+**Promotion** (`opencodealt-promote.yml`, daily 07:17 AEST, script `.github/scripts/opencodealt-promote.sh`): the newest release is promoted when it is a pre-release, at least 3 days old, and no issue labelled `release-hold` is open. "Newest" means no newer edge build has landed since, so a busy week waits for a quiet one.
+
+- **Stop promotions:** open an issue labelled `release-hold`. Close it to resume.
+- **Promote now / roll back:** Actions → `opencodealt-promote` → Run with `tag` set. An older tag makes that release Latest again.
+- **Dry run:** the same, with `dry_run` ticked.
+
+**Inside opencodealt:** the build reads its channel from `<install root>\channel` (AI Office writes it) or `OPENCODEALT_RELEASE_CHANNEL`. Edge checks all releases; stable checks Latest. It only ever offers a strictly newer version, so an edge build is never asked to step back to stable. `opencodealt upgrade` follows the same rule.
+
+## How to release by hand
+
+Not needed any more: merges release themselves. To build a specific commit: Actions → `opencodealt-release` → Run workflow with `ref`.
 
 ## Evidence (2026-10-04, local, before the PR)
 

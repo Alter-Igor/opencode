@@ -16,9 +16,12 @@ import { NpmConfig } from "@opencode-ai/core/npm-config"
 import { InstallationEvent } from "@opencode-ai/schema/installation-event"
 import {
   OPENCODEALT_LATEST_RELEASE_URL,
+  OPENCODEALT_RELEASES_URL,
   OPENCODEALT_UPDATE_COMMAND,
   isOpencodealt,
+  newestOpencodealtVersion,
   opencodealtVersion,
+  readOpencodealtChannel,
 } from "./opencodealt"
 
 // Fork-only (#90): "aio" = an opencodealt release build that AI Office installed.
@@ -69,6 +72,9 @@ export class UpgradeFailedError extends Schema.TaggedErrorClass<UpgradeFailedErr
 
 // Response schemas for external version APIs
 const GitHubRelease = Schema.Struct({ tag_name: Schema.String })
+const GitHubReleaseList = Schema.Array(
+  Schema.Struct({ tag_name: Schema.String, draft: Schema.optional(Schema.Boolean) }),
+)
 const NpmPackage = Schema.Struct({ version: Schema.String })
 const BrewFormula = Schema.Struct({ versions: Schema.Struct({ stable: Schema.String }) })
 const BrewInfoV2 = Schema.Struct({
@@ -219,6 +225,18 @@ const layer: Layer.Layer<Service, never, HttpClient.HttpClient | AppProcess.Serv
         const detectedMethod = installMethod || (yield* result.method())
 
         if (detectedMethod === "aio") {
+          // #97: an edge install looks at every release, pre-releases included.
+          // If that lookup fails, fall back to the stable (Latest) check below.
+          if (readOpencodealtChannel() === "edge") {
+            const newest = yield* httpOk
+              .execute(HttpClientRequest.get(OPENCODEALT_RELEASES_URL).pipe(HttpClientRequest.acceptJson))
+              .pipe(
+                Effect.flatMap(HttpClientResponse.schemaBodyJson(GitHubReleaseList)),
+                Effect.map(newestOpencodealtVersion),
+                Effect.catch(() => Effect.succeed(undefined)),
+              )
+            if (newest) return newest
+          }
           const response = yield* httpOk.execute(
             HttpClientRequest.get(OPENCODEALT_LATEST_RELEASE_URL).pipe(HttpClientRequest.acceptJson),
           )

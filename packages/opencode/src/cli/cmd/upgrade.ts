@@ -3,6 +3,7 @@ import { UI } from "../ui"
 import * as prompts from "@clack/prompts"
 import { Installation } from "../../installation"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
+import { isNewerOpencodealt } from "../../installation/opencodealt"
 
 export const UpgradeCommand = {
   command: "upgrade [target]",
@@ -48,6 +49,13 @@ export const UpgradeCommand = {
     if (!target) {
       prompts.log.error("Could not find the latest release. Check your network, or pass a version.")
       process.exitCode = 1
+      prompts.outro("Done")
+      return
+    }
+
+    // Fork-only (#97): on an edge build the stable release can be older; never step back unasked.
+    if (method === "aio" && !args.target && !isNewerOpencodealt(target, InstallationVersion)) {
+      prompts.log.warn(`opencodealt ${InstallationVersion} is already the newest on your channel (latest: ${target})`)
       prompts.outro("Done")
       return
     }

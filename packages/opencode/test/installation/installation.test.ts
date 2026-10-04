@@ -9,7 +9,17 @@ import { Installation } from "../../src/installation"
 import { InstallationChannel } from "@opencode-ai/core/installation/version"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { testEffect } from "../lib/effect"
-import { OPENCODEALT_LATEST_RELEASE_URL, opencodealtVersion } from "../../src/installation/opencodealt"
+import fs from "fs"
+import os from "os"
+import path from "path"
+import {
+  OPENCODEALT_LATEST_RELEASE_URL,
+  OPENCODEALT_RELEASES_URL,
+  isNewerOpencodealt,
+  newestOpencodealtVersion,
+  opencodealtVersion,
+  readOpencodealtChannel,
+} from "../../src/installation/opencodealt"
 
 const encoder = new TextEncoder()
 
@@ -227,6 +237,73 @@ describe("installation", () => {
         expect(error.stderr).not.toContain("secret")
       }),
     )
+
+    // #97: stable and edge channels.
+    const edgeCalls: string[] = []
+    testEffect(
+      testLayer((request) => {
+        edgeCalls.push(request.url)
+        return jsonResponse([
+          { tag_name: "opencodealt-v1.18.31-alt.9", draft: true },
+          { tag_name: "opencodealt-v1.18.31-alt.8", draft: false },
+          { tag_name: "opencodealt-v1.18.31-alt.10", draft: false },
+          { tag_name: "v2.0.0", draft: false },
+        ])
+      }),
+    ).effect("an edge install looks at every release and picks the highest version", () =>
+      Effect.gen(function* () {
+        const before = process.env["OPENCODEALT_RELEASE_CHANNEL"]
+        process.env["OPENCODEALT_RELEASE_CHANNEL"] = "edge"
+        try {
+          const result = yield* Installation.use.latest("aio")
+          expect(result).toBe("1.18.31-alt.10")
+          expect(edgeCalls).toEqual([OPENCODEALT_RELEASES_URL])
+        } finally {
+          if (before === undefined) delete process.env["OPENCODEALT_RELEASE_CHANNEL"]
+          else process.env["OPENCODEALT_RELEASE_CHANNEL"] = before
+        }
+      }),
+    )
+
+    testEffect(
+      testLayer((request) =>
+        request.url === OPENCODEALT_RELEASES_URL
+          ? new Response("not found", { status: 404 })
+          : jsonResponse({ tag_name: "opencodealt-v1.18.31-alt.2" }),
+      ),
+    ).effect("an edge install falls back to the stable release when the list lookup fails", () =>
+      Effect.gen(function* () {
+        const before = process.env["OPENCODEALT_RELEASE_CHANNEL"]
+        process.env["OPENCODEALT_RELEASE_CHANNEL"] = "edge"
+        try {
+          expect(yield* Installation.use.latest("aio")).toBe("1.18.31-alt.2")
+        } finally {
+          if (before === undefined) delete process.env["OPENCODEALT_RELEASE_CHANNEL"]
+          else process.env["OPENCODEALT_RELEASE_CHANNEL"] = before
+        }
+      }),
+    )
+
+    test("reads the channel AI Office wrote next to bin, defaulting to stable", () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "oca-channel-"))
+      const exe = path.join(root, "bin", "opencodealt.exe")
+      expect(readOpencodealtChannel(exe, {})).toBe("stable")
+      fs.writeFileSync(path.join(root, "channel"), "edge\n")
+      expect(readOpencodealtChannel(exe, {})).toBe("edge")
+      fs.writeFileSync(path.join(root, "channel"), "nightly")
+      expect(readOpencodealtChannel(exe, {})).toBe("stable")
+      expect(readOpencodealtChannel(exe, { OPENCODEALT_RELEASE_CHANNEL: "edge" })).toBe("edge")
+      fs.rmSync(root, { recursive: true, force: true })
+    })
+
+    test("never treats an older stable as an update for a newer edge build", () => {
+      expect(isNewerOpencodealt("1.18.31-alt.7", "1.18.31-alt.8")).toBe(false)
+      expect(isNewerOpencodealt("1.18.31-alt.10", "1.18.31-alt.9")).toBe(true)
+      expect(isNewerOpencodealt("1.18.32-alt.11", "1.18.31-alt.10")).toBe(true)
+      expect(isNewerOpencodealt("1.18.31-alt.8", "1.18.31-alt.8")).toBe(false)
+      expect(isNewerOpencodealt("1.18.31-alt.8", "1.18.31-alt [abc1234567]")).toBe(false)
+      expect(newestOpencodealtVersion([])).toBeUndefined()
+    })
 
     test("turns a release tag into a version", () => {
       expect(opencodealtVersion("opencodealt-v1.18.31-alt.7")).toBe("1.18.31-alt.7")

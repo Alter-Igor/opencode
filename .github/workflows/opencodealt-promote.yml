@@ -1,0 +1,46 @@
+name: opencodealt-promote
+
+# Fork-only (#97): once a day, promote a soaked opencodealt edge release to stable.
+# Rule and manual override: see .github/scripts/opencodealt-promote.sh.
+# To stop promotions, open an issue with the label `release-hold`; close it to resume.
+
+on:
+  schedule:
+    - cron: "17 21 * * *" # 07:17 AEST / 08:17 AEDT
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Promote this tag now (skips soak and hold). An older tag rolls stable back."
+        required: false
+        default: ""
+      dry_run:
+        description: "Report what would happen, change nothing"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: read
+
+concurrency:
+  group: opencodealt-promote
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Promote
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SOAK_DAYS: "3"
+          TAG: ${{ inputs.tag }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+        run: bash .github/scripts/opencodealt-promote.sh
