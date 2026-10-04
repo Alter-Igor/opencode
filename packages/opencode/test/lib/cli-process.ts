@@ -25,6 +25,7 @@ import { AppProcess } from "@opencode-ai/core/process"
 import { Deferred, Duration, Effect, Layer, Queue, Schedule, Scope, Stream } from "effect"
 import { FetchHttpClient, HttpClient } from "effect/unstable/http"
 import { ChildProcess } from "effect/unstable/process"
+import os from "node:os"
 import path from "node:path"
 import { TestLLMServer } from "./llm-server"
 import { testProviderConfig } from "./test-provider"
@@ -58,6 +59,66 @@ function forkStderrDrain(stream: ReadableStream<Uint8Array>, into: string[]) {
     ),
   )
 }
+
+// Fork-only (#100): at most this many short-lived CLI children run at once, across every fixture
+// in the process. `cliIt.concurrent` otherwise starts one cold `bun run src/index.ts` per test at
+// the same time; on a 4-vCPU GitHub runner ten of them took 13-15 s each instead of about 2 s, so
+// the timing-sensitive tests in test/cli/run/run-process.test.ts hit their limits. Waiting for a
+// slot does not count towards `durationMs` or the per-spawn timeout. Override with
+// OPENCODE_TEST_CLI_CONCURRENCY.
+const concurrencyOverride = Number(process.env.OPENCODE_TEST_CLI_CONCURRENCY)
+export const cliConcurrency =
+  Number.isSafeInteger(concurrencyOverride) && concurrencyOverride > 0
+    ? concurrencyOverride
+    : Math.max(2, Math.floor(os.availableParallelism() / 2))
+
+/** One held slot. `release` is idempotent, so the child's exit and the scope may both call it. */
+type CliLease = { readonly release: () => void }
+const cliSlots = (() => {
+  let active = 0
+  // Insertion-ordered, so waiters are served first come, first served.
+  const waiting = new Set<() => void>()
+  const lease = (): CliLease => {
+    let held = true
+    return {
+      release: () => {
+        if (!held) return
+        held = false
+        active--
+        const next = waiting.values().next()
+        if (next.done) return
+        waiting.delete(next.value)
+        next.value()
+      },
+    }
+  }
+  // Interruptible: a waiter that is interrupted leaves the queue and never holds a slot. If the
+  // slot was handed over in the same instant, the canceller gives it back.
+  const acquire = Effect.callback<CliLease>((resume) => {
+    if (active < cliConcurrency) {
+      active++
+      return resume(Effect.succeed(lease()))
+    }
+    let granted: CliLease | undefined
+    const waiter = () => {
+      active++
+      granted = lease()
+      resume(Effect.succeed(granted))
+    }
+    waiting.add(waiter)
+    return Effect.sync(() => {
+      if (granted) granted.release()
+      else waiting.delete(waiter)
+    })
+  })
+  return { acquire, waiting: () => waiting.size, active: () => active }
+})()
+/** Holds a slot until the surrounding scope closes. Only the wait itself can be interrupted. */
+const cliSlot = Effect.uninterruptibleMask((restore) =>
+  Effect.tap(restore(cliSlots.acquire), (held) => Effect.addFinalizer(() => Effect.sync(held.release))),
+)
+/** For tests of the pool itself. */
+export const cliSlotsForTest = { slot: cliSlot, waiting: cliSlots.waiting, active: cliSlots.active }
 
 function isolatedEnv(home: string, configJson: string): Record<string, string> {
   return {
@@ -205,6 +266,11 @@ export function withCliFixture<A, E>(
     const env = isolatedEnv(home, configJson)
 
     const spawn = Effect.fn("opencode.spawn")(function* (args: string[], opts?: SpawnOpts) {
+      // #100: hold a slot for the child's whole life; released when the spawn ends.
+      return yield* Effect.scoped(Effect.flatMap(cliSlot, () => spawnNow(args, opts)))
+    })
+
+    const spawnNow = Effect.fn("opencode.spawnNow")(function* (args: string[], opts?: SpawnOpts) {
       const start = Date.now()
       const timeoutMs = opts?.timeoutMs ?? 30_000
       // stdin: "ignore" so the child doesn't see a piped stdin and block
@@ -279,6 +345,9 @@ export function withCliFixture<A, E>(
     }
 
     const startRun = Effect.fn("opencode.startRun")(function* (message: string, opts?: RunOpts) {
+      // #100: freed when the child exits, so a scope that runs several children in turn cannot
+      // block itself; the scope's finalizer frees it otherwise (release is idempotent).
+      const held = yield* cliSlot
       const start = Date.now()
       const options = runOpts(opts)
       const proc = yield* Effect.acquireRelease(
@@ -297,6 +366,7 @@ export function withCliFixture<A, E>(
             return child.exited
           }).pipe(Effect.ignore),
       )
+      void proc.exited.then(held.release, held.release)
       const stdout = new Response(proc.stdout).text()
       const stderr = new Response(proc.stderr).text()
 
