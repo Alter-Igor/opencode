@@ -43,14 +43,15 @@ await Bun.write(path.join(configDir, "plugins", "env-scrub.ts"), Bun.file("/opt/
 // #108: a bundle that does not match what the service sent is refused before anything is served.
 const verified = { sha256: false, tree: false }
 if (manifest.repo?.bundle) {
-  if (manifest.repo.sha256) {
+  // Present at all means checked: an empty value fails the check rather than skipping it.
+  if (manifest.repo.sha256 !== undefined) {
     const check = await checkBundleFile(manifest.repo.bundle, manifest.repo.sha256)
     if (!check.ok) fail(`refusing to start: ${check.reason}`)
     verified.sha256 = true
   }
   await $`git clone --quiet ${manifest.repo.bundle} ${repoDir}`
   if (manifest.repo.ref) await $`git -C ${repoDir} checkout --quiet ${manifest.repo.ref}`
-  if (manifest.repo.treeSha) {
+  if (manifest.repo.treeSha !== undefined) {
     const check = await checkTree(repoDir, manifest.repo.treeSha)
     if (!check.ok) fail(`refusing to start: ${check.reason}`)
     verified.tree = true
