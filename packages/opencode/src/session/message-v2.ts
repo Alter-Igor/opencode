@@ -275,7 +275,9 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
         return part.metadata?.anthropic?.signature != null
       })
       for (const part of msg.parts) {
-        if (part.type === "text" && !part.synthetic) {
+        // Fork (#40, narrowed in #95): skip only the context-usage measurement part. Other
+        // synthetic assistant text still reaches the model, as upstream sends it.
+        if (part.type === "text" && !(part.synthetic && part.metadata?.contextUsage !== undefined)) {
           const text = part.text === "" && hasSignedReasoning ? " " : part.text
           assistantMessage.parts.push({
             type: "text",

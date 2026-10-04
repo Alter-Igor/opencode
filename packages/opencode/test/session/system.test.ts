@@ -109,11 +109,36 @@ describe("session.system", () => {
     }
   })
 
+  /** Runs `effect` with the RAG standards prompt turned off, so the local catalogue is pasted. */
+  const withLocalCatalogue = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+    Effect.acquireUseRelease(
+      Effect.sync(() => {
+        const previous = process.env.ALTERSPECTIVE_STANDARDS_INJECTION_DISABLED
+        process.env.ALTERSPECTIVE_STANDARDS_INJECTION_DISABLED = "true"
+        return previous
+      }),
+      () => effect,
+      (previous) =>
+        Effect.sync(() => {
+          if (previous === undefined) delete process.env.ALTERSPECTIVE_STANDARDS_INJECTION_DISABLED
+          else process.env.ALTERSPECTIVE_STANDARDS_INJECTION_DISABLED = previous
+        }),
+    )
+
+  // Fork (#40): the local skill catalogue is pasted only when the RAG standards prompt is turned
+  // off; by default the fork plugin's RAG lookup replaces it.
+  it.effect("fork default: no local skill catalogue while the RAG standards prompt is on", () =>
+    Effect.gen(function* () {
+      const prompt = yield* SystemPrompt.Service
+      expect(yield* prompt.skills(build)).toBeUndefined()
+    }),
+  )
+
   it.effect("skills output is sorted by name and stable across calls", () =>
     Effect.gen(function* () {
       const prompt = yield* SystemPrompt.Service
-      const first = yield* prompt.skills(build)
-      const second = yield* prompt.skills(build)
+      const first = yield* withLocalCatalogue(prompt.skills(build))
+      const second = yield* withLocalCatalogue(prompt.skills(build))
       const output = first ?? (yield* Effect.fail(new NamedError.Unknown({ message: "missing skills output" })))
 
       expect(first).toBe(second)

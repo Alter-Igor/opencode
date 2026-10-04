@@ -17,6 +17,9 @@ export class Service extends ConfigService.Service<Service>()("@opencode/Runtime
   autoShare: bool("OPENCODE_AUTO_SHARE"),
   pure: bool("OPENCODE_PURE"),
   disableDefaultPlugins: bool("OPENCODE_DISABLE_DEFAULT_PLUGINS"),
+  // Fork-only (#95): leave out the fork's own built-in plugins (Synapse, /goal, /docs) so upstream
+  // tests and recorded fixtures see upstream behaviour.
+  disableForkPlugins: bool("OPENCODE_DISABLE_FORK_PLUGINS"),
   disableEmbeddedWebUi: bool("OPENCODE_DISABLE_EMBEDDED_WEB_UI"),
   disableExternalSkills: bool("OPENCODE_DISABLE_EXTERNAL_SKILLS"),
   disableLspDownload: bool("OPENCODE_DISABLE_LSP_DOWNLOAD"),

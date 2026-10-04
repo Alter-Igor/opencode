@@ -334,6 +334,25 @@ afterEach(async () => {
   await resetDatabase()
 })
 
+/**
+ * Fork (#40, #95): the local skill catalogue reaches the prompt only when the RAG standards prompt
+ * is turned off; by default the fork plugin's RAG lookup replaces it.
+ */
+const withLocalSkillCatalogue = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+  Effect.acquireUseRelease(
+    Effect.sync(() => {
+      const previous = process.env.ALTERSPECTIVE_STANDARDS_INJECTION_DISABLED
+      process.env.ALTERSPECTIVE_STANDARDS_INJECTION_DISABLED = "true"
+      return previous
+    }),
+    () => effect,
+    (previous) =>
+      Effect.sync(() => {
+        if (previous === undefined) delete process.env.ALTERSPECTIVE_STANDARDS_INJECTION_DISABLED
+        else process.env.ALTERSPECTIVE_STANDARDS_INJECTION_DISABLED = previous
+      }),
+  )
+
 describe("HttpApi SDK", () => {
   httpapi(
     "uses the generated SDK for global and control routes",
@@ -808,29 +827,31 @@ describe("HttpApi SDK", () => {
   httpapi(
     "includes project skills in REST API prompt context",
     withFakeLlmProject("default", { setup: writeProjectSkill }, ({ sdk, llm }) =>
-      Effect.gen(function* () {
-        yield* llm.text("skill context ok", { usage: { input: 11, output: 7 } })
-        const session = yield* capture(() =>
-          sdk.session.create({
-            title: "project skill prompt",
-            permission: [{ permission: "*", pattern: "*", action: "allow" }],
-          }),
-        )
-        const sessionID = String(record(session.data).id)
-        const prompt = yield* capture(() =>
-          sdk.session.prompt({
-            sessionID,
-            agent: "build",
-            model: { providerID: "test", modelID: "test-model" },
-            parts: [{ type: "text", text: "hello skill context" }],
-          }),
-        )
-        const inputs = yield* llm.inputs
+      withLocalSkillCatalogue(
+        Effect.gen(function* () {
+          yield* llm.text("skill context ok", { usage: { input: 11, output: 7 } })
+          const session = yield* capture(() =>
+            sdk.session.create({
+              title: "project skill prompt",
+              permission: [{ permission: "*", pattern: "*", action: "allow" }],
+            }),
+          )
+          const sessionID = String(record(session.data).id)
+          const prompt = yield* capture(() =>
+            sdk.session.prompt({
+              sessionID,
+              agent: "build",
+              model: { providerID: "test", modelID: "test-model" },
+              parts: [{ type: "text", text: "hello skill context" }],
+            }),
+          )
+          const inputs = yield* llm.inputs
 
-        expect(session.status).toBe(200)
-        expect(prompt.status).toBe(200)
-        expect(JSON.stringify(inputs[0])).toContain("project-rest-skill")
-      }),
+          expect(session.status).toBe(200)
+          expect(prompt.status).toBe(200)
+          expect(JSON.stringify(inputs[0])).toContain("project-rest-skill")
+        }),
+      ),
     ),
   )
 

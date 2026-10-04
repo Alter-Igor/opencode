@@ -246,6 +246,28 @@ describe("session.message-v2.toModelMessage", () => {
     ])
   })
 
+  test("fork (#40): the context-usage measurement part never reaches the model", async () => {
+    const messageID = "m-user"
+    const input: SessionV1.WithParts[] = [
+      {
+        info: userInfo(messageID),
+        parts: [{ ...basePart(messageID, "p1"), type: "text", text: "hello" }] as SessionV1.Part[],
+      },
+      {
+        info: assistantInfo("m-assistant", messageID),
+        parts: [
+          { ...basePart("m-assistant", "a0"), type: "text", text: "", synthetic: true, metadata: { contextUsage: [] } },
+          { ...basePart("m-assistant", "a1"), type: "text", text: "answer" },
+        ] as SessionV1.Part[],
+      },
+    ]
+
+    expect(await MessageV2.toModelMessages(input, model)).toStrictEqual([
+      { role: "user", content: [{ type: "text", text: "hello" }] },
+      { role: "assistant", content: [{ type: "text", text: "answer" }] },
+    ])
+  })
+
   test("converts user text/file parts and injects compaction/subtask prompts", async () => {
     const messageID = "m-user"
 
