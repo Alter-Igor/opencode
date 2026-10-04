@@ -109,19 +109,28 @@ describe("session.system", () => {
     }
   })
 
-  /** Runs `effect` with the RAG standards prompt turned off, so the local catalogue is pasted. */
-  const withLocalCatalogue = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+  /** Runs `effect` with both standards-injection switches set, then restores them. */
+  const withInjection = <A, E, R>(on: boolean, effect: Effect.Effect<A, E, R>) =>
     Effect.acquireUseRelease(
       Effect.sync(() => {
-        const previous = process.env.ALTERSPECTIVE_STANDARDS_INJECTION_DISABLED
-        process.env.ALTERSPECTIVE_STANDARDS_INJECTION_DISABLED = "true"
+        const previous = {
+          disabled: process.env.ALTERSPECTIVE_STANDARDS_INJECTION_DISABLED,
+          enabled: process.env.ALTERSPECTIVE_STANDARDS_INJECTION_ENABLED,
+        }
+        process.env.ALTERSPECTIVE_STANDARDS_INJECTION_DISABLED = on ? "false" : "true"
+        process.env.ALTERSPECTIVE_STANDARDS_INJECTION_ENABLED = on ? "true" : "false"
         return previous
       }),
       () => effect,
       (previous) =>
         Effect.sync(() => {
-          if (previous === undefined) delete process.env.ALTERSPECTIVE_STANDARDS_INJECTION_DISABLED
-          else process.env.ALTERSPECTIVE_STANDARDS_INJECTION_DISABLED = previous
+          for (const [name, value] of [
+            ["ALTERSPECTIVE_STANDARDS_INJECTION_DISABLED", previous.disabled],
+            ["ALTERSPECTIVE_STANDARDS_INJECTION_ENABLED", previous.enabled],
+          ] as const) {
+            if (value === undefined) delete process.env[name]
+            else process.env[name] = value
+          }
         }),
     )
 
@@ -130,15 +139,15 @@ describe("session.system", () => {
   it.effect("fork default: no local skill catalogue while the RAG standards prompt is on", () =>
     Effect.gen(function* () {
       const prompt = yield* SystemPrompt.Service
-      expect(yield* prompt.skills(build)).toBeUndefined()
+      expect(yield* withInjection(true, prompt.skills(build))).toBeUndefined()
     }),
   )
 
   it.effect("skills output is sorted by name and stable across calls", () =>
     Effect.gen(function* () {
       const prompt = yield* SystemPrompt.Service
-      const first = yield* withLocalCatalogue(prompt.skills(build))
-      const second = yield* withLocalCatalogue(prompt.skills(build))
+      const first = yield* withInjection(false, prompt.skills(build))
+      const second = yield* withInjection(false, prompt.skills(build))
       const output = first ?? (yield* Effect.fail(new NamedError.Unknown({ message: "missing skills output" })))
 
       expect(first).toBe(second)
