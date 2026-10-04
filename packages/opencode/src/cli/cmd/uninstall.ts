@@ -136,6 +136,7 @@ async function showRemovalSummary(targets: RemovalTargets, method: Installation.
       brew: "brew uninstall opencode",
       choco: "choco uninstall opencode",
       scoop: "scoop uninstall opencode",
+      aio: "opencodealt binary (installed by AI Office)",
     }
     prompts.log.info(`  ✓ Package: ${cmds[method] || method}`)
   }
@@ -207,6 +208,13 @@ async function executeUninstall(method: Installation.Method, targets: RemovalTar
         spinner.stop("Package removed")
       }
     }
+  }
+
+  // Fork-only (#90): AI Office put the binary there; a running .exe cannot delete itself.
+  if (method === "aio") {
+    UI.empty()
+    prompts.log.message("To finish removing opencodealt, delete:")
+    prompts.log.info(`  ${process.execPath}`)
   }
 
   if (method === "curl" && targets.binary) {

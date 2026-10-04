@@ -1,0 +1,80 @@
+name: opencodealt-release
+
+# Fork-only (#90): builds opencodealt.exe (Windows x64) and publishes it as a GitHub release.
+# AI Office (`aio opencode install`) downloads the latest release and checks the .sha256.
+# The build runs on Windows so build.ts can build and smoke-test the native binary (--single).
+# The binary is not code-signed: this fork has no signing certificate.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Commit or branch to build"
+        required: false
+        default: dev
+
+permissions:
+  contents: write
+
+concurrency:
+  group: opencodealt-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: ./.github/actions/setup-bun
+
+      - name: Version
+        id: version
+        shell: bash
+        run: |
+          base=$(node -p "require('./packages/opencode/package.json').version")
+          version="${base}-alt.${GITHUB_RUN_NUMBER}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "opencodealt $version from $(git rev-parse --short HEAD)"
+
+      - name: Build
+        shell: bash
+        run: bun run --cwd packages/opencode script/build.ts --single --skip-install
+        env:
+          OPENCODE_CHANNEL: opencodealt
+          OPENCODE_VERSION: ${{ steps.version.outputs.version }}
+
+      - name: Package
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force release | Out-Null
+          Copy-Item packages/opencode/dist/opencode-windows-x64/bin/opencode.exe release/opencodealt.exe
+          $reported = (& ./release/opencodealt.exe --version).Trim()
+          if ($reported -ne $env:VERSION) { throw "opencodealt.exe reports '$reported', expected '$env:VERSION'" }
+          Compress-Archive -Path release/opencodealt.exe -DestinationPath release/opencodealt-windows-x64.zip
+          $hash = (Get-FileHash release/opencodealt-windows-x64.zip -Algorithm SHA256).Hash.ToLower()
+          [IO.File]::WriteAllText("$PWD/release/opencodealt-windows-x64.zip.sha256", "$hash  opencodealt-windows-x64.zip`n")
+          Get-Content release/opencodealt-windows-x64.zip.sha256
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          SHA: ${{ steps.version.outputs.sha }}
+        run: |
+          gh release create "opencodealt-v${VERSION}" \
+            release/opencodealt-windows-x64.zip \
+            release/opencodealt-windows-x64.zip.sha256 \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SHA" \
+            --title "opencodealt ${VERSION}" \
+            --latest \
+            --notes "opencodealt ${VERSION}, built from ${SHA}. Install or update with \`aio opencode install\` (AI Office). User guide: https://aio.alterspective.com.au/app/ai-os/opencodealt"

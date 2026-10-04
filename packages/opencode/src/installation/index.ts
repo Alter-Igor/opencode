@@ -14,8 +14,15 @@ import semver from "semver"
 import { InstallationChannel, InstallationVersion } from "@opencode-ai/core/installation/version"
 import { NpmConfig } from "@opencode-ai/core/npm-config"
 import { InstallationEvent } from "@opencode-ai/schema/installation-event"
+import {
+  OPENCODEALT_LATEST_RELEASE_URL,
+  OPENCODEALT_UPDATE_COMMAND,
+  isOpencodealt,
+  opencodealtVersion,
+} from "./opencodealt"
 
-export type Method = "curl" | "npm" | "yarn" | "pnpm" | "bun" | "brew" | "scoop" | "choco" | "unknown"
+// Fork-only (#90): "aio" = an opencodealt release build that AI Office installed.
+export type Method = "curl" | "npm" | "yarn" | "pnpm" | "bun" | "brew" | "scoop" | "choco" | "aio" | "unknown"
 
 export type ReleaseType = "patch" | "minor" | "major"
 
@@ -132,6 +139,7 @@ const layer: Layer.Layer<Service, never, HttpClient.HttpClient | AppProcess.Serv
 
     const upgradeFailure = (method: Method, result?: { code: number; stdout: string; stderr: string }) => {
       if (method === "choco") return "not running from an elevated command shell"
+      if (method === "aio") return `opencodealt updates through AI Office. Run: ${OPENCODEALT_UPDATE_COMMAND.join(" ")}`
       if (result) return `Upgrade failed for ${method} (exit code ${result.code}).`
       return `Upgrade failed for ${method}.`
     }
@@ -172,6 +180,8 @@ const layer: Layer.Layer<Service, never, HttpClient.HttpClient | AppProcess.Serv
         }
       }),
       method: Effect.fn("Installation.method")(function* () {
+        // Fork-only (#90): checked first so no package-manager probe can pick upstream.
+        if (isOpencodealt()) return "aio" as Method
         if (process.execPath.includes(path.join(".opencode", "bin"))) return "curl" as Method
         if (process.execPath.includes(path.join(".local", "bin"))) return "curl" as Method
         const exec = process.execPath.toLowerCase()
@@ -207,6 +217,14 @@ const layer: Layer.Layer<Service, never, HttpClient.HttpClient | AppProcess.Serv
       }),
       latest: Effect.fn("Installation.latest")(function* (installMethod?: Method) {
         const detectedMethod = installMethod || (yield* result.method())
+
+        if (detectedMethod === "aio") {
+          const response = yield* httpOk.execute(
+            HttpClientRequest.get(OPENCODEALT_LATEST_RELEASE_URL).pipe(HttpClientRequest.acceptJson),
+          )
+          const data = yield* HttpClientResponse.schemaBodyJson(GitHubRelease)(response)
+          return opencodealtVersion(data.tag_name)
+        }
 
         if (detectedMethod === "brew") {
           const formula = yield* getBrewFormula()
@@ -304,6 +322,10 @@ const layer: Layer.Layer<Service, never, HttpClient.HttpClient | AppProcess.Serv
             break
           case "scoop":
             upgradeResult = yield* run(["scoop", "install", `opencode@${target}`])
+            break
+          case "aio":
+            // AI Office installs the latest opencodealt release, so `target` is not passed on.
+            upgradeResult = yield* run(OPENCODEALT_UPDATE_COMMAND)
             break
           default:
             return yield* new UpgradeFailedError({ stderr: `Unknown installation method: ${m}` })
