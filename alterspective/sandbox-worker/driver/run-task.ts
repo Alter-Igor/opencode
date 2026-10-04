@@ -3,8 +3,12 @@
 // requests by rule, and collects the patch, tokens and cost as JSON.
 //
 //   SBXW_MODEL_KEY=<named spike key> bun alterspective/sandbox-worker/driver/run-task.ts \
-//     --repo C:\path\to\repo --task "Add a test for foo" [--model auto] [--base-url https://…/v1] \
-//     [--timeout-min 30] [--keep]
+//     --repo C:\path\to\repo --task "Add a test for foo" [--base-url https://…/v1] \
+//     [--policy-url https://<cas> --policy-repo owner/repo [--task-type code]] [--timeout-min 30] [--keep]
+//
+// The models come from the CAS AI-roles policy (#102), not from a flag. Without --policy-url the
+// supervisor fails closed to Synapse `auto` with x-privacy-tier: local-only. A bearer token for the
+// policy call, if one is needed, goes in SBXW_POLICY_TOKEN.
 //
 // The model key is passed to the container in this spike only. Phase 2 replaces it with the
 // gateway, and the sandbox then holds no key (ADR-037 decision 1).
@@ -18,7 +22,9 @@ const { values: args } = parseArgs({
   options: {
     repo: { type: "string" },
     task: { type: "string" },
-    model: { type: "string", default: "auto" },
+    "policy-url": { type: "string" },
+    "policy-repo": { type: "string" },
+    "task-type": { type: "string" },
     "base-url": { type: "string", default: "https://synapse2-api.alterspective.com.au/v1" },
     image: { type: "string", default: "opencodealt-sandbox-worker:spike" },
     "timeout-min": { type: "string", default: "30" },
@@ -53,7 +59,10 @@ log(`bundled ${args.repo} at ${baseSha}`)
 
 const manifest = {
   taskId,
-  model: { baseURL: args["base-url"], id: args.model, headers: { "x-task-type": "code" } },
+  model: { baseURL: args["base-url"], headers: { "x-task-type": "code" } },
+  ...(args["policy-url"] && args["policy-repo"]
+    ? { policy: { url: args["policy-url"], repo: args["policy-repo"], taskType: args["task-type"] } }
+    : {}),
   repo: { bundle: "/run/sbxw/input/repo.bundle" },
   // Spike only: the server listens on all container interfaces so the host can reach it through
   // a loopback-only published port. Phase 2 keeps it on 127.0.0.1 and uses the outbound link.
@@ -66,7 +75,7 @@ await run(
     "docker", "run", "-d", "--name", taskId,
     "-p", `127.0.0.1:${port}:4096`,
     "-v", `${runDir}:/run/sbxw/input:ro`,
-    "-e", "SBXW_MANIFEST", "-e", "SBXW_SERVER_PASSWORD", "-e", "SBXW_MODEL_KEY",
+    "-e", "SBXW_MANIFEST", "-e", "SBXW_SERVER_PASSWORD", "-e", "SBXW_MODEL_KEY", "-e", "SBXW_POLICY_TOKEN",
     "--memory", "4g", "--cpus", "2", "--pids-limit", "1024",
     "--label", "alterspective.sandbox-worker=spike",
     args.image,
