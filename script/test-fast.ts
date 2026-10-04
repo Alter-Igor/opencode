@@ -122,17 +122,24 @@ if (plan.size === 0) console.log("  no mapped tests (the Linux full suite in CI 
 if (listOnly) process.exit(0)
 
 let failed = false
-if (!flag("--no-lint") && lintable.length > 0) {
-  const lint = Bun.spawnSync(["bun", "x", "oxlint", ...lintable], { cwd: root, stdout: "inherit", stderr: "inherit" })
-  if (lint.exitCode !== 0) failed = true
-}
-for (const [pkg, tests] of plan) {
-  // A package outside the workspaces (alterspective/delegate-mcp) has its own lockfile and install.
+// A package outside the workspaces (alterspective/delegate-mcp) has its own lockfile and install.
+// Install it before linting: oxlint's type-aware rules need its types, and without them CI reported
+// an error that its GitHub output format did not show (#92).
+const packages = new Set([...plan.keys(), ...lintable.map(packageOf).filter((pkg): pkg is string => pkg !== undefined)])
+for (const pkg of packages) {
   const pkgDir = path.join(root, pkg)
   if (existsSync(path.join(pkgDir, "bun.lock")) && !existsSync(path.join(pkgDir, "node_modules"))) {
     const install = Bun.spawnSync(["bun", "install", "--frozen-lockfile"], { cwd: pkgDir, stdout: "inherit", stderr: "inherit" })
     if (install.exitCode !== 0) failed = true
   }
+}
+if (!flag("--no-lint") && lintable.length > 0) {
+  // The default format prints every finding with its file and line; under GitHub Actions oxlint
+  // otherwise switches to annotations, which dropped the one error (#92).
+  const lint = Bun.spawnSync(["bun", "x", "oxlint", "--format", "default", ...lintable], { cwd: root, stdout: "inherit", stderr: "inherit" })
+  if (lint.exitCode !== 0) failed = true
+}
+for (const [pkg, tests] of plan) {
   const run = Bun.spawnSync(["bun", "test", "--timeout", "30000", ...[...tests].sort().map((test) => `./${test}`)], {
     cwd: path.join(root, pkg),
     stdout: "inherit",
