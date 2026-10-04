@@ -1,6 +1,5 @@
 import { tool, type Hooks, type PluginInput } from "@opencode-ai/plugin"
 import { createServer } from "http"
-import * as os from "os"
 import * as path from "path"
 import * as fs from "fs/promises"
 import open from "open"
@@ -43,6 +42,29 @@ export const SYNAPSE_DEFAULT_INFERENCE_URL = "https://synapse2-api.alterspective
 export const SYNAPSE_RESOURCE = "https://synapse-mcp.alterspective.com.au/mcp"
 /** #80: the MCP bridge path's fallback model: Synapse's own routing, still local-only. */
 export const SYNAPSE_MCP_FALLBACK_MODEL = SYNAPSE_AUTO_ROUTE
+/** #101: when set, every Synapse call this plugin makes carries `x-privacy-tier: local-only`. */
+export const SYNAPSE_PRIVACY_TIER_ENV = "SYNAPSE_PRIVACY_TIER"
+export type SynapsePrivacyTier = "local-only"
+
+/**
+ * #101: the privacy tier forced on every Synapse call, or undefined when the variable is unset or
+ * empty. Only `local-only` exists here. Any other non-empty value, even spaces only, is treated as
+ * `local-only`, so a typo narrows routing and never widens it.
+ */
+export function forcedPrivacyTier(env: Record<string, string | undefined> = process.env): SynapsePrivacyTier | undefined {
+  return env[SYNAPSE_PRIVACY_TIER_ENV] ? "local-only" : undefined
+}
+
+/** #101: put the forced tier on the `synapse` provider's headers, replacing any other value. */
+export function applyPrivacyTierHeader(cfg: { provider?: Record<string, any> }, tier: SynapsePrivacyTier): void {
+  const provider = cfg.provider?.synapse
+  if (!provider) return
+  // Header names are case-insensitive: drop every spelling, or a fetch would send both values.
+  const headers = Object.fromEntries(
+    Object.entries(provider.options?.headers ?? {}).filter(([name]) => name.toLowerCase() !== "x-privacy-tier"),
+  )
+  provider.options = { ...provider.options, headers: { ...headers, "x-privacy-tier": tier } }
+}
 // /v1 inference and /mcp both admit a token minted for the `synapse` app audience
 // (ADR-0076 pass-through). A resource-URI audience is rejected by /v1, which is why
 // the fork previously fell back to the MCP bridge (which cannot carry tool schemas).
@@ -799,12 +821,15 @@ interface SynapsePluginOptions {
   fallbackMemory?: PinnedFallbackMemory
   /** #80 follow-up: bounds for peeking at a stream's first event. Default 64 KB and 15 s. */
   ssePeek?: { maxBytes?: number; timeoutMs?: number }
+  /** #101: force `x-privacy-tier` on every Synapse call. Default: from SYNAPSE_PRIVACY_TIER. */
+  privacyTier?: SynapsePrivacyTier
 }
 
 export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePluginOptions): Promise<Hooks> {
   const inferenceUrl = options?.inferenceUrl || process.env.SYNAPSE_BASE_URL || SYNAPSE_DEFAULT_INFERENCE_URL
   const audience = options?.audience || SYNAPSE_AUDIENCE
   const userAgent = `opencode/${InstallationVersion}`
+  const privacyTier = options?.privacyTier ?? forcedPrivacyTier()
   // Set by the auth loader per request: true when the credential is a Keystone
   // JWT (MCP bridge path, text tool-call protocol), false on the native REST path.
   let bridgeMode = false
@@ -941,6 +966,8 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
     // Fork-only (#74): the live Synapse model list replaces a hand-typed one.
     // Core reads cfg.provider after this hook resolves (provider/provider.ts).
     config: async (cfg) => {
+      // #101: before the model list is read, so that call carries the tier too.
+      if (privacyTier) applyPrivacyTierHeader(cfg, privacyTier)
       modelsTarget = synapseModelsTarget(cfg, inferenceUrl)
       await loadSynapseModels(cfg, {
         defaultBaseURL: inferenceUrl,
@@ -1093,6 +1120,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                     ? { model: requestBodyJson.model }
                     : {}),
                   taskType: "code",
+                  ...(privacyTier ? { privacyTier } : {}),
                   ...(typeof requestBodyJson?.max_tokens === "number"
                     ? { maxTokens: requestBodyJson.max_tokens }
                     : {}),
@@ -1447,6 +1475,8 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
             headers.set("x-api-key", activeToken)
             headers.set("x-task-type", "code")
             headers.set("User-Agent", `opencode/${InstallationVersion}`)
+            // #101: set last, so no provider or request header can remove or widen it.
+            if (privacyTier) headers.set("x-privacy-tier", privacyTier)
 
             // AIESC-01/02: declared tier per model; observer-owned one-request bump.
             const baseTier = declaredTier(requestBodyJson?.model) ?? "balanced"
@@ -1949,7 +1979,8 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
 
           let token = ""
           try {
-            const homedir = os.homedir()
+            // Global.Path.home is os.homedir() unless OPENCODE_TEST_HOME is set (tests).
+            const homedir = Global.Path.home
             const authPath = path.join(homedir, ".local", "share", "opencode", "auth.json")
             const authContent = JSON.parse(await fs.readFile(authPath, "utf8"))
             token = authContent.synapse?.key || authContent.synapse?.access_token || ""
@@ -1989,6 +2020,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                   arguments: {
                     messages: reviewPrompt,
                     taskType: "code",
+                    ...(privacyTier ? { privacyTier } : {}),
                   },
                 },
               }),
