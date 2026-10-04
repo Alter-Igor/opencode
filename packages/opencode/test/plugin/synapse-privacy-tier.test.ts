@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test"
+import * as fs from "fs/promises"
+import * as os from "os"
+import * as path from "path"
 import {
   SYNAPSE_PRIVACY_TIER_ENV,
   SynapseAuthPlugin,
@@ -143,6 +146,34 @@ describe("every Synapse call carries the forced tier (#101)", () => {
     expect(list).toHaveLength(1)
     expect(list[0].headers.get("x-privacy-tier")).toBe("local-only")
     expect(cfg.provider.synapse.options.headers["x-privacy-tier"]).toBe("local-only")
+  })
+
+  test("synapse_buddy_review: the MCP chat call asks for local-only", async () => {
+    // The tool reads its token from <home>/.local/share/opencode/auth.json, so point the home
+    // directory at a temp folder for this test only.
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "oc-privacy-tier-"))
+    const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE }
+    process.env.HOME = home
+    process.env.USERPROFILE = home
+    try {
+      await fs.mkdir(path.join(home, ".local", "share", "opencode"), { recursive: true })
+      await fs.writeFile(path.join(home, ".local", "share", "opencode", "auth.json"), JSON.stringify({ synapse: { key: API_KEY } }))
+      expect(os.homedir()).toBe(home)
+      const calls = await capture(async () => {
+        const hooks = await SynapseAuthPlugin(pluginInput, { inferenceUrl: BASE })
+        const review = hooks.tool?.synapse_buddy_review
+        await review?.execute({ code: "const a = 1" }, {} as never)
+      }, "local-only")
+      expect(calls).toHaveLength(1)
+      expect(calls[0].href).toBe(MCP)
+      expect(calls[0].body.params.arguments.privacyTier).toBe("local-only")
+    } finally {
+      for (const [name, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[name]
+        else process.env[name] = value
+      }
+      await fs.rm(home, { recursive: true, force: true })
+    }
   })
 
   test("the plugin option forces the tier without the env var", async () => {
