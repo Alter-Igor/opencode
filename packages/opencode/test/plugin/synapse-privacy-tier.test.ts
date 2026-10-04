@@ -73,9 +73,13 @@ async function chat(input: { key: string; headers?: Record<string, string>; meta
 }
 
 describe("forcedPrivacyTier (#101)", () => {
-  test("unset or blank forces nothing", () => {
+  test("unset or empty forces nothing", () => {
     expect(forcedPrivacyTier({})).toBeUndefined()
-    expect(forcedPrivacyTier({ [SYNAPSE_PRIVACY_TIER_ENV]: "  " })).toBeUndefined()
+    expect(forcedPrivacyTier({ [SYNAPSE_PRIVACY_TIER_ENV]: "" })).toBeUndefined()
+  })
+
+  test("spaces only still force local-only", () => {
+    expect(forcedPrivacyTier({ [SYNAPSE_PRIVACY_TIER_ENV]: "  " })).toBe("local-only")
   })
 
   test("local-only forces local-only", () => {
@@ -102,6 +106,15 @@ describe("applyPrivacyTierHeader (#101)", () => {
     const cfg: { provider: Record<string, any> } = { provider: { synapse: {} } }
     applyPrivacyTierHeader(cfg, "local-only")
     expect(cfg.provider.synapse.options.headers).toEqual({ "x-privacy-tier": "local-only" })
+  })
+
+  test("drops every spelling of the header, so a fetch cannot send two values", () => {
+    const cfg: { provider: Record<string, any> } = {
+      provider: { synapse: { options: { headers: { "X-Privacy-Tier": "cloud-ok", "x-task-type": "code" } } } },
+    }
+    applyPrivacyTierHeader(cfg, "local-only")
+    expect(cfg.provider.synapse.options.headers).toEqual({ "x-task-type": "code", "x-privacy-tier": "local-only" })
+    expect(new Headers(cfg.provider.synapse.options.headers).get("x-privacy-tier")).toBe("local-only")
   })
 
   test("does nothing without a synapse provider", () => {
