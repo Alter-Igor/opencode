@@ -74,7 +74,8 @@ if (manifest.repo?.bundle) {
     const check = await checkDependenciesDir(manifest.repo.dependencies)
     if (!check.ok) fail(`refusing to start: ${check.reason}`)
     const target = path.join(repoDir, "node_modules")
-    if ((await $`test -e ${target}`.nothrow().quiet()).exitCode === 0) {
+    // `test -L` too: a dangling node_modules symlink in the bundle is invisible to `test -e`.
+    if ((await $`test -e ${target} || test -L ${target}`.nothrow().quiet()).exitCode === 0) {
       fail("refusing to start: the repository already has node_modules; repo.dependencies would shadow it")
     }
     const moved = await $`/bin/mv ${manifest.repo.dependencies} ${target}`.nothrow().quiet()
