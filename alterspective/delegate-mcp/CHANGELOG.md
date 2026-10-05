@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.0 — 2026-10-05
+
+**A local dashboard for delegated work (#129).** New tool `oc_dashboard`.
+
+- `oc_dashboard` returns a link to a read-only web page on your PC. It shows how busy the box is, which bridges delegated, which repos, the model sent, the model Synapse served, and each task's state and duration, across every bridge sharing the bridge home.
+- The page is served by the bridge on `127.0.0.1` only, on a random port, behind a random path token. Only GET is answered, and a request whose `Host` header is not `127.0.0.1:<port>` is refused. It starts once per bridge, never keeps the bridge alive, and stops with it.
+- It reads the same host-side task records as `oc_report`. It never starts the box and never calls Docker. No new dependency.
+
 ## 0.4.0 — 2026-10-05
 
 **Which model Synapse actually served (#76).** `oc_report` can now say what `synapse/auto` routed each task to.

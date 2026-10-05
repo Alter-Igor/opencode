@@ -3,6 +3,7 @@
 import type { z } from "zod"
 import { cleanupTool, closeSessionTool } from "./close-session.ts"
 import { collectTool } from "./collect.ts"
+import { dashboardTool } from "./dashboard.ts"
 import type { ToolSpec } from "./define.ts"
 import { doctorTool } from "./doctor.ts"
 import { interactionTools } from "./interaction.ts"
@@ -33,6 +34,7 @@ export const coreTools: AnyTool[] = [
   closeSessionTool,
   cleanupTool,
   reportTool,
+  dashboardTool,
   restartTool,
 ]
 

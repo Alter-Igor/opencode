@@ -326,6 +326,7 @@ Each result is at most 32,000 characters. When a result is too big, whole list i
 | `oc_close_session` | `{sessionID, deleteBranch?, abort?, discardWork?}`. Deletes one finished session: the OpenCode session, its copy in the box and the host record. Refuses while work would be lost. See "Closing sessions and clean-up". |
 | `oc_cleanup` | `{dryRun? = true, deleteBranch?}`. Lists, then closes, this bridge's sessions idle longer than `OPENCODE_DELEGATE_SESSION_TTL_DAYS` (default 14; 0 turns it off). It never aborts and never discards work. |
 | `oc_report` | `{sinceDays? = 30, groupBy? = "model" \| "servedModel" \| "agent" \| "repo", recent? = 0}`. How delegated tasks went: counts, success rate, duration, and what happened to the work. See "Reporting". |
+| `oc_dashboard` | No input. Returns a link to a local, read-only web page of delegated work across all bridges sharing this home. See "Dashboard". |
 | `oc_list_sessions` | This bridge's sessions. `all: true` lists every session in the box, with the bridge that owns it. |
 | `oc_post` | Posts to the agent inbox as this bridge. `wake: true` also delivers it to one of this bridge's sessions. |
 | `oc_inbox` | Reads this bridge's inbox. Text is untrusted; `truncated: true` means old unread messages were dropped. |
@@ -380,6 +381,14 @@ The bridge keeps one small record per task on your PC, at `<home>/workspaces/rep
   - **Where served models come from:** Synapse names the model it used in the response header `x-synapse-served-model`. front's access log writes that header and the session id the box's OpenCode sends (`x-opencode-session`); nothing else from the request (no URI, body or token). After `oc_result` and at close, the bridge reads front's log since the task's first send (`docker logs --since`, the newest 20,000 lines at most, in the background) and stores the counts in the record. front's log is shared by every session, so on a busy box a long task's earliest calls can fall outside those lines and its counts come out low; a later read can raise them. A read after a box restart sees fewer calls (front's log starts again), so it never replaces a larger count. `(unknown)` means it was never read.
   - The session id is written by the box, and the box is one trust zone, so one session could claim another's. That skews these counts only; treat them as a guide.
   - Token counts are a lower bound: they cover only the messages `oc_result` fetched.
+
+## Dashboard
+
+`oc_dashboard` returns a link to a read-only web page, "Delegated work", for you to open in a browser. It shows, across every bridge sharing this bridge home: whether the box is running and how many tasks are running; which bridges delegated (running, last 24 hours, last 7 days); the tasks running now; the 200 most recent tasks of the last 7 days (bridge, repo, model sent, model Synapse served, state, duration); and the models served over 7 days. It reads the same task records as `oc_report` (see "Reporting") and refreshes every 5 seconds.
+
+- **Local only.** The page is served on `127.0.0.1` at a random port, behind a random path token in the link. Only GET is answered, and a request whose `Host` header is not `127.0.0.1:<port>` is refused. The link works only on this machine.
+- **Stops with the bridge.** It starts on the first `oc_dashboard` call (a second call returns the same link) and never keeps the bridge running.
+- **Read-only.** It never starts the box and never calls Docker. Repo and model names are shown as plain text.
 
 ## Troubleshooting
 
