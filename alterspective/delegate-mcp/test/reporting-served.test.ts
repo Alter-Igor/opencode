@@ -40,6 +40,18 @@ describe("parseServed", () => {
     expect(parseServed(line(SID, "qwen flash"), SID)).toEqual({})
   })
 
+  test("model names like constructor or toString are counted as names, never as inherited keys; __proto__ is not a model id", () => {
+    const log = [line(SID, "constructor"), line(SID, "constructor"), line(SID, "toString"), line(SID, "__proto__")].join("\n")
+    const counts = parseServed(log, SID)
+    expect(Object.entries(counts).sort()).toEqual([["constructor", 2], ["toString", 1]])
+    expect(Object.getPrototypeOf(counts)).toBe(Object.prototype)
+    // A record file with those keys (JSON.parse makes `__proto__` an own key) reads back the same way.
+    const raw = `{"v":1,"sessionID":"${SID}","key":"s-0123456789","bridge":"claude-main","repo":"opencode","startedAt":"2026-10-05T05:40:00.000Z","sendCount":1,"outcome":"completed","collected":false,"disposition":"open","servedModels":{"__proto__":5,"constructor":2,"toString":1}}`
+    const record = parseTaskRecord(raw)
+    expect(Object.entries(record?.servedModels ?? {}).sort()).toEqual([["constructor", 2], ["toString", 1]])
+    expect(Object.getPrototypeOf(record?.servedModels)).toBe(Object.prototype)
+  })
+
   test("an invalid session id reads nothing", () => {
     expect(parseServed(line("not-a-session", "m/x"), "not-a-session")).toEqual({})
   })

@@ -34,18 +34,20 @@ const FIELDS_RE = / sess="([^"]*)" served="([^"]*)"$/
 
 /** Count, per served model, the Synapse calls in `log` that carry `sessionID`. */
 export function parseServed(log: string, sessionID: string): ServedModels {
-  const counts: ServedModels = {}
-  if (!SESSION_ID_RE.test(sessionID)) return counts
+  // A Map, then own properties only: a model named `constructor` or `__proto__` is counted like any
+  // other name and never reads or changes an inherited property (CodeRabbit on #126).
+  const counts = new Map<string, number>()
+  if (!SESSION_ID_RE.test(sessionID)) return {}
   for (const line of log.split(/\r?\n/)) {
     if (!line.includes(` host=${SYNAPSE_HOST} `)) continue
     const fields = FIELDS_RE.exec(line)
     if (!fields || fields[1] !== sessionID) continue
     const model = fields[2] ?? ""
     if (!SERVED_MODEL_RE.test(model)) continue
-    if (counts[model] === undefined && Object.keys(counts).length >= MAX_SERVED_MODELS) continue
-    counts[model] = (counts[model] ?? 0) + 1
+    if (!counts.has(model) && counts.size >= MAX_SERVED_MODELS) continue
+    counts.set(model, (counts.get(model) ?? 0) + 1)
   }
-  return counts
+  return Object.fromEntries(counts)
 }
 
 /**

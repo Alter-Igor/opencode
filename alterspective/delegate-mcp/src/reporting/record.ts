@@ -104,12 +104,13 @@ function tokens(v: unknown): Tokens | undefined {
 
 function servedModels(v: unknown): ServedModels | undefined {
   if (!v || typeof v !== "object" || Array.isArray(v)) return undefined
-  const out: ServedModels = {}
+  // Own properties only (Object.fromEntries), so `__proto__` or `constructor` stays a plain name.
+  const out = new Map<string, number>()
   for (const [model, n] of Object.entries(v as Record<string, unknown>).slice(0, MAX_SERVED_MODELS)) {
     const c = count(n)
-    if (SERVED_MODEL_RE.test(model) && c !== undefined && c > 0) out[model] = c
+    if (SERVED_MODEL_RE.test(model) && c !== undefined && c > 0) out.set(model, c)
   }
-  return Object.keys(out).length ? out : undefined
+  return out.size ? Object.fromEntries(out) : undefined
 }
 
 /** A record from disk, validated field by field; undefined when a required field is missing or bad. */
