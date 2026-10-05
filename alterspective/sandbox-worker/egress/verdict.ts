@@ -46,7 +46,18 @@ export type Observations = {
   agentSudoExit: number
   /** A command run through the SDK after lockdown came back. */
   sdkWorksAfter: boolean
+  /** Connections opened BEFORE lockdown and used after it (checks.py --hold). */
+  preOpened: PreOpened[]
 }
+
+export type PreOpened = { id: string; answeredBefore: boolean; answeredAfter: boolean | null; detail: string }
+
+/** Blocked targets held open across the lockdown: a flow the box opened earlier must not survive it. */
+export const PRE_OPEN_TARGETS = [
+  { id: "pre-open-metadata", host: "169.254.169.254", port: 80 },
+  // Plain HTTP so the reply is data: a close or reset alone could come from the peer on its own.
+  { id: "pre-open-other-host", host: "1.0.0.1", port: 80 },
+]
 
 export type Verdict = { go: boolean; line: string; failures: string[]; notes: string[] }
 
@@ -73,6 +84,12 @@ export function decide(o: Observations): Verdict {
   else if (o.agentFlushExit === 127) failures.push("the flush attempt did not run (nft not found), so it proves nothing")
   if (o.agentSudoExit === 0) failures.push("the agent user has sudo")
   if (!o.sdkWorksAfter) failures.push("the E2B SDK could not run a command after lockdown")
+  // Recorded, not judged: conntrack picks pre-lockdown flows up mid-stream, so one can survive.
+  // That is why lockdown.ts refuses to run once an agent process exists.
+  for (const r of o.preOpened) {
+    const outcome = r.answeredAfter === null ? "inconclusive" : r.answeredAfter ? "still gets through" : "cut"
+    notes.push(`${r.id}: a connection opened before lockdown ${outcome} (${r.detail}); lockdown runs before the agent starts`)
+  }
 
   if (before.get("metadata")?.reachable) notes.push("metadata was reachable before lockdown, so the check discriminates")
   else notes.push("metadata was NOT reachable before lockdown; the after-check alone does not prove the firewall blocked it (the counter does)")

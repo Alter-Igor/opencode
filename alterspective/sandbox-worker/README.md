@@ -120,7 +120,12 @@ fork's pinned-model fallback (#80) resends with `auto`. Not checked live yet.
   - metadata, link-local, private, CGNAT, multicast and reserved ranges are dropped and counted;
   - only the `SBXW_EGRESS_ALLOW` `ip:port` pairs are allowed (IPv4, TCP), plus DNS only if
     `SBXW_EGRESS_DNS` is set;
-  - every IPv6 packet is dropped and counted.
+  - every IPv6 packet is dropped and counted (link-local has its own counter).
+
+  **Run it before the agent starts.** Connection tracking begins when the tables load and picks
+  older connections up mid-stream, in either direction, so a connection opened before lockdown can
+  survive it (seen on E2B: run4 evidence). `lockdown.ts` therefore refuses to run while any live
+  process of the agent user (`SBXW_AGENT_USER`, default `agent`) exists.
 
   An allow entry inside a forbidden range is refused. `lockdown.ts` exits non-zero on any failure,
   and then the supervisor must not start. The agent user has no sudo and cannot change the rules.

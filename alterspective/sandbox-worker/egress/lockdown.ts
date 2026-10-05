@@ -1,7 +1,10 @@
 // #118: run as ROOT, before the supervisor, inside the sandbox:
 //   SBXW_EGRESS_ALLOW="203.0.113.10:443" [SBXW_EGRESS_DNS=…] bun /opt/sbxw/egress/lockdown.ts
 // Exits non-zero on any failure. The caller must not start the supervisor if it does.
+// It refuses to run once any process of the agent user (SBXW_AGENT_USER, default "agent") exists:
+// a connection opened before lockdown can survive it (see preflight.ts).
 import { $ } from "bun"
+import { pidsOwnedBy } from "./preflight"
 import { TABLE, parseAllow, renderRuleset } from "./rules"
 
 /** Print the reason and exit 1: the caller must then not start the supervisor. */
@@ -11,6 +14,12 @@ const fail = (message: string): never => {
 }
 
 if (process.getuid?.() !== 0) fail("must run as root")
+const agentUser = process.env.SBXW_AGENT_USER || "agent"
+const agentUid = await $`id -u ${agentUser}`.nothrow().quiet()
+if (agentUid.exitCode === 0) {
+  const running = pidsOwnedBy(Number(agentUid.text().trim()))
+  if (running.length > 0) fail(`${agentUser} already has ${running.length} process(es); lock down before the agent starts`)
+}
 let ruleset: string
 try {
   ruleset = renderRuleset({ allow: parseAllow(process.env.SBXW_EGRESS_ALLOW), dns: process.env.SBXW_EGRESS_DNS || undefined })

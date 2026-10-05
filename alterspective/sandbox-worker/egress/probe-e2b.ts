@@ -7,13 +7,14 @@
 //   1. create a non-sudo user and run the checks as it (BEFORE);
 //   2. apply renderRuleset() as root with `nft -f`;
 //   3. run the same checks as that user (AFTER), read the drop counters, try to change the rules
-//      and sudo as that user, and run one more SDK command.
+//      and sudo as that user, and run one more SDK command;
+//   4. connections the user opened BEFORE lockdown (to blocked targets) must not get through AFTER.
 // Never prints the API key. Writes the evidence JSON and prints the go/no-go line.
 import { parseArgs } from "util"
 import path from "path"
 import { CommandExitError, Sandbox } from "e2b"
 import { TABLE, parseCounters, renderRuleset } from "./rules"
-import { decide, probePlan, type CheckResult } from "./verdict"
+import { PRE_OPEN_TARGETS, decide, probePlan, type CheckResult, type PreOpened } from "./verdict"
 
 const { values: args } = parseArgs({
   options: {
@@ -58,13 +59,27 @@ try {
   if (created.exitCode !== 0) throw new Error(`useradd failed: ${created.stderr.trim()}`)
   await sbx.files.write("/tmp/sbxw-checks.py", await Bun.file(path.join(import.meta.dir, "checks.py")).text())
   await sbx.files.write("/tmp/sbxw-plan.json", JSON.stringify(plan))
-  await sh(sbx, "chmod 644 /tmp/sbxw-checks.py /tmp/sbxw-plan.json", "root")
+  await sbx.files.write("/tmp/sbxw-hold.json", JSON.stringify(PRE_OPEN_TARGETS))
+  await sh(sbx, "chmod 644 /tmp/sbxw-checks.py /tmp/sbxw-plan.json /tmp/sbxw-hold.json", "root")
 
   const before = await runChecks(sbx)
+
+  // Open and hold the pre-lockdown connections in the background, as the agent user.
+  await sbx.commands.run(
+    "python3 /tmp/sbxw-checks.py --hold /tmp/sbxw-hold.json /tmp/sbxw-held.ready /tmp/sbxw-held.go /tmp/sbxw-held.json",
+    { user: AGENT, background: true },
+  )
+  const ready = await sh(sbx, "for i in $(seq 1 60); do [ -f /tmp/sbxw-held.ready ] && exit 0; sleep 0.5; done; exit 1", "root")
+  if (ready.exitCode !== 0) throw new Error("the held connections never became ready")
 
   await sbx.files.write("/tmp/sbxw-egress.nft", ruleset)
   const applied = await sh(sbx, "nft -f /tmp/sbxw-egress.nft", "root")
   if (applied.exitCode !== 0) throw new Error(`nft -f failed: ${applied.stderr.trim()}`)
+
+  // Use the held connections straight away, before an idle peer closes them.
+  await sh(sbx, "touch /tmp/sbxw-held.go", "root")
+  const held = await sh(sbx, "for i in $(seq 1 60); do [ -f /tmp/sbxw-held.json ] && cat /tmp/sbxw-held.json && exit 0; sleep 0.5; done; exit 1", "root")
+  const preOpened: PreOpened[] = held.exitCode === 0 ? JSON.parse(held.stdout) : []
 
   const after = await runChecks(sbx)
   const listing = (await sh(sbx, `nft list table ip ${TABLE}; nft list table ip6 ${TABLE}`, "root")).stdout
@@ -81,6 +96,7 @@ try {
     agentFlushExit: flush.exitCode === 0 && !stillLocked ? 0 : flush.exitCode || 1,
     agentSudoExit: sudo.exitCode,
     sdkWorksAfter: sdk.exitCode === 0 && sdk.stdout.includes("sdk-ok"),
+    preOpened,
   }
   const verdict = decide(observations)
   const report = {

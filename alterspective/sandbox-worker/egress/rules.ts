@@ -94,6 +94,10 @@ export function renderRuleset(config: EgressConfig): string {
     `  chain output {`,
     `    type filter hook output priority 0; policy drop;`,
     `    oif "lo" accept`,
+    // Replies first: the E2B control channel arrives from a private address. Conntrack only starts
+    // when this table loads and picks older flows up mid-stream, in either direction, so a flow
+    // opened BEFORE lockdown can survive it. lockdown.ts therefore refuses to run once any agent
+    // process exists (#120 review; seen on E2B, evidence run4).
     `    ct state established,related accept`,
     ...FORBIDDEN_V4.map((f) => `    ip daddr ${f.cidr} counter drop comment "${f.label}"`),
     ...config.allow.map((a) => `    ip daddr ${a.cidr} tcp dport ${a.port} accept comment "allow"`),
@@ -105,6 +109,10 @@ export function renderRuleset(config: EgressConfig): string {
     `  chain output {`,
     `    type filter hook output priority 0; policy drop;`,
     `    oif "lo" accept`,
+    // Replies first: the E2B control channel arrives from a private address. Conntrack only starts
+    // when this table loads and picks older flows up mid-stream, in either direction, so a flow
+    // opened BEFORE lockdown can survive it. lockdown.ts therefore refuses to run once any agent
+    // process exists (#120 review; seen on E2B, evidence run4).
     `    ct state established,related accept`,
     // Its own counter, so the on-link check proves it hit the firewall (a public IPv6 address can
     // fail on routing before the hook and never count).

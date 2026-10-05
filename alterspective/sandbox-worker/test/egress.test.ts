@@ -1,8 +1,12 @@
 import { afterAll, describe, expect, test } from "bun:test"
 import net from "net"
 import { FORBIDDEN_V4, TABLE, cidrRange, parseAllow, parseCounters, renderRuleset } from "../egress/rules"
-import { MUST_BE_BLOCKED, decide, probePlan, type CheckResult, type Observations } from "../egress/verdict"
+import { MUST_BE_BLOCKED, PRE_OPEN_TARGETS, decide, probePlan, type CheckResult, type Observations } from "../egress/verdict"
 import { checkUnreachable } from "../supervisor/egress-guard"
+import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "fs"
+import { tmpdir } from "os"
+import path from "path"
+import { pidsOwnedBy } from "../egress/preflight"
 
 // #118 (svc-coding-agent#46): the in-sandbox egress lockdown.
 
@@ -97,17 +101,24 @@ describe("decide", () => {
     agentFlushExit: 1,
     agentSudoExit: 1,
     sdkWorksAfter: true,
+    preOpened: PRE_OPEN_TARGETS.map((t) => ({ id: t.id, answeredBefore: true, answeredAfter: false, detail: "x" })),
   }
 
   test("the plan covers every must-be-blocked id plus the control", () => {
     expect(plan.map((p) => p.id).sort()).toEqual(["control", ...MUST_BE_BLOCKED].sort())
   })
 
+  test("a pre-opened flow is recorded as a note, not a failure (lockdown runs before the agent)", () => {
+    const v = decide({ ...good, preOpened: [{ id: "pre-open-other-host", answeredBefore: true, answeredAfter: true, detail: "x" }] })
+    expect(v.go).toBe(true)
+    expect(v.notes.join(" ")).toContain("pre-open-other-host: a connection opened before lockdown still gets through")
+  })
+
   test("all good is GO, and notes that the metadata check discriminates", () => {
     const v = decide(good)
     expect(v.go).toBe(true)
     expect(v.line).toContain("GO")
-    expect(v.notes[0]).toContain("discriminates")
+    expect(v.notes.join(" ")).toContain("so the check discriminates")
   })
 
   const nogo: [string, Partial<Observations>, RegExp][] = [
@@ -153,5 +164,20 @@ describe("supervisor metadata guard", () => {
   test("a timeout passes", async () => {
     // TEST-NET-1 is not routed; the connect hangs until the timeout.
     expect((await checkUnreachable({ host: "192.0.2.1", port: 80 }, 200)).ok).toBe(true)
+  })
+})
+
+describe("pidsOwnedBy", () => {
+  test("lists live numeric /proc entries owned by the uid, skips zombies, and nothing for another uid", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "sbxw-proc-"))
+    mkdirSync(path.join(dir, "123"))
+    mkdirSync(path.join(dir, "self"))
+    mkdirSync(path.join(dir, "456"))
+    writeFileSync(path.join(dir, "456", "stat"), "456 (sleep (x)) Z 1 456")
+    writeFileSync(path.join(dir, "123", "stat"), "123 (sleep) S 1 123")
+    const uid = statSync(path.join(dir, "123")).uid
+    expect(pidsOwnedBy(uid, dir)).toEqual([123])
+    expect(pidsOwnedBy(uid + 4242, dir)).toEqual([])
+    rmSync(dir, { recursive: true, force: true })
   })
 })
