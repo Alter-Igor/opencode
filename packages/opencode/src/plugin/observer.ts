@@ -133,13 +133,18 @@ class SessionObserverManager {
         await fs.appendFile(filePath, logLine, "utf8")
       } catch {}
     }
-    try {
-      const centralLogDir = diagnosticsLogDir()
-      if (centralLogDir) {
-        await fs.mkdir(centralLogDir, { recursive: true })
-        await fs.appendFile(path.join(centralLogDir, "diagnostics.log"), logLine, "utf8")
-      }
-    } catch {}
+    // #83: a broken OPENCODE_DIAGNOSTICS_DIR (a file, no permission) used to drop the line
+    // silently; fall back to the default log folder instead.
+    const configured = diagnosticsLogDir()
+    const fallback = defaultDiagnosticsLogDir()
+    for (const dir of configured === fallback ? [configured] : [configured, fallback]) {
+      if (!dir) continue
+      try {
+        await fs.mkdir(dir, { recursive: true })
+        await fs.appendFile(path.join(dir, "diagnostics.log"), logLine, "utf8")
+        return
+      } catch {}
+    }
   }
 
   public onToolBefore(sessionId: string, callId: string, tool: string, args: any) {
@@ -486,14 +491,26 @@ export const INJECTED_LEARNINGS_LIMIT = 5
  * Global.Path.home, so a test run never writes to the person's real log (#80 follow-up).
  */
 export function diagnosticsLogDir(): string | undefined {
-  if (process.env.OPENCODE_DIAGNOSTICS_DIR) return process.env.OPENCODE_DIAGNOSTICS_DIR
-  const homeDir = process.env.OPENCODE_TEST_HOME || process.env.USERPROFILE || process.env.HOME || ""
-  return homeDir ? path.join(homeDir, ".local", "share", "opencode", "log") : undefined
+  return process.env.OPENCODE_DIAGNOSTICS_DIR || defaultDiagnosticsLogDir()
 }
 
-/** The two on-disk rule stores: global (whole machine) and this project. */
+/** <home>/.local/share/opencode/log: where diagnostics.log goes without OPENCODE_DIAGNOSTICS_DIR. */
+export function defaultDiagnosticsLogDir(): string | undefined {
+  const home = observerHome()
+  return home ? path.join(home, ".local", "share", "opencode", "log") : undefined
+}
+
+/** The home the observer writes under: OPENCODE_TEST_HOME first, as in core's Global.Path.home. */
+function observerHome(): string {
+  return process.env.OPENCODE_TEST_HOME || process.env.USERPROFILE || process.env.HOME || ""
+}
+
+/**
+ * The two on-disk rule stores: global (whole machine) and this project. #83: the global store
+ * honours OPENCODE_TEST_HOME too, so a test never writes to the person's real learnings.json.
+ */
 export function learningStorePaths(workspaceDir?: string): { global?: string; project?: string } {
-  const homeDir = process.env.USERPROFILE || process.env.HOME || ""
+  const homeDir = observerHome()
   return {
     global: homeDir ? path.join(homeDir, ".local", "share", "opencode", "learnings.json") : undefined,
     project: workspaceDir ? path.join(workspaceDir, ".system_generated", "logs", "learnings.json") : undefined,

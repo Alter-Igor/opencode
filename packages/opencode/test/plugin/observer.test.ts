@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test"
-import { sessionObserver } from "../../src/plugin/observer"
+import { defaultDiagnosticsLogDir, learningStorePaths, sessionObserver } from "../../src/plugin/observer"
 import { tmpdir } from "../fixture/fixture"
 import * as fs from "fs/promises"
 import * as path from "path"
@@ -61,9 +61,11 @@ describe("session retrospective profile", () => {
   })
 })
 
-function restoreUserProfile(value: string | undefined) {
-  if (value === undefined) delete process.env.USERPROFILE
-  else process.env.USERPROFILE = value
+// #83: the learning store follows OPENCODE_TEST_HOME (set by test/preload.ts), so these tests
+// redirect that, not USERPROFILE.
+function restoreTestHome(value: string | undefined) {
+  if (value === undefined) delete process.env.OPENCODE_TEST_HOME
+  else process.env.OPENCODE_TEST_HOME = value
 }
 
 describe("SessionObserverManager.onToolAfter", () => {
@@ -142,8 +144,8 @@ describe("rule visibility", () => {
   test("injects a rule that exists only in the project store", async () => {
     await using home = await tmpdir()
     await using ws = await tmpdir()
-    const prev = process.env.USERPROFILE
-    process.env.USERPROFILE = home.path
+    const prev = process.env.OPENCODE_TEST_HOME
+    process.env.OPENCODE_TEST_HOME = home.path
     try {
       const wsFile = path.join(ws.path, ".system_generated", "logs", "learnings.json")
       await fs.mkdir(path.dirname(wsFile), { recursive: true })
@@ -158,15 +160,15 @@ describe("rule visibility", () => {
       expect(row.origin).toBe("project")
       expect(row.injected).toBe(true)
     } finally {
-      restoreUserProfile(prev)
+      restoreTestHome(prev)
     }
   })
 
   test("reports the real injection window and counts a rule once across both stores", async () => {
     await using home = await tmpdir()
     await using ws = await tmpdir()
-    const prev = process.env.USERPROFILE
-    process.env.USERPROFILE = home.path
+    const prev = process.env.OPENCODE_TEST_HOME
+    process.env.OPENCODE_TEST_HOME = home.path
     try {
       const globalFile = path.join(home.path, ".local", "share", "opencode", "learnings.json")
       await fs.mkdir(path.dirname(globalFile), { recursive: true })
@@ -195,14 +197,14 @@ describe("rule visibility", () => {
       expect((await sessionObserver.listLearnings(ws.path)).map((r) => r.lesson)).not.toContain("rule 1")
       expect(await sessionObserver.forgetLearning("rule 1", ws.path)).toBe(0)
     } finally {
-      restoreUserProfile(prev)
+      restoreTestHome(prev)
     }
   })
 
   test("re-recording a rule moves it to the front so it re-enters the window", async () => {
     await using home = await tmpdir()
-    const prev = process.env.USERPROFILE
-    process.env.USERPROFILE = home.path
+    const prev = process.env.OPENCODE_TEST_HOME
+    process.env.OPENCODE_TEST_HOME = home.path
     try {
       const file = path.join(home.path, ".local", "share", "opencode", "learnings.json")
       await fs.mkdir(path.dirname(file), { recursive: true })
@@ -222,14 +224,14 @@ describe("rule visibility", () => {
       expect(after.find((r) => r.lesson === "rule 6")!.injected).toBe(true)
       expect(after.length).toBe(6)
     } finally {
-      restoreUserProfile(prev)
+      restoreTestHome(prev)
     }
   })
 
   test("forgetting keeps the row as a tombstone instead of deleting it", async () => {
     await using home = await tmpdir()
-    const prev = process.env.USERPROFILE
-    process.env.USERPROFILE = home.path
+    const prev = process.env.OPENCODE_TEST_HOME
+    process.env.OPENCODE_TEST_HOME = home.path
     try {
       const file = path.join(home.path, ".local", "share", "opencode", "learnings.json")
       await sessionObserver.recordLearning({ lesson: "tombstone me", source: "user_feedback" })
@@ -243,14 +245,14 @@ describe("rule visibility", () => {
       expect(typeof row.deletedAt).toBe("string")
       expect(row.scope).toBe("global")
     } finally {
-      restoreUserProfile(prev)
+      restoreTestHome(prev)
     }
   })
 
   test("re-recording a forgotten rule revives it without duplicating", async () => {
     await using home = await tmpdir()
-    const prev = process.env.USERPROFILE
-    process.env.USERPROFILE = home.path
+    const prev = process.env.OPENCODE_TEST_HOME
+    process.env.OPENCODE_TEST_HOME = home.path
     try {
       const file = path.join(home.path, ".local", "share", "opencode", "learnings.json")
       await sessionObserver.recordLearning({ lesson: "revive me", source: "user_feedback" })
@@ -265,15 +267,15 @@ describe("rule visibility", () => {
       expect(rowsForLesson.length).toBe(1)
       expect(rowsForLesson[0].deletedAt).toBeUndefined()
     } finally {
-      restoreUserProfile(prev)
+      restoreTestHome(prev)
     }
   })
 
   test("records the scope of each rule", async () => {
     await using home = await tmpdir()
     await using ws = await tmpdir()
-    const prev = process.env.USERPROFILE
-    process.env.USERPROFILE = home.path
+    const prev = process.env.OPENCODE_TEST_HOME
+    process.env.OPENCODE_TEST_HOME = home.path
     try {
       await sessionObserver.recordLearning({ lesson: "global rule", source: "user_feedback" })
       await sessionObserver.recordLearning({ lesson: "project rule", source: "user_feedback" }, ws.path)
@@ -287,14 +289,14 @@ describe("rule visibility", () => {
       expect(global.find((r: { lesson: string }) => r.lesson === "global rule").scope).toBe("global")
       expect(project.find((r: { lesson: string }) => r.lesson === "project rule").scope).toBe("project")
     } finally {
-      restoreUserProfile(prev)
+      restoreTestHome(prev)
     }
   })
 
   test("a tombstone survives the record cap", async () => {
     await using home = await tmpdir()
-    const prev = process.env.USERPROFILE
-    process.env.USERPROFILE = home.path
+    const prev = process.env.OPENCODE_TEST_HOME
+    process.env.OPENCODE_TEST_HOME = home.path
     try {
       const file = path.join(home.path, ".local", "share", "opencode", "learnings.json")
       const rows: Array<{
@@ -328,15 +330,15 @@ describe("rule visibility", () => {
       expect(tomb).toBeDefined()
       expect(tomb.deletedAt).toBe("2026-09-02T00:00:00.000Z")
     } finally {
-      restoreUserProfile(prev)
+      restoreTestHome(prev)
     }
   })
 
   test("forgetting still counts when the other store does not exist", async () => {
     await using home = await tmpdir()
     await using ws = await tmpdir()
-    const prev = process.env.USERPROFILE
-    process.env.USERPROFILE = home.path
+    const prev = process.env.OPENCODE_TEST_HOME
+    process.env.OPENCODE_TEST_HOME = home.path
     try {
       await sessionObserver.recordLearning({ lesson: "only global", source: "user_feedback" }, ws.path)
       // Remove the project store so only the global copy remains.
@@ -344,15 +346,15 @@ describe("rule visibility", () => {
 
       expect(await sessionObserver.forgetLearning("only global", ws.path)).toBe(1)
     } finally {
-      restoreUserProfile(prev)
+      restoreTestHome(prev)
     }
   })
 
   test("forgetting reports nothing when a store is unreadable data", async () => {
     await using home = await tmpdir()
     await using ws = await tmpdir()
-    const prev = process.env.USERPROFILE
-    process.env.USERPROFILE = home.path
+    const prev = process.env.OPENCODE_TEST_HOME
+    process.env.OPENCODE_TEST_HOME = home.path
     try {
       await sessionObserver.recordLearning({ lesson: "fragile", source: "user_feedback" })
       // The project store exists but holds valid JSON that is not the expected array.
@@ -362,7 +364,40 @@ describe("rule visibility", () => {
 
       expect(await sessionObserver.forgetLearning("fragile", ws.path)).toBe(0)
     } finally {
-      restoreUserProfile(prev)
+      restoreTestHome(prev)
     }
+  })
+})
+
+describe("observer paths (#83)", () => {
+  const saved = { home: process.env.OPENCODE_TEST_HOME, diag: process.env.OPENCODE_DIAGNOSTICS_DIR }
+  afterEach(() => {
+    if (saved.home === undefined) delete process.env.OPENCODE_TEST_HOME
+    else process.env.OPENCODE_TEST_HOME = saved.home
+    if (saved.diag === undefined) delete process.env.OPENCODE_DIAGNOSTICS_DIR
+    else process.env.OPENCODE_DIAGNOSTICS_DIR = saved.diag
+  })
+
+  test("the global learning store honours OPENCODE_TEST_HOME", async () => {
+    await using tmp = await tmpdir()
+    process.env.OPENCODE_TEST_HOME = tmp.path
+    expect(learningStorePaths().global).toBe(path.join(tmp.path, ".local", "share", "opencode", "learnings.json"))
+  })
+
+  test("a broken OPENCODE_DIAGNOSTICS_DIR falls back to the default log folder", async () => {
+    await using tmp = await tmpdir()
+    process.env.OPENCODE_TEST_HOME = tmp.path
+    // A file where the folder should be: mkdir and append both fail there.
+    const notADir = path.join(tmp.path, "not-a-dir")
+    await fs.writeFile(notADir, "x")
+    process.env.OPENCODE_DIAGNOSTICS_DIR = notADir
+    sessionObserver.logDiagnostic({ timestamp: new Date().toISOString(), type: "AUTH_EVENT", details: { marker: "obs-83-fallback" } })
+    const log = path.join(defaultDiagnosticsLogDir()!, "diagnostics.log")
+    let text = ""
+    for (let i = 0; i < 50 && !text.includes("obs-83-fallback"); i++) {
+      await new Promise((r) => setTimeout(r, 20))
+      text = await fs.readFile(log, "utf8").catch(() => "")
+    }
+    expect(text).toContain("obs-83-fallback")
   })
 })
