@@ -3,13 +3,15 @@
 //   open:    host `git bundle create <handoff>/in/<fresh>.bundle HEAD` (the owner's current branch
 //            only, review W3C-11) -> box `git clone --no-checkout` into /sessions/.<key>.<nonce>.tmp,
 //            checks out delegate/<key> at the host HEAD, then `mv -T` to /sessions/<key> (refused
-//            with directory_busy when it already exists). The host record is workspaces-state.ts.
+//            with directory_busy when it already exists). A shallow host repo's boundary list goes
+//            into the copy's .git/shallow (#130). The host record is workspaces-state.ts.
 //   collect: box `git bundle create /handoff/out/<fresh>.bundle delegate/<key>` (a box-only volume) ->
 //            `docker cp` streams it into a host-only folder, checked (workspaces-copyout.ts), then
 //            `git fetch <bundle>`. The box has no writable host folder (issue G-7).
 // No host-side git command ever runs inside the box clone, so hooks planted there cannot run on the host.
 // Hand-off hardening: workspaces-handoff.ts. Host-executable detection: workspaces-detect.ts.
 import { randomUUID } from "node:crypto"
+import { readFileSync } from "node:fs"
 import path from "node:path"
 import type { BridgeConfig } from "../shared/config.ts"
 import type { Workspace, Workspaces } from "../shared/contracts.ts"
@@ -146,8 +148,38 @@ async function hostHead(ctx: Ctx, repo: string): Promise<string> {
 export const WORKSPACE_EXCLUDES = [".system_generated/"]
 
 /** Clone the bundle into a private temp folder and put delegate/<key> at `base`. */
-async function cloneAt(ctx: Ctx, bundle: string, tmp: string, key: string, base: string): Promise<void> {
+/** At most this many shallow boundary commits are carried into the box (one argument each). */
+export const MAX_SHALLOW = 1000
+
+/**
+ * #130: the commits a shallow host repository's history stops at (git's `shallow` file), or none for
+ * a full one. A bundle does not carry this list, so without it the box copy's oldest commits name
+ * parents it never got, and any walk past them fails: `git log` for the agent, and the bundle that
+ * collect makes. The list is shared by every worktree of the repository.
+ */
+async function hostShallow(ctx: Ctx, repo: string): Promise<string[]> {
+  const shallow = (await hostGit(ctx, ["-C", repo, "rev-parse", "--is-shallow-repository"], "check for a shallow history")).trim()
+  if (shallow !== "true") return []
+  const file = (await hostGit(ctx, ["-C", repo, "rev-parse", "--path-format=absolute", "--git-path", "shallow"], "find the shallow history list")).trim()
+  let ids: string[]
+  try {
+    ids = readFileSync(file, "utf8").split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+  } catch (error) {
+    throw new DelegateError("upstream_error", "git says the repository is shallow, but its shallow history list cannot be read.", "Retry; or run `git fetch --unshallow` in the repository.", String(error))
+  }
+  if (!ids.length || ids.length > MAX_SHALLOW || !ids.every((id) => COMMIT_ID.test(id))) {
+    throw new DelegateError("upstream_error", "The repository's shallow history list is not in the expected shape.", "Run `git fetch --unshallow` in the repository, then retry.", `${ids.length} entries`)
+  }
+  return ids
+}
+
+async function cloneAt(ctx: Ctx, bundle: string, tmp: string, key: string, base: string, shallow: readonly string[]): Promise<void> {
   await boxRun(ctx, ["git", "clone", "--quiet", "--no-checkout", bundle, tmp], "clone the session workspace", "long")
+  if (shallow.length) {
+    // Arguments, never interpolated into the script: the file is $1, the commit ids follow.
+    const write = 'f="$1"; shift; printf "%s\\n" "$@" > "$f"'
+    await boxRun(ctx, ["sh", "-c", write, "sh", `${tmp}/.git/shallow`, ...shallow], "mark the session copy's history as shallow")
+  }
   // Arguments, never interpolated into the script: the file is $1, the patterns follow.
   const append = 'f="$1"; shift; mkdir -p "$(dirname "$f")" && printf "%s\\n" "$@" >> "$f"'
   await boxRun(ctx, ["sh", "-c", append, "sh", `${tmp}/.git/info/exclude`, ...WORKSPACE_EXCLUDES], "hide OpenCode scratch files from git")
@@ -179,9 +211,10 @@ async function open(ctx: Ctx, hostRepo: string, key: string): Promise<OpenedWork
   const bundle = reserveInBundle(ctx.handoffDir, ctx.boxHandoff, key, ctx.nonce())
   let placed = false
   try {
+    const shallow = await hostShallow(ctx, repo)
     await hostGit(ctx, ["-C", repo, "bundle", "create", bundle.hostPath, "HEAD"], "bundle the repository", "long")
     assertRegularFile(bundle.hostPath, "repository bundle")
-    await cloneAt(ctx, bundle.boxPath, tmp, key, base)
+    await cloneAt(ctx, bundle.boxPath, tmp, key, base, shallow)
     await moveIntoPlace(ctx, tmp, final, key)
     placed = true
     const boxBase = (await boxRun(ctx, ["git", "-C", final, "rev-parse", "HEAD"], "read the base commit")).trim()
