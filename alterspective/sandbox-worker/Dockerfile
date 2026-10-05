@@ -25,7 +25,7 @@ ARG GIT_SHA=unknown
 LABEL org.opencontainers.image.revision=$GIT_SHA \
       org.opencontainers.image.source=https://github.com/Alter-Igor/opencode
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends git ripgrep ca-certificates curl procps \
+  && apt-get install -y --no-install-recommends git ripgrep ca-certificates curl nftables procps \
   && curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" \
     | tar -xz -C /tmp \
   && mv "/tmp/gh_${GH_VERSION}_linux_amd64/bin/gh" /usr/local/bin/gh \
@@ -38,6 +38,10 @@ COPY --from=node:22-bookworm-slim /usr/local /usr/local
 COPY --from=build /src/packages/opencode/dist/opencode-linux-x64/bin/opencode /usr/local/bin/opencode
 COPY alterspective/sandbox-worker/supervisor /opt/sbxw/supervisor
 COPY alterspective/sandbox-worker/plugins /opt/sbxw/plugins
+# #118: the in-sandbox egress lockdown. ROOT runs it before the supervisor and before any agent process (it refuses otherwise):
+#   SBXW_EGRESS_ALLOW=<gateway ip:port> bun /opt/sbxw/egress/lockdown.ts
+# A non-zero exit means: do not start the supervisor.
+COPY alterspective/sandbox-worker/egress/lockdown.ts alterspective/sandbox-worker/egress/preflight.ts alterspective/sandbox-worker/egress/rules.ts /opt/sbxw/egress/
 
 # Non-root user. Data and work dirs are pre-created and owned by it (a root-owned volume
 # made OpenCode exit with EACCES in the #41 spike).

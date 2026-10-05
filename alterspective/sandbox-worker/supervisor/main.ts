@@ -5,6 +5,7 @@ import { $ } from "bun"
 import path from "path"
 import { PRIVACY_TIER, PRIVACY_TIER_ENV, renderConfig, type Manifest } from "./config"
 import { checkBundleFile, checkTree } from "./bundle"
+import { checkUnreachable } from "./egress-guard"
 import { parseResolveBody } from "./policy"
 
 const fail = (message: string): never => {
@@ -17,6 +18,10 @@ if (!manifest.taskId) fail("manifest.taskId is required")
 if (!manifest.model?.baseURL) fail("manifest.model.baseURL is required")
 // Never run the server unauthenticated, even bound to loopback.
 const password = process.env.SBXW_SERVER_PASSWORD ?? fail("SBXW_SERVER_PASSWORD is not set")
+
+// #118: refuse to run if the cloud metadata endpoint is reachable (egress not locked down).
+const metadata = await checkUnreachable()
+if (!metadata.ok) fail(`refusing to start: ${metadata.detail} (run egress/lockdown.ts as root first)`)
 
 // #108: the fork commit this image was built from (Dockerfile `GIT_SHA` build argument).
 const buildSha = process.env.SBXW_BUILD_SHA || "unknown"

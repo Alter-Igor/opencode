@@ -17,6 +17,9 @@ two do not share files, image names, container names or ports.
 | `supervisor/config.ts` | Renders the managed OpenCode config from the manifest and the model ids. Pure, so it is unit tested in `test/`. |
 | `supervisor/policy.ts` | Checks the CAS AI-roles answer passed in the manifest (#102), failing closed to `auto` + `local-only`. Unit tested in `test/`. |
 | `supervisor/bundle.ts` | Checks the repository bundle's SHA-256 and the checked-out tree against the manifest (#108). Unit tested in `test/`, including a tampered bundle. |
+| `supervisor/egress-guard.ts` | Refuses to start the supervisor if the metadata endpoint is reachable (#118). |
+| `egress/rules.ts`, `egress/lockdown.ts` | The in-sandbox egress firewall (#118). Root runs `lockdown.ts` before the supervisor. |
+| `egress/probe-e2b.ts`, `egress/checks.py`, `egress/verdict.ts` | Proves the lockdown in a real E2B sandbox and writes the evidence JSON (`bun run probe:e2b-egress`). |
 | `supervisor/harness.ts`, `supervisor/harness-run.ts` | The harness check (#121): root runs hidden acceptance tests after the agent claims GOAL_MET, and reports the result apart from the claim. |
 | `test/` | Unit tests: `bun test` from this folder. `bun run test:fast` at the repo root runs a changed test file here; it does not map a changed `supervisor/` file to its tests, so run `bun test` here after a supervisor change. |
 | `plugins/env-scrub.ts` | Blanks the server password and model key in every shell the agent runs. |
@@ -145,6 +148,28 @@ fork's pinned-model fallback (#80) resends with `auto`. Not checked live yet.
 - **Each task records which build ran (#108).** The image is built with `--build-arg GIT_SHA=…`
   (OCI label `org.opencontainers.image.revision`, env `SBXW_BUILD_SHA`). The supervisor writes
   it into `state.json` and its start log line. Without the argument it records `unknown`.
+- **The box cannot reach the cloud metadata endpoint, private ranges or IPv6 (#118, svc-coding-agent#46).**
+  E2B's own network rules do not stop `169.254.169.254` (Firecracker MMDS answers `401`) and refuse
+  an IPv6 `::/0` deny rule. So **root** runs `egress/lockdown.ts` before the supervisor. It installs
+  an nftables `ip` table and an `ip6` table, both default **drop**:
+  - loopback and replies are accepted first (E2B's control connection reaches the box from a
+    private address);
+  - metadata, link-local, private, CGNAT, multicast and reserved ranges are dropped and counted;
+  - only the `SBXW_EGRESS_ALLOW` `ip:port` pairs are allowed (IPv4, TCP), plus DNS only if
+    `SBXW_EGRESS_DNS` is set;
+  - every IPv6 packet is dropped and counted (link-local has its own counter).
+
+  **Run it before the agent starts.** Connection tracking begins when the tables load and picks
+  older connections up mid-stream, in either direction, so a connection opened before lockdown can
+  survive it (seen on E2B: run4 evidence). `lockdown.ts` therefore refuses to run while any live
+  process of the agent user (`SBXW_AGENT_USER`, default `agent`) exists.
+
+  An allow entry inside a forbidden range is refused. `lockdown.ts` exits non-zero on any failure,
+  and then the supervisor must not start. The agent user has no sudo and cannot change the rules.
+  The supervisor also checks for itself: it refuses to start if `169.254.169.254:80` accepts a
+  connection. The E2B kernel has no `inet` (dual-stack) nftables family, hence two tables.
+  Evidence: `evidence/egress-lockdown-e2b-*.json` (`bun run probe:e2b-egress -- --out …`, needs
+  `E2B_API_KEY`).
 - **The repository config cannot steer the agent.** `OPENCODE_DISABLE_PROJECT_CONFIG=1` stops the
   repository's own `opencode.json` and `.opencode/` from loading. The only config is the one the
   supervisor writes.
