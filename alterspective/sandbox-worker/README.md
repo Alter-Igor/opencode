@@ -20,6 +20,7 @@ two do not share files, image names, container names or ports.
 | `supervisor/egress-guard.ts` | Refuses to start the supervisor if the metadata endpoint is reachable (#118). |
 | `egress/rules.ts`, `egress/lockdown.ts` | The in-sandbox egress firewall (#118). Root runs `lockdown.ts` before the supervisor. |
 | `egress/probe-e2b.ts`, `egress/checks.py`, `egress/verdict.ts` | Proves the lockdown in a real E2B sandbox and writes the evidence JSON (`bun run probe:e2b-egress`). |
+| `supervisor/harness.ts`, `supervisor/harness-run.ts` | The harness check (#121): root runs hidden acceptance tests after the agent claims GOAL_MET, and reports the result apart from the claim. |
 | `test/` | Unit tests: `bun test` from this folder. `bun run test:fast` at the repo root runs a changed test file here; it does not map a changed `supervisor/` file to its tests, so run `bun test` here after a supervisor change. |
 | `plugins/env-scrub.ts` | Blanks the server password and model key in every shell the agent runs. |
 | `driver/run-task.ts` | Stands in for CAS. Runs one task end to end and writes `runs/<taskId>/result.json` and `change.patch`. |
@@ -58,6 +59,42 @@ Containers are named `sbxw-<id>`, labelled `alterspective.sandbox-worker=spike`,
   "listen": { "hostname": "127.0.0.1", "port": 4096 }
 }
 ```
+
+## Harness check: hidden acceptance tests (#121)
+
+The agent's own `GOAL_MET` is not evidence. In the svc-coding-agent#4 gate, every run said
+`GOAL_MET`, but about 10% failed hidden tests. So after the agent claims `GOAL_MET`, the
+**service** runs tests the agent never saw, and gets their result back apart from the claim.
+
+**Nothing comes from the box.** The agent can write `/work/repo` and `state.json`, so the command,
+the tests and the claim all come from the service. Steps, all through the E2B SDK **as root**:
+
+1. `mkdir -p -m 700 /var/lib/sbxw-harness/in`, then write the tests as a tar archive (it may be gzipped)
+   and a request JSON there:
+
+   ```json
+   { "taskId": "task-42", "archive": "/var/lib/sbxw-harness/in/tests.tar", "sha256": "<archive sha-256>",
+     "command": ["bun", "test", "hidden"], "extractTo": ".", "timeoutSec": 600, "agentClaim": "GOAL_MET" }
+   ```
+
+   Optional: `repoDir` (default `/work/repo`), `freezeAgent` (default `true`).
+2. `bun /opt/sbxw/supervisor/harness-run.ts /var/lib/sbxw-harness/in/request.json`. The runner:
+   - checks the archive SHA-256;
+   - copies the repo into a run folder that only the separate `sbxwharness` user can read (0700),
+     and unpacks the tests there. It refuses (harness error) if the repo has a symlink anywhere the
+     tests would be written;
+   - freezes the agent's processes (SIGSTOP) while the tests run, then resumes them;
+   - runs the command as `sbxwharness` with a clean environment (`PATH`, `HOME`, `LANG`, `CI` only)
+     and the timeout (on timeout it kills every `sbxwharness` process);
+   - deletes the copy.
+3. Read the printed JSON (also `/var/lib/sbxw-harness/result-<taskId>.json`, root-only):
+   `harness` (`ran`, `passed`, `exitCode`, `timedOut`, `durationMs`, output tails), `agentClaim`,
+   and `agreement`: `claim-confirmed`, `claim-refuted`, `unclaimed-pass`, `unclaimed-fail` or
+   `harness-error`. Exit code: 0 passed, 1 failed, 2 harness error. It fails closed: an error is
+   never a pass. A timeout is a harness error (`timedOut: true`), not a verdict on the work.
+
+The manifest's optional `harness: { required: true }` is recorded in `state.json` only. The runner
+never reads it.
 
 ## Model policy (#102)
 

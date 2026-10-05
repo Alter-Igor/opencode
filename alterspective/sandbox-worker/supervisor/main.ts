@@ -89,6 +89,8 @@ await Bun.write(
     // #102: which policy this task ran under (ADR-042: effectivePolicyVersion frozen at task start).
     modelPolicy: policy,
     privacyTier: PRIVACY_TIER,
+    // #121: recorded only; the harness never reads this file (the agent can write it).
+    harnessRequired: manifest.harness?.required === true,
   }),
 )
 

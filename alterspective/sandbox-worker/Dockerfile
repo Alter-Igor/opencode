@@ -25,7 +25,7 @@ ARG GIT_SHA=unknown
 LABEL org.opencontainers.image.revision=$GIT_SHA \
       org.opencontainers.image.source=https://github.com/Alter-Igor/opencode
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends git ripgrep ca-certificates curl nftables \
+  && apt-get install -y --no-install-recommends git ripgrep ca-certificates curl nftables procps \
   && curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" \
     | tar -xz -C /tmp \
   && mv "/tmp/gh_${GH_VERSION}_linux_amd64/bin/gh" /usr/local/bin/gh \
