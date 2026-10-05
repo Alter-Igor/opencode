@@ -48,8 +48,15 @@ export async function planFor(deps: PlanDeps, keystone?: readonly string[]): Pro
   const built = buildProfile({ ...input, hostAuth })
   // With no Keystone entry chosen the flag changes nothing in the profile: both hashes are equal,
   // and a matching box must never be read as a flag mismatch (review cycle 2, High).
-  const other = buildProfile({ ...input, hostAuth: !hostAuth }).hash
-  return { config, built, front: frontFilesFor(config), ...(other !== built.hash ? { otherFlagHash: other } : {}) }
+  // #104: a set with `dynamic` has no profile under box-held tokens (the entry check refuses it),
+  // so there is no other-flag hash to compare with; that must not stop the real build.
+  let other: string | undefined
+  try {
+    other = buildProfile({ ...input, hostAuth: !hostAuth }).hash
+  } catch {
+    other = undefined
+  }
+  return { config, built, front: frontFilesFor(config), ...(other !== undefined && other !== built.hash ? { otherFlagHash: other } : {}) }
 }
 
 const UNSET: RegisteredModels & { source: "fallback" } = { models: [...FALLBACK_MODELS], limits: {}, source: "fallback", reason: "the bridge reads no Synapse model list (no registeredModels)" }
