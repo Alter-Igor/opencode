@@ -74,7 +74,7 @@ describe("task records across the session lifecycle", () => {
     const f = context()
     const key = await started(f)
     let r = stored(f, key)
-    expect(r).toMatchObject({ sessionID: SID, key, bridge: "test-bridge", repo: "demo-repo", sendCount: 0, outcome: "unknown", collected: false, disposition: "open" })
+    expect(r).toMatchObject({ sessionID: SID, key, bridge: "test-bridge", caller: "test-caller", repo: "demo-repo", sendCount: 0, outcome: "unknown", collected: false, disposition: "open" })
     expect(JSON.stringify(r)).not.toContain("C:\\\\GitHub")
 
     expect((await invoke(sendTool, { sessionID: SID, message: "first", model: "synapse/auto" }, f.ctx)).isError).toBeUndefined()
@@ -356,6 +356,7 @@ describe("oc_report", () => {
     expect(schema.safeParse({ sinceDays: 0 }).success).toBe(false)
     expect(schema.safeParse({ sinceDays: 366 }).success).toBe(false)
     expect(schema.safeParse({ sinceDays: 1.5 }).success).toBe(false)
+    expect(schema.safeParse({ groupBy: "caller" }).success).toBe(true)
     expect(schema.safeParse({ groupBy: "bridge" }).success).toBe(false)
     expect(schema.safeParse({ recent: 51 }).success).toBe(false)
   })
@@ -380,6 +381,18 @@ describe("oc_report", () => {
     expect(line).toContain("success rate 100% of 1 finished")
     expect(line).not.toContain("build")
     expect(recent[0]).not.toHaveProperty("servedModel")
+  })
+
+  test("#132: groupBy caller names the session; recent rows carry the caller under untrusted", async () => {
+    const f = context()
+    const key = await started(f)
+    const result = await invoke(reportTool, { groupBy: "caller", recent: 1 }, f.ctx)
+    expect(result.isError).toBeUndefined()
+    const d = data(result)
+    expect(d.groupBy).toBe("caller")
+    expect((d.groups as Array<Record<string, unknown>>)[0]?.name).toEqual({ text: "test-caller", truncated: false })
+    expect((d.recent as Array<Record<string, unknown>>)[0]).toMatchObject({ key, bridge: "test-bridge", caller: { text: "test-caller", truncated: false } })
+    expect(reportTool.description).toContain("caller")
   })
 
   test("notes say synapse/auto hides the routed model, servedModel shows it (#76), and tokens are a lower bound", async () => {

@@ -318,6 +318,28 @@ describe("record parsing", () => {
     expect(parsed?.tokens).toEqual({ input: 5, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 })
   })
 
+  test("#132: a valid caller is kept, an invalid one is dropped, and a record without one still parses", () => {
+    const base = rec("s-0000000311")
+    expect(parseTaskRecord(JSON.stringify({ ...base, caller: "my project" }))?.caller).toBe("my project")
+    expect(parseTaskRecord(JSON.stringify({ ...base, caller: "C:\\work\\x" }))?.caller).toBe("C:\\work\\x")
+    for (const bad of ["x".repeat(129), "line\nbreak", "nul\u0000", "", 7, { a: 1 }]) {
+      const parsed = parseTaskRecord(JSON.stringify({ ...base, caller: bad }))
+      expect(parsed).toBeDefined()
+      expect(parsed).not.toHaveProperty("caller")
+    }
+    const old = parseTaskRecord(JSON.stringify(base))
+    expect(old).toBeDefined()
+    expect(old).not.toHaveProperty("caller")
+    expect(old?.v).toBe(1)
+  })
+
+  test("#132: newTaskRecord keeps a valid caller only", () => {
+    const input = { sessionID: "ses_000000000000000001", key: "s-0000000312", bridge: "b1", repo: "demo", startedAt: new Date(NOW).toISOString() }
+    expect(newTaskRecord({ ...input, caller: "proj" }).caller).toBe("proj")
+    expect(newTaskRecord(input)).not.toHaveProperty("caller")
+    expect(newTaskRecord({ ...input, caller: "bad\nname" })).not.toHaveProperty("caller")
+  })
+
   test("errorCode allowlist: bridge error codes and OpenCode error names kept, anything else is other", () => {
     expect(errorCode("not_started")).toBe("not_started")
     expect(errorCode("upstream_error")).toBe("upstream_error")
@@ -375,6 +397,16 @@ describe("report maths", () => {
     expect(byRepo.map((g) => [g.name, g.tasks, g.durationMs.median])).toEqual([
       ["alpha", 3, 3000],
       ["beta", 3, 5500],
+    ])
+  })
+
+  test("#132: groupBy caller; a record without a caller is (unknown)", () => {
+    const records = [rec("s-0000000521", { caller: "proj-a" }), rec("s-0000000522", { caller: "proj-a" }), rec("s-0000000523", { caller: "proj-b" }), rec("s-0000000524")]
+    const groups = summarise(records, { sinceDays: 30, groupBy: "caller", recent: 0, now: NOW }).groups
+    expect(groups.map((g) => [g.name, g.tasks])).toEqual([
+      ["proj-a", 2],
+      ["(unknown)", 1],
+      ["proj-b", 1],
     ])
   })
 

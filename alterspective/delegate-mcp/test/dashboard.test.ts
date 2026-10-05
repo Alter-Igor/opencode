@@ -52,7 +52,7 @@ describe("dashboardData", () => {
     expect(d.running[1]).toMatchObject({ elapsedMs: 3 * HOUR, requestedModel: "synapse/auto", sendCount: 2, lastSendAt: ago(HOUR) })
   })
 
-  test("per-bridge counts, 24 h and 7 day windows, sorted by running then name", () => {
+  test("per-caller counts (bridge when a record has no caller), 24 h and 7 day windows, sorted by running then name", () => {
     const d = dashboardData(
       [
         rec({ bridge: "zed", outcome: "running" }),
@@ -65,11 +65,32 @@ describe("dashboardData", () => {
       NOW,
       extras,
     )
-    expect(d.bridges).toEqual([
-      { bridge: "zed", running: 1, last24h: 1, last7d: 2 },
-      { bridge: "alpha", running: 0, last24h: 1, last7d: 2 },
-      { bridge: "beta", running: 0, last24h: 1, last7d: 1 },
+    expect(d.callers).toEqual([
+      { who: "zed", running: 1, last24h: 1, last7d: 2 },
+      { who: "alpha", running: 0, last24h: 1, last7d: 2 },
+      { who: "beta", running: 0, last24h: 1, last7d: 1 },
     ])
+  })
+
+  test("#132: groups by caller; several sessions on one bridge name are told apart, old records fall back to the bridge", () => {
+    const d = dashboardData(
+      [
+        rec({ caller: "proj-a", outcome: "running", startedAt: ago(HOUR) }),
+        rec({ caller: "proj-a", startedAt: ago(2 * HOUR) }),
+        rec({ caller: "proj-b", startedAt: ago(3 * HOUR) }),
+        rec({ startedAt: ago(4 * HOUR) }),
+      ],
+      NOW,
+      extras,
+    )
+    expect(d.callers).toEqual([
+      { who: "proj-a", running: 1, last24h: 2, last7d: 2 },
+      { who: "alpha", running: 0, last24h: 1, last7d: 1 },
+      { who: "proj-b", running: 0, last24h: 1, last7d: 1 },
+    ])
+    expect(d.running[0]).toMatchObject({ bridge: "alpha", caller: "proj-a" })
+    expect(d.recent.map((r) => r.caller)).toEqual(["proj-a", "proj-a", "proj-b", undefined])
+    expect(d.recent[3]).not.toHaveProperty("caller")
   })
 
   test("recent keeps the last 7 days only, newest first, at most 200", () => {
@@ -80,20 +101,20 @@ describe("dashboardData", () => {
     expect(d.recent[0]?.startedAt).toBe(ago(1000))
     expect(d.recent[199]?.startedAt).toBe(ago(1000 + 199 * 1000))
     expect(d.recent.some((r) => r.startedAt === old.startedAt)).toBe(false)
-    expect(d.bridges[0]?.last7d).toBe(250)
+    expect(d.callers[0]?.last7d).toBe(250)
   })
 
   test("recent rows: main served model with a tie goes to the first name; fields carried", () => {
     const d = dashboardData(
       [
-        rec({ servedModels: { "b/model": 3, "a/model": 3, "c/model": 1 }, outcome: "error", errorCode: "boom", finishedAt: ago(HOUR / 2), durationMs: 1800_000, disposition: "collected", requestedModel: "synapse/auto" }),
+        rec({ servedModels: { "b/model": 3, "a/model": 3, "c/model": 1 }, outcome: "error", errorCode: "boom", finishedAt: ago(HOUR / 2), durationMs: 1800_000, disposition: "collected", requestedModel: "synapse/auto", caller: "proj" }),
         rec({ servedModels: { "z/big": 9, "a/small": 1 }, startedAt: ago(2 * HOUR) }),
         rec({ startedAt: ago(3 * HOUR) }),
       ],
       NOW,
       extras,
     )
-    expect(d.recent[0]).toEqual({ bridge: "alpha", repo: "demo", requestedModel: "synapse/auto", servedModel: "a/model", outcome: "error", startedAt: ago(HOUR), finishedAt: ago(HOUR / 2), durationMs: 1800_000, errorCode: "boom", disposition: "collected" })
+    expect(d.recent[0]).toEqual({ bridge: "alpha", caller: "proj", repo: "demo", requestedModel: "synapse/auto", servedModel: "a/model", outcome: "error", startedAt: ago(HOUR), finishedAt: ago(HOUR / 2), durationMs: 1800_000, errorCode: "boom", disposition: "collected" })
     expect(d.recent[1]?.servedModel).toBe("z/big")
     expect(d.recent[2]?.servedModel).toBeUndefined()
   })
@@ -112,19 +133,19 @@ describe("dashboardData", () => {
 
   test("repo, model and bridge strings are cut to 128 characters", () => {
     const long = "x".repeat(300)
-    const d = dashboardData([rec({ repo: long, requestedModel: long, servedModels: { [long]: 1 }, outcome: "running" }), rec({ repo: long, requestedModel: long, bridge: long })], NOW, { boxRunning: true, bridge: long })
+    const d = dashboardData([rec({ repo: long, requestedModel: long, servedModels: { [long]: 1 }, outcome: "running" }), rec({ repo: long, requestedModel: long, bridge: long, caller: long })], NOW, { boxRunning: true, bridge: long })
     expect(d.bridge).toHaveLength(128)
     expect(d.running[0]?.repo).toHaveLength(128)
     expect(d.running[0]?.requestedModel).toHaveLength(128)
     expect(Object.keys(d.running[0]?.servedModels ?? {})[0]).toHaveLength(128)
-    expect(d.recent.every((r) => r.repo.length === 128 && r.bridge.length <= 128 && (r.servedModel ?? "").length <= 128)).toBe(true)
-    expect(d.bridges.every((b) => b.bridge.length <= 128)).toBe(true)
+    expect(d.recent.every((r) => r.repo.length === 128 && r.bridge.length <= 128 && (r.caller ?? "").length <= 128 && (r.servedModel ?? "").length <= 128)).toBe(true)
+    expect(d.callers.every((c) => c.who.length <= 128)).toBe(true)
     expect(d.servedModels[0]?.model).toHaveLength(128)
   })
 
   test("no records: empty lists, nothing busy", () => {
     const d = dashboardData([], NOW, extras)
-    expect(d).toMatchObject({ busy: 0, bridges: [], running: [], recent: [], servedModels: [] })
+    expect(d).toMatchObject({ busy: 0, callers: [], running: [], recent: [], servedModels: [] })
   })
 })
 
@@ -304,8 +325,12 @@ describe("dashboard page", () => {
     )({ createElement: () => new Node(), querySelector: () => new Node() }, async () => ({ ok: false }), () => 0) as { render(d: unknown, now: number): Node; formatDuration(ms: number): string }
     const empty = texts(made.render(dashboardData([], NOW, { boxRunning: false, bridge: "me" }), NOW)).join("|")
     for (const words of ["Box stopped", "0 tasks running", "Who is delegating", "Running now", "Nothing running.", "Recent tasks", "Models served (7 days)"]) expect(empty).toContain(words)
-    const full = texts(made.render(dashboardData([rec({ outcome: "running", repo: "<b>x</b>", servedModels: { "m/a": 2 } })], NOW, extras), NOW)).join("|")
+    const full = texts(made.render(dashboardData([rec({ outcome: "running", repo: "<b>x</b>", caller: "proj-<i>", servedModels: { "m/a": 2 } })], NOW, extras), NOW)).join("|")
     expect(full).toContain("<b>x</b>")
+    expect(full).toContain("proj-<i>")
+    expect(full).toContain("Session (project folder)")
+    expect(full).toContain("Session|Bridge")
+    expect(texts(made.render(dashboardData([rec({ outcome: "running" })], NOW, extras), NOW)).join("|")).toContain("n/a")
     expect(full).toContain("Running")
     expect(full).toContain("m/a (2 calls)")
     expect(made.formatDuration(3_725_000)).toBe("1 h 2 min")

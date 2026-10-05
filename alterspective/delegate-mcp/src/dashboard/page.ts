@@ -138,22 +138,22 @@ function render(data, now) {
   root.appendChild(el("p", (data.boxRunning ? "Box running" : "Box stopped") + ". " + count + ". This bridge: " + data.bridge + ".", "top"));
 
   root.appendChild(section("Who is delegating", table(
-    [{ label: "Bridge" }, { label: "Running", num: true }, { label: "Tasks, last 24 hours", num: true }, { label: "Tasks, last 7 days", num: true }],
-    data.bridges.map(function (b) { return [b.bridge, b.running, b.last24h, b.last7d]; }),
-    "No bridge has delegated work in the last 7 days.")));
+    [{ label: "Session (project folder)" }, { label: "Running", num: true }, { label: "Tasks, last 24 hours", num: true }, { label: "Tasks, last 7 days", num: true }],
+    data.callers.map(function (c) { return [c.who, c.running, c.last24h, c.last7d]; }),
+    "No session has delegated work in the last 7 days.")));
 
   root.appendChild(section("Running now", table(
-    [{ label: "Bridge" }, { label: "Repo" }, { label: "Model sent" }, { label: "Model served" }, { label: "Started" }, { label: "Last send" }, { label: "Sends", num: true }, { label: "Running for" }],
+    [{ label: "Session" }, { label: "Bridge" }, { label: "Repo" }, { label: "Model sent" }, { label: "Model served" }, { label: "Started" }, { label: "Last send" }, { label: "Sends", num: true }, { label: "Running for" }],
     data.running.map(function (r) {
-      return [r.bridge, r.repo, r.requestedModel || "n/a", modelsText(r.servedModels), formatTime(r.startedAt), r.lastSendAt ? formatTime(r.lastSendAt) : "not sent", r.sendCount, formatDuration(now - Date.parse(r.startedAt))];
+      return [r.caller || "n/a", r.bridge, r.repo, r.requestedModel || "n/a", modelsText(r.servedModels), formatTime(r.startedAt), r.lastSendAt ? formatTime(r.lastSendAt) : "not sent", r.sendCount, formatDuration(now - Date.parse(r.startedAt))];
     }),
     "Nothing running.")));
 
   root.appendChild(section("Recent tasks", table(
-    [{ label: "Started" }, { label: "Bridge" }, { label: "Repo" }, { label: "Model sent" }, { label: "Model served" }, { label: "State" }, { label: "Duration" }, { label: "Error" }, { label: "Work" }],
+    [{ label: "Started" }, { label: "Session" }, { label: "Bridge" }, { label: "Repo" }, { label: "Model sent" }, { label: "Model served" }, { label: "State" }, { label: "Duration" }, { label: "Error" }, { label: "Work" }],
     data.recent.map(function (r) {
       var duration = r.outcome === "running" ? formatDuration(now - Date.parse(r.startedAt)) + " so far" : formatDuration(r.durationMs);
-      return [formatTime(r.startedAt), r.bridge, r.repo, r.requestedModel || "n/a", r.servedModel || "not known", stateCell(r.outcome), duration, r.errorCode || "none", r.disposition];
+      return [formatTime(r.startedAt), r.caller || "n/a", r.bridge, r.repo, r.requestedModel || "n/a", r.servedModel || "not known", stateCell(r.outcome), duration, r.errorCode || "none", r.disposition];
     }),
     "No tasks in the last 7 days.")));
 

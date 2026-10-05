@@ -10,6 +10,7 @@ import { createGuard } from "./guard/index.ts"
 import { cachedTarget, createInbox, inboxTargetFromDocker } from "./inbox/index.ts"
 import { createGateApprovals, gateTargetFromDocker } from "./gate/client.ts"
 import { servedModelsFromFront } from "./reporting/served.ts"
+import { callerName } from "./reporting/caller.ts"
 import { flushReports } from "./reporting/hooks.ts"
 import { currentKeystone, defaultConfig, frontDir, type BridgeConfig } from "./shared/config.ts"
 import { DelegateError } from "./shared/errors.ts"
@@ -254,6 +255,7 @@ export async function createRuntime(options: RuntimeOptions = {}): Promise<Runti
     config,
     supervisor: `supervisor:${name}`,
     bridgeId,
+    caller: callerName(env),
     version: versionInfo.version,
     log,
     guard: createGuard(config),

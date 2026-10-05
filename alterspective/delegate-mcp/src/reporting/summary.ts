@@ -5,7 +5,7 @@ import type { TaskRecord } from "./record.ts"
 import { mainServedModel } from "./served.ts"
 
 /** `servedModel` (#76): the model Synapse served most of a task's calls; `model` is the one sent. */
-export type GroupBy = "model" | "servedModel" | "agent" | "repo"
+export type GroupBy = "model" | "servedModel" | "agent" | "repo" | "caller"
 export type ReportOptions = { sinceDays: number; groupBy: GroupBy; recent: number; now: number }
 
 export type Durations = { median: number | null; p90: number | null; samples: number }
@@ -87,6 +87,7 @@ function groupName(record: TaskRecord, groupBy: GroupBy): string {
   if (groupBy === "model") return record.requestedModel ?? UNKNOWN_GROUP
   if (groupBy === "servedModel") return mainServedModel(record.servedModels) ?? UNKNOWN_GROUP
   if (groupBy === "agent") return record.agent ?? UNKNOWN_GROUP
+  if (groupBy === "caller") return record.caller ?? UNKNOWN_GROUP
   return record.repo
 }
 
