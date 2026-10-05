@@ -24,6 +24,8 @@ export interface PinnedFallbackEvent {
   localOnly: boolean
   /** True when the failure came as the first event of an HTTP 200 stream. */
   inStream?: boolean
+  /** The status code the stream's error event carried itself, when it had one (#83). */
+  streamCode?: number
 }
 
 /** On unless OPENCODE_SYNAPSE_PINNED_FALLBACK is 0, false, off or no. */
@@ -270,6 +272,7 @@ export async function pinnedModelFallback(
       ...(servedModel ? { servedModel } : {}),
       localOnly: input.headers.get("x-privacy-tier") === "local-only",
       ...(streamError ? { inStream: true } : {}),
+      ...(streamError?.code !== undefined ? { streamCode: streamError.code } : {}),
     },
   }
 }
@@ -285,7 +288,10 @@ const REASON_WORDS: Record<PinnedFallbackReason, string> = {
 export function pinnedFallbackNotice(event: PinnedFallbackEvent): string {
   const served = event.servedModel ? ` (served by ${event.servedModel})` : ""
   const outcome = event.fallbackStatus >= 200 && event.fallbackStatus < 300 ? `used Synapse auto${served}` : `Synapse auto also failed (HTTP ${event.fallbackStatus})`
-  const where = event.inStream ? `error in stream, HTTP ${event.status}` : `HTTP ${event.status}`
+  // #83: a stream failure came on an HTTP 200; its `status` may be the 502 default, so say what happened.
+  const where = event.inStream
+    ? `error event in an HTTP 200 stream${event.streamCode !== undefined ? `, code ${event.streamCode}` : ""}`
+    : `HTTP ${event.status}`
   return `${event.originalModel} is ${REASON_WORDS[event.reason]} (${where}); ${outcome}.`
 }
 
@@ -306,9 +312,12 @@ export const SSE_PEEK_TIMEOUT_MS = 15_000
 export const SSE_ERROR_DEFAULT_STATUS = 502
 
 export interface StreamError {
+  /** The event's own status code, else SSE_ERROR_DEFAULT_STATUS (used to classify, never shown as HTTP). */
   status: number
   /** The first event's data (the error JSON), for classifyModelUnusable. */
   text: string
+  /** The status code the event carried itself; undefined when `status` is the default (#83). */
+  code?: number
 }
 
 export function isEventStream(response: Response): boolean {
@@ -350,12 +359,27 @@ function eventError(block: string): StreamError | undefined {
   const numeric = [error.status, error.statusCode, error.code, payload?.status].find(
     (v) => typeof v === "number" && v >= 400 && v < 600,
   )
-  return { status: numeric ?? SSE_ERROR_DEFAULT_STATUS, text: text || name }
+  return { status: numeric ?? SSE_ERROR_DEFAULT_STATUS, text: text || name, ...(numeric !== undefined ? { code: numeric } : {}) }
 }
 
-/** True when a block holds only comments or blank lines (a keep-alive), so the peek reads on. */
-function isCommentOnly(block: string): boolean {
-  return block.split(/\r?\n|\r/).every((line) => line === "" || line.startsWith(":"))
+/**
+ * True when a block dispatches no event, so the peek reads on: comments (keep-alives), a lone
+ * `retry:` or `id:`, or an event with no `data:` line such as `event: ping` (#83; the SSE rules
+ * dispatch nothing without data). `event: error` is never skipped, with or without data.
+ */
+function dispatchesNoEvent(block: string): boolean {
+  let hasData = false
+  let isError = false
+  for (const line of block.split(/\r?\n|\r/)) {
+    if (line === "" || line.startsWith(":")) continue
+    const colon = line.indexOf(":")
+    const field = colon === -1 ? line : line.slice(0, colon)
+    if (field === "data") hasData = true
+    // Only the one optional leading space goes, as in eventError and the SSE rules: `event: error `
+    // is a different event type, so it must not stop the peek here and then read as "no error".
+    else if (field === "event" && line.slice(colon + 1).replace(/^ /, "") === "error") isError = true
+  }
+  return !hasData && !isError
 }
 
 /**
@@ -420,9 +444,9 @@ export async function peekSseError(
       // Past the bound the stream is handed on unread, even if this chunk ends an event.
       if (size > maxBytes) break
       text += decoder.decode(result.value, { stream: true })
-      // Skip keep-alive comment blocks; stop at the first real event.
+      // Skip blocks that dispatch no event (keep-alives, retry:, event: ping); stop at the first real event.
       let end = firstEventEnd(text.slice(scanFrom))
-      while (end !== -1 && isCommentOnly(text.slice(scanFrom, scanFrom + end))) {
+      while (end !== -1 && dispatchesNoEvent(text.slice(scanFrom, scanFrom + end))) {
         scanFrom += end
         end = firstEventEnd(text.slice(scanFrom))
       }
