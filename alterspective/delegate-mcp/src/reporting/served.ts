@@ -17,7 +17,11 @@ import { SYNAPSE_HOST } from "../synapse/auth-conf.ts"
 export const SERVED_MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$/
 /** The most distinct served models kept per task. */
 export const MAX_SERVED_MODELS = 20
-/** The most log lines read per harvest. */
+/**
+ * The most log lines read per harvest: the newest ones since the first send. front's log is shared
+ * by every session and host, so on a busy box a long task's earliest calls can fall outside it and
+ * its counts come out low (CodeRabbit on #126). A later read can raise them (keepServed).
+ */
 export const MAX_LOG_LINES = 20_000
 export const LOG_TIMEOUT_MS = 15_000
 
