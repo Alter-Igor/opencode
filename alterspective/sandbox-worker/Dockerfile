@@ -38,10 +38,10 @@ COPY --from=node:22-bookworm-slim /usr/local /usr/local
 COPY --from=build /src/packages/opencode/dist/opencode-linux-x64/bin/opencode /usr/local/bin/opencode
 COPY alterspective/sandbox-worker/supervisor /opt/sbxw/supervisor
 COPY alterspective/sandbox-worker/plugins /opt/sbxw/plugins
-# #118: the in-sandbox egress lockdown. ROOT runs it before the supervisor (the E2B start command):
+# #118: the in-sandbox egress lockdown. ROOT runs it before the supervisor and before any agent process (it refuses otherwise):
 #   SBXW_EGRESS_ALLOW=<gateway ip:port> bun /opt/sbxw/egress/lockdown.ts
 # A non-zero exit means: do not start the supervisor.
-COPY alterspective/sandbox-worker/egress/lockdown.ts alterspective/sandbox-worker/egress/rules.ts /opt/sbxw/egress/
+COPY alterspective/sandbox-worker/egress/lockdown.ts alterspective/sandbox-worker/egress/preflight.ts alterspective/sandbox-worker/egress/rules.ts /opt/sbxw/egress/
 
 # Non-root user. Data and work dirs are pre-created and owned by it (a root-owned volume
 # made OpenCode exit with EACCES in the #41 spike).
