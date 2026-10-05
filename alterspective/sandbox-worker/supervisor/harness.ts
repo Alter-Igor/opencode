@@ -98,6 +98,15 @@ export function tail(text: string, max = 8000): string {
   return text.length <= max ? text : `…${text.slice(-max)}`
 }
 
+/**
+ * `pkill` exit codes: 0 = signalled, 1 = no matching process (nothing to freeze). Anything else
+ * (2/3 = error, 127 = pkill missing) means the freeze did not happen: fail closed.
+ */
+export function freezeSucceeded(pkillExit: number): boolean {
+  return pkillExit === 0 || pkillExit === 1
+}
+
+/** 0 = tests passed, 1 = tests failed, 2 = harness error (never a pass). */
 export function exitCodeFor(agreement: Agreement, outcome: HarnessOutcome): 0 | 1 | 2 {
   if (agreement === "harness-error" || !outcome.ran) return 2
   return outcome.passed ? 0 : 1

@@ -9,6 +9,7 @@ import { sha256File } from "./bundle"
 import {
   HARNESS_USER,
   classify,
+  freezeSucceeded,
   exitCodeFor,
   harnessEnv,
   parseHarnessRequest,
@@ -91,9 +92,14 @@ async function main(): Promise<number> {
     const request = parsed.request
     const work = await prepare(request, workRoot)
     if (request.freezeAgent) {
-      // Freeze the agent's processes so nothing it left running can race the tests.
-      await $`pkill -STOP -u ${AGENT_USER}`.nothrow().quiet()
+      // Freeze the agent's processes so nothing it left running can race the tests. A freeze that
+      // cannot run (pkill missing or failing) is a harness error, never a silent skip.
+      // Bun's shell reports a missing command as exit 1 ("no process matched" for pkill), so check
+      // that pkill exists first.
+      if (!Bun.which("pkill")) throw new Error("cannot freeze the agent's processes: pkill is not installed (procps)")
+      const freeze = await $`pkill -STOP -u ${AGENT_USER}`.nothrow().quiet()
       frozen = true
+      if (!freezeSucceeded(freeze.exitCode)) throw new Error(`cannot freeze the agent's processes (pkill exit ${freeze.exitCode})`)
     }
     outcome = await runTests(request, work, workRoot)
   } catch (error) {

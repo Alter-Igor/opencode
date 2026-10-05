@@ -3,6 +3,7 @@ import {
   DEFAULT_TIMEOUT_SEC,
   MAX_TIMEOUT_SEC,
   classify,
+  freezeSucceeded,
   exitCodeFor,
   harnessEnv,
   parseHarnessRequest,
@@ -83,6 +84,16 @@ describe("classify: the agent's claim and the tests are reported apart", () => {
   test("exit codes: 0 passed, 1 failed", () => {
     expect(exitCodeFor("claim-confirmed", passed)).toBe(0)
     expect(exitCodeFor("claim-refuted", failed)).toBe(1)
+  })
+})
+
+describe("freezeSucceeded", () => {
+  test("signalled or nothing to freeze is fine", () => {
+    expect(freezeSucceeded(0)).toBe(true)
+    expect(freezeSucceeded(1)).toBe(true)
+  })
+  test("an error or a missing pkill fails closed", () => {
+    for (const code of [2, 3, 127, -1]) expect(freezeSucceeded(code)).toBe(false)
   })
 })
 
