@@ -6,6 +6,7 @@ import type { Logger } from "../shared/log.ts"
 import type { ApiTarget, OpencodeApi } from "../shared/opencode-api.ts"
 import type { DelegateHub } from "../events/index.ts"
 import type { BridgeInbox } from "../inbox/index.ts"
+import type { GateApprovals } from "../gate/client.ts"
 import type { DelegateSupervisor, ReplaceOptions } from "../supervisor/lifecycle.ts"
 import type { DelegateWorkspaces } from "../supervisor/workspaces.ts"
 import type { SynapseAuth } from "../synapse/index.ts"
@@ -52,6 +53,8 @@ export type ToolContext = {
    */
   workspaces: Pick<DelegateWorkspaces, "open" | "collect" | "resolveRepo" | "bindSession" | "sessionState" | "listSessionStates" | "pruneSessionStates" | "discard" | "inspectClose" | "closeSession" | "closeCandidates">
   inbox: BridgeInbox
+  /** #104: the delegation gate's approvals (tool calls on /mcp/dynamic waiting for a decision). Absent in older test contexts. */
+  gate?: GateApprovals
   /** Start or reuse the box and its event hub (idempotent, shared by concurrent calls). */
   box(): Promise<Box>
   /** Additive (Wave 3): the box this bridge already holds, without starting or reusing one. */

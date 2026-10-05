@@ -8,7 +8,7 @@ import { randomUUID } from "node:crypto"
 import http from "node:http"
 import { KS_NAME } from "../guard/entries.ts"
 import { keystoneHostAuth } from "../guard/egress-identity.ts"
-import { idOfEntry } from "../shared/keystone.ts"
+import { idOfEntry, keystonePath } from "../shared/keystone.ts"
 import { DelegateError, isDelegateError } from "../shared/errors.ts"
 import { safeLog, silentLogger, type Logger } from "../shared/log.ts"
 import { expectOk, type McpStatus, type OpencodeApi } from "../shared/opencode-api.ts"
@@ -112,7 +112,7 @@ export const loopbackRedirect = (port: number) => `http://127.0.0.1:${port}${CAL
  */
 export function entryResource(authOrigin: string, entry: string): string | undefined {
   const id = idOfEntry(entry)
-  return id === undefined ? undefined : `${authOrigin}/mcp/c/${id}`
+  return id === undefined ? undefined : `${authOrigin}${keystonePath(id)}`
 }
 
 function parseUrl(raw: string): URL | undefined {

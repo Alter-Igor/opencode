@@ -9,7 +9,7 @@ import { mkdir, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { removeLegacyOut, sweepOutBundles } from "./handoff-hygiene.ts"
 import { mcpAllowPolicy, type BridgeConfig } from "../shared/config.ts"
-import { saveKeystoneSet } from "../shared/keystone.ts"
+import { DYNAMIC_ID, saveKeystoneSet } from "../shared/keystone.ts"
 import type { Supervisor } from "../shared/contracts.ts"
 import { DelegateError, isDelegateError } from "../shared/errors.ts"
 import type { Logger } from "../shared/log.ts"
@@ -19,7 +19,7 @@ import { emptyUnchosenKsAuthConf, ensureAuthConf, ensureKsAuthConf } from "../sy
 import { KEYSTONE_HOST_AUTH_ENV, keystoneHostAuth } from "../guard/egress-identity.ts"
 import { SYNAPSE_LOCK_WAIT_MS } from "../synapse/lock.ts"
 import type { RegisteredModels } from "../synapse/models.ts"
-import { INSPECT_ENV, MCP_ALLOW_ENV, approvedValues, boxEnvOverride, composeDownEnv, composeEnv, siblingContainers } from "./compose-env.ts"
+import { INSPECT_ENV, MCP_ALLOW_ENV, approvedValues, boxEnvOverride, composeDownEnv, composeEnv, dynamicProfileFor, siblingContainers } from "./compose-env.ts"
 import { LABEL, dockerArgs, imageExists, inspectBox, redactAll, requireDocker, type BoxInspect, type Exec, type ExecResult } from "./docker.ts"
 import { waitHealthy } from "./health.ts"
 import { pruneSignIns, verifyLive } from "./live.ts"
@@ -233,11 +233,18 @@ async function start(run: Run, planned: Plan): Promise<ApiTarget> {
     // MOD-05: the inbox admin port and token are made per start, like the password (compose-env.ts).
     const inboxPort = await deps.freePort()
     const inbox = { port: inboxPort === port ? await deps.freePort() : inboxPort, token: deps.randomPassword() }
+    // #104: the delegation gate's admin port and token, per start like the inbox's.
+    // One retry, like the inbox port: a loop would never end with a port source that repeats itself.
+    const firstGatePort = await deps.freePort()
+    const gatePort = firstGatePort === port || firstGatePort === inbox.port ? await deps.freePort() : firstGatePort
+    // The profile matters only to a box that uses dynamic: a bad one must not stop any other box (review).
+    const profile = plan.config.keystoneConnections.includes(DYNAMIC_ID) ? dynamicProfileFor(plan.config) : ""
+    const gate = { port: gatePort, token: deps.randomPassword(), profile }
     const build = !(await imageExists(deps.exec, deps.image))
     run.note("info", "starting sandbox", { image: deps.image, build, port, inboxPort: inbox.port, profileHash: plan.built.hash.slice(0, 12), keystone: plan.config.keystoneConnections.join(",") })
-    const env = composeEnv({ ...deps, config: plan.config }, { built: plan.built, port, password, inbox, front: plan.front })
+    const env = composeEnv({ ...deps, config: plan.config }, { built: plan.built, port, password, inbox, gate, front: plan.front })
     const result = await deps.exec(dockerArgs.up(run.compose, build), { env, timeoutMs: 20 * 60_000 })
-    if (result.code !== 0) throw upFailure(result, [password, inbox.token, ...Object.values(approvedValues(deps))])
+    if (result.code !== 0) throw upFailure(result, [password, inbox.token, gate.token, ...Object.values(approvedValues(deps))])
     const target = { baseUrl: `http://127.0.0.1:${port}`, password }
     await waitHealthy(deps, target, run.container)
     run.state.startedHere = true

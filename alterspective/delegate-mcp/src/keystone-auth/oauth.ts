@@ -26,6 +26,7 @@ import type { AuthorizationServerMetadata } from "@modelcontextprotocol/sdk/shar
 import { DelegateError, isDelegateError } from "../shared/errors.ts"
 import { jwtClaims } from "../synapse/keystone-token.ts"
 import { MAX_TOKEN_LENGTH, isTokenShape } from "../synapse/auth-conf.ts"
+import { keystonePath } from "../shared/keystone.ts"
 import { assertConnectionId } from "./state.ts"
 
 /** The SDK's fetch shape (shared/transport FetchLike). */
@@ -74,7 +75,8 @@ function sameOrigin(expected: URL, value: string | URL | undefined, what: string
  */
 export async function discoverKeystone(fetchFn: FetchLike, origin: string, connectionId: string): Promise<KeystoneServer> {
   const base = keystoneOrigin(origin)
-  const resource = new URL(`${base.origin}/mcp/c/${assertConnectionId(connectionId)}`)
+  // #104: the reserved id `dynamic` is Keystone /mcp/dynamic, whose tokens are bound to that resource.
+  const resource = new URL(`${base.origin}${keystonePath(assertConnectionId(connectionId))}`)
   const prm = await discoverOAuthProtectedResourceMetadata(resource, undefined, fetchFn)
   if (new URL(prm.resource).href !== resource.href)
     throw new DelegateError("policy_violation", "Keystone's protected-resource metadata names another resource.", "Check the connection id.", "resource mismatch")

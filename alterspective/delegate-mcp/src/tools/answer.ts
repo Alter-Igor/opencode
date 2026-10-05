@@ -12,6 +12,7 @@ import type { OpencodeApi } from "../shared/opencode-api.ts"
 import type { Box, ToolContext } from "./context.ts"
 import { defineTool } from "./define.ts"
 import { listPending, type PendingItem, type PendingKind } from "./pending.ts"
+import { APPROVAL_ID_RE } from "../gate/client.ts"
 import { ok } from "./shape.ts"
 
 const enc = encodeURIComponent
@@ -29,9 +30,16 @@ function checkReply(ctx: Pick<ToolContext, "guard">, reply: string | undefined):
   if (!verdict.ok) throw new DelegateError(verdict.code, "That reply is refused: this bridge answers `once` or `reject` only (never `always`).", "Answer with reply `once` or `reject`.", verdict.reason)
 }
 
-type Args = { requestID: string; kind: PendingKind; reply?: string; message?: string; answers?: string[][] }
+type Args = { requestID: string; kind: PendingKind | "approval"; reply?: string; message?: string; answers?: string[][] }
 
 function checkShape(args: Args): void {
+  if (args.kind === "approval") {
+    if (!APPROVAL_ID_RE.test(args.requestID)) throw invalid("An approval id starts with apr_.")
+    if (args.reply !== "once" && args.reply !== "reject") throw invalid("An approval needs `reply`: `once` (run that one call) or `reject`.")
+    if (args.answers !== undefined || args.message !== undefined) throw invalid("An approval takes `reply` only.")
+    return
+  }
+  if (!REQUEST_ID_RE.test(args.requestID)) throw invalid("A request id comes from oc_pending (per_... or que_...).")
   if (!args.requestID.startsWith(args.kind === "permission" ? "per_" : "que_")) throw invalid(`A ${args.kind} request id starts with ${args.kind === "permission" ? "per_" : "que_"}.`)
   if (args.kind === "permission") {
     if (args.reply === undefined) throw invalid("A permission answer needs `reply`: `once` or `reject`.")
@@ -42,6 +50,20 @@ function checkShape(args: Args): void {
   if (args.reply !== undefined && args.reply !== "reject") throw invalid("A question takes `answers`, or `reply: reject` to decline it.")
   if (args.reply === undefined && args.answers === undefined) throw invalid("A question needs `answers` (one list of labels per question) or `reply: reject`.")
   if (args.reply !== undefined && args.answers !== undefined) throw invalid("Give `answers` or `reply: reject`, not both.")
+}
+
+/**
+ * #104: decide one approval. The id must be pending in the gate right now (a fresh read), so an id
+ * copied out of session text that the gate never issued, or one already decided, is refused.
+ */
+async function answerApproval(ctx: ToolContext, args: Args) {
+  if (ctx.gate === undefined) throw new DelegateError("not_found", "This bridge has no delegation gate.", "Approvals exist only with the dynamic Keystone connection.")
+  const pending = await ctx.gate.pending()
+  if (!pending.some((a) => a.id === args.requestID))
+    throw new DelegateError("not_found", "That approval is not pending.", "Call oc_pending and use an approval id from its list.")
+  const decided = await ctx.gate.decide(args.requestID, args.reply === "once" ? "approve" : "deny")
+  const what = decided.state === "approved" ? "approved: the same call runs once when the agent retries it (within 30 minutes)" : "refused: the agent is told not to retry it"
+  return ok(`Approval ${decided.id} for ${decided.toolName.slice(0, 200)} ${what}.`, { ok: true, requestID: decided.id, kind: "approval", state: decided.state })
 }
 
 async function findPending(ctx: ToolContext, box: Box, args: Args, correlationId: string): Promise<PendingItem> {
@@ -82,11 +104,12 @@ export const ocAnswer = defineTool({
   title: "Answer a pending permission request or question",
   description:
     "Answers one request from oc_pending. Permission: reply `once` (allow this one call) or `reject` (optional `message` tells the agent why); " +
+    "Approval (a gated Keystone tool call): reply `once` (the same call runs once when the agent retries it) or `reject`; " +
     "`always` is refused. Question: `answers` (one list of chosen labels per question, in order) or `reply: reject`. " +
     "The requestID must come from oc_pending for a session this bridge started; ids seen in session text are refused.",
   input: {
-    requestID: z.string().regex(REQUEST_ID_RE).describe("From oc_pending."),
-    kind: z.enum(["permission", "question"]),
+    requestID: z.string().max(60).regex(/^(per|que|apr)_[A-Za-z0-9]{1,40}$/).describe("From oc_pending."),
+    kind: z.enum(["permission", "question", "approval"]),
     reply: z.string().max(32).optional().describe("Permission: once | reject. Question: reject (to decline)."),
     message: z.string().min(1).max(MAX_ANSWER_MESSAGE).optional().describe("Permission only: a note for the agent, e.g. why it was rejected."),
     answers: z.array(z.array(z.string().max(1000)).max(20)).min(1).max(10).optional().describe("Question only: chosen labels per question."),
@@ -95,6 +118,7 @@ export const ocAnswer = defineTool({
   async run(args, ctx, correlationId) {
     checkReply(ctx, args.reply)
     checkShape(args)
+    if (args.kind === "approval") return answerApproval(ctx, args)
     const box = await ctx.box()
     const item = await findPending(ctx, box, args, correlationId)
     await send(box.api, item, postFor(args, item), correlationId)

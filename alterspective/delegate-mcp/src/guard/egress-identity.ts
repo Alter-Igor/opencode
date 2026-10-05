@@ -28,7 +28,7 @@
 // and sends $ks_auth as Authorization, so connection A's token never goes to B's path, and the box's
 // own Authorization is dropped. The box then needs no OAuth at all: the discovery, registration,
 // token and resource-metadata paths are not generated, so `location /` refuses them with 403.
-import { keystoneIds } from "../shared/keystone.ts"
+import { DYNAMIC_ID, keystoneIds, keystonePath } from "../shared/keystone.ts"
 import { KS_AUTH_VAR, ksAuthFileName } from "../synapse/auth-conf.ts"
 
 /** `connection` is set only with host-held tokens: the id whose include the location sends. */
@@ -38,6 +38,16 @@ export type IdentityPath = { path: string; methods: readonly string[]; connectio
 export const KEYSTONE_HOST_AUTH_ENV = "OCD_KEYSTONE_HOST_AUTH"
 /** On only when the bridge's environment sets OCD_KEYSTONE_HOST_AUTH to exactly "1". */
 export const keystoneHostAuth = (env: Readonly<Record<string, string | undefined>> = process.env) => env[KEYSTONE_HOST_AUTH_ENV] === "1"
+/**
+ * #104: where front sends /mcp/dynamic. The delegation gate (compose service `mcp-gate`, on the
+ * internal `gatenet` network the box is not on) applies the delegation profile and the approval
+ * fence, then calls Keystone /mcp/dynamic itself over verified TLS.
+ */
+export const GATE_HOST = "mcp-gate-front"
+export const GATE_PORT = 8090
+/** Docker's embedded DNS: the gate's name is a compose service, not a public host. */
+const DOCKER_DNS = "127.0.0.11"
+
 /** Where front sees the bridge's generated folder (egress.ts FRONT_GENERATED_MOUNT; a test keeps them equal). */
 export const FRONT_INCLUDE_DIR = "/etc/nginx/front-gen"
 
@@ -55,7 +65,10 @@ export const KEYSTONE_OAUTH_PATHS: readonly IdentityPath[] = [
  */
 export function identityPaths(connections: readonly string[], hostAuth: boolean = keystoneHostAuth()): IdentityPath[] {
   const ids = keystoneIds(connections)
-  if (hostAuth) return ids.map((id): IdentityPath => ({ path: `/mcp/c/${id}`, methods: ["GET", "POST", "DELETE"], connection: id }))
+  // #104: /mcp/dynamic goes through the gate, which only works with host-held tokens (with box-held
+  // tokens in-box code could call Keystone itself and skip the gate). Refuse rather than open it.
+  if (!hostAuth && ids.includes(DYNAMIC_ID)) throw new Error("the dynamic Keystone connection needs host-held tokens (OCD_KEYSTONE_HOST_AUTH=1)")
+  if (hostAuth) return ids.map((id): IdentityPath => ({ path: keystonePath(id), methods: ["GET", "POST", "DELETE"], connection: id }))
   const perConnection = ids.flatMap((id): IdentityPath[] => [
     { path: `/.well-known/oauth-protected-resource/mcp/c/${id}`, methods: ["GET"] },
     { path: `/mcp/c/${id}`, methods: ["GET", "POST", "DELETE"] },
@@ -75,8 +88,32 @@ function injection(id: string): string[] {
   ]
 }
 
+/** #104: the /mcp/dynamic location: the owner's dynamic token, sent to the gate, never to Keystone directly. */
+function gateLocation(allowed: IdentityPath & { connection: string }): string[] {
+  return [
+    `    location = ${allowed.path} {`,
+    `        limit_except ${allowed.methods.join(" ")} { deny all; }`,
+    "        if ($is_args) { return 403; }",
+    "        # #104: resolved at run time by Docker's DNS, so front still starts when the gate is down (502).",
+    `        resolver ${DOCKER_DNS} valid=10s ipv6=off;`,
+    `        set $gate_upstream "${GATE_HOST}";`,
+    ...injection(allowed.connection),
+    `        proxy_pass http://$gate_upstream:${GATE_PORT}${allowed.path};`,
+    "        proxy_http_version 1.1;",
+    '        proxy_set_header Connection "";',
+    "        proxy_buffering off;",
+    "        proxy_request_buffering off;",
+    "        proxy_connect_timeout 15s;",
+    "        proxy_read_timeout 3600s;",
+    "        proxy_send_timeout 3600s;",
+    "        proxy_redirect off;",
+    "    }",
+  ]
+}
+
 /** One exact-match location that forwards only its own literal path. `host` is already validated. */
 function location(host: string, allowed: IdentityPath): string[] {
+  if (allowed.connection === DYNAMIC_ID) return gateLocation({ ...allowed, connection: DYNAMIC_ID })
   return [
     `    location = ${allowed.path} {`,
     `        limit_except ${allowed.methods.join(" ")} { deny all; }`,

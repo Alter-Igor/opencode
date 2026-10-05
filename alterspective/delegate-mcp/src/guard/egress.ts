@@ -25,6 +25,7 @@ import path from "node:path"
 import { defaultConfig, type BridgeConfig } from "../shared/config.ts"
 import { SYNAPSE_HOST } from "../synapse/auth-conf.ts"
 import { synapseLocations } from "../synapse/front-routes.ts"
+import { DYNAMIC_ID } from "../shared/keystone.ts"
 import { identityLocations } from "./egress-identity.ts"
 
 // Lower-case DNS name, at least two labels, no wildcard, port, scheme, quote, space or brace.
@@ -130,9 +131,16 @@ export function frontServers(hosts: readonly string[], keystone: FrontKeystone):
   return [SERVERS_HEADER, ...defaultServer, ...servers, ""].join("\n")
 }
 
-/** frontServers for a config whose keystoneConnections is already the effective set (effectiveConfig). */
-export function frontServersFor(config: Pick<BridgeConfig, "egressHosts" | "keystoneOrigin" | "keystoneConnections">): string {
-  return frontServers(config.egressHosts, { host: new URL(config.keystoneOrigin).hostname, connections: config.keystoneConnections })
+/**
+ * frontServers for a config whose keystoneConnections is already the effective set (effectiveConfig).
+ * #104: with the dynamic connection chosen, the delegation profile's digest is written as a comment,
+ * so the front-config label (the file's sha256) changes with the profile and a running set with
+ * another profile is never reused (the gate reads the profile only when it starts).
+ */
+export function frontServersFor(config: Pick<BridgeConfig, "egressHosts" | "keystoneOrigin" | "keystoneConnections" | "dynamicProfile">): string {
+  const servers = frontServers(config.egressHosts, { host: new URL(config.keystoneOrigin).hostname, connections: config.keystoneConnections })
+  if (!config.keystoneConnections.includes(DYNAMIC_ID)) return servers
+  return `${servers}# delegation profile sha256: ${createHash("sha256").update(config.dynamicProfile).digest("hex")}\n`
 }
 
 /** The front-config label value: sha256 of the generated servers file. */
