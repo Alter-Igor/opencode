@@ -16,6 +16,7 @@ two do not share files, image names, container names or ports.
 | `supervisor/main.ts` | Container entry point. Reads the manifest, writes the managed OpenCode config, clones the repository from a git bundle into `/work/repo`, and starts `opencode serve`. |
 | `supervisor/config.ts` | Renders the managed OpenCode config from the manifest and the model ids. Pure, so it is unit tested in `test/`. |
 | `supervisor/policy.ts` | Checks the CAS AI-roles answer passed in the manifest (#102), failing closed to `auto` + `local-only`. Unit tested in `test/`. |
+| `supervisor/bundle.ts` | Checks the repository bundle's SHA-256 and the checked-out tree against the manifest (#108). Unit tested in `test/`, including a tampered bundle. |
 | `test/` | Unit tests: `bun test` from this folder. `bun run test:fast` at the repo root runs a changed test file here; it does not map a changed `supervisor/` file to its tests, so run `bun test` here after a supervisor change. |
 | `plugins/env-scrub.ts` | Blanks the server password and model key in every shell the agent runs. |
 | `driver/run-task.ts` | Stands in for CAS. Runs one task end to end and writes `runs/<taskId>/result.json` and `change.patch`. |
@@ -23,7 +24,8 @@ two do not share files, image names, container names or ports.
 ## Build and run
 
 ```sh
-docker build -f alterspective/sandbox-worker/Dockerfile -t opencodealt-sandbox-worker:spike .
+docker build -f alterspective/sandbox-worker/Dockerfile --build-arg GIT_SHA=$(git rev-parse HEAD) \
+  -t opencodealt-sandbox-worker:spike .
 SBXW_MODEL_KEY=<named spike key> bun alterspective/sandbox-worker/driver/run-task.ts \
   --repo /path/to/test/repo --task "Add a unit test for parseDate"
 ```
@@ -48,7 +50,7 @@ Containers are named `sbxw-<id>`, labelled `alterspective.sandbox-worker=spike`,
   "taskId": "sbxw-…",
   "model": { "baseURL": "https://…/v1", "headers": { "x-task-type": "code" }, "onPremDefault": ["qwen3.8-27b-dflash2"] },
   "modelPolicy": { "cell": { "modelIds": ["…"] }, "effectivePolicyVersion": "…" },
-  "repo": { "bundle": "/run/sbxw/input/repo.bundle", "ref": "optional" },
+  "repo": { "bundle": "/run/sbxw/input/repo.bundle", "ref": "optional", "sha256": "<bundle file SHA-256>", "treeSha": "<tree of the commit to work on>" },
   "permission": { "*": "allow", "external_directory": "deny" },
   "listen": { "hostname": "127.0.0.1", "port": 4096 }
 }
@@ -99,6 +101,13 @@ fork's pinned-model fallback (#80) resends with `auto`. Not checked live yet.
   resolved cell server-side (ADR-042). Until then, the box can only be trusted to stay on-prem
   because of the `local-only` tier.
 - **Model calls stay on-prem (#101).** The `synapse` provider always sends `x-privacy-tier: local-only`, set after the manifest headers, so a manifest cannot remove or widen it. The supervisor also sets `SYNAPSE_PRIVACY_TIER=local-only` for `opencode serve`, so the fork's Synapse plugin puts the tier on every Synapse call it makes (chat, model list, MCP bridge, `synapse_buddy_review`). CAS ADR-042 requires this for the opencodealt engine.
+- **The box works on the bundle the service sent (#108).** When the manifest gives `repo.sha256`
+  and `repo.treeSha`, the supervisor checks the bundle file before cloning and the checked-out tree
+  after, and exits (code 2, nothing served) on a mismatch. The service should always send both;
+  `state.json` records `bundleVerified` either way.
+- **Each task records which build ran (#108).** The image is built with `--build-arg GIT_SHA=…`
+  (OCI label `org.opencontainers.image.revision`, env `SBXW_BUILD_SHA`). The supervisor writes
+  it into `state.json` and its start log line. Without the argument it records `unknown`.
 - **The repository config cannot steer the agent.** `OPENCODE_DISABLE_PROJECT_CONFIG=1` stops the
   repository's own `opencode.json` and `.opencode/` from loading. The only config is the one the
   supervisor writes.
