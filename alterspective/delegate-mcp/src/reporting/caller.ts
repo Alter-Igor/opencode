@@ -8,7 +8,9 @@ export const UNKNOWN_CALLER = "(unknown)"
 
 /** OPENCODE_DELEGATE_CALLER if set and non-empty, else the last folder name of the working directory. */
 export function callerName(env: NodeJS.ProcessEnv = process.env, cwd: string = process.cwd()): string {
-  const chosen = env.OPENCODE_DELEGATE_CALLER?.trim() || folderName(cwd.trim())
+  // Control characters (a tab or newline in the variable) become spaces: the record would drop the whole label.
+  const clean = (text: string) => text.replace(/[\u0000-\u001f\u007f]+/g, " ").trim()
+  const chosen = clean(env.OPENCODE_DELEGATE_CALLER ?? "") || folderName(clean(cwd))
   return chosen.trim().slice(0, MAX_CALLER_CHARS).trim() || UNKNOWN_CALLER
 }
 
