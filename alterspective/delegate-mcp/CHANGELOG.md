@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.0 — 2026-10-05
+
+**Which model Synapse actually served (#76).** `oc_report` can now say what `synapse/auto` routed each task to.
+
+- front's access log adds the box session id (`x-opencode-session`) and Synapse's `x-synapse-served-model` to each line. No other header, no URI, no body. front's image rebuilds once.
+- After `oc_result` and at close (and in the sweep), the bridge reads front's log for that session in the background and stores `servedModels` (model → calls) in the task record. Unreadable logs change nothing; a smaller read after a box restart never replaces a larger count.
+- `oc_report {groupBy: "servedModel"}` groups tasks by the model that served most of their calls; `recent` rows carry `servedModels`; the notes say how to read it.
+
 ## 0.3.2 — 2026-10-05
 
 - Read-only sessions no longer ask before every `ks-dynamic` tool call (#104, owner decision A). The delegation gate already holds every risky call for an approval, so a session got two prompts for one call. With an owner profile that has `approvals: "listed"` (or one that cannot be read), they still ask. Other Keystone tools in read-only sessions still ask. Read-only sessions started before this version refuse further sends (their rules differ from the new baseline); start a new session.

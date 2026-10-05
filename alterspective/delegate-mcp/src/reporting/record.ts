@@ -5,6 +5,7 @@
 import { errorLabel } from "../events/describe.ts"
 import { ErrorCode } from "../shared/errors.ts"
 import { AGENT_RE, MODEL_RE, SESSION_ID_RE, SESSION_KEY } from "../supervisor/workspaces-state.ts"
+import { MAX_SERVED_MODELS, SERVED_MODEL_RE, type ServedModels } from "./served.ts"
 
 export const RECORD_VERSION = 1
 
@@ -22,10 +23,15 @@ export type TaskRecord = {
   repo: string
   agent?: string
   /**
-   * The model last sent (`synapse/<id>` since #71). Review cycle 1: there is no served model; OpenCode
-   * only echoes the requested ids, so `synapse/auto` hides which model Synapse routed to.
+   * The model last sent (`synapse/<id>` since #71). OpenCode only echoes the requested ids, so
+   * `synapse/auto` hides which model Synapse routed to; `servedModels` (#76) says that.
    */
   requestedModel?: string
+  /**
+   * #76: how many of the task's model calls each model served, as Synapse named it
+   * (`x-synapse-served-model`, read from front's log). Absent when it could not be read.
+   */
+  servedModels?: ServedModels
   startedAt: string
   sendCount: number
   firstSendAt?: string
@@ -96,6 +102,16 @@ function tokens(v: unknown): Tokens | undefined {
   return { input: count(t.input) ?? 0, output: count(t.output) ?? 0, reasoning: count(t.reasoning) ?? 0, cacheRead: count(t.cacheRead) ?? 0, cacheWrite: count(t.cacheWrite) ?? 0 }
 }
 
+function servedModels(v: unknown): ServedModels | undefined {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return undefined
+  const out: ServedModels = {}
+  for (const [model, n] of Object.entries(v as Record<string, unknown>).slice(0, MAX_SERVED_MODELS)) {
+    const c = count(n)
+    if (SERVED_MODEL_RE.test(model) && c !== undefined && c > 0) out[model] = c
+  }
+  return Object.keys(out).length ? out : undefined
+}
+
 /** A record from disk, validated field by field; undefined when a required field is missing or bad. */
 export function parseTaskRecord(raw: string): TaskRecord | undefined {
   let parsed: unknown
@@ -117,6 +133,7 @@ export function parseTaskRecord(raw: string): TaskRecord | undefined {
   const optional = {
     agent: str(p.agent, AGENT_RE),
     requestedModel: str(p.requestedModel, MODEL_RE),
+    servedModels: servedModels(p.servedModels),
     firstSendAt: str(p.firstSendAt, ISO_RE),
     lastSendAt: str(p.lastSendAt, ISO_RE),
     finishedAt: str(p.finishedAt, ISO_RE),

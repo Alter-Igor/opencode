@@ -2,8 +2,10 @@
 // success rate = completed / finished (completed + error + aborted + unknown after a send), median and p90 (nearest rank)
 // of first-send-to-finish durations, and what happened to each task's work.
 import type { TaskRecord } from "./record.ts"
+import { mainServedModel } from "./served.ts"
 
-export type GroupBy = "model" | "agent" | "repo"
+/** `servedModel` (#76): the model Synapse served most of a task's calls; `model` is the one sent. */
+export type GroupBy = "model" | "servedModel" | "agent" | "repo"
 export type ReportOptions = { sinceDays: number; groupBy: GroupBy; recent: number; now: number }
 
 export type Durations = { median: number | null; p90: number | null; samples: number }
@@ -83,6 +85,7 @@ function metrics(records: readonly TaskRecord[]): Metrics {
 
 function groupName(record: TaskRecord, groupBy: GroupBy): string {
   if (groupBy === "model") return record.requestedModel ?? UNKNOWN_GROUP
+  if (groupBy === "servedModel") return mainServedModel(record.servedModels) ?? UNKNOWN_GROUP
   if (groupBy === "agent") return record.agent ?? UNKNOWN_GROUP
   return record.repo
 }

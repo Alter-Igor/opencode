@@ -2,6 +2,8 @@
 // best effort: it never throws, never makes an API call of its own (it reads what the tool already
 // fetched) and never receives prompt or answer text. Hooks are idempotent: a wait or result call
 // repeated on a finished run changes nothing, and only a new send starts a new run.
+// One exception (#76): recordServed reads front's container log through Docker, in the background,
+// so no tool waits for it.
 import path from "node:path"
 import type { BridgeConfig } from "../shared/config.ts"
 import type { SessionState } from "../shared/contracts.ts"
@@ -9,6 +11,7 @@ import { safeLog } from "../shared/log.ts"
 import { MODEL_RE } from "../supervisor/workspaces-state.ts"
 import type { SessionRecord, ToolContext } from "../tools/context.ts"
 import { errorCode, newTaskRecord, repoName, type Disposition, type Outcome, type TaskRecord, type Tokens } from "./record.ts"
+import { keepServed } from "./served.ts"
 import { createReportStore, type ReportStore } from "./store.ts"
 
 type Ctx = Pick<ToolContext, "config" | "log" | "supervisor" | "sessions">
@@ -32,8 +35,12 @@ export function reportsFor(ctx: Pick<ToolContext, "config" | "log">): ReportStor
   return store
 }
 
+/** #76: served-model reads still running; their record update is queued only after the read. */
+const reads = new Set<Promise<unknown>>()
+
 /** Review cycle 2 (LOW 1): wait for every queued record update of every store (tests, shutdown). */
 export async function flushReports(): Promise<void> {
+  await Promise.all([...reads].map((r) => r.catch(() => undefined)))
   await Promise.all([...stores.values()].map((s) => s.flush()))
 }
 
@@ -197,6 +204,32 @@ export function recordResult(ctx: Ctx, rec: SessionRecord, seen: { state: Sessio
       return JSON.stringify(next) === JSON.stringify(current) ? undefined : next
     }),
   )
+}
+
+/**
+ * #76, oc_result and close: which models Synapse served this task's calls, from front's log since
+ * the first send. Runs in the background; a log that cannot be read leaves the record as it is.
+ */
+export function recordServed(ctx: Ctx & Pick<ToolContext, "servedModels">, key: string, sessionID: string): void {
+  const read = ctx.servedModels
+  if (!read) return
+  return guarded(ctx, () => {
+    const run = (async () => {
+      const store = reportsFor(ctx)
+      const current = store.get(key)
+      if (!current || current.sendCount === 0) return
+      const served = await read(sessionID, current.firstSendAt ?? current.startedAt)
+      if (!served) return
+      await store.update(key, (latest) => {
+        if (!latest) return undefined
+        const kept = keepServed(latest.servedModels, served)
+        return kept === latest.servedModels ? undefined : { ...latest, servedModels: kept }
+      })
+    })()
+    reads.add(run)
+    void run.finally(() => reads.delete(run)).catch(() => undefined)
+    return run
+  })
 }
 
 /** oc_collect: the host-verified commit count. */

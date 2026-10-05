@@ -55,6 +55,8 @@ export type ToolContext = {
   inbox: BridgeInbox
   /** #104: the delegation gate's approvals (tool calls on /mcp/dynamic waiting for a decision). Absent in older test contexts. */
   gate?: GateApprovals
+  /** #76: the models Synapse served one session since a time, from front's log; undefined when unreadable. Absent in older test contexts. */
+  servedModels?: (sessionID: string, sinceIso: string) => Promise<Record<string, number> | undefined>
   /** Start or reuse the box and its event hub (idempotent, shared by concurrent calls). */
   box(): Promise<Box>
   /** Additive (Wave 3): the box this bridge already holds, without starting or reusing one. */

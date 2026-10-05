@@ -90,7 +90,10 @@ describe("generated front servers", () => {
   test("nginx logs never carry the Authorization header", () => {
     const nginx = readFileSync(path.join(import.meta.dir, "..", "docker", "front", "nginx.conf"), "utf8")
     const format = nginx.split("\n").find((line) => line.includes("log_format")) ?? ""
-    expect(format).not.toMatch(/http_authorization|http_x_api_key|\$http_|\$request\b|request_uri|\$args/)
+    // #76: the session id is the one request header allowed (not a secret); every other stays out.
+    const others = format.replaceAll("$http_x_opencode_session", "")
+    expect(others).not.toMatch(/http_authorization|http_x_api_key|\$http_|\$request\b|request_uri|\$args/)
+    expect(format).toContain('sess="$http_x_opencode_session" served="$upstream_http_x_synapse_served_model"')
   })
 })
 

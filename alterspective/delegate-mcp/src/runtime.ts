@@ -9,6 +9,7 @@ import { createHub, type DelegateHub } from "./events/index.ts"
 import { createGuard } from "./guard/index.ts"
 import { cachedTarget, createInbox, inboxTargetFromDocker } from "./inbox/index.ts"
 import { createGateApprovals, gateTargetFromDocker } from "./gate/client.ts"
+import { servedModelsFromFront } from "./reporting/served.ts"
 import { flushReports } from "./reporting/hooks.ts"
 import { currentKeystone, defaultConfig, frontDir, type BridgeConfig } from "./shared/config.ts"
 import { DelegateError } from "./shared/errors.ts"
@@ -260,6 +261,7 @@ export async function createRuntime(options: RuntimeOptions = {}): Promise<Runti
     workspaces: createWorkspaces({ config, container, logger: log }),
     inbox: createInbox({ supervisor: `supervisor:${name}`, target: inboxTarget.target, invalidate: inboxTarget.invalidate }),
     gate: createGateApprovals({ target: gateTarget.target, invalidate: gateTarget.invalidate }),
+    servedModels: (sessionID, sinceIso) => servedModelsFromFront(bunExec, config, sessionID, sinceIso),
     box: () => manager.box(),
     peekBox: () => manager.peek(),
     apiFor: (target) => createApi(target),
