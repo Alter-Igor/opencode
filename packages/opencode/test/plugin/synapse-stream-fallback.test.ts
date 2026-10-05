@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import * as os from "os"
 import * as path from "path"
 import * as fs from "fs/promises"
-import { PINNED_FALLBACK_ENV, PinnedFallbackMemory, SSE_PEEK_MAX_BYTES, peekSseError } from "../../src/plugin/synapse-fallback"
+import { PINNED_FALLBACK_ENV, PinnedFallbackMemory, SSE_PEEK_MAX_BYTES, peekSseError, pinnedFallbackNotice } from "../../src/plugin/synapse-fallback"
 import { SynapseAuthPlugin, setLatestSynapseServing } from "../../src/plugin/synapse"
 import { diagnosticsLogDir, sessionObserver } from "../../src/plugin/observer"
 
@@ -125,6 +125,46 @@ describe("peekSseError (#80 follow-up)", () => {
     const peek = await peekSseError(sse(chunks))
     expect(peek.error).toBeUndefined()
     expect(await bytes(peek.response)).toEqual(concat(chunks))
+  })
+})
+
+describe("peekSseError and the notice (#83)", () => {
+  test("a lone retry:, an id: and an event with no data are skipped, then the error is found", async () => {
+    const chunks = ["retry: 3000\n\n", "id: 7\n\n", "event: ping\n\n", TOOL_ERROR_EVENT]
+    const peek = await peekSseError(sse(chunks))
+    expect(peek.error?.text).toContain("No endpoints found that support tool use")
+    expect(await bytes(peek.response)).toEqual(concat(chunks))
+  })
+
+  test("`event: error ` (trailing space) with no data is another event type: skipped, then the real error is found", async () => {
+    const peek = await peekSseError(sse(["event: error \n\n", TOOL_ERROR_EVENT]))
+    expect(peek.error?.text).toContain("No endpoints found that support tool use")
+  })
+
+  test("event: error with no data is still an error", async () => {
+    const peek = await peekSseError(sse(["event: error\n\n"]))
+    expect(peek.error?.status).toBe(502)
+    expect(peek.error?.code).toBeUndefined()
+  })
+
+  test("a skipped block does not stretch the bounds: past the byte cap the stream is handed on unread", async () => {
+    const pings = "event: ping\n\n".repeat(Math.ceil(SSE_PEEK_MAX_BYTES / 12) + 1)
+    const peek = await peekSseError(sse([pings, TOOL_ERROR_EVENT]))
+    expect(peek.error).toBeUndefined()
+  })
+
+  test("the event's own code is kept; the 502 default is not", async () => {
+    expect((await peekSseError(sse(['data: {"error":{"code":"budget_exhausted","status":402}}\n\n']))).error?.code).toBe(402)
+    expect((await peekSseError(sse([TOOL_ERROR_EVENT]))).error?.code).toBeUndefined()
+  })
+
+  test("the notice names a stream error as such, not as HTTP 502", () => {
+    const base = { originalModel: "google/gemini-3.1-flash-image", reason: "no-tool-support" as const, fallbackModel: "auto" as const, fallbackStatus: 200, localOnly: false }
+    const noCode = pinnedFallbackNotice({ ...base, status: 502, inStream: true })
+    expect(noCode).toContain("error event in an HTTP 200 stream")
+    expect(noCode).not.toContain("502")
+    expect(pinnedFallbackNotice({ ...base, status: 429, inStream: true, streamCode: 429 })).toContain("error event in an HTTP 200 stream, code 429")
+    expect(pinnedFallbackNotice({ ...base, status: 404 })).toContain("(HTTP 404)")
   })
 })
 
