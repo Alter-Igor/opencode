@@ -136,6 +136,11 @@ describe("peekSseError and the notice (#83)", () => {
     expect(await bytes(peek.response)).toEqual(concat(chunks))
   })
 
+  test("`event: error ` (trailing space) with no data is another event type: skipped, then the real error is found", async () => {
+    const peek = await peekSseError(sse(["event: error \n\n", TOOL_ERROR_EVENT]))
+    expect(peek.error?.text).toContain("No endpoints found that support tool use")
+  })
+
   test("event: error with no data is still an error", async () => {
     const peek = await peekSseError(sse(["event: error\n\n"]))
     expect(peek.error?.status).toBe(502)

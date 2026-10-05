@@ -375,7 +375,9 @@ function dispatchesNoEvent(block: string): boolean {
     const colon = line.indexOf(":")
     const field = colon === -1 ? line : line.slice(0, colon)
     if (field === "data") hasData = true
-    else if (field === "event" && line.slice(colon + 1).trim() === "error") isError = true
+    // Only the one optional leading space goes, as in eventError and the SSE rules: `event: error `
+    // is a different event type, so it must not stop the peek here and then read as "no error".
+    else if (field === "event" && line.slice(colon + 1).replace(/^ /, "") === "error") isError = true
   }
   return !hasData && !isError
 }
