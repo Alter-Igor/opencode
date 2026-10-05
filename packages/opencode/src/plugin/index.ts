@@ -90,7 +90,7 @@ function internalPlugins(flags: RuntimeFlags.Info): PluginInstance[] {
 }
 
 /** Fork-only built-in plugins. OPENCODE_DISABLE_FORK_PLUGINS leaves them out (#95). */
-function forkPlugins(): PluginInstance[] {
+export function forkPlugins(): PluginInstance[] {
   return [
     SynapseAuthPlugin,
     // Fork-only (#84): inert until a person runs /goal.
