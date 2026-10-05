@@ -6,6 +6,10 @@ name: alterspective-fast-cycle
 #          then the opencode typecheck. Agents wait on this one.
 #   full — every PR and every push to dev: the whole packages/opencode suite on Linux. `integrate`
 #          reads this result before a merge instead of a slow, noisy local Windows run.
+#          (#112) The suite runs as 4 shards in parallel (`bun test --shard`, split by file); the job
+#          named `full` passes only when every shard passed. No `--parallel` inside a shard: each
+#          worker would apply its own CLI child cap (#106, test/lib/cli-process.ts) and
+#          oversubscribe the 4-vCPU runner.
 # A merge queue would run `full` speculatively before landing, but merge queues need an
 # organisation-owned repository and this fork is user-owned.
 on:
@@ -41,10 +45,15 @@ jobs:
         working-directory: packages/opencode
         run: bun run typecheck
 
-  full:
+  full-shard:
+    name: full shard ${{ matrix.shard }}/4
     if: github.repository == 'Alter-Igor/opencode'
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
@@ -56,6 +65,20 @@ jobs:
           git config --global user.email "bot@opencode.ai"
           git config --global user.name "opencode"
 
-      - name: Full opencode suite
+      - name: Full opencode suite (shard ${{ matrix.shard }}/4)
         working-directory: packages/opencode
-        run: bun test --timeout 30000 --only-failures
+        run: bun test --timeout 30000 --only-failures --shard=${{ matrix.shard }}/4
+
+  # One result for `integrate` to read. Runs even when a shard fails or is cancelled, and fails then.
+  full:
+    if: always() && github.repository == 'Alter-Igor/opencode'
+    needs: full-shard
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every shard passed
+        env:
+          SHARDS: ${{ needs.full-shard.result }}
+        run: |
+          echo "full-shard result: $SHARDS"
+          test "$SHARDS" = "success"
