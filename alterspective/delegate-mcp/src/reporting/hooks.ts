@@ -14,7 +14,7 @@ import { errorCode, newTaskRecord, repoName, type Disposition, type Outcome, typ
 import { keepServed } from "./served.ts"
 import { createReportStore, type ReportStore } from "./store.ts"
 
-type Ctx = Pick<ToolContext, "config" | "log" | "supervisor" | "sessions">
+type Ctx = Pick<ToolContext, "config" | "log" | "supervisor" | "sessions" | "caller">
 
 /** The bridge's host state folder (<home>/workspaces, as workspaces.ts) plus `reports`. Never mounted in the box. */
 export function reportsDir(config: Pick<BridgeConfig, "home">): string {
@@ -76,6 +76,7 @@ function fresh(ctx: Ctx, rec: SessionRecord): TaskRecord {
     key: rec.sessionKey,
     bridge: bridgeName(ctx),
     repo: repoName(rec.hostRepo),
+    caller: ctx.caller,
     startedAt: ISO_RE.test(rec.createdAt) ? rec.createdAt : nowIso(),
     agent: rec.agent,
     requestedModel: rec.model,

@@ -19,7 +19,7 @@ export const dashboardTool = defineTool({
   name: "oc_dashboard",
   title: "Delegation dashboard",
   description:
-    "Returns a link to a local, read-only web page for the owner: how busy the box is, which bridges delegated, which repos, the model sent and the model Synapse served, and each task's state and duration, across all bridges sharing this bridge home. " +
+    "Returns a link to a local, read-only web page for the owner: how busy the box is, which sessions (project folders) delegated, which repos, the model sent and the model Synapse served, and each task's state and duration, across all bridges sharing this bridge home. " +
     "Open it in a browser on this machine. The link works only on this machine and stops when the bridge stops. A second call returns the same link. It never starts the box.",
   input: {},
   annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },

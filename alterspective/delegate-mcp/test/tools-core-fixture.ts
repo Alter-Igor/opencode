@@ -211,6 +211,7 @@ export function fakeContext(options: { boxHeld?: boolean } = {}): Fake {
     config,
     supervisor: "supervisor:test-bridge",
     bridgeId: "test-bridge-1",
+    caller: "test-caller",
     version: "0.1.0-dev+abc1234",
     log: silentLogger,
     guard: createGuard(config),

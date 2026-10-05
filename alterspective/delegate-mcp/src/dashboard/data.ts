@@ -10,9 +10,11 @@ export const MAX_FIELD_CHARS = 128
 
 export type DashboardExtras = { boxRunning: boolean; bridge: string }
 
-export type BridgeRow = { bridge: string; running: number; last24h: number; last7d: number }
+/** #132: `who` is the caller (session project folder) of the tasks, or the bridge name for a record without one. */
+export type CallerRow = { who: string; running: number; last24h: number; last7d: number }
 export type RunningRow = {
   bridge: string
+  caller?: string
   repo: string
   requestedModel?: string
   servedModels?: Record<string, number>
@@ -23,6 +25,7 @@ export type RunningRow = {
 }
 export type RecentRow = {
   bridge: string
+  caller?: string
   repo: string
   requestedModel?: string
   servedModel?: string
@@ -39,7 +42,7 @@ export type DashboardData = {
   bridge: string
   boxRunning: boolean
   busy: number
-  bridges: BridgeRow[]
+  callers: CallerRow[]
   running: RunningRow[]
   recent: RecentRow[]
   servedModels: ServedRow[]
@@ -54,16 +57,16 @@ export function dashboardData(records: readonly TaskRecord[], now: number, extra
   const running = records.filter((r) => r.outcome === "running")
   const week = records.filter((r) => now - started(r) <= 7 * DAY_MS)
 
-  const perBridge = new Map<string, BridgeRow>()
-  const rowFor = (name: string) => {
-    const bridge = cut(name)
-    const row = perBridge.get(bridge) ?? { bridge, running: 0, last24h: 0, last7d: 0 }
-    perBridge.set(bridge, row)
+  const perCaller = new Map<string, CallerRow>()
+  const rowFor = (r: TaskRecord) => {
+    const who = cut(r.caller ?? r.bridge)
+    const row = perCaller.get(who) ?? { who, running: 0, last24h: 0, last7d: 0 }
+    perCaller.set(who, row)
     return row
   }
-  for (const r of running) rowFor(r.bridge).running++
+  for (const r of running) rowFor(r).running++
   for (const r of week) {
-    const row = rowFor(r.bridge)
+    const row = rowFor(r)
     row.last7d++
     if (now - started(r) <= DAY_MS) row.last24h++
   }
@@ -76,9 +79,10 @@ export function dashboardData(records: readonly TaskRecord[], now: number, extra
     bridge: cut(extras.bridge),
     boxRunning: extras.boxRunning,
     busy: running.length,
-    bridges: [...perBridge.values()].sort((a, b) => b.running - a.running || byName(a.bridge, b.bridge)),
+    callers: [...perCaller.values()].sort((a, b) => b.running - a.running || byName(a.who, b.who)),
     running: [...running].sort(newestFirst).map((r) => ({
       bridge: cut(r.bridge),
+      ...(r.caller ? { caller: cut(r.caller) } : {}),
       repo: cut(r.repo),
       ...(r.requestedModel ? { requestedModel: cut(r.requestedModel) } : {}),
       ...(r.servedModels ? { servedModels: Object.fromEntries(Object.entries(r.servedModels).map(([m, n]) => [cut(m), n])) } : {}),
@@ -91,6 +95,7 @@ export function dashboardData(records: readonly TaskRecord[], now: number, extra
       const main = mainServedModel(r.servedModels)
       return {
         bridge: cut(r.bridge),
+        ...(r.caller ? { caller: cut(r.caller) } : {}),
         repo: cut(r.repo),
         ...(r.requestedModel ? { requestedModel: cut(r.requestedModel) } : {}),
         ...(main ? { servedModel: cut(main) } : {}),

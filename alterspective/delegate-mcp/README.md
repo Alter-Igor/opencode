@@ -247,6 +247,8 @@ claude mcp add opencode-delegate -- bun <checkout>\alterspective\delegate-mcp\sr
 
 `OPENCODE_DELEGATE_NAME` is optional. A fixed name lets a restarted bridge find its own sessions again.
 
+`OPENCODE_DELEGATE_CALLER` is optional. It labels which session delegated, for the dashboard and `oc_report` (#132). Default: the folder name of the bridge's working directory, so each Claude Code project is told apart even when all share one `OPENCODE_DELEGATE_NAME`. At most 128 characters. It is a label only: it never decides which sessions a bridge owns, so changing it does not affect adoption or clean-up.
+
 `OPENCODE_DELEGATE_PROJECT` is optional (default `opencode-delegate`). It names the Docker Compose project, and so the box and its containers and volumes. Use another name, with its own `OPENCODE_DELEGATE_HOME`, for a separate test box. Keep one compose project to one bridge home: front reads the Synapse token from the home that started it, and bridges with another home would write a different token file than the one front loaded (`oc_doctor` flags this as `matchesHost: false`, but does not prevent it).
 
 **Codex CLI** (`~/.codex/config.toml`). *Not verified.*
@@ -369,7 +371,7 @@ A finished session should not leave anything behind. The usual order is `oc_coll
 
 ## Reporting
 
-The bridge keeps one small record per task on your PC, at `<home>/workspaces/reports/<key>.json`. The box never sees this folder. A record holds metadata only: model sent, the models Synapse served (#76), agent, repo name, times, send count, outcome, commits collected and what happened to the work. It never holds prompt or answer text, file contents or error bodies. An error is kept only as a known error code, else `other`.
+The bridge keeps one small record per task on your PC, at `<home>/workspaces/reports/<key>.json`. The box never sees this folder. A record holds metadata only: model sent, the models Synapse served (#76), agent, repo name, the caller (#132, which session delegated: the bridge's working-directory folder name, or `OPENCODE_DELEGATE_CALLER`; not an ownership key), times, send count, outcome, commits collected and what happened to the work. It never holds prompt or answer text, file contents or error bodies. An error is kept only as a known error code, else `other`.
 
 - **When records change:** start, send, wait, result, collect, close and the sweep. A tool never waits for a record to be saved. Saves run in the background and are flushed before `oc_report` reads and at shutdown. A failed save is logged once and never fails a tool.
 - **Several bridges** can share the home folder. Each record has its own lock file, so two processes do not lose each other's counts. In one rare race (an old lock being taken over while its owner wakes up), two writers can still overlap; the worst case is one lost count. This is logged as `lock_relink_failed`.
@@ -380,11 +382,12 @@ The bridge keeps one small record per task on your PC, at `<home>/workspaces/rep
   - `groupBy: "model"` is the model the bridge sent, so a `synapse/auto` row does not say which model Synapse picked. `groupBy: "servedModel"` (#76) does: each task is grouped by the model that served most of its calls.
   - **Where served models come from:** Synapse names the model it used in the response header `x-synapse-served-model`. front's access log writes that header and the session id the box's OpenCode sends (`x-opencode-session`); nothing else from the request (no URI, body or token). After `oc_result` and at close, the bridge reads front's log since the task's first send (`docker logs --since`, the newest 20,000 lines at most, in the background) and stores the counts in the record. front's log is shared by every session, so on a busy box a long task's earliest calls can fall outside those lines and its counts come out low; a later read can raise them. A read after a box restart sees fewer calls (front's log starts again), so it never replaces a larger count. `(unknown)` means it was never read.
   - The session id is written by the box, and the box is one trust zone, so one session could claim another's. That skews these counts only; treat them as a guide.
+  - `groupBy: "caller"` (#132) shows which session delegated. Several Claude Code sessions share one bridge name, so the bridge name cannot tell them apart; the caller can. Tasks recorded before 0.5.1 have no caller and group under `(unknown)`. `recent` rows carry `caller` under `untrusted`.
   - Token counts are a lower bound: they cover only the messages `oc_result` fetched.
 
 ## Dashboard
 
-`oc_dashboard` returns a link to a read-only web page, "Delegated work", for you to open in a browser. It shows, across every bridge sharing this bridge home: whether the box is running and how many tasks are running; which bridges delegated (running, last 24 hours, last 7 days); the tasks running now; the 200 most recent tasks of the last 7 days (bridge, repo, model sent, model Synapse served, state, duration); and the models served over 7 days. It reads the same task records as `oc_report` (see "Reporting") and refreshes every 5 seconds.
+`oc_dashboard` returns a link to a read-only web page, "Delegated work", for you to open in a browser. It shows, across every bridge sharing this bridge home: whether the box is running and how many tasks are running; which sessions delegated (#132: the caller, the project folder of each Claude Code session, or `OPENCODE_DELEGATE_CALLER`; a task recorded before 0.5.1 is listed under its bridge name) with running, last 24 hours and last 7 days; the tasks running now; the 200 most recent tasks of the last 7 days (session, bridge, repo, model sent, model Synapse served, state, duration); and the models served over 7 days. It reads the same task records as `oc_report` (see "Reporting") and refreshes every 5 seconds.
 
 - **Local only.** The page is served on `127.0.0.1` at a random port, behind a random path token in the link. Only GET is answered, and a request whose `Host` header is not `127.0.0.1:<port>` is refused. The link works only on this machine.
 - **Stops with the bridge.** It starts on the first `oc_dashboard` call (a second call returns the same link) and never keeps the bridge running.

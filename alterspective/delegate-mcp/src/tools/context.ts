@@ -43,6 +43,8 @@ export type ToolContext = {
   /** `supervisor:<name>` — this bridge's inbox address and the value stored in session metadata. */
   supervisor: string
   bridgeId: string
+  /** #132: which session delegated (callerName, computed once per bridge process); for reporting only, never an ownership key. Absent in older test contexts. */
+  caller?: string
   version: string
   log: Logger
   guard: Guard
