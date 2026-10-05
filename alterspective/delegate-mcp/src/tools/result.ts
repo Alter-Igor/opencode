@@ -2,7 +2,7 @@
 // the session's clone against its base commit, and the todo list.
 import { z } from "zod"
 import { errorLabel } from "../events/describe.ts"
-import { recordResult } from "../reporting/hooks.ts"
+import { recordResult, recordServed } from "../reporting/hooks.ts"
 import { DelegateError } from "../shared/errors.ts"
 import { sessionErrorCode, sessionErrorDetail } from "../shared/session-error.ts"
 import type { Box, SessionRecord } from "./context.ts"
@@ -76,6 +76,7 @@ export const resultTool = defineTool({
       box.hub.view(record.sessionID),
     ])
     recordResult(ctx, record, { state: view.state, at: view.since }, messages)
+    recordServed(ctx, record.sessionKey, record.sessionID)
     const n = diff.boxReportedCommits
     const commits = n === undefined ? "commit count unknown" : `${n} commit${n === 1 ? "" : "s"} (box-reported)`
     return ok(`${record.sessionID} is ${view.state}; ${replies.length} repl${replies.length === 1 ? "y" : "ies"}; ${commits} on ${record.branch}.`, {

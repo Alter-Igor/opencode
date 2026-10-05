@@ -6,7 +6,7 @@
 // files and an unmerged delegate branch. oc_cleanup uses neither. Every close holds the close lock
 // (closing.ts), so oc_send / oc_collect refuse the session meanwhile. Results carry ids, keys, counts.
 import { z } from "zod"
-import { recordClose } from "../reporting/hooks.ts"
+import { recordClose, recordServed } from "../reporting/hooks.ts"
 import { DelegateError } from "../shared/errors.ts"
 import type { SessionState, SessionView } from "../shared/contracts.ts"
 import type { CloseOutcome, SessionRemoval } from "../supervisor/workspaces.ts"
@@ -183,6 +183,7 @@ async function closeOne(ctx: ToolContext, box: Box, located: Located, args: Clos
     ctx.sessions.delete(args.sessionID)
     const lostWork = outcome.uncollectedCommits + outcome.uncommittedPaths + outcome.ignoredPaths > 0
     recordClose(ctx, located.sessionKey, args.discardWork === true && lostWork ? "closed_discarded" : "closed_clean", { aborted, seen: closeSeen(seen) })
+    recordServed(ctx, located.sessionKey, args.sessionID)
   } else if (outcome.session !== "kept") await keepTracked(ctx, args.sessionID, located.sessionKey)
   const { ignoredExamples, ...rest } = outcome
   return ok(closeSummary(outcome), { ...rest, aborted, ...(ignoredExamples.length ? { ignoredExamples: untrusted(ignoredExamples.join("\n"), 2000) } : {}) })
@@ -266,6 +267,7 @@ async function sweepOne(run: SweepRun, state: Candidate): Promise<void> {
     ctx.sessions.delete(state.sessionID)
     out.closed.push(state.sessionKey)
     recordClose(ctx, state.sessionKey, "swept", { seen: closeSeen(seen) })
+    recordServed(ctx, state.sessionKey, state.sessionID)
   } else if (o.refused && o.session === "kept") keep(out, state.sessionKey, o.refused, o)
   else {
     // Late refusal (session deleted, copy and host record kept): same handling as oc_close_session.

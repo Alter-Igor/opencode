@@ -382,15 +382,17 @@ describe("oc_report", () => {
     expect(recent[0]).not.toHaveProperty("servedModel")
   })
 
-  test("notes say synapse/auto hides the routed model and tokens are a lower bound; the description says how unknown counts", async () => {
+  test("notes say synapse/auto hides the routed model, servedModel shows it (#76), and tokens are a lower bound", async () => {
     const f = context()
     const result = await invoke(reportTool, {}, f.ctx)
     const notes = data(result).notes as string[]
-    expect(notes).toHaveLength(2)
+    expect(notes).toHaveLength(3)
     expect(notes[0]).toContain("synapse/auto")
-    expect(notes[1]).toContain("lower bound")
+    expect(notes[0]).toContain("servedModel")
+    expect(notes[1]).toContain("session id")
+    expect(notes[2]).toContain("lower bound")
     expect(reportTool.description).toContain("unknown")
-    expect(reportTool.description).not.toContain("served")
+    expect(reportTool.description).toContain("servedModel")
   })
 
   test("an empty folder gives an empty report, not an error", async () => {
@@ -399,5 +401,42 @@ describe("oc_report", () => {
     expect(result.isError).toBeUndefined()
     expect(data(result).totals).toMatchObject({ tasks: 0, successRate: null })
     expect(text(result)).toContain("No tasks")
+  })
+})
+
+describe("#76 served models through the tools", () => {
+  test("oc_result stores the served-model counts read from front; oc_report groups by them", async () => {
+    const f = context()
+    const reads: Array<{ sessionID: string; since: string }> = []
+    f.ctx.servedModels = async (sessionID, since) => (reads.push({ sessionID, since }), { "qwen/qwen3.8-flash": 3, "google/gemini-3.1-pro": 1 })
+    const key = await started(f)
+    expect((await invoke(sendTool, { sessionID: SID, message: "task", model: "synapse/auto" }, f.ctx)).isError).toBeUndefined()
+    settle(f, "idle", key)
+    f.api.on(`GET /session/${SID}/message?limit=8`, { status: 200, data: [] })
+    expect((await invoke(resultTool, { sessionID: SID }, f.ctx)).isError).toBeUndefined()
+    const r = stored(f, key)
+    expect(r.servedModels).toEqual({ "qwen/qwen3.8-flash": 3, "google/gemini-3.1-pro": 1 })
+    expect(reads[0]).toEqual({ sessionID: SID, since: r.firstSendAt! })
+
+    const report = data(await invoke(reportTool, { groupBy: "servedModel", recent: 1 }, f.ctx))
+    expect((report.groups as Array<{ name: { text: string } }>).map((g) => g.name.text)).toEqual(["qwen/qwen3.8-flash"])
+    expect((report.recent as Array<Record<string, unknown>>)[0]?.servedModels).toEqual({ "qwen/qwen3.8-flash": 3, "google/gemini-3.1-pro": 1 })
+  })
+
+  test("an unreadable log, or a smaller read after a restart, leaves the stored counts alone", async () => {
+    const f = context()
+    let next: Record<string, number> | undefined = { "a/x": 2 }
+    f.ctx.servedModels = async () => next
+    const key = await started(f)
+    await invoke(sendTool, { sessionID: SID, message: "task" }, f.ctx)
+    settle(f, "idle", key)
+    f.api.on(`GET /session/${SID}/message?limit=8`, { status: 200, data: [] })
+    await invoke(resultTool, { sessionID: SID }, f.ctx)
+    expect(stored(f, key).servedModels).toEqual({ "a/x": 2 })
+    next = undefined
+    await invoke(resultTool, { sessionID: SID }, f.ctx)
+    next = { "b/y": 1 }
+    await invoke(resultTool, { sessionID: SID }, f.ctx)
+    expect(stored(f, key).servedModels).toEqual({ "a/x": 2 })
   })
 })

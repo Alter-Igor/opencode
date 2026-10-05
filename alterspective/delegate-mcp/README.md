@@ -325,7 +325,7 @@ Each result is at most 32,000 characters. When a result is too big, whole list i
 | `oc_abort` | Stops a running session. |
 | `oc_close_session` | `{sessionID, deleteBranch?, abort?, discardWork?}`. Deletes one finished session: the OpenCode session, its copy in the box and the host record. Refuses while work would be lost. See "Closing sessions and clean-up". |
 | `oc_cleanup` | `{dryRun? = true, deleteBranch?}`. Lists, then closes, this bridge's sessions idle longer than `OPENCODE_DELEGATE_SESSION_TTL_DAYS` (default 14; 0 turns it off). It never aborts and never discards work. |
-| `oc_report` | `{sinceDays? = 30, groupBy? = "model" \| "agent" \| "repo", recent? = 0}`. How delegated tasks went: counts, success rate, duration, and what happened to the work. See "Reporting". |
+| `oc_report` | `{sinceDays? = 30, groupBy? = "model" \| "servedModel" \| "agent" \| "repo", recent? = 0}`. How delegated tasks went: counts, success rate, duration, and what happened to the work. See "Reporting". |
 | `oc_list_sessions` | This bridge's sessions. `all: true` lists every session in the box, with the bridge that owns it. |
 | `oc_post` | Posts to the agent inbox as this bridge. `wake: true` also delivers it to one of this bridge's sessions. |
 | `oc_inbox` | Reads this bridge's inbox. Text is untrusted; `truncated: true` means old unread messages were dropped. |
@@ -368,7 +368,7 @@ A finished session should not leave anything behind. The usual order is `oc_coll
 
 ## Reporting
 
-The bridge keeps one small record per task on your PC, at `<home>/workspaces/reports/<key>.json`. The box never sees this folder. A record holds metadata only: model sent, agent, repo name, times, send count, outcome, commits collected and what happened to the work. It never holds prompt or answer text, file contents or error bodies. An error is kept only as a known error code, else `other`.
+The bridge keeps one small record per task on your PC, at `<home>/workspaces/reports/<key>.json`. The box never sees this folder. A record holds metadata only: model sent, the models Synapse served (#76), agent, repo name, times, send count, outcome, commits collected and what happened to the work. It never holds prompt or answer text, file contents or error bodies. An error is kept only as a known error code, else `other`.
 
 - **When records change:** start, send, wait, result, collect, close and the sweep. A tool never waits for a record to be saved. Saves run in the background and are flushed before `oc_report` reads and at shutdown. A failed save is logged once and never fails a tool.
 - **Several bridges** can share the home folder. Each record has its own lock file, so two processes do not lose each other's counts. In one rare race (an old lock being taken over while its owner wakes up), two writers can still overlap; the worst case is one lost count. This is logged as `lock_relink_failed`.
@@ -376,7 +376,9 @@ The bridge keeps one small record per task on your PC, at `<home>/workspaces/rep
 - **`oc_report`** returns `notes`, `sinceDays`, `groupBy`, `since`, `totals`, `groups` (each `name` under `untrusted`), and `recent` when asked for. `totals` and each group hold `tasks`, `completed`, `error`, `aborted`, `unknown`, `notSent`, `running`, `finished`, `successRate`, `durationMs {median, p90, samples}` and `dispositions {collected, closedDiscarded, open, closedClean, swept}`.
   - `unknown` includes `notSent` (started but never given a task). `finished` = completed + error + aborted + unknown − notSent, so tasks never sent are left out.
   - A task nobody waited on is settled at close from the session's state: idle is `completed`, an error state or a session that never started is `error`, a real abort is `aborted`, anything else is `unknown`.
-  - "Model" means the model the bridge sent. **A `synapse/auto` row does not say which model Synapse picked** (follow-up #76).
+  - `groupBy: "model"` is the model the bridge sent, so a `synapse/auto` row does not say which model Synapse picked. `groupBy: "servedModel"` (#76) does: each task is grouped by the model that served most of its calls.
+  - **Where served models come from:** Synapse names the model it used in the response header `x-synapse-served-model`. front's access log writes that header and the session id the box's OpenCode sends (`x-opencode-session`); nothing else from the request (no URI, body or token). After `oc_result` and at close, the bridge reads front's log since the task's first send (`docker logs --since`, the newest 20,000 lines at most, in the background) and stores the counts in the record. front's log is shared by every session, so on a busy box a long task's earliest calls can fall outside those lines and its counts come out low; a later read can raise them. A read after a box restart sees fewer calls (front's log starts again), so it never replaces a larger count. `(unknown)` means it was never read.
+  - The session id is written by the box, and the box is one trust zone, so one session could claim another's. That skews these counts only; treat them as a guide.
   - Token counts are a lower bound: they cover only the messages `oc_result` fetched.
 
 ## Troubleshooting

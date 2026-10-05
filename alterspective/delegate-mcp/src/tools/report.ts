@@ -15,7 +15,8 @@ export const MAX_SINCE_DAYS = 365
 export const MAX_RECENT = 50
 /** Review cycle 1: what the numbers cannot show (bridge words only). */
 export const NOTES = [
-  "Models are the ones sent: synapse/auto hides which model Synapse routed each task to.",
+  "groupBy model is the model sent (synapse/auto hides the routed model). groupBy servedModel (#76) is the model Synapse served most of a task's calls, read from front's log when oc_result or a close ran; (unknown) means it was never read, for example a task from before bridge 0.4.0 or one whose box was restarted before any read.",
+  "Served models are attributed by the session id the box sends; one session could claim another's, so treat them as a guide.",
   "Token counts are a lower bound: they cover only the messages oc_result fetched.",
 ]
 
@@ -27,6 +28,7 @@ function row(r: TaskRecord) {
     repo: untrusted(r.repo, 128),
     ...(r.agent ? { agent: untrusted(r.agent, 64) } : {}),
     ...(r.requestedModel ? { requestedModel: r.requestedModel } : {}),
+    ...(r.servedModels ? { servedModels: r.servedModels } : {}),
     startedAt: r.startedAt,
     sendCount: r.sendCount,
     ...(r.lastSendAt ? { lastSendAt: r.lastSendAt } : {}),
@@ -60,11 +62,11 @@ export const reportTool = defineTool({
   name: "oc_report",
   title: "Delegation report",
   description:
-    "Report on delegated tasks recorded by the bridges sharing this bridge home: task count, completed / error / aborted / unknown / running, success rate (completed / finished, where finished = completed + error + aborted + unknown; unknown is a run closed or lost before it settled, so it lowers the rate and never raises it; a task never sent is not counted), median and p90 duration (first send to finish), and work collected vs discarded vs still open, overall and per model (the model sent), agent or repo. " +
+    "Report on delegated tasks recorded by the bridges sharing this bridge home: task count, completed / error / aborted / unknown / running, success rate (completed / finished, where finished = completed + error + aborted + unknown; unknown is a run closed or lost before it settled, so it lowers the rate and never raises it; a task never sent is not counted), median and p90 duration (first send to finish), and work collected vs discarded vs still open, overall and per model (the model sent), servedModel (the model Synapse actually served most of each task's calls, #76), agent or repo. " +
     "recent: N adds the newest N task records (metadata only: no prompt or answer text is ever recorded). Agent and repo names are under untrusted; `notes` says what the numbers cannot show. Records older than 90 days, or beyond the newest 2000 (open tasks excepted), are dropped.",
   input: {
     sinceDays: z.number().int().min(1).max(MAX_SINCE_DAYS).optional().describe(`Tasks started in the last N days. Default ${DEFAULT_SINCE_DAYS}.`),
-    groupBy: z.enum(["model", "agent", "repo"]).optional().describe("Break the metrics down by model (default), agent or repo."),
+    groupBy: z.enum(["model", "servedModel", "agent", "repo"]).optional().describe("Break the metrics down by model sent (default), servedModel (the model Synapse served most of each task's calls), agent or repo."),
     recent: z.number().int().min(0).max(MAX_RECENT).optional().describe(`Also list the newest N task records. Default 0, at most ${MAX_RECENT}.`),
   },
   annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
