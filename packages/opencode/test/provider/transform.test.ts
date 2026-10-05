@@ -2194,6 +2194,68 @@ describe("ProviderTransform.message - Mistral tool call IDs", () => {
   )
 })
 
+describe("ProviderTransform.message - Synapse single system message (#111)", () => {
+  const synapse = {
+    id: "synapse/auto",
+    providerID: "synapse",
+    api: { id: "auto", url: "https://synapse.example/v1", npm: "@ai-sdk/openai-compatible" },
+    capabilities: { interleaved: false, input: { text: true, image: false, audio: false, video: false, pdf: false } },
+  } as any
+  const custom = { ...synapse, id: "custom/auto", providerID: "custom" } as any
+
+  test("merges every system message into one leading message, in order", () => {
+    const result = ProviderTransform.message(
+      [
+        { role: "system", content: "header" },
+        { role: "system", content: "plugin line" },
+        { role: "user", content: "hi" },
+        { role: "system", content: "late line" },
+        { role: "assistant", content: "hello" },
+      ] as ModelMessage[],
+      synapse,
+      {},
+    )
+    expect(result).toEqual([
+      { role: "system", content: "header\n\nplugin line\n\nlate line" },
+      { role: "user", content: "hi" },
+      { role: "assistant", content: "hello" },
+    ])
+  })
+
+  test("drops empty system blocks and leaves one leading system message as it is", () => {
+    const merged = ProviderTransform.message(
+      [
+        { role: "system", content: "header" },
+        { role: "system", content: "  " },
+        { role: "user", content: "hi" },
+      ] as ModelMessage[],
+      synapse,
+      {},
+    )
+    expect(merged.map((m) => m.role)).toEqual(["system", "user"])
+    expect(merged[0]!.content).toBe("header")
+
+    const single = [
+      { role: "system", content: "header" },
+      { role: "user", content: "hi" },
+    ] as ModelMessage[]
+    expect(ProviderTransform.message(single, synapse, {})).toEqual(single)
+  })
+
+  test("other providers keep their system messages as they are", () => {
+    const result = ProviderTransform.message(
+      [
+        { role: "system", content: "header" },
+        { role: "system", content: "plugin line" },
+        { role: "user", content: "hi" },
+      ] as ModelMessage[],
+      custom,
+      {},
+    )
+    expect(result.map((m) => m.role)).toEqual(["system", "system", "user"])
+  })
+})
+
 describe("ProviderTransform.message - DeepSeek reasoning content", () => {
   test("DeepSeek with tool calls includes reasoning_content in providerOptions", () => {
     const msgs = [
