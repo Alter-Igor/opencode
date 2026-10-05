@@ -14,8 +14,8 @@ import {
   exitCodeFor,
   harnessEnv,
   parseHarnessRequest,
+  readTail,
   pathsToCheck,
-  tail,
   type HarnessOutcome,
   type HarnessRequest,
 } from "./harness"
@@ -75,9 +75,13 @@ async function runTests(request: HarnessRequest, work: string, home: string): Pr
     proc.kill("SIGKILL")
     // runuser alone dies; its children (bun test, a server the tests started) would keep the output
     // pipes open and hang this run. Kill everything the harness user owns.
-    Bun.spawn(["pkill", "-KILL", "-u", HARNESS_USER], { stdout: "ignore", stderr: "ignore" })
+    // main() checked that pkill exists; a spawn error here must not crash the runner.
+    try {
+      Bun.spawn(["pkill", "-KILL", "-u", HARNESS_USER], { stdout: "ignore", stderr: "ignore" })
+    } catch {}
   }, request.timeoutSec * 1000)
-  const [stdout, stderr, exitCode] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited])
+  // Keep only the end of each stream while reading, so endless test output cannot exhaust memory.
+  const [stdoutTail, stderrTail, exitCode] = await Promise.all([readTail(proc.stdout), readTail(proc.stderr), proc.exited])
   clearTimeout(timer)
   // A timeout is never a pass; classify() reports it as a harness error.
   return {
@@ -86,8 +90,8 @@ async function runTests(request: HarnessRequest, work: string, home: string): Pr
     exitCode: timedOut ? null : exitCode,
     timedOut,
     durationMs: Date.now() - started,
-    stdoutTail: tail(stdout),
-    stderrTail: tail(stderr),
+    stdoutTail,
+    stderrTail,
   }
 }
 
@@ -106,13 +110,13 @@ async function main(): Promise<number> {
   try {
     if (!parsed.ok) throw new Error(`bad request: ${parsed.reason}`)
     const request = parsed.request
+    // pkill freezes the agent and kills the test tree on timeout, whatever freezeAgent says. Bun's
+    // shell reports a missing command as exit 1 ("no process matched" for pkill), so check it exists.
+    if (!Bun.which("pkill")) throw new Error("pkill is not installed (procps): cannot freeze the agent or stop the tests")
     const work = await prepare(request, workRoot)
     if (request.freezeAgent) {
       // Freeze the agent's processes so nothing it left running can race the tests. A freeze that
-      // cannot run (pkill missing or failing) is a harness error, never a silent skip.
-      // Bun's shell reports a missing command as exit 1 ("no process matched" for pkill), so check
-      // that pkill exists first.
-      if (!Bun.which("pkill")) throw new Error("cannot freeze the agent's processes: pkill is not installed (procps)")
+      // fails is a harness error, never a silent skip.
       const freeze = await $`pkill -STOP -u ${AGENT_USER}`.nothrow().quiet()
       frozen = true
       if (!freezeSucceeded(freeze.exitCode)) throw new Error(`cannot freeze the agent's processes (pkill exit ${freeze.exitCode})`)

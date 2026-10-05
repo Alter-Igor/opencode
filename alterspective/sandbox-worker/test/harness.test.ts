@@ -8,6 +8,7 @@ import {
   harnessEnv,
   parseHarnessRequest,
   pathsToCheck,
+  readTail,
   tail,
   type HarnessOutcome,
 } from "../supervisor/harness"
@@ -108,6 +109,22 @@ describe("harnessEnv and tail", () => {
     const env = harnessEnv("/var/lib/sbxw-harness/run-x")
     expect(Object.keys(env).sort()).toEqual(["CI", "HOME", "LANG", "PATH"])
     expect(JSON.stringify(env)).not.toMatch(/SBXW_|KEY|TOKEN|PASSWORD/)
+  })
+
+  test("readTail keeps only the end of a long stream", async () => {
+    const chunks = Array.from({ length: 50 }, (_, i) => `line-${i};`)
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const c of chunks) controller.enqueue(new TextEncoder().encode(c))
+        controller.close()
+      },
+    })
+    const all = chunks.join("")
+    expect(await readTail(stream, 20)).toBe("…" + all.slice(-20))
+  })
+
+  test("readTail returns a short stream unchanged", async () => {
+    expect(await readTail(new Response("hello").body!, 20)).toBe("hello")
   })
 
   test("tail keeps the end of a long log", () => {

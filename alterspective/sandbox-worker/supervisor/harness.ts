@@ -114,6 +114,26 @@ export function pathsToCheck(extractTo: string, members: string[]): { ok: true; 
   return { ok: true, paths: [...paths].sort() }
 }
 
+/** Read a stream to the end, keeping only its last `max` characters (as `tail` would). */
+export async function readTail(stream: ReadableStream<Uint8Array>, max = 8000): Promise<string> {
+  const decoder = new TextDecoder()
+  let kept = ""
+  let cut = false
+  for await (const chunk of stream) {
+    kept += decoder.decode(chunk, { stream: true })
+    if (kept.length > 2 * max) {
+      kept = kept.slice(-max)
+      cut = true
+    }
+  }
+  kept += decoder.decode()
+  if (kept.length > max) {
+    kept = kept.slice(-max)
+    cut = true
+  }
+  return cut ? `…${kept}` : kept
+}
+
 /** The last `max` characters, so a huge test log cannot bloat the result. */
 export function tail(text: string, max = 8000): string {
   return text.length <= max ? text : `…${text.slice(-max)}`
