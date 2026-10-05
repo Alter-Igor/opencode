@@ -21,6 +21,8 @@ export type TaskRecord = {
   bridge: string
   /** The owner repo's folder name only, never the full path. */
   repo: string
+  /** Folder name of the bridge's working directory, the Claude Code session's project, or OPENCODE_DELEGATE_CALLER; not an ownership key. */
+  caller?: string
   agent?: string
   /**
    * The model last sent (`synapse/<id>` since #71). OpenCode only echoes the requested ids, so
@@ -57,6 +59,8 @@ const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/
 const BRIDGE_RE = /^[a-z0-9-]{1,40}$/
 /** A folder name: printable, no separators. */
 const REPO_RE = /^[^\\/\u0000-\u001f\u007f]{1,128}$/
+/** #132: the caller label: printable, at most 128 characters (separators are fine here). */
+const CALLER_RE = /^[^\u0000-\u001f\u007f]{1,128}$/
 
 /** Review cycle 1 (INFO 7): the only error codes a record keeps. Anything else is stored as "other". */
 const KNOWN_ERROR_CODES: ReadonlySet<string> = new Set<string>(ErrorCode)
@@ -75,13 +79,14 @@ export function repoName(hostRepo: string): string {
   return REPO_RE.test(name) ? name : "(unknown)"
 }
 
-export function newTaskRecord(input: { sessionID: string; key: string; bridge: string; repo: string; startedAt: string; agent?: string; requestedModel?: string }): TaskRecord {
+export function newTaskRecord(input: { sessionID: string; key: string; bridge: string; repo: string; caller?: string; startedAt: string; agent?: string; requestedModel?: string }): TaskRecord {
   return {
     v: RECORD_VERSION,
     sessionID: input.sessionID,
     key: input.key,
     bridge: input.bridge,
     repo: input.repo,
+    ...(input.caller && CALLER_RE.test(input.caller) ? { caller: input.caller } : {}),
     ...(input.agent && AGENT_RE.test(input.agent) ? { agent: input.agent } : {}),
     ...(input.requestedModel && MODEL_RE.test(input.requestedModel) ? { requestedModel: input.requestedModel } : {}),
     startedAt: input.startedAt,
@@ -132,6 +137,7 @@ export function parseTaskRecord(raw: string): TaskRecord | undefined {
   const disposition = pick(p.disposition, DISPOSITIONS)
   if (p.v !== RECORD_VERSION || !sessionID || !key || !bridge || !repo || !startedAt || !outcome || !disposition) return undefined
   const optional = {
+    caller: str(p.caller, CALLER_RE),
     agent: str(p.agent, AGENT_RE),
     requestedModel: str(p.requestedModel, MODEL_RE),
     servedModels: servedModels(p.servedModels),

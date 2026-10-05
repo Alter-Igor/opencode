@@ -26,6 +26,7 @@ function row(r: TaskRecord) {
     sessionID: r.sessionID,
     bridge: r.bridge,
     repo: untrusted(r.repo, 128),
+    ...(r.caller ? { caller: untrusted(r.caller, 128) } : {}),
     ...(r.agent ? { agent: untrusted(r.agent, 64) } : {}),
     ...(r.requestedModel ? { requestedModel: r.requestedModel } : {}),
     ...(r.servedModels ? { servedModels: r.servedModels } : {}),
@@ -62,11 +63,11 @@ export const reportTool = defineTool({
   name: "oc_report",
   title: "Delegation report",
   description:
-    "Report on delegated tasks recorded by the bridges sharing this bridge home: task count, completed / error / aborted / unknown / running, success rate (completed / finished, where finished = completed + error + aborted + unknown; unknown is a run closed or lost before it settled, so it lowers the rate and never raises it; a task never sent is not counted), median and p90 duration (first send to finish), and work collected vs discarded vs still open, overall and per model (the model sent), servedModel (the model Synapse actually served most of each task's calls, #76), agent or repo. " +
-    "recent: N adds the newest N task records (metadata only: no prompt or answer text is ever recorded). Agent and repo names are under untrusted; `notes` says what the numbers cannot show. Records older than 90 days, or beyond the newest 2000 (open tasks excepted), are dropped.",
+    "Report on delegated tasks recorded by the bridges sharing this bridge home: task count, completed / error / aborted / unknown / running, success rate (completed / finished, where finished = completed + error + aborted + unknown; unknown is a run closed or lost before it settled, so it lowers the rate and never raises it; a task never sent is not counted), median and p90 duration (first send to finish), and work collected vs discarded vs still open, overall and per model (the model sent), servedModel (the model Synapse actually served most of each task's calls, #76), agent, repo or caller (#132: which session delegated: the folder name of the bridge's working directory, or OPENCODE_DELEGATE_CALLER). " +
+    "recent: N adds the newest N task records (metadata only: no prompt or answer text is ever recorded). Agent, repo and caller names are under untrusted; `notes` says what the numbers cannot show. Records older than 90 days, or beyond the newest 2000 (open tasks excepted), are dropped.",
   input: {
     sinceDays: z.number().int().min(1).max(MAX_SINCE_DAYS).optional().describe(`Tasks started in the last N days. Default ${DEFAULT_SINCE_DAYS}.`),
-    groupBy: z.enum(["model", "servedModel", "agent", "repo"]).optional().describe("Break the metrics down by model sent (default), servedModel (the model Synapse served most of each task's calls), agent or repo."),
+    groupBy: z.enum(["model", "servedModel", "agent", "repo", "caller"]).optional().describe("Break the metrics down by model sent (default), servedModel (the model Synapse served most of each task's calls), agent, repo or caller (which session delegated; a record from before 0.5.1 is (unknown))."),
     recent: z.number().int().min(0).max(MAX_RECENT).optional().describe(`Also list the newest N task records. Default 0, at most ${MAX_RECENT}.`),
   },
   annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },

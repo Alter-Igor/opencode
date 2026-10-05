@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.1 — 2026-10-05
+
+**Which session delegated (#132).** The dashboard and `oc_report` can now tell sessions apart even when every session starts its bridge with the same `OPENCODE_DELEGATE_NAME`.
+
+- Each task record gets a `caller`: the folder name of the bridge's working directory (the Claude Code session's project), or `OPENCODE_DELEGATE_CALLER` when set. It is worked out once when the bridge starts. It is a label only, not an ownership key. The bridge name, ownership, pruning, adoption and close logic are unchanged.
+- The dashboard's "Who is delegating" table is now per session (project folder); a record without a caller (from before this version) is listed under its bridge name. The running and recent tables gain a "Session" column.
+- `oc_report {groupBy: "caller"}` groups by it (records without one are `(unknown)`), and `recent` rows carry `caller` under `untrusted`.
+- Old records have no caller and still read as before (record version stays 1). No new dependency.
+
 ## 0.5.0 — 2026-10-05
 
 **A local dashboard for delegated work (#129).** New tool `oc_dashboard`.
