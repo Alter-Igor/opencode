@@ -79,7 +79,7 @@ export const startSessionTool = defineTool({
     title: z.string().max(200).optional(),
     agent: agentSchema.optional().describe("OpenCode agent for the session, e.g. build (default) or plan."),
     model: modelSchema.optional().describe("Default model for this session's sends: a Synapse model from oc_list_models (synapse/<id>). Default: the sandbox's default, synapse/auto."),
-    profile: z.enum(["standard", "readonly"]).optional().describe("Permission profile. readonly denies edits and asks before any shell command. Default standard."),
+    profile: z.enum(["standard", "readonly"]).optional().describe("Permission profile. readonly denies edits and asks before any shell command and Keystone tool call (except the dynamic connection when the delegation gate asks before risky tools). Default standard."),
     allowShared: z.boolean().optional().describe("Allow this session while another one of ours is still working in the same repo (each has its own copy)."),
     keystone: z
       .array(z.string().regex(CONNECTION_ID, "a Keystone connection id"))

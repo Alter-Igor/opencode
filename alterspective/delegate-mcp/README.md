@@ -60,7 +60,7 @@ The box sets `OPENCODE_DISABLE_SESSION_RETROSPECTIVES=1`. The fork's observer sk
 **Other known limits.**
 
 - The bash "ask" rules (for example `git push`) are a convenience, not a wall. An agent can dodge them with a script or another spelling. Subagents drop "ask" rules.
-- Keystone tools can change remote state. The `readonly` profile asks before each Keystone tool call. The `standard` profile allows them.
+- Keystone tools can change remote state. The `readonly` profile asks before each Keystone tool call. The `standard` profile allows them. Exception (#104): `ks-dynamic` tools do not ask in `readonly`, because the delegation gate already holds every risky call for an approval; with a profile that has `approvals: "listed"` they ask again.
 - `oc_start_session {keystone: [...]}` narrows one session to some of the chosen services. **This is not a wall.** It is an OpenCode permission rule. It keeps a well-behaved agent to those services. Code in the box can still use every service of the box-wide set.
 - The caches can serve any public package. A bad package runs inside the box only.
 - Code in the box can fill its own volumes (`/sessions`, `/data`, `/handoff/out`). They live on the Docker disk, not in a folder on your PC, but on Docker Desktop that disk is still a file on your drive. Docker's local volumes have no size cap.
@@ -101,6 +101,7 @@ box (no tokens) --> front (adds your dynamic token) --> mcp-gate (profile + appr
   - makes **risky tools wait for an approval**: anything that may send data out, change something or run code (send mail, post, create, delete, execute code). The risk words are copied from CAS (`src/core/domain/tool-risk.ts`). A name with no read verb counts as a change (fail closed);
   - never logs your token or a call's arguments.
 - **Approvals.** A held call returns at once with "needs approval `apr_...`". `oc_pending` lists it (kind `approval`, box-wide, the call details under `untrusted`). `oc_answer {requestID: "apr_...", kind: "approval", reply: "once"}` lets **that exact call** (same tool, same arguments) run once when the agent retries it within 30 minutes; `reply: "reject"` refuses it. `always` is refused. Approvals live in the gate's memory: a restart forgets them.
+- **Read-only sessions** (owner decision A, 2026-10-05): OpenCode does not ask before `ks-dynamic` calls, so you are asked once, by the gate, and only for risky tools. If your profile has `approvals: "listed"`, the gate no longer asks for every risky tool, so read-only sessions ask before each `ks-dynamic` call again.
 - **The profile** (optional, yours): `OPENCODE_DELEGATE_DYNAMIC_PROFILE` in this MCP server's env, JSON with CAS's field names. A profile only narrows; empty means every tool, risky ones asked first.
 
   ```json

@@ -3,6 +3,8 @@
 // its effect under OpenCode's last-match-wins evaluation.
 import { describe, expect, test } from "bun:test"
 import { checkPermissionReply, permissionBaseline, type Rule } from "../src/guard/permissions.ts"
+import { createGuard, gateAsksForRisky } from "../src/guard/index.ts"
+import { defaultConfig } from "../src/shared/config.ts"
 
 // Mirror of packages/opencode/src/util/wildcard.ts + permission/index.ts `evaluate` (findLast).
 function wildcard(input: string, pattern: string): boolean {
@@ -74,6 +76,51 @@ describe("permissionBaseline(readonly)", () => {
   test("keeps every standard rule", () => {
     const standard = permissionBaseline("standard")
     for (const rule of standard) expect(rules).toContainEqual(rule)
+  })
+})
+
+describe("#104: read-only sessions and the dynamic connection (owner decision A)", () => {
+  test("gated: ks-dynamic tools are allowed, other Keystone tools still ask, edits and shell unchanged", () => {
+    const rules = permissionBaseline("readonly", undefined, true)
+    expect(evaluate(rules, "ks-dynamic_execute-tool", "*")).toBe("allow")
+    expect(evaluate(rules, "ks-dynamic_search-tools", "*")).toBe("allow")
+    expect(evaluate(rules, "ks-github_add_issue_comment", "*")).toBe("ask")
+    expect(evaluate(rules, "edit", "src/a.ts")).toBe("deny")
+    expect(evaluate(rules, "bash", "ls")).toBe("ask")
+  })
+
+  test("not gated (approvals listed): ks-dynamic tools still ask", () => {
+    expect(evaluate(permissionBaseline("readonly", undefined, false), "ks-dynamic_execute-tool", "*")).toBe("ask")
+  })
+
+  test("narrowed to dynamic + github: dynamic allowed only when gated, github asks, others denied", () => {
+    const rules = permissionBaseline("readonly", ["dynamic", "github"], true)
+    expect(evaluate(rules, "ks-dynamic_execute-tool", "*")).toBe("allow")
+    expect(evaluate(rules, "ks-github_issue_read", "*")).toBe("ask")
+    expect(evaluate(rules, "ks-seqlogs_query", "*")).toBe("deny")
+    expect(evaluate(permissionBaseline("readonly", ["dynamic"], false), "ks-dynamic_execute-tool", "*")).toBe("ask")
+  })
+
+  test("standard sessions do not change with the flag", () => {
+    expect(permissionBaseline("standard", undefined, true)).toEqual(permissionBaseline("standard"))
+    expect(permissionBaseline("standard", ["dynamic"], true)).toEqual(permissionBaseline("standard", ["dynamic"]))
+  })
+
+  test("gateAsksForRisky: default and risky profiles ask at the gate; listed or a damaged profile does not", () => {
+    expect(gateAsksForRisky("")).toBe(true)
+    expect(gateAsksForRisky('{"approvals":"risky"}')).toBe(true)
+    expect(gateAsksForRisky('{"deniedToolPatterns":["m365__*"]}')).toBe(true)
+    expect(gateAsksForRisky('{"approvals":"listed"}')).toBe(false)
+    expect(gateAsksForRisky("{not json")).toBe(false)
+  })
+
+  test("createGuard reads the owner's profile, and the tool deny list still comes last", () => {
+    const base = defaultConfig({})
+    expect(evaluate(createGuard(base).permissionBaseline("readonly"), "ks-dynamic_execute-tool", "*")).toBe("allow")
+    const listed = createGuard({ ...base, dynamicProfile: '{"approvals":"listed"}' }).permissionBaseline("readonly")
+    expect(evaluate(listed, "ks-dynamic_execute-tool", "*")).toBe("ask")
+    const denied = createGuard({ ...base, keystoneToolDeny: ["ks-dynamic_execute-tool"] }).permissionBaseline("readonly")
+    expect(evaluate(denied, "ks-dynamic_execute-tool", "*")).toBe("deny")
   })
 })
 
