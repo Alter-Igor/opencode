@@ -16,10 +16,11 @@ const fail = (message: string): never => {
 if (process.getuid?.() !== 0) fail("must run as root")
 const agentUser = process.env.SBXW_AGENT_USER || "agent"
 const agentUid = await $`id -u ${agentUser}`.nothrow().quiet()
-if (agentUid.exitCode === 0) {
-  const running = pidsOwnedBy(Number(agentUid.text().trim()))
-  if (running.length > 0) fail(`${agentUser} already has ${running.length} process(es); lock down before the agent starts`)
-}
+// Fail closed: a wrong user name would skip the check and let a running agent's flows survive.
+const uid = Number(agentUid.text().trim())
+if (agentUid.exitCode !== 0 || !Number.isInteger(uid)) fail(`agent user ${agentUser} not found; set SBXW_AGENT_USER`)
+const running = pidsOwnedBy(uid)
+if (running.length > 0) fail(`${agentUser} already has ${running.length} process(es); lock down before the agent starts`)
 let ruleset: string
 try {
   ruleset = renderRuleset({ allow: parseAllow(process.env.SBXW_EGRESS_ALLOW), dns: process.env.SBXW_EGRESS_DNS || undefined })
