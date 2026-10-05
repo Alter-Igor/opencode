@@ -54,7 +54,7 @@ Containers are named `sbxw-<id>`, labelled `alterspective.sandbox-worker=spike`,
   "taskId": "sbxw-…",
   "model": { "baseURL": "https://…/v1", "headers": { "x-task-type": "code" }, "onPremDefault": ["qwen3.8-27b-dflash2"] },
   "modelPolicy": { "cell": { "modelIds": ["…"] }, "effectivePolicyVersion": "…" },
-  "repo": { "bundle": "/run/sbxw/input/repo.bundle", "ref": "optional", "sha256": "<bundle file SHA-256>", "treeSha": "<tree of the commit to work on>", "dependencies": "/run/sbxw/input/deps/node_modules" },
+  "repo": { "bundle": "/run/sbxw/input/repo.bundle", "ref": "optional", "sha256": "<bundle file SHA-256>", "treeSha": "<tree of the commit to work on>", "dependencies": "/work/.sbxw-deps/node_modules" },
   "permission": { "*": "allow", "external_directory": "deny" },
   "listen": { "hostname": "127.0.0.1", "port": 4096 }
 }

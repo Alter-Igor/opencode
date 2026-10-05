@@ -67,9 +67,9 @@ if (manifest.repo?.bundle) {
     if (!check.ok) fail(`refusing to start: ${check.reason}`)
     verified.tree = true
   }
-  // #85: dependencies the service installed before the egress lockdown. Moved, not copied (same
-  // tmpfs), and kept out of the patch below. A clone that already carries node_modules is refused:
-  // two sources of truth.
+  // #85: dependencies the service installed before the egress lockdown. Moved with the system mv
+  // (a rename on the same filesystem; Bun's builtin mv refuses a cross-device move), and kept out of
+  // the patch below. A clone that already carries node_modules is refused: two sources of truth.
   if (manifest.repo.dependencies !== undefined) {
     const check = await checkDependenciesDir(manifest.repo.dependencies)
     if (!check.ok) fail(`refusing to start: ${check.reason}`)
@@ -77,7 +77,7 @@ if (manifest.repo?.bundle) {
     if ((await $`test -e ${target}`.nothrow().quiet()).exitCode === 0) {
       fail("refusing to start: the repository already has node_modules; repo.dependencies would shadow it")
     }
-    const moved = await $`mv ${manifest.repo.dependencies} ${target}`.nothrow().quiet()
+    const moved = await $`/bin/mv ${manifest.repo.dependencies} ${target}`.nothrow().quiet()
     if (moved.exitCode !== 0) fail(`refusing to start: cannot move repo.dependencies into the clone: ${moved.stderr.toString().trim()}`)
   }
 } else {
