@@ -139,8 +139,13 @@ export function frontServers(hosts: readonly string[], keystone: FrontKeystone):
  */
 export function frontServersFor(config: Pick<BridgeConfig, "egressHosts" | "keystoneOrigin" | "keystoneConnections" | "dynamicProfile">): string {
   const servers = frontServers(config.egressHosts, { host: new URL(config.keystoneOrigin).hostname, connections: config.keystoneConnections })
-  if (!config.keystoneConnections.includes(DYNAMIC_ID)) return servers
-  return `${servers}# delegation profile sha256: ${createHash("sha256").update(config.dynamicProfile).digest("hex")}\n`
+  return withDelegationProfile(servers, config.keystoneConnections, config.dynamicProfile)
+}
+
+/** The profile-digest line frontServersFor adds when dynamic is chosen; oc_doctor's check (#115) uses it too. */
+export function withDelegationProfile(servers: string, connections: readonly string[], profile: string): string {
+  if (!connections.includes(DYNAMIC_ID)) return servers
+  return `${servers}# delegation profile sha256: ${createHash("sha256").update(profile).digest("hex")}\n`
 }
 
 /** The front-config label value: sha256 of the generated servers file. */
