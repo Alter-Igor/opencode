@@ -7,6 +7,7 @@ import {
   exitCodeFor,
   harnessEnv,
   parseHarnessRequest,
+  pathsToCheck,
   tail,
   type HarnessOutcome,
 } from "../supervisor/harness"
@@ -81,6 +82,11 @@ describe("classify: the agent's claim and the tests are reported apart", () => {
     expect(classify("GOAL_MET", error)).toBe("harness-error")
     expect(exitCodeFor("harness-error", error)).toBe(2)
   })
+  test("a timeout is a harness error, never claim-refuted", () => {
+    const timedOut: HarnessOutcome = { ...failed, exitCode: null, timedOut: true }
+    expect(classify("GOAL_MET", timedOut)).toBe("harness-error")
+    expect(exitCodeFor(classify("GOAL_MET", timedOut), timedOut)).toBe(2)
+  })
   test("exit codes: 0 passed, 1 failed", () => {
     expect(exitCodeFor("claim-confirmed", passed)).toBe(0)
     expect(exitCodeFor("claim-refuted", failed)).toBe(1)
@@ -108,5 +114,22 @@ describe("harnessEnv and tail", () => {
     expect(tail("short")).toBe("short")
     const long = "x".repeat(20) + "END"
     expect(tail(long, 5)).toBe("…" + long.slice(-5))
+  })
+})
+
+describe("pathsToCheck: every place the tests get written", () => {
+  test("covers extractTo and every folder and file of each member", () => {
+    expect(pathsToCheck("a/b", ["hidden/", "hidden/x.test.ts"])).toEqual({
+      ok: true,
+      paths: ["a", "a/b", "a/b/hidden", "a/b/hidden/x.test.ts"],
+    })
+  })
+  test("the repo root itself is not a path to check", () => {
+    expect(pathsToCheck(".", ["./hidden/x.test.ts", ""])).toEqual({ ok: true, paths: ["hidden", "hidden/x.test.ts"] })
+  })
+  test("refuses members that escape the repo", () => {
+    expect(pathsToCheck(".", ["../x"]).ok).toBe(false)
+    expect(pathsToCheck(".", ["/etc/x"]).ok).toBe(false)
+    expect(pathsToCheck(".", ["a/../../x"]).ok).toBe(false)
   })
 })

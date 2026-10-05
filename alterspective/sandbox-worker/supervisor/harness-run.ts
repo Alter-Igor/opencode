@@ -4,6 +4,7 @@
 // Prints the result JSON and writes it to /var/lib/sbxw-harness/result-<taskId>.json.
 // Exit: 0 = tests passed, 1 = tests failed, 2 = harness error (fails closed: passed is false).
 import { $ } from "bun"
+import { lstat } from "fs/promises"
 import path from "path"
 import { sha256File } from "./bundle"
 import {
@@ -13,6 +14,7 @@ import {
   exitCodeFor,
   harnessEnv,
   parseHarnessRequest,
+  pathsToCheck,
   tail,
   type HarnessOutcome,
   type HarnessRequest,
@@ -39,6 +41,17 @@ async function prepare(request: HarnessRequest, workRoot: string): Promise<strin
   if ((await $`test -d ${work}`.nothrow().quiet()).exitCode !== 0 || copied.exitCode !== 0) {
     throw new Error(`cannot copy ${request.repoDir}: ${copied.stderr.toString().trim()}`)
   }
+  // The agent wrote the repo. A symlink where the tests go (say `hidden -> /tmp/x`) would make root
+  // unpack the hidden tests outside the private copy, where the agent can read them later. The copy
+  // sits in a root-only folder, so nothing can change it between this check and the unpack.
+  const listed = await $`tar -tf ${request.archive}`.nothrow().quiet()
+  if (listed.exitCode !== 0) throw new Error(`cannot list the tests archive: ${listed.stderr.toString().trim()}`)
+  const checked = pathsToCheck(request.extractTo, listed.stdout.toString().split("\n"))
+  if (!checked.ok) throw new Error(checked.reason)
+  for (const rel of checked.paths) {
+    const info = await lstat(path.join(work, rel)).catch(() => undefined)
+    if (info?.isSymbolicLink()) throw new Error(`the repo has a symlink at ${rel}, where the hidden tests go`)
+  }
   const target = path.join(work, request.extractTo)
   await $`mkdir -p ${target}`.quiet()
   const unpacked = await $`tar -xf ${request.archive} -C ${target} --no-same-owner`.nothrow().quiet()
@@ -60,10 +73,13 @@ async function runTests(request: HarnessRequest, work: string, home: string): Pr
   const timer = setTimeout(() => {
     timedOut = true
     proc.kill("SIGKILL")
+    // runuser alone dies; its children (bun test, a server the tests started) would keep the output
+    // pipes open and hang this run. Kill everything the harness user owns.
+    Bun.spawn(["pkill", "-KILL", "-u", HARNESS_USER], { stdout: "ignore", stderr: "ignore" })
   }, request.timeoutSec * 1000)
   const [stdout, stderr, exitCode] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited])
   clearTimeout(timer)
-  // A timeout is a failed run, never a pass.
+  // A timeout is never a pass; classify() reports it as a harness error.
   return {
     ran: true,
     passed: !timedOut && exitCode === 0,
@@ -105,6 +121,8 @@ async function main(): Promise<number> {
   } catch (error) {
     outcome = { ran: false, error: error instanceof Error ? error.message : String(error) }
   } finally {
+    // Nothing the tests started may outlive the run (and the agent must not find it later).
+    await $`pkill -KILL -u ${HARNESS_USER}`.nothrow().quiet()
     if (frozen) await $`pkill -CONT -u ${AGENT_USER}`.nothrow().quiet()
     await $`rm -rf ${workRoot}`.nothrow().quiet()
   }

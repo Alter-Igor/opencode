@@ -78,16 +78,17 @@ the tests and the claim all come from the service. Steps, all through the E2B SD
 2. `bun /opt/sbxw/supervisor/harness-run.ts /var/lib/sbxw-harness/in/request.json`. The runner:
    - checks the archive SHA-256;
    - copies the repo into a run folder that only the separate `sbxwharness` user can read (0700),
-     and unpacks the tests there;
+     and unpacks the tests there. It refuses (harness error) if the repo has a symlink anywhere the
+     tests would be written;
    - freezes the agent's processes (SIGSTOP) while the tests run, then resumes them;
    - runs the command as `sbxwharness` with a clean environment (`PATH`, `HOME`, `LANG`, `CI` only)
-     and the timeout;
+     and the timeout (on timeout it kills every `sbxwharness` process);
    - deletes the copy.
 3. Read the printed JSON (also `/var/lib/sbxw-harness/result-<taskId>.json`, root-only):
    `harness` (`ran`, `passed`, `exitCode`, `timedOut`, `durationMs`, output tails), `agentClaim`,
    and `agreement`: `claim-confirmed`, `claim-refuted`, `unclaimed-pass`, `unclaimed-fail` or
    `harness-error`. Exit code: 0 passed, 1 failed, 2 harness error. It fails closed: an error is
-   never a pass, and a timeout is a fail.
+   never a pass. A timeout is a harness error (`timedOut: true`), not a verdict on the work.
 
 The manifest's optional `harness: { required: true }` is recorded in `state.json` only. The runner
 never reads it.

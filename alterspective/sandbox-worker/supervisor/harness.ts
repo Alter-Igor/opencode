@@ -77,7 +77,9 @@ export type Agreement = "claim-confirmed" | "claim-refuted" | "unclaimed-pass" |
 
 /** The agent's claim and the hidden tests are reported apart; this only names how they relate. */
 export function classify(agentClaim: string, outcome: HarnessOutcome): Agreement {
-  if (!outcome.ran) return "harness-error"
+  // A timeout is a harness error, not a verdict on the work: the service cannot tell a hung test
+  // from wrong work, so it must not be read as claim-refuted (#121).
+  if (!outcome.ran || outcome.timedOut) return "harness-error"
   const claimed = agentClaim.trim().toUpperCase() === "GOAL_MET"
   if (claimed) return outcome.passed ? "claim-confirmed" : "claim-refuted"
   return outcome.passed ? "unclaimed-pass" : "unclaimed-fail"
@@ -91,6 +93,25 @@ export function harnessEnv(home: string): Record<string, string> {
     LANG: "C.UTF-8",
     CI: "1",
   }
+}
+
+/**
+ * Every path, relative to the repo root, where the tests get written: each folder of `extractTo`
+ * and each folder and file of every archive member. The runner checks none of them is a symlink in
+ * the repo copy, because the agent wrote that repo and root does the unpacking.
+ */
+export function pathsToCheck(extractTo: string, members: string[]): { ok: true; paths: string[] } | { ok: false; reason: string } {
+  const parts = (value: string) => value.split("/").filter((part) => part !== "" && part !== ".")
+  const base = parts(extractTo)
+  const paths = new Set<string>()
+  for (let i = 1; i <= base.length; i++) paths.add(base.slice(0, i).join("/"))
+  for (const member of members) {
+    if (member.trim() === "") continue
+    if (member.startsWith("/") || parts(member).includes("..")) return { ok: false, reason: `archive member escapes the repo: ${member}` }
+    const full = [...base, ...parts(member)]
+    for (let i = base.length + 1; i <= full.length; i++) paths.add(full.slice(0, i).join("/"))
+  }
+  return { ok: true, paths: [...paths].sort() }
 }
 
 /** The last `max` characters, so a huge test log cannot bloat the result. */
