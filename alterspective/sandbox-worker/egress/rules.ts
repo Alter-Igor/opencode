@@ -106,6 +106,9 @@ export function renderRuleset(config: EgressConfig): string {
     `    type filter hook output priority 0; policy drop;`,
     `    oif "lo" accept`,
     `    ct state established,related accept`,
+    // Its own counter, so the on-link check proves it hit the firewall (a public IPv6 address can
+    // fail on routing before the hook and never count).
+    `    ip6 daddr fe80::/10 counter drop comment "ipv6-link-local"`,
     `    counter drop comment "ipv6"`,
     `  }`,
     `}`,

@@ -24,5 +24,5 @@ if (applied.exitCode !== 0) fail(`nft -f failed: ${applied.stderr.toString().tri
 const v4 = (await $`nft list table ip ${TABLE}`.nothrow().quiet().text()).trim()
 const v6 = (await $`nft list table ip6 ${TABLE}`.nothrow().quiet().text()).trim()
 if (!/policy drop/.test(v4) || !/comment "metadata"/.test(v4)) fail("the ip table did not load as expected")
-if (!/policy drop/.test(v6) || !/comment "ipv6"/.test(v6)) fail("the ip6 table did not load as expected")
+if (!/policy drop/.test(v6) || !/comment "ipv6"/.test(v6) || !/comment "ipv6-link-local"/.test(v6)) fail("the ip6 table did not load as expected")
 console.log(`[sbxw-egress] locked down: tables ip and ip6 ${TABLE}, policy drop`)

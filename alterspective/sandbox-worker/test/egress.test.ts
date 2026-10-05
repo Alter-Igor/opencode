@@ -38,6 +38,7 @@ describe("renderRuleset", () => {
     expect(text).not.toContain("inet")
     expect(ip).toContain("policy drop;")
     expect(ip6).toContain("policy drop;")
+    expect(ip6).toContain('ip6 daddr fe80::/10 counter drop comment "ipv6-link-local"')
     expect(ip6).toContain('counter drop comment "ipv6"')
   })
 
@@ -92,7 +93,7 @@ describe("decide", () => {
   const good: Observations = {
     before: result((id) => ["control", "metadata", "other-host", "other-port", "udp-dns"].includes(id)),
     after: result((id) => id === "control"),
-    counters: { metadata: 2, ipv6: 5 },
+    counters: { metadata: 2, ipv6: 5, "ipv6-link-local": 1 },
     agentFlushExit: 1,
     agentSudoExit: 1,
     sdkWorksAfter: true,
@@ -113,8 +114,8 @@ describe("decide", () => {
     ["metadata reachable after", { after: result((id) => id === "control" || id === "metadata") }, /metadata: reachable/],
     ["control blocked", { after: result(() => false) }, /control/],
     ["a check missing", { after: result((id) => id === "control").filter((r) => r.id !== "udp-dns") }, /udp-dns: not checked/],
-    ["no metadata counter", { counters: { ipv6: 5 } }, /metadata drop rule/],
-    ["no ipv6 counter", { counters: { metadata: 2 } }, /ipv6 drop rule/],
+    ["no metadata counter", { counters: { "ipv6-link-local": 1 } }, /metadata drop rule/],
+    ["only the generic ipv6 counter", { counters: { metadata: 2, ipv6: 5 } }, /ipv6-link-local drop rule/],
     ["agent could flush", { agentFlushExit: 0 }, /could flush/],
     ["flush never ran", { agentFlushExit: 127 }, /proves nothing/],
     ["agent has sudo", { agentSudoExit: 0 }, /has sudo/],

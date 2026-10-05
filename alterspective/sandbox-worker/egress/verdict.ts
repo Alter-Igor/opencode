@@ -52,7 +52,7 @@ export type Verdict = { go: boolean; line: string; failures: string[]; notes: st
 
 /**
  * GO only when the control is reachable, every must-be-blocked check is blocked, the metadata and
- * ipv6 counters prove real drops, the agent can neither flush the rules nor sudo, and the SDK still
+ * ipv6-link-local counters prove real drops, the agent can neither flush the rules nor sudo, and the SDK still
  * works. Every failure is listed; notes say whether the metadata check discriminates.
  */
 export function decide(o: Observations): Verdict {
@@ -68,7 +68,7 @@ export function decide(o: Observations): Verdict {
     else if (r.reachable) failures.push(`${id}: reachable after lockdown (${r.detail})`)
   }
   if (!(o.counters.metadata > 0)) failures.push("counter: no packet hit the metadata drop rule")
-  if (!(o.counters.ipv6 > 0)) failures.push("counter: no packet hit the ipv6 drop rule")
+  if (!(o.counters["ipv6-link-local"] > 0)) failures.push("counter: no packet hit the ipv6-link-local drop rule")
   if (o.agentFlushExit === 0) failures.push("the agent user could flush the ruleset")
   else if (o.agentFlushExit === 127) failures.push("the flush attempt did not run (nft not found), so it proves nothing")
   if (o.agentSudoExit === 0) failures.push("the agent user has sudo")
