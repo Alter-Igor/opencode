@@ -8,6 +8,8 @@
 - The page is served by the bridge on `127.0.0.1` only, on a random port, behind a random path token. Only GET is answered, and a request whose `Host` header is not `127.0.0.1:<port>` is refused. It starts once per bridge, never keeps the bridge alive, and stops with it.
 - It reads the same host-side task records as `oc_report`. It never starts the box and never calls Docker. No new dependency.
 
+**Fix: collect works for a session opened from a shallow repository (#130).** Before, `oc_collect` always failed with "The delegate box failed to bundle the session branch" when the host repo was a `--depth` clone (or a worktree of one). A bundle does not carry git's shallow list, so the box copy's oldest commit named a parent it never got, and every history walk in the box failed. `oc_start_session` now writes the host's shallow list into the box copy's `.git/shallow` (commit ids only, checked, at most 1000). A full repository is unchanged. Sessions opened before this fix stay broken: close them and start a new one.
+
 ## 0.4.0 — 2026-10-05
 
 **Which model Synapse actually served (#76).** `oc_report` can now say what `synapse/auto` routed each task to.

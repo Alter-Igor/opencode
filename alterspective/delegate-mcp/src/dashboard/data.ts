@@ -2,6 +2,7 @@
 // bridge sharing this bridge home. A pure function: no clock, no disk, no Docker. Repo and model
 // strings are data that a client or the box chose; they are cut here and the page never treats them as markup.
 import type { Outcome, TaskRecord } from "../reporting/record.ts"
+import { mainServedModel } from "../reporting/served.ts"
 
 export const DAY_MS = 24 * 60 * 60 * 1000
 export const MAX_RECENT_TASKS = 200
@@ -103,10 +104,4 @@ export function dashboardData(records: readonly TaskRecord[], now: number, extra
     }),
     servedModels: [...totals].map(([model, calls]) => ({ model, calls })).sort((a, b) => b.calls - a.calls || byName(a.model, b.model)),
   }
-}
-
-/** The model that served most of a task's calls; a tie goes to the name that sorts first. */
-function mainServedModel(served: TaskRecord["servedModels"]): string | undefined {
-  const entries = Object.entries(served ?? {})
-  return entries.sort((a, b) => b[1] - a[1] || byName(a[0], b[0]))[0]?.[0]
 }

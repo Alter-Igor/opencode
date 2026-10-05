@@ -32,11 +32,10 @@ export const dashboardTool = defineTool({
 function start(ctx: ToolContext): Dashboard {
   const bridge = ctx.supervisor.replace(/^supervisor:/, "")
   const dashboard = startDashboard(async () => {
-    // This process's own queued updates first, so the page includes its latest work.
+    // This process's own queued updates first, so the page includes its latest work. No prune here:
+    // the page polls every few seconds and stays read-only; oc_report and the bridge do retention.
     await flushReports()
-    const store = reportsFor(ctx)
-    store.prune()
-    return dashboardData(store.list(), Date.now(), { boxRunning: ctx.peekBox() !== undefined, bridge })
+    return dashboardData(reportsFor(ctx).list(), Date.now(), { boxRunning: ctx.peekBox() !== undefined, bridge })
   })
   running.set(ctx, dashboard)
   return dashboard

@@ -297,3 +297,40 @@ describe("workspaces: deadlines and folder validation", () => {
     T,
   )
 })
+
+describe("workspaces: a shallow host repository (#130)", () => {
+  test(
+    "open carries the shallow list into the box copy, so the copy's history reads and collect works",
+    async () => {
+      // Three commits on the host, then a depth-1 clone of them under the allowed root: its history
+      // stops at the newest commit, whose parent the clone never got (as a `git clone --depth` makes).
+      for (const n of [1, 2]) {
+        writeFileSync(path.join(fx.hostRepo, `deep-${n}.txt`), `${n}\n`)
+        await git(fx.hostRepo, ["add", "-A"])
+        await git(fx.hostRepo, ["commit", "-q", "-m", `deep ${n}`])
+      }
+      const shallowRepo = path.join(fx.root, "shallow-repo")
+      const url = `file://${fx.hostRepo.replace(/\\/g, "/")}`
+      expect((await runCommand(["git", "clone", "-q", "--depth", "1", url, shallowRepo])).code).toBe(0)
+      expect(await git(shallowRepo, ["rev-parse", "--is-shallow-repository"])).toBe("true")
+
+      const ws = await fx.workspaces().open(shallowRepo, "shallow-key")
+      // Without the list the box copy names a parent it does not have: rev-list fails here.
+      expect(await fx.boxGit("shallow-key", ["rev-list", "--count", "HEAD"])).toBe("1")
+      await fx.boxCommit("shallow-key", { "new.txt": "from the box\n" }, "box work")
+      const result = await fx.workspaces().collect(ws)
+      expect(result.commits).toBe(1)
+      expect(await git(shallowRepo, ["log", "-1", "--format=%s", "delegate/shallow-key"])).toBe("box work")
+    },
+    T,
+  )
+
+  test(
+    "a full repository gets no shallow list in the box copy",
+    async () => {
+      await fx.workspaces().open(fx.hostRepo, "full-key")
+      expect(await fx.boxGit("full-key", ["rev-parse", "--is-shallow-repository"])).toBe("false")
+    },
+    T,
+  )
+})
