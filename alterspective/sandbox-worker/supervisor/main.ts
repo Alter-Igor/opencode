@@ -77,7 +77,8 @@ if (manifest.repo?.bundle) {
     if ((await $`test -e ${target}`.nothrow().quiet()).exitCode === 0) {
       fail("refusing to start: the repository already has node_modules; repo.dependencies would shadow it")
     }
-    await $`mv ${manifest.repo.dependencies} ${target}`
+    const moved = await $`mv ${manifest.repo.dependencies} ${target}`.nothrow().quiet()
+    if (moved.exitCode !== 0) fail(`refusing to start: cannot move repo.dependencies into the clone: ${moved.stderr.toString().trim()}`)
   }
 } else {
   // Hashes with no bundle is an inconsistent manifest: refuse it rather than serve an empty repo.
