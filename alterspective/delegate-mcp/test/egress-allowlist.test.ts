@@ -169,9 +169,9 @@ describe("committed front files", () => {
 })
 
 /** A bridge home whose front folder holds the servers file generated for `connections`. */
-async function generatedHome(connections = KS.connections): Promise<EgressInput> {
+async function generatedHome(connections = KS.connections, dynamicProfile = ""): Promise<EgressInput> {
   const home = await mkdtemp(path.join(os.tmpdir(), "ocd-egress-home-"))
-  const config = { ...defaultConfig({}), home, keystoneConnections: connections }
+  const config = { ...defaultConfig({}), home, keystoneConnections: connections, dynamicProfile }
   await mkdir(path.join(home, "front"), { recursive: true })
   await writeFile(path.join(home, "front", "servers.conf"), frontServersFor(config))
   return egressInput(config)
@@ -197,6 +197,22 @@ describe("checkEgress (oc_doctor)", () => {
     expect(check).toMatchObject({ ok: false, frontConfigMatches: false })
     expect(check.problems.join(" ")).toContain("chosen Keystone set")
     expect(checkEgress({ ...other, frontDir: path.join(os.tmpdir(), "ocd-no-front-dir") })).toMatchObject({ ok: false, frontConfigMatches: false })
+  })
+
+  test("#115: with dynamic, the file the bridge generated (profile digest line included) passes; one for another profile fails", async () => {
+    const prev = process.env.OCD_KEYSTONE_HOST_AUTH
+    process.env.OCD_KEYSTONE_HOST_AUTH = "1"
+    try {
+      const profile = '{"deniedToolPatterns":["m365__*"]}'
+      const home = await generatedHome(["github", "dynamic"], profile)
+      expect(checkEgress(home)).toMatchObject({ ok: true, frontConfigMatches: true, problems: [] })
+      const check = checkEgress({ ...home, dynamicProfile: "" })
+      expect(check).toMatchObject({ ok: false, frontConfigMatches: false })
+      expect(check.problems.join(" ")).toContain("chosen Keystone set")
+    } finally {
+      if (prev === undefined) delete process.env.OCD_KEYSTONE_HOST_AUTH
+      else process.env.OCD_KEYSTONE_HOST_AUTH = prev
+    }
   })
 
   test("a different host list fails: generated files and aliases no longer match", async () => {

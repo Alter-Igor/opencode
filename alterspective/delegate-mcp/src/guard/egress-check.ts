@@ -8,14 +8,18 @@
 // (OCD_LIVE_EGRESS=1). Never throws: an unreadable file is a failed check with a reason.
 import { readFileSync } from "node:fs"
 import path from "node:path"
-import { FRONT_GENERATED_MOUNT, FRONT_HOSTS_FILE, FRONT_SERVERS_NAME, egressHostList, frontHosts, frontServers, type FrontKeystone } from "./egress.ts"
+import { FRONT_GENERATED_MOUNT, FRONT_HOSTS_FILE, FRONT_SERVERS_NAME, egressHostList, frontHosts, frontServers, withDelegationProfile, type FrontKeystone } from "./egress.ts"
 import { identityPaths } from "./egress-identity.ts"
 import { frontDir, type BridgeConfig } from "../shared/config.ts"
 
 export const DOCKER_DIR = path.join(import.meta.dir, "..", "..", "docker")
 
-/** What the front should be generated from: the egress hosts, the Keystone host + chosen set, and the bridge's front folder. */
-export type EgressInput = { hosts: readonly string[]; keystone: FrontKeystone; frontDir: string }
+/**
+ * What the front should be generated from: the egress hosts, the Keystone host + chosen set, the
+ * bridge's front folder, and (#104/#115) the delegation profile, whose digest the file carries when
+ * the dynamic connection is chosen.
+ */
+export type EgressInput = { hosts: readonly string[]; keystone: FrontKeystone; frontDir: string; dynamicProfile: string }
 
 export type EgressCheck = {
   ok: boolean
@@ -63,7 +67,7 @@ function frontMatches(dir: string, input: EgressInput, problems: string[]): bool
   let servers: string
   let hosts: string
   try {
-    servers = frontServers(input.hosts, input.keystone)
+    servers = withDelegationProfile(frontServers(input.hosts, input.keystone), input.keystone.connections, input.dynamicProfile)
     hosts = frontHosts(input.hosts)
   } catch (error) {
     problems.push(`config.egressHosts or the Keystone set refused: ${error instanceof Error ? error.message : "invalid"}`)
@@ -209,6 +213,11 @@ export function checkEgress(input: EgressInput, dir: string = DOCKER_DIR): Egres
 }
 
 /** The EgressInput for a config whose keystoneConnections is already the effective set (effectiveConfig). */
-export function egressInput(config: Pick<BridgeConfig, "egressHosts" | "keystoneOrigin" | "keystoneConnections" | "home">): EgressInput {
-  return { hosts: config.egressHosts, keystone: { host: new URL(config.keystoneOrigin).hostname, connections: config.keystoneConnections }, frontDir: frontDir(config) }
+export function egressInput(config: Pick<BridgeConfig, "egressHosts" | "keystoneOrigin" | "keystoneConnections" | "home" | "dynamicProfile">): EgressInput {
+  return {
+    hosts: config.egressHosts,
+    keystone: { host: new URL(config.keystoneOrigin).hostname, connections: config.keystoneConnections },
+    frontDir: frontDir(config),
+    dynamicProfile: config.dynamicProfile,
+  }
 }

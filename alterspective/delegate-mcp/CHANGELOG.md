@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.1 — 2026-10-05
+
+- `oc_doctor` no longer reports `frontConfigMatches: false` (and `verified: false`) when the `dynamic` connection is chosen (#115). Its egress check now builds the expected servers.conf with the delegation-profile digest line, the same way the bridge writes it.
+
 ## 0.3.0 — 2026-10-05
 
 **Full delegation over Keystone `/mcp/dynamic` (#104).** A delegated task can use the Keystone tools its caller can, with a delegation gate between the box and Keystone.
