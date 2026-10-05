@@ -38,11 +38,17 @@ console.log(
 )
 const config = renderConfig(manifest, policy.modelIds)
 
-await $`mkdir -p ${path.join(configDir, "plugins")} ${process.env.XDG_CONFIG_HOME ?? "/run/sbxw/xdg-config"}`
+const globalConfigDir = path.join(process.env.XDG_CONFIG_HOME ?? "/run/sbxw/xdg-config", "opencode")
+await $`mkdir -p ${path.join(configDir, "plugins")} ${globalConfigDir}`
 await Bun.write(path.join(configDir, "opencode.json"), JSON.stringify(config, null, 2))
 // OpenCode writes a .gitignore into each config dir unless one exists (#41 spike finding).
-await Bun.write(path.join(configDir, ".gitignore"), "node_modules\npackage.json\nbun.lock\n")
+for (const dir of [configDir, globalConfigDir]) await Bun.write(path.join(dir, ".gitignore"), "node_modules\npackage.json\nbun.lock\n")
 await Bun.write(path.join(configDir, "plugins", "env-scrub.ts"), Bun.file("/opt/sbxw/plugins/env-scrub.ts"))
+// #127: the box has no npm registry (egress lockdown, #118). At boot OpenCode installs
+// @opencode-ai/plugin into every WRITABLE config dir and waits for it before loading plugins, so it
+// hung behind the lockdown. A read-only dir is skipped (packages/core/src/npm.ts), and env-scrub.ts
+// imports nothing. So the config dirs are read-only from here on.
+await $`chmod 555 ${configDir} ${path.join(configDir, "plugins")} ${globalConfigDir}`
 
 // Work inside the box on its own clone; never a bind mount of the host's repository.
 // #108: a bundle that does not match what the service sent is refused before anything is served.
