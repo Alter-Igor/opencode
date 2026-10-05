@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.2 — 2026-10-05
+
+- Read-only sessions no longer ask before every `ks-dynamic` tool call (#104, owner decision A). The delegation gate already holds every risky call for an approval, so a session got two prompts for one call. With an owner profile that has `approvals: "listed"` (or one that cannot be read), they still ask. Other Keystone tools in read-only sessions still ask. Read-only sessions started before this version refuse further sends (their rules differ from the new baseline); start a new session.
+
 ## 0.3.1 — 2026-10-05
 
 - `oc_doctor` no longer reports `frontConfigMatches: false` (and `verified: false`) when the `dynamic` connection is chosen (#115). Its egress check now builds the expected servers.conf with the delegation-profile digest line, the same way the bridge writes it.

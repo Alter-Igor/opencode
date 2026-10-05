@@ -13,7 +13,7 @@
 // OpenCode evaluates rules last-match-wins (permission/index.ts `evaluate` uses findLast), so
 // the catch-all comes first and specific rules follow.
 import type { Verdict } from "../shared/contracts.ts"
-import { entryName, keystoneIds } from "../shared/keystone.ts"
+import { DYNAMIC_ID, entryName, keystoneIds } from "../shared/keystone.ts"
 import { toolDenyNames } from "../shared/keystone-policy.ts"
 
 export type Rule = { permission: string; pattern: string; action: "allow" | "deny" | "ask" }
@@ -33,7 +33,15 @@ function standard(): Rule[] {
   ]
 }
 
-function readonly(): Rule[] {
+/**
+ * #104 (owner decision A, 2026-10-05): the dynamic entry's tools (search-tools, get-tool-schema,
+ * execute-tool) need no OpenCode ask in a read-only session when the delegation gate outside the
+ * box already holds every risky call for an approval. Asking at both layers only multiplied the
+ * prompts. `dynamicGated` is false when the owner's profile asks only for listed tools.
+ */
+const dynamicAllow = (): Rule => ({ permission: `${entryName(DYNAMIC_ID)}_*`, pattern: "*", action: "allow" })
+
+function readonly(dynamicGated: boolean): Rule[] {
   return [
     ...standard(),
     { permission: "edit", pattern: "*", action: "deny" },
@@ -41,6 +49,7 @@ function readonly(): Rule[] {
     // Keystone tools may change remote state, so a read-only session asks first
     // (review A-16). Last-match-wins: this overrides the standard `ks-*_*` allow above.
     { permission: "ks-*_*", pattern: "*", action: "ask" },
+    ...(dynamicGated ? [dynamicAllow()] : []),
   ]
 }
 
@@ -53,13 +62,13 @@ function readonly(): Rule[] {
  * ids are `<entry>_<tool>` and resource reads ask `read` for `mcp:<entry>:<uri>`; entry names
  * have no `_` or `:`, so `ks-<id>_*` and `mcp:ks-<id>:*` match that entry only.
  */
-function narrowed(profile: "standard" | "readonly", ids: readonly string[]): Rule[] {
+function narrowed(profile: "standard" | "readonly", ids: readonly string[], dynamicGated: boolean): Rule[] {
   const action: Rule["action"] = profile === "readonly" ? "ask" : "allow"
   return [
     { permission: "ks-*_*", pattern: "*", action: "deny" },
     { permission: "read", pattern: "mcp:ks-*:*", action: "deny" },
     ...ids.flatMap((id): Rule[] => [
-      { permission: `${entryName(id)}_*`, pattern: "*", action },
+      { permission: `${entryName(id)}_*`, pattern: "*", action: id === DYNAMIC_ID && dynamicGated ? "allow" : action },
       { permission: "read", pattern: `mcp:${entryName(id)}:*`, action: "allow" },
     ]),
   ]
@@ -68,10 +77,12 @@ function narrowed(profile: "standard" | "readonly", ids: readonly string[]): Rul
 /**
  * A fresh ruleset each call, so callers may extend it without sharing state. `keystone` (validated
  * connection ids) narrows the session's Keystone tools to those connections; omitted, no narrowing.
+ * `dynamicGated` (#104): the delegation gate asks before risky tools, so read-only sessions allow
+ * the dynamic entry's tools; createGuard works it out from the owner's delegation profile.
  */
-export function permissionBaseline(profile: "standard" | "readonly", keystone?: readonly string[]): Rule[] {
-  const base = profile === "readonly" ? readonly() : standard()
-  return keystone === undefined ? base : [...base, ...narrowed(profile, keystoneIds(keystone))]
+export function permissionBaseline(profile: "standard" | "readonly", keystone?: readonly string[], dynamicGated = false): Rule[] {
+  const base = profile === "readonly" ? readonly(dynamicGated) : standard()
+  return keystone === undefined ? base : [...base, ...narrowed(profile, keystoneIds(keystone), dynamicGated)]
 }
 
 /**

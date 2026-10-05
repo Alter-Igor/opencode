@@ -4,8 +4,23 @@ import type { Guard, Verdict } from "../shared/contracts.ts"
 import { validateEntries } from "./entries.ts"
 import { checkPermissionReply, permissionBaseline, toolDenyRules } from "./permissions.ts"
 import { checkRuntime } from "./runtime.ts"
+import { parseProfile } from "../../mcp-gate/src/policy.ts"
 
-type GuardConfig = Pick<BridgeConfig, "keystoneOrigin" | "home" | "keystoneConnections" | "keystoneAllowed" | "keystoneToolDeny">
+type GuardConfig = Pick<BridgeConfig, "keystoneOrigin" | "home" | "keystoneConnections" | "keystoneAllowed" | "keystoneToolDeny" | "dynamicProfile">
+
+/**
+ * #104: whether the delegation gate holds every risky dynamic call for an approval: the default
+ * profile, or one with approvals "risky". "listed", or a profile that cannot be read (the box would
+ * not start with it anyway), keeps read-only sessions asking before each dynamic call.
+ */
+export function gateAsksForRisky(profile: string): boolean {
+  if (profile === "") return true
+  try {
+    return (parseProfile(profile).approvals ?? "risky") === "risky"
+  } catch {
+    return false
+  }
+}
 
 /**
  * The chosen Keystone set, read on every check (another bridge may have changed it), or the
@@ -20,6 +35,7 @@ function chosen(config: GuardConfig): string[] | Verdict {
 }
 
 export function createGuard(config: GuardConfig): Guard {
+  const dynamicGated = gateAsksForRisky(config.dynamicProfile)
   return {
     validateEntries: (entries) => {
       const connections = chosen(config)
@@ -31,7 +47,7 @@ export function createGuard(config: GuardConfig): Guard {
     },
     // R5-02: the deny list goes LAST, in the profile and in every session (the same function makes
     // both), so neither the `ks-*_*` allow nor a session's narrowing can give a denied tool back.
-    permissionBaseline: (profile, keystone) => [...permissionBaseline(profile, keystone), ...toolDenyRules(config.keystoneToolDeny)],
+    permissionBaseline: (profile, keystone) => [...permissionBaseline(profile, keystone, dynamicGated), ...toolDenyRules(config.keystoneToolDeny)],
     checkPermissionReply,
   }
 }
