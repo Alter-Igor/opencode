@@ -5,6 +5,10 @@
   "type": "module",
   "description": "Sandbox worker for the optional CAS opencodealt engine (FEAT-CAS-012). Unit tests only; the image is built from the Dockerfile.",
   "scripts": {
-    "test": "bun test"
+    "test": "bun test",
+    "probe:e2b-egress": "bun egress/probe-e2b.ts"
+  },
+  "devDependencies": {
+    "e2b": "2.51.0"
   }
 }

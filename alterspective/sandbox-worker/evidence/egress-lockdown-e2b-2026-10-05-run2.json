@@ -1,0 +1,165 @@
+{
+  "probe": "svc-coding-agent#46 T1 follow-up: in-sandbox egress lockdown (fork #118)",
+  "started": "2026-10-05T02:02:19.969Z",
+  "finished": "2026-10-05T02:03:29.041Z",
+  "sandbox": {
+    "template": "e2b default",
+    "environment": "6.1.158+\nDebian GNU/Linux 12 (bookworm)\nnftables v1.0.6 (Lester Gooch #5)"
+  },
+  "allow": {
+    "host": "1.1.1.1",
+    "port": 443
+  },
+  "ruleset": "add table ip sbxw_egress\ndelete table ip sbxw_egress\nadd table ip6 sbxw_egress\ndelete table ip6 sbxw_egress\ntable ip sbxw_egress {\n  chain output {\n    type filter hook output priority 0; policy drop;\n    oif \"lo\" accept\n    ct state established,related accept\n    ip daddr 169.254.169.254/32 counter drop comment \"metadata\"\n    ip daddr 169.254.0.0/16 counter drop comment \"link-local\"\n    ip daddr 10.0.0.0/8 counter drop comment \"private\"\n    ip daddr 172.16.0.0/12 counter drop comment \"private\"\n    ip daddr 192.168.0.0/16 counter drop comment \"private\"\n    ip daddr 100.64.0.0/10 counter drop comment \"cgnat\"\n    ip daddr 0.0.0.0/8 counter drop comment \"this-network\"\n    ip daddr 224.0.0.0/4 counter drop comment \"multicast\"\n    ip daddr 240.0.0.0/4 counter drop comment \"reserved\"\n    ip daddr 1.1.1.1 tcp dport 443 accept comment \"allow\"\n    counter drop comment \"default\"\n  }\n}\ntable ip6 sbxw_egress {\n  chain output {\n    type filter hook output priority 0; policy drop;\n    oif \"lo\" accept\n    ct state established,related accept\n    counter drop comment \"ipv6\"\n  }\n}\n",
+  "observations": {
+    "before": [
+      {
+        "id": "control",
+        "reachable": true,
+        "detail": "connected"
+      },
+      {
+        "id": "metadata",
+        "reachable": true,
+        "detail": "connected"
+      },
+      {
+        "id": "link-local",
+        "reachable": false,
+        "detail": "timeout"
+      },
+      {
+        "id": "private-10",
+        "reachable": false,
+        "detail": "timeout"
+      },
+      {
+        "id": "private-172",
+        "reachable": false,
+        "detail": "timeout"
+      },
+      {
+        "id": "private-192",
+        "reachable": false,
+        "detail": "timeout"
+      },
+      {
+        "id": "cgnat",
+        "reachable": false,
+        "detail": "timeout"
+      },
+      {
+        "id": "other-host",
+        "reachable": true,
+        "detail": "connected"
+      },
+      {
+        "id": "other-port",
+        "reachable": true,
+        "detail": "connected"
+      },
+      {
+        "id": "udp-dns",
+        "reachable": true,
+        "detail": "reply"
+      },
+      {
+        "id": "ipv6-public",
+        "reachable": false,
+        "detail": "Network is unreachable"
+      },
+      {
+        "id": "ipv6-on-link",
+        "reachable": false,
+        "detail": "sent (no reply expected; see the ipv6 counter)"
+      }
+    ],
+    "after": [
+      {
+        "id": "control",
+        "reachable": true,
+        "detail": "connected"
+      },
+      {
+        "id": "metadata",
+        "reachable": false,
+        "detail": "timeout"
+      },
+      {
+        "id": "link-local",
+        "reachable": false,
+        "detail": "timeout"
+      },
+      {
+        "id": "private-10",
+        "reachable": false,
+        "detail": "timeout"
+      },
+      {
+        "id": "private-172",
+        "reachable": false,
+        "detail": "timeout"
+      },
+      {
+        "id": "private-192",
+        "reachable": false,
+        "detail": "timeout"
+      },
+      {
+        "id": "cgnat",
+        "reachable": false,
+        "detail": "timeout"
+      },
+      {
+        "id": "other-host",
+        "reachable": false,
+        "detail": "timeout"
+      },
+      {
+        "id": "other-port",
+        "reachable": false,
+        "detail": "timeout"
+      },
+      {
+        "id": "udp-dns",
+        "reachable": false,
+        "detail": "Operation not permitted"
+      },
+      {
+        "id": "ipv6-public",
+        "reachable": false,
+        "detail": "Network is unreachable"
+      },
+      {
+        "id": "ipv6-on-link",
+        "reachable": false,
+        "detail": "Operation not permitted"
+      }
+    ],
+    "counters": {
+      "metadata": 2,
+      "link-local": 2,
+      "private": 16,
+      "cgnat": 2,
+      "this-network": 0,
+      "multicast": 0,
+      "reserved": 0,
+      "default": 27,
+      "ipv6": 5
+    },
+    "agentFlushExit": 1,
+    "agentSudoExit": 1,
+    "sdkWorksAfter": true,
+    "agentFlushStderr": "Error: Could not process rule: Operation not permitted\nflush ruleset\n^^^^^^^^^^^^^^",
+    "agentSudoStderr": "sudo: a password is required"
+  },
+  "counterListing": "table ip sbxw_egress {\n\tchain output {\n\t\ttype filter hook output priority filter; policy drop;\n\t\toif \"lo\" accept\n\t\tct state established,related accept\n\t\tip daddr 169.254.169.254 counter packets 2 bytes 120 drop comment \"metadata\"\n\t\tip daddr 169.254.0.0/16 counter packets 2 bytes 120 drop comment \"link-local\"\n\t\tip daddr 10.0.0.0/8 counter packets 12 bytes 1488 drop comment \"private\"\n\t\tip daddr 172.16.0.0/12 counter packets 2 bytes 120 drop comment \"private\"\n\t\tip daddr 192.168.0.0/16 counter packets 2 bytes 120 drop comment \"private\"\n\t\tip daddr 100.64.0.0/10 counter packets 2 bytes 120 drop comment \"cgnat\"\n\t\tip daddr 0.0.0.0/8 counter packets 0 bytes 0 drop comment \"this-network\"\n\t\tip daddr 224.0.0.0/4 counter packets 0 bytes 0 drop comment \"multicast\"\n\t\tip daddr 240.0.0.0/4 counter packets 0 bytes 0 drop comment \"reserved\"\n\t\tip daddr 1.1.1.1 tcp dport 443 accept comment \"allow\"\n\t\tcounter packets 27 bytes 1617 drop comment \"default\"\n\t}\n}\ntable ip6 sbxw_egress {\n\tchain output {\n\t\ttype filter hook output priority filter; policy drop;\n\t\toif \"lo\" accept\n\t\tct state established,related accept\n\t\tcounter packets 5 bytes 321 drop comment \"ipv6\"\n\t}\n}\n",
+  "verdict": {
+    "go": true,
+    "line": "T1 in-sandbox egress: GO — metadata, link-local, private, other hosts/ports, UDP DNS and IPv6 blocked; control reachable; agent cannot change rules",
+    "failures": [],
+    "notes": [
+      "metadata was reachable before lockdown, so the check discriminates"
+    ]
+  }
+}
