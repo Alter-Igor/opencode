@@ -85,6 +85,10 @@ if (manifest.repo?.bundle) {
   if (manifest.repo?.sha256 !== undefined || manifest.repo?.treeSha !== undefined) {
     fail("refusing to start: repo.sha256 or repo.treeSha was given without repo.bundle")
   }
+  // #85: prepared dependencies only make sense in a clone of the bundle they were installed from.
+  if (manifest.repo?.dependencies !== undefined) {
+    fail("refusing to start: repo.dependencies was given without repo.bundle")
+  }
   await $`mkdir -p ${repoDir}`
   await $`git -C ${repoDir} init --quiet`
 }
