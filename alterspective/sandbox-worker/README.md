@@ -54,7 +54,7 @@ Containers are named `sbxw-<id>`, labelled `alterspective.sandbox-worker=spike`,
   "taskId": "sbxw-…",
   "model": { "baseURL": "https://…/v1", "headers": { "x-task-type": "code" }, "onPremDefault": ["qwen3.8-27b-dflash2"] },
   "modelPolicy": { "cell": { "modelIds": ["…"] }, "effectivePolicyVersion": "…" },
-  "repo": { "bundle": "/run/sbxw/input/repo.bundle", "ref": "optional", "sha256": "<bundle file SHA-256>", "treeSha": "<tree of the commit to work on>" },
+  "repo": { "bundle": "/run/sbxw/input/repo.bundle", "ref": "optional", "sha256": "<bundle file SHA-256>", "treeSha": "<tree of the commit to work on>", "dependencies": "/run/sbxw/input/deps/node_modules" },
   "permission": { "*": "allow", "external_directory": "deny" },
   "listen": { "hostname": "127.0.0.1", "port": 4096 }
 }
@@ -145,6 +145,12 @@ fork's pinned-model fallback (#80) resends with `auto`. Not checked live yet.
   and `repo.treeSha`, the supervisor checks the bundle file before cloning and the checked-out tree
   after, and exits (code 2, nothing served) on a mismatch. The service should always send both;
   `state.json` records `bundleVerified` either way.
+- **Dependencies come from the service, never from a registry (#85, svc-coding-agent#85).** The box
+  cannot reach npm (egress lockdown, #118). When the manifest gives `repo.dependencies`, an absolute
+  path ending in `/node_modules` that the service prepared as root before the lockdown (`npm ci
+  --ignore-scripts` from the lockfile) and chowned to `agent`, the supervisor moves it into the clone
+  and adds `node_modules/` to the clone's git exclude. A missing folder, a relative path, or a clone
+  that already has `node_modules` is refused (exit 2).
 - **Each task records which build ran (#108).** The image is built with `--build-arg GIT_SHA=…`
   (OCI label `org.opencontainers.image.revision`, env `SBXW_BUILD_SHA`). The supervisor writes
   it into `state.json` and its start log line. Without the argument it records `unknown`.

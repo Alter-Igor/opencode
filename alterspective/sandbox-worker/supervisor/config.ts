@@ -23,7 +23,13 @@ export type Manifest = {
    * #108: `sha256` is the bundle file's SHA-256 and `treeSha` the expected tree of the checked-out
    * commit. When given, the supervisor refuses to start on a mismatch.
    */
-  repo?: { bundle: string; ref?: string; sha256?: string; treeSha?: string }
+  /**
+   * #85 (svc-coding-agent): `dependencies` is an absolute path to a `node_modules` folder the SERVICE
+   * prepared as root before the egress lockdown (`npm ci --ignore-scripts` from the lockfile) and
+   * chowned to the agent user. The supervisor moves it into the clone; the agent never reaches a
+   * registry. Given but missing or not a folder ⇒ refuse to start.
+   */
+  repo?: { bundle: string; ref?: string; sha256?: string; treeSha?: string; dependencies?: string }
   permission?: Record<string, unknown>
   /**
    * #121: the service will run hidden acceptance tests after the agent claims GOAL_MET.

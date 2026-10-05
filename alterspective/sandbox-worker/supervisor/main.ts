@@ -4,7 +4,7 @@
 import { $ } from "bun"
 import path from "path"
 import { PRIVACY_TIER, PRIVACY_TIER_ENV, renderConfig, type Manifest } from "./config"
-import { checkBundleFile, checkTree } from "./bundle"
+import { checkBundleFile, checkDependenciesDir, checkTree } from "./bundle"
 import { checkUnreachable } from "./egress-guard"
 import { parseResolveBody } from "./policy"
 
@@ -67,6 +67,18 @@ if (manifest.repo?.bundle) {
     if (!check.ok) fail(`refusing to start: ${check.reason}`)
     verified.tree = true
   }
+  // #85: dependencies the service installed before the egress lockdown. Moved, not copied (same
+  // tmpfs), and kept out of the patch below. A clone that already carries node_modules is refused:
+  // two sources of truth.
+  if (manifest.repo.dependencies !== undefined) {
+    const check = await checkDependenciesDir(manifest.repo.dependencies)
+    if (!check.ok) fail(`refusing to start: ${check.reason}`)
+    const target = path.join(repoDir, "node_modules")
+    if ((await $`test -e ${target}`.nothrow().quiet()).exitCode === 0) {
+      fail("refusing to start: the repository already has node_modules; repo.dependencies would shadow it")
+    }
+    await $`mv ${manifest.repo.dependencies} ${target}`
+  }
 } else {
   // Hashes with no bundle is an inconsistent manifest: refuse it rather than serve an empty repo.
   if (manifest.repo?.sha256 !== undefined || manifest.repo?.treeSha !== undefined) {
@@ -78,7 +90,7 @@ if (manifest.repo?.bundle) {
 // The fork's observer plugin writes session retrospectives into the workspace
 // (packages/opencode/src/plugin/observer.ts). Keep them out of the patch without patching the fork.
 const exclude = path.join(repoDir, ".git", "info", "exclude")
-await Bun.write(exclude, `${await Bun.file(exclude).text().catch(() => "")}\n.system_generated/\n`)
+await Bun.write(exclude, `${await Bun.file(exclude).text().catch(() => "")}\n.system_generated/\nnode_modules/\n`)
 await $`git -C ${repoDir} config user.name "OpenCode sandbox worker"`
 await $`git -C ${repoDir} config user.email "sandbox-worker@noreply.alterspective.com.au"`
 const baseSha = (await $`git -C ${repoDir} rev-parse --verify --quiet HEAD`.nothrow().text()).trim()

@@ -1,9 +1,9 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test"
 import { $ } from "bun"
-import { mkdtemp, readFile, rm, writeFile } from "fs/promises"
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "fs/promises"
 import { tmpdir } from "os"
 import path from "path"
-import { checkBundleFile, checkTree, sha256File } from "../supervisor/bundle"
+import { checkBundleFile, checkDependenciesDir, checkTree, sha256File } from "../supervisor/bundle"
 
 // #108 (fork #57 T5): a real repository, bundled, then checked the way the supervisor does.
 let dir: string
@@ -97,5 +97,20 @@ describe("checkTree (#108)", () => {
     const empty = path.join(dir, "empty")
     await $`git init --quiet ${empty}`.quiet()
     expect(await checkTree(empty, tree)).toEqual({ ok: false, reason: "the cloned repository has no commit to check" })
+  })
+})
+
+describe("checkDependenciesDir (#85)", () => {
+  test("accepts an absolute, existing node_modules folder", async () => {
+    const deps = path.join(dir, "prepared", "node_modules")
+    await mkdir(deps, { recursive: true })
+    expect(await checkDependenciesDir(deps)).toEqual({ ok: true })
+  })
+  test("refuses a relative path, a traversal, a wrong basename, a file, or a missing folder", async () => {
+    expect(await checkDependenciesDir("prepared/node_modules")).toEqual({ ok: false, reason: "repo.dependencies is not an absolute path" })
+    expect(await checkDependenciesDir("/run/sbxw/../etc/node_modules")).toEqual({ ok: false, reason: "repo.dependencies is not an absolute path" })
+    expect(await checkDependenciesDir(path.join(dir, "prepared"))).toEqual({ ok: false, reason: "repo.dependencies must end in /node_modules" })
+    expect((await checkDependenciesDir(path.join(dir, "nowhere", "node_modules"))).ok).toBe(false)
+    expect(await checkDependenciesDir(42)).toEqual({ ok: false, reason: "repo.dependencies is not a string" })
   })
 })

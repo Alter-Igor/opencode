@@ -2,6 +2,8 @@
 // The service puts the bundle file's SHA-256 and the expected tree of the checked-out commit in
 // the manifest; the supervisor refuses to start `opencode serve` on any mismatch.
 import { $ } from "bun"
+import { stat } from "fs/promises"
+import path from "path"
 
 export type BundleCheck = { ok: true } | { ok: false; reason: string }
 
@@ -28,6 +30,19 @@ export async function checkBundleFile(file: string, expectedSha256: unknown): Pr
 }
 
 /** Checks the tree of the commit checked out in `repoDir` after the clone. */
+/**
+ * #85: the prepared dependencies folder the service names in `repo.dependencies`. Pure checks on
+ * the value and the filesystem; the move itself happens in main.ts.
+ */
+export async function checkDependenciesDir(value: unknown): Promise<BundleCheck> {
+  if (typeof value !== "string") return { ok: false, reason: "repo.dependencies is not a string" }
+  if (!path.isAbsolute(value) || value.split(/[\\/]/).includes("..")) return { ok: false, reason: "repo.dependencies is not an absolute path" }
+  if (path.basename(value) !== "node_modules") return { ok: false, reason: "repo.dependencies must end in /node_modules" }
+  const info = await stat(value).catch(() => undefined)
+  if (!info?.isDirectory()) return { ok: false, reason: `repo.dependencies is not a folder: ${value}` }
+  return { ok: true }
+}
+
 export async function checkTree(repoDir: string, expectedTree: unknown): Promise<BundleCheck> {
   if (typeof expectedTree !== "string") return { ok: false, reason: "repo.treeSha is not a string" }
   const expected = expectedTree.trim().toLowerCase()
