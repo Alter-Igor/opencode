@@ -50,6 +50,11 @@ export type Observations = {
 
 export type Verdict = { go: boolean; line: string; failures: string[]; notes: string[] }
 
+/**
+ * GO only when the control is reachable, every must-be-blocked check is blocked, the metadata and
+ * ipv6 counters prove real drops, the agent can neither flush the rules nor sudo, and the SDK still
+ * works. Every failure is listed; notes say whether the metadata check discriminates.
+ */
 export function decide(o: Observations): Verdict {
   const failures: string[] = []
   const notes: string[] = []

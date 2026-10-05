@@ -4,6 +4,7 @@
 import { $ } from "bun"
 import { TABLE, parseAllow, renderRuleset } from "./rules"
 
+/** Print the reason and exit 1: the caller must then not start the supervisor. */
 const fail = (message: string): never => {
   console.error(`[sbxw-egress] ${message}`)
   process.exit(1)

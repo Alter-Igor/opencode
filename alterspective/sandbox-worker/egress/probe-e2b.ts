@@ -32,6 +32,7 @@ const ruleset = renderRuleset({ allow: [{ cidr: allow.host, port: allow.port }] 
 const plan = probePlan(allow)
 
 type Shell = { exitCode: number; stdout: string; stderr: string }
+/** Run a command in the sandbox as `user`; a non-zero exit is a result, not an exception. */
 async function sh(sbx: Sandbox, cmd: string, user: string): Promise<Shell> {
   try {
     const r = await sbx.commands.run(cmd, { user, timeoutMs: 120_000 })
@@ -42,6 +43,7 @@ async function sh(sbx: Sandbox, cmd: string, user: string): Promise<Shell> {
   }
 }
 
+/** Run checks.py as the non-sudo agent user and parse its JSON results. */
 const runChecks = async (sbx: Sandbox): Promise<CheckResult[]> => {
   const r = await sh(sbx, "python3 /tmp/sbxw-checks.py /tmp/sbxw-plan.json", AGENT)
   if (r.exitCode !== 0) throw new Error(`checks failed: ${r.stderr.trim()}`)

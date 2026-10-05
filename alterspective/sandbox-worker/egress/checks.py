@@ -15,6 +15,7 @@ DNS_QUERY = bytes.fromhex("abcd01000001000000000000076578616d706c6503636f6d00000
 
 
 def tcp(host, port):
+    """TCP connect; reachable only if the handshake completes."""
     family = socket.AF_INET6 if ":" in host else socket.AF_INET
     s = socket.socket(family, socket.SOCK_STREAM)
     s.settimeout(TIMEOUT)
@@ -30,6 +31,7 @@ def tcp(host, port):
 
 
 def udp_dns(host, port):
+    """Send one DNS query; reachable only if a reply arrives."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.settimeout(TIMEOUT)
     try:
@@ -62,6 +64,7 @@ KINDS = {"tcp": tcp, "udp-dns": udp_dns, "udp6-send": udp6_send}
 
 
 def main():
+    """Run every plan item and print the results as one JSON array."""
     plan = json.load(open(sys.argv[1]))
     results = []
     for item in plan:

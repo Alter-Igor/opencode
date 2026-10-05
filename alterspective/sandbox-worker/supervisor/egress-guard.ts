@@ -7,6 +7,7 @@ export const METADATA = { host: "169.254.169.254", port: 80 }
 
 export type GuardResult = { ok: true; detail: string } | { ok: false; detail: string }
 
+/** Resolves ok when `target` cannot be connected to (refused, unreachable or timeout); not ok if it accepts. */
 export function checkUnreachable(target = METADATA, timeoutMs = 1500): Promise<GuardResult> {
   return new Promise((resolve) => {
     const socket = net.createConnection({ host: target.host, port: target.port })

@@ -24,6 +24,7 @@ export type EgressConfig = { allow: AllowEntry[]; dns?: string }
 const OCTET = "(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)"
 const IPV4 = new RegExp(`^${OCTET}(\\.${OCTET}){3}$`)
 
+/** Dotted IPv4 to an unsigned integer (input already validated). */
 function ipToInt(ip: string): number {
   return ip.split(".").reduce((n, o) => n * 256 + Number(o), 0)
 }
@@ -39,6 +40,7 @@ export function cidrRange(cidr: string): [number, number] {
   return [first, first + size - 1]
 }
 
+/** True when two IPv4 CIDR blocks share any address. */
 const overlaps = (a: string, b: string): boolean => {
   const [a1, a2] = cidrRange(a)
   const [b1, b2] = cidrRange(b)
