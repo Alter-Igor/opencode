@@ -19,7 +19,11 @@ export type Manifest = {
    * else `auto`; always local-only.
    */
   modelPolicy?: unknown
-  repo?: { bundle: string; ref?: string }
+  /**
+   * #108: `sha256` is the bundle file's SHA-256 and `treeSha` the expected tree of the checked-out
+   * commit. When given, the supervisor refuses to start on a mismatch.
+   */
+  repo?: { bundle: string; ref?: string; sha256?: string; treeSha?: string }
   permission?: Record<string, unknown>
   listen?: { hostname?: string; port?: number }
 }

@@ -1,6 +1,7 @@
 # Sandbox worker image for CAS delegation (FEAT-CAS-012 Phase 1, fork issue #47).
 # Build from the repository root:
-#   docker build -f alterspective/sandbox-worker/Dockerfile -t opencodealt-sandbox-worker:spike .
+#   docker build -f alterspective/sandbox-worker/Dockerfile --build-arg GIT_SHA=$(git rev-parse HEAD) \
+#     -t opencodealt-sandbox-worker:spike .
 # The build context is filtered by Dockerfile.dockerignore beside this file, not the root .dockerignore.
 
 FROM oven/bun:1.3.14 AS build
@@ -18,6 +19,11 @@ RUN cd packages/opencode && bun run script/build.ts --single --skip-embed-web-ui
 
 FROM oven/bun:1.3.14-slim
 ARG GH_VERSION=2.62.0
+# #108: the fork commit this image is built from. The build context has no .git, so pass it in:
+#   docker build --build-arg GIT_SHA=$(git rev-parse HEAD) ...
+ARG GIT_SHA=unknown
+LABEL org.opencontainers.image.revision=$GIT_SHA \
+      org.opencontainers.image.source=https://github.com/Alter-Igor/opencode
 RUN apt-get update \
   && apt-get install -y --no-install-recommends git ripgrep ca-certificates curl \
   && curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" \
@@ -41,7 +47,8 @@ RUN useradd -m -u 10001 agent \
   && opencode --version && node --version && npm --version && bun --version
 
 USER agent
-ENV XDG_DATA_HOME=/data \
+ENV SBXW_BUILD_SHA=$GIT_SHA \
+    XDG_DATA_HOME=/data \
     XDG_CONFIG_HOME=/run/sbxw/xdg-config \
     XDG_STATE_HOME=/data/state \
     XDG_CACHE_HOME=/data/cache \
