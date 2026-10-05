@@ -25,6 +25,12 @@ export type Manifest = {
    */
   repo?: { bundle: string; ref?: string; sha256?: string; treeSha?: string }
   permission?: Record<string, unknown>
+  /**
+   * #121: the service will run hidden acceptance tests after the agent claims GOAL_MET.
+   * Informational only: the command and tests never come from the manifest or the box; the
+   * service sends them to `harness-run.ts` (run as root) after the session.
+   */
+  harness?: { required: boolean }
   listen?: { hostname?: string; port?: number }
 }
 
