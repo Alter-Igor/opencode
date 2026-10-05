@@ -49,6 +49,23 @@ describe("supervisor: start and reuse", () => {
     expect(up.env!.GATE_PROFILE).toBe("")
   })
 
+  test("#104: a set with dynamic starts with host-held tokens (no other-flag profile exists for it)", async () => {
+    await writeOwner()
+    const previous = process.env.OCD_KEYSTONE_HOST_AUTH
+    process.env.OCD_KEYSTONE_HOST_AUTH = "1"
+    try {
+      const calls: Call[] = []
+      const base = deps(fakeDocker({ running: false, labels: {}, env: [] }, calls))
+      const sup = supervisor({ ...base, config: { ...base.config, keystoneConnections: ["github", "dynamic"], keystoneAllowed: ["github", "dynamic"] } })
+      await sup.ensure()
+      const up = calls.find((c) => c.argv.includes("up"))!
+      expect(JSON.parse(up.env!.OPENCODE_MCP_ALLOW!).remote[0].path).toBe("^(/mcp/c/(github)|/mcp/dynamic)$")
+    } finally {
+      if (previous === undefined) delete process.env.OCD_KEYSTONE_HOST_AUTH
+      else process.env.OCD_KEYSTONE_HOST_AUTH = previous
+    }
+  })
+
   test("--build is passed only when the image is missing", async () => {
     const calls: Call[] = []
     await supervisor(deps(fakeDocker({ running: false, labels: {}, env: [] }, calls, { imageMissing: true }))).ensure()
