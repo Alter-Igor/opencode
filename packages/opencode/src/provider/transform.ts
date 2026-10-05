@@ -462,9 +462,25 @@ function mapProviderOptions(
   })
 }
 
+// Fork (#111): Synapse routes to vLLM backends whose chat templates refuse any system message that
+// is not the first one ("System message must be at the beginning."). Plugins add system blocks in
+// registration order, so one that runs after the Synapse plugin's fold (the /docs line) brings a
+// second block back. Merging here runs after every hook, on both runtimes and every auth path.
+function singleLeadingSystem(msgs: ModelMessage[]): ModelMessage[] {
+  const system = msgs.filter((msg) => msg.role === "system")
+  if (system.length === 0 || (system.length === 1 && msgs[0] === system[0])) return msgs
+  const rest = msgs.filter((msg) => msg.role !== "system")
+  const content = system
+    .map((msg) => msg.content)
+    .filter((text) => text.trim())
+    .join("\n\n")
+  return content ? [{ ...system[0], content }, ...rest] : rest
+}
+
 export function message(msgs: ModelMessage[], model: Provider.Model, options: Record<string, unknown>) {
   msgs = unsupportedParts(msgs, model)
   msgs = normalizeMessages(msgs, model, options)
+  if (model.providerID === "synapse") msgs = singleLeadingSystem(msgs)
   const usesAnthropicAutomaticCaching =
     options.cacheControl !== undefined &&
     (model.api.npm === "@ai-sdk/anthropic" || model.api.npm === "@ai-sdk/google-vertex/anthropic")

@@ -7,13 +7,17 @@ import { generateText } from "ai"
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible"
 import { ProviderTransform } from "@/provider/transform"
 import { LLMRequestPrep } from "@/session/llm/request"
-import { SynapseAuthPlugin } from "../../src/plugin/synapse"
+import { forkPlugins } from "../../src/plugin"
+import { DOCS_SYSTEM_LINE } from "../../src/plugin/opencodealt-docs"
 
 // The delegate box authenticates Synapse from config (`apiKey: {env:SYNAPSE_API_KEY}`), so
 // there is no stored `synapse` auth entry and the plugin auth loader (and its fetch wrapper,
 // which runs normalizeSystemMessages) never runs. The system prompt must still reach the
 // wire as ONE leading system message, because vLLM backends reject a second one with
 // "System message must be at the beginning."
+//
+// #111: every fork plugin runs, in registration order. With only the Synapse plugin loaded this
+// test missed the /docs line, which lands after the Synapse plugin folds its blocks into one.
 
 const synapseModel = {
   id: "auto",
@@ -38,7 +42,7 @@ const synapseModel = {
 
 async function sendThroughSessionPath(small: boolean) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "synapse-wire-"))
-  const hooks = await SynapseAuthPlugin({
+  const input = {
     client: {} as never,
     project: {} as never,
     directory: dir,
@@ -46,16 +50,19 @@ async function sendThroughSessionPath(small: boolean) {
     experimental_workspace: { register() {} },
     serverUrl: new URL("https://example.com"),
     $: {} as never,
-  } as any)
+  } as any
+  const hooks = await Promise.all(forkPlugins().map((init) => init(input)))
 
   const plugin = {
     trigger: (name: string, input: unknown, output: unknown) =>
       Effect.promise(async () => {
-        const hook = (hooks as any)[name]
-        if (hook) await hook(input, output)
+        for (const entry of hooks) {
+          const hook = (entry as any)[name]
+          if (hook) await hook(input, output)
+        }
         return output
       }),
-    list: () => Effect.succeed([hooks]),
+    list: () => Effect.succeed(hooks),
     init: () => Effect.void,
   } as any
 
@@ -144,6 +151,7 @@ describe("synapse system prompt on the wire (config apiKey, no stored auth)", ()
       const system = String(sent[0].content)
       expect(system).toContain("<env>working directory: /sessions</env>")
       expect(system).toContain("Mandatory Keystone Dynamic MCP Gateway Instructions")
+      expect(system).toContain(DOCS_SYSTEM_LINE)
     })
   }
 })
