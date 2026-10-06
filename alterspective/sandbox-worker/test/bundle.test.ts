@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test"
 import { $ } from "bun"
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "fs/promises"
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "fs/promises"
 import { tmpdir } from "os"
 import path from "path"
 import { checkBundleFile, checkDependenciesDir, checkTree, sha256File } from "../supervisor/bundle"
@@ -112,5 +112,13 @@ describe("checkDependenciesDir (#85)", () => {
     expect(await checkDependenciesDir(path.join(dir, "prepared"))).toEqual({ ok: false, reason: "repo.dependencies must end in /node_modules" })
     expect((await checkDependenciesDir(path.join(dir, "nowhere", "node_modules"))).ok).toBe(false)
     expect(await checkDependenciesDir(42)).toEqual({ ok: false, reason: "repo.dependencies is not a string" })
+  })
+  test("refuses a symlink to a folder: the link would move, not the folder", async () => {
+    const real = path.join(dir, "real-deps")
+    await mkdir(real, { recursive: true })
+    const link = path.join(dir, "linked", "node_modules")
+    await mkdir(path.dirname(link), { recursive: true })
+    await symlink(real, link, "junction")
+    expect((await checkDependenciesDir(link)).ok).toBe(false)
   })
 })
