@@ -4,7 +4,7 @@
 import { $ } from "bun"
 import path from "path"
 import { PRIVACY_TIER, PRIVACY_TIER_ENV, renderConfig, type Manifest } from "./config"
-import { checkBundleFile, checkTree } from "./bundle"
+import { checkBundleFile, checkDependenciesDir, checkTree } from "./bundle"
 import { checkUnreachable } from "./egress-guard"
 import { parseResolveBody } from "./policy"
 
@@ -67,10 +67,28 @@ if (manifest.repo?.bundle) {
     if (!check.ok) fail(`refusing to start: ${check.reason}`)
     verified.tree = true
   }
+  // #85: dependencies the service installed before the egress lockdown. Moved with the system mv
+  // (a rename on the same filesystem; Bun's builtin mv refuses a cross-device move), and kept out of
+  // the patch below. A clone that already carries node_modules is refused: two sources of truth.
+  if (manifest.repo.dependencies !== undefined) {
+    const check = await checkDependenciesDir(manifest.repo.dependencies)
+    if (!check.ok) fail(`refusing to start: ${check.reason}`)
+    const target = path.join(repoDir, "node_modules")
+    // `test -L` too: a dangling node_modules symlink in the bundle is invisible to `test -e`.
+    if ((await $`test -e ${target} || test -L ${target}`.nothrow().quiet()).exitCode === 0) {
+      fail("refusing to start: the repository already has node_modules; repo.dependencies would shadow it")
+    }
+    const moved = await $`/bin/mv ${manifest.repo.dependencies} ${target}`.nothrow().quiet()
+    if (moved.exitCode !== 0) fail(`refusing to start: cannot move repo.dependencies into the clone: ${moved.stderr.toString().trim()}`)
+  }
 } else {
   // Hashes with no bundle is an inconsistent manifest: refuse it rather than serve an empty repo.
   if (manifest.repo?.sha256 !== undefined || manifest.repo?.treeSha !== undefined) {
     fail("refusing to start: repo.sha256 or repo.treeSha was given without repo.bundle")
+  }
+  // #85: prepared dependencies only make sense in a clone of the bundle they were installed from.
+  if (manifest.repo?.dependencies !== undefined) {
+    fail("refusing to start: repo.dependencies was given without repo.bundle")
   }
   await $`mkdir -p ${repoDir}`
   await $`git -C ${repoDir} init --quiet`
@@ -78,7 +96,7 @@ if (manifest.repo?.bundle) {
 // The fork's observer plugin writes session retrospectives into the workspace
 // (packages/opencode/src/plugin/observer.ts). Keep them out of the patch without patching the fork.
 const exclude = path.join(repoDir, ".git", "info", "exclude")
-await Bun.write(exclude, `${await Bun.file(exclude).text().catch(() => "")}\n.system_generated/\n`)
+await Bun.write(exclude, `${await Bun.file(exclude).text().catch(() => "")}\n.system_generated/\nnode_modules/\n`)
 await $`git -C ${repoDir} config user.name "OpenCode sandbox worker"`
 await $`git -C ${repoDir} config user.email "sandbox-worker@noreply.alterspective.com.au"`
 const baseSha = (await $`git -C ${repoDir} rev-parse --verify --quiet HEAD`.nothrow().text()).trim()
