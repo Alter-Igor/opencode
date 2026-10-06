@@ -35,7 +35,11 @@ export function entryView(e: EntryView): SessionView {
   if (e.detail) view.detail = e.detail
   if (e.pending.length) view.pending = e.pending
   if (e.parentID) view.parentID = e.parentID
-  if (e.lastError) view.lastError = e.lastError
+  if (e.lastError) {
+    view.lastError = e.lastError
+    view.errorCode = e.errorCode ?? e.lastError
+  }
+  if (e.lastActiveAt) view.lastActiveAt = iso(e.lastActiveAt)
   return view
 }
 
@@ -47,7 +51,11 @@ export function remoteView(sessionID: string, remote: Remote, now: number, detai
   const view: SessionView = { sessionID, ...placement(known?.directory, remote.directory), state: waiting ? "needs_input" : entry.base, since: observedAt, observedAt, detail: entry.detail ? `${entry.detail}; ${detail}` : detail }
   if (waiting) view.pending = entry.pending.map((p) => p.requestID)
   if (known?.parentID) view.parentID = known.parentID
-  if (known?.lastError) view.lastError = known.lastError
+  if (known?.lastError) {
+    view.lastError = known.lastError
+    view.errorCode = known.errorCode ?? known.lastError
+  }
+  if (known?.lastActiveAt) view.lastActiveAt = iso(known.lastActiveAt)
   return view
 }
 

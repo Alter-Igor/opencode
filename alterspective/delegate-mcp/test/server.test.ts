@@ -42,7 +42,7 @@ describe("MCP server", () => {
     for (const name of CORE) expect(names).toContain(name)
     const send = tools.find((t) => t.name === "oc_send")
     expect(send?.inputSchema.required).toEqual(["sessionID", "message"])
-    expect(Object.keys(send?.inputSchema.properties ?? {})).toEqual(["sessionID", "message", "model", "agent", "correlationId"])
+    expect(Object.keys(send?.inputSchema.properties ?? {})).toEqual(["sessionID", "message", "model", "agent", "correlationId", "allowedPaths", "syncRef"])
     const wait = tools.find((t) => t.name === "oc_wait")
     expect(wait?.inputSchema.properties?.timeoutSec).toMatchObject({ type: "integer", maximum: 240 })
     // W3A-10: a tool that can start the sandbox is not read-only; oc_events and oc_inbox never start it.

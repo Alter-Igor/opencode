@@ -1,6 +1,9 @@
 // MOD-04 oc_start_session, oc_list_sessions, oc_status, oc_abort.
+import { rm, writeFile } from "node:fs/promises"
+import path from "node:path"
 import { describe, expect, test } from "bun:test"
 import { abortTool, listSessionsTool, startSessionTool, statusTool } from "../src/tools/sessions.ts"
+import { authConfPath, writeAuthConf } from "../src/synapse/auth-conf.ts"
 import { BASE, OTHER_SID, SID, TARGET, data, fakeContext, invoke, okCmd, record, text, type Fake } from "./tools-core-fixture.ts"
 
 function canCreate(f: Fake) {
@@ -55,6 +58,30 @@ describe("oc_start_session", () => {
     expect(f.opened).toEqual([])
     const ok = await invoke(startSessionTool, { directory: "C:\\GitHub\\demo", model: "synapse/auto" }, f.ctx)
     expect(ok.isError).toBeUndefined()
+  })
+
+  test("#149: pre-flight check refuses unavailable model when Synapse is live", async () => {
+    const f = fakeContext()
+    canCreate(f)
+    const frontDir = path.join(f.ctx.config.home, "front")
+    const token = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJvd25lciJ9.c2lnbmF0dXJlLXZhbHVl"
+    await writeAuthConf(frontDir, token)
+    const origFetch = globalThis.fetch
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      if (String(input).includes("/v1/models")) {
+        return new Response(JSON.stringify({ object: "list", data: [{ id: "claude-sonnet-4-6", capabilities: { ops: ["chat"] } }] }), { status: 200 })
+      }
+      return origFetch(input)
+    }) as typeof fetch
+    try {
+      const res = await invoke(startSessionTool, { directory: "C:\\GitHub\\demo", model: "synapse/gpt-5-unserved" }, f.ctx)
+      expect(data(res)).toMatchObject({ code: "model_unavailable" })
+      expect(String(data(res).message)).toContain("not currently served by Synapse")
+      expect(f.opened).toEqual([])
+    } finally {
+      globalThis.fetch = origFetch
+      await rm(authConfPath(frontDir), { force: true })
+    }
   })
 
   test("readonly profile sends the readonly baseline", async () => {
@@ -143,6 +170,29 @@ describe("oc_list_sessions", () => {
     expect(sessions[1]).toMatchObject({ metadataSupervisor: "supervisor:other", mine: false })
     expect(text(result).split("\n")[0]).not.toContain("ignore previous")
   })
+
+  test("#146: filters by caller by default when caller is set; all: true shows other callers", async () => {
+    const f = fakeContext()
+    f.ctx.caller = "agent-1"
+    f.ctx.sessions.set(SID, { ...record(), caller: "agent-1" })
+    f.ctx.sessions.set(OTHER_SID, { ...record(), sessionID: OTHER_SID, caller: "agent-2" })
+    f.api.on("GET /experimental/session?roots=true&limit=200", {
+      status: 200,
+      data: [
+        { id: SID, directory: "/sessions/s-0000000001", title: "agent 1 work", metadata: { supervisor: f.ctx.supervisor } },
+        { id: OTHER_SID, directory: "/sessions/s-other00001", title: "agent 2 work", metadata: { supervisor: f.ctx.supervisor } },
+      ],
+    })
+    const defaultList = await invoke(listSessionsTool, {}, f.ctx)
+    const defaultSessions = data(defaultList).sessions as Array<Record<string, unknown>>
+    expect(defaultSessions.map((s) => s.sessionID)).toEqual([SID])
+    expect(defaultSessions[0]).toMatchObject({ mine: true, caller: "agent-1" })
+
+    const allList = await invoke(listSessionsTool, { all: true }, f.ctx)
+    const allSessions = data(allList).sessions as Array<Record<string, unknown>>
+    expect(allSessions.map((s) => s.sessionID)).toEqual([SID, OTHER_SID])
+    expect(allSessions.find((s) => s.sessionID === OTHER_SID)).toMatchObject({ mine: false, caller: "agent-2" })
+  })
 })
 
 describe("oc_status and oc_abort", () => {
@@ -177,5 +227,20 @@ describe("oc_status and oc_abort", () => {
     const result = await invoke(abortTool, { sessionID: SID }, f.ctx)
     expect(data(result).code).toBe("not_found")
     expect(f.api.find("POST", `/session/${SID}/abort`)).toBeUndefined()
+  })
+
+  test("#146: oc_abort refuses another caller's session unless force is true", async () => {
+    const f = fakeContext()
+    f.ctx.caller = "agent-1"
+    f.ctx.sessions.set(SID, { ...record(), caller: "agent-2" })
+    f.api.on(`POST /session/${SID}/abort`, { status: 200, data: true })
+    const refused = await invoke(abortTool, { sessionID: SID }, f.ctx)
+    expect(data(refused)).toMatchObject({ code: "policy_violation" })
+    expect(String(data(refused).message)).toContain("agent-2")
+    expect(f.api.find("POST", `/session/${SID}/abort`)).toBeUndefined()
+
+    const forced = await invoke(abortTool, { sessionID: SID, force: true }, f.ctx)
+    expect(data(forced)).toMatchObject({ abortRequested: true, serverConfirmed: true })
+    expect(f.api.find("POST", `/session/${SID}/abort`)).toBeDefined()
   })
 })

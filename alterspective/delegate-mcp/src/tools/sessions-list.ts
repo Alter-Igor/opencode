@@ -21,15 +21,26 @@ async function listRemote(box: Box, correlationId: string): Promise<RemoteSessio
   return res.data.filter((s) => typeof s?.id === "string" && SESSION_ID_RE.test(s.id))
 }
 
-/** Session ids this bridge owns: started or adopted in this process, or named by a host record. */
-async function ownedIds(ctx: ToolContext): Promise<Set<string>> {
-  const ids = new Set(ctx.sessions.keys())
-  for (const state of await ownedStates(ctx)) ids.add(state.sessionID)
-  return ids
+type OwnedInfo = { caller?: string; mine: boolean }
+
+/** Session ids this bridge owns, stamped with caller and whether it belongs to the current caller. */
+async function ownedMap(ctx: ToolContext): Promise<Map<string, OwnedInfo>> {
+  const map = new Map<string, OwnedInfo>()
+  for (const [id, rec] of ctx.sessions.entries()) {
+    const mine = !rec.caller || !ctx.caller || rec.caller === ctx.caller
+    map.set(id, { caller: rec.caller, mine })
+  }
+  for (const state of await ownedStates(ctx)) {
+    if (!map.has(state.sessionID)) {
+      const mine = !state.caller || !ctx.caller || state.caller === ctx.caller
+      map.set(state.sessionID, { caller: state.caller, mine })
+    }
+  }
+  return map
 }
 
 /** Box data: only validated shapes outside `untrusted` (W3A-06 / W3C-03). */
-function listed(s: RemoteSession, mine: boolean) {
+function listed(s: RemoteSession, mine: boolean, caller?: string) {
   const directory = typeof s.directory === "string" && BOX_DIRECTORY_RE.test(s.directory) ? { directory: s.directory } : { untrustedDirectory: untrusted(typeof s.directory === "string" ? s.directory : "", 200) }
   const claimed = s.metadata?.supervisor
   const updated = s.time?.updated
@@ -39,6 +50,7 @@ function listed(s: RemoteSession, mine: boolean) {
     /** What the box's metadata claims (box data); `mine` comes from the host records. */
     metadataSupervisor: typeof claimed === "string" && SUPERVISOR_RE.test(claimed) ? claimed : undefined,
     mine,
+    ...(caller ? { caller } : {}),
     title: untrusted(s.title, 200),
     ...(typeof updated === "number" && Number.isFinite(updated) ? { updated } : {}),
   }
@@ -72,13 +84,13 @@ export const listSessionsTool = defineTool({
   name: "oc_list_sessions",
   title: "List delegated sessions",
   description:
-    "List this bridge's sessions with their state, or (all:true) every top-level session in the sandbox. `mine` comes from the bridge's own host records; `metadataSupervisor` is only what the sandbox claims. Starts the sandbox if it is not running.",
-  input: { all: z.boolean().optional().describe("Every session in the sandbox, not just this bridge's. Default false.") },
+    "List this caller's sessions with their state, or (all:true) every top-level session in the sandbox. `mine` means this caller's sessions; `caller` is included when known; `metadataSupervisor` is only what the sandbox claims. Starts the sandbox if it is not running.",
+  input: { all: z.boolean().optional().describe("Every session in the sandbox, not just this caller's. Default false.") },
   // Destructive: it may delete this box's host records of sessions proved gone (#53), listed in `prunedRecords`.
   annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   async run(args, ctx, correlationId) {
     const box = await ctx.box()
-    const [remote, owned] = await Promise.all([listRemote(box, correlationId), ownedIds(ctx)])
+    const [remote, owned] = await Promise.all([listRemote(box, correlationId), ownedMap(ctx)])
     // Share a 20-read budget between maintenance and missing-row display. Absence from a capped
     // list is not deletion; cleanup always needs a direct 404 plus a separate clone absence proof.
     const checked = new Map<string, number | undefined>()
@@ -101,13 +113,16 @@ export const listSessionsTool = defineTool({
         return []
       })
     for (const sessionKey of pruned) ctx.log.log("info", "tools", "removed the host record of a session gone from the sandbox with its clone", { correlationId, sessionKey })
-    const rows: Row[] = remote.map((s) => listed(s, owned.has(s.id)))
+    const rows: Row[] = remote.map((s) => {
+      const info = owned.get(s.id)
+      return listed(s, info ? info.mine : false, info?.caller)
+    })
     const shown = args.all ? rows : rows.filter((r) => r.mine)
     const sessions = await Promise.all(shown.map((row) => (row.mine ? withState(ctx, box, row, correlationId) : row)))
-    const absent = [...owned].filter((id) => !remote.some((s) => s.id === id))
+    const absent = [...owned.entries()].filter(([id, info]) => info.mine && !remote.some((s) => s.id === id)).map(([id]) => id)
     const gaps = absent.length ? await missing(absent, readPresence) : undefined
-    const summary = `${sessions.length} session${sessions.length === 1 ? "" : "s"}${args.all ? " in the sandbox" : " of this bridge"}.`
-    return ok(summary, { supervisor: ctx.supervisor, sessions, ...(gaps?.missingFromServer.length ? { missingFromServer: gaps.missingFromServer } : {}), ...(gaps?.unknown.length ? { presenceUnknown: gaps.unknown } : {}), ...(pruned.length ? { prunedRecords: pruned } : {}) })
+    const summary = `${sessions.length} session${sessions.length === 1 ? "" : "s"}${args.all ? " in the sandbox" : " of this caller"}.`
+    return ok(summary, { supervisor: ctx.supervisor, ...(ctx.caller ? { caller: ctx.caller } : {}), sessions, ...(gaps?.missingFromServer.length ? { missingFromServer: gaps.missingFromServer } : {}), ...(gaps?.unknown.length ? { presenceUnknown: gaps.unknown } : {}), ...(pruned.length ? { prunedRecords: pruned } : {}) })
   },
 })
 
@@ -138,7 +153,8 @@ export const statusTool = defineTool({
   input: { sessionID: sessionIdSchema.optional() },
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   async run(args, ctx, correlationId) {
-    const ids = args.sessionID ? [args.sessionID] : [...(await ownedIds(ctx))]
+    const map = await ownedMap(ctx)
+    const ids = args.sessionID ? [args.sessionID] : [...map.keys()]
     if (ids.length === 0) return ok("This bridge has no sessions yet.", { sessions: [] })
     const box = await ctx.box()
     if (args.sessionID) {

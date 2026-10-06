@@ -101,6 +101,8 @@ export const sendTool = defineTool({
     model: modelSchema.optional().describe("synapse/<id> for this send (see oc_list_models); default the session's model, else synapse/auto."),
     agent: agentSchema.optional(),
     correlationId: z.string().regex(CORRELATION_RE).optional().describe("Your id for this task; sent as X-Correlation-ID and logged."),
+    allowedPaths: z.array(z.string().min(1).max(256)).max(50).optional().describe("File path globs the session is allowed to edit (#148). Edits outside these are flagged in oc_result."),
+    syncRef: z.string().min(1).max(128).optional().describe("Fetch this host git ref into the session's copy before delivering the message (#143)."),
   },
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   async run(args, ctx, correlationId) {
@@ -108,7 +110,21 @@ export const sendTool = defineTool({
     const box = await ctx.box()
     const { record, remote } = await ownSession(ctx, box, args.sessionID, cid, true)
     await checkPolicy(ctx, box, record, remote?.permission)
-    if (args.model) await requireModel(box.api, args.model, cid)
+    if (args.syncRef) {
+      const syncRes = await ctx.workspaces.sync(
+        { sessionKey: record.sessionKey, hostRepo: record.hostRepo, boxPath: record.boxPath, branch: record.branch },
+        args.syncRef,
+        { correlationId: cid },
+      )
+      if (!syncRes.synced) {
+        throw new DelegateError("branch_diverged", `Could not sync ref ${args.syncRef}: ${syncRes.reason}`, "Resolve conflicts or send without syncRef.")
+      }
+    }
+    if (args.allowedPaths !== undefined) {
+      await ctx.workspaces.updateSessionState(record.sessionKey, { allowedPaths: args.allowedPaths })
+      record.allowedPaths = args.allowedPaths
+    }
+    if (args.model) await requireModel(box.api, args.model, cid, ctx)
     const sent = await sendPrompt(ctx, box, record, { text: args.message, model: args.model, agent: args.agent, correlationId: cid })
     const warn =
       (sent.instructions.failed ? ` Warning: could not read ${sent.instructions.failed.join(", ")} from the repository, so it was not passed on.` : "") +

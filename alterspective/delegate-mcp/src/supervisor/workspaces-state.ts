@@ -39,6 +39,10 @@ export type HostSessionState = {
   agent?: string
   /** R4-01: the Keystone connections the session was narrowed to; absent = the whole box-wide set. */
   keystone?: string[]
+  /** #146: which caller started the session (callerName); for filtering and caller isolation. */
+  caller?: string
+  /** #148: allowed file path globs; oc_result flags files touched outside these patterns. */
+  allowedPaths?: string[]
   /**
    * #53: the compose project (OPENCODE_DELEGATE_PROJECT) of the box whose `sessions` volume holds the
    * clone, stamped at bind time. Absent on records from older bridges; those are never pruned.
@@ -47,7 +51,7 @@ export type HostSessionState = {
 }
 
 /** Written by oc_start_session right after POST /session; the workspaces layer adds `boxProject`. */
-export type SessionBinding = { sessionID: string; profile: SessionProfile; supervisor: string; model?: string; agent?: string; keystone?: string[]; boxProject?: string }
+export type SessionBinding = { sessionID: string; profile: SessionProfile; supervisor: string; model?: string; agent?: string; keystone?: string[]; boxProject?: string; caller?: string; allowedPaths?: string[] }
 
 /** A valid narrowing list (each a connection id, bounded), or undefined. */
 function keystoneList(value: unknown): string[] | undefined {
@@ -89,7 +93,9 @@ export function parseHostState(raw: string, key: string): HostSessionState | und
   const keystone = keystoneList(p.keystone)
   // A box name that does not parse is dropped: the record then counts as legacy and is never pruned.
   const boxProject = optional(p.boxProject, PROJECT_RE)
-  return { ...state, ...(model ? { model } : {}), ...(agent ? { agent } : {}), ...(keystone ? { keystone } : {}), ...(boxProject ? { boxProject } : {}) }
+  const caller = str(p.caller)?.slice(0, 128)
+  const allowedPaths = Array.isArray(p.allowedPaths) ? p.allowedPaths.filter((s): s is string => typeof s === "string") : undefined
+  return { ...state, ...(model ? { model } : {}), ...(agent ? { agent } : {}), ...(keystone ? { keystone } : {}), ...(boxProject ? { boxProject } : {}), ...(caller ? { caller } : {}), ...(allowedPaths ? { allowedPaths } : {}) }
 }
 
 function checkState(state: HostSessionState): void {
@@ -101,7 +107,9 @@ function checkState(state: HostSessionState): void {
     (state.model !== undefined && !MODEL_RE.test(state.model)) ||
     (state.agent !== undefined && !AGENT_RE.test(state.agent)) ||
     (state.keystone !== undefined && keystoneList(state.keystone) === undefined) ||
-    (state.boxProject !== undefined && !PROJECT_RE.test(state.boxProject))
+    (state.boxProject !== undefined && !PROJECT_RE.test(state.boxProject)) ||
+    (state.caller !== undefined && typeof state.caller !== "string") ||
+    (state.allowedPaths !== undefined && (!Array.isArray(state.allowedPaths) || !state.allowedPaths.every((s) => typeof s === "string")))
   if (bad) throw new DelegateError("upstream_error", "The session's host record would not be valid, so it was not saved.", "Start the session again with oc_start_session.", "invalid host state")
 }
 
@@ -169,6 +177,15 @@ export function bindHostState(dir: string, key: string, binding: SessionBinding)
   if (current.sessionID && current.sessionID !== binding.sessionID)
     throw new DelegateError("directory_busy", "This workspace already belongs to another session.", "Start a new session with oc_start_session.", `bound: ${key}`)
   const next: HostSessionState = { ...current, ...binding }
+  writeHostState(dir, next)
+  return next
+}
+
+/** Update fields on an existing host record. */
+export function updateHostState(dir: string, key: string, patch: Partial<HostSessionState>): HostSessionState {
+  const current = readHostState(dir, key)
+  if (!current) throw new DelegateError("not_found", "This session has no workspace record on the host.", "Start a new session with oc_start_session.", `missing: ${key}`)
+  const next: HostSessionState = { ...current, ...patch }
   writeHostState(dir, next)
   return next
 }

@@ -57,9 +57,21 @@ async function hubChanged(ctx: ToolContext, args: WaitArgs) {
   return ok(summary, { still_running: false, hub_changed: true, ...(next ? { next } : {}), views })
 }
 
+function formatViewState(v: SessionView, now: number = Date.now()): string {
+  let s = `${v.sessionID} ${v.state}`
+  const reason = v.lastError || (v.state === "error" || v.state === "aborted" ? v.detail : undefined)
+  if (reason) s += ` (${reason})`
+  if (v.lastActiveAt && RUNNING.has(v.state)) {
+    const inactiveSec = Math.floor((now - Date.parse(v.lastActiveAt)) / 1000)
+    if (inactiveSec >= 120) s += ` [no activity for ${Math.floor(inactiveSec / 60)} min]`
+  }
+  return s
+}
+
 function timedOut(timeoutSec: number, next: string, events: ReturnType<typeof shapeEvent>[], states: SessionView[]) {
+  const now = Date.now()
   const running = states.some((v) => RUNNING.has(v.state))
-  const list = states.map((v) => `${v.sessionID} ${v.state}`).join("; ")
+  const list = states.map((v) => formatViewState(v, now)).join("; ")
   const advice = running ? " Still running: call oc_wait again with the next cursor." : " Check oc_status or oc_pending."
   return ok(`No matching state after ${timeoutSec} s: ${list}.${advice}`, { still_running: running, next, events, views: states })
 }
@@ -82,7 +94,11 @@ async function waitOn(ctx: ToolContext, box: Box, args: WaitArgs) {
   }
   const views = result.views ?? []
   recordStates(ctx, observed(result.events, views))
-  const matched = [...page.events.filter((e) => e.state).map((e) => `${e.sessionID ?? "?"} ${e.state}`), ...views.map((v) => `${v.sessionID} ${v.state}`)]
+  const now = Date.now()
+  const matched = [
+    ...page.events.filter((e) => e.state).map((e) => `${e.sessionID ?? "?"} ${e.state}${e.code ? ` (${e.code})` : ""}`),
+    ...views.map((v) => formatViewState(v, now)),
+  ]
   return ok(`Done waiting: ${matched.join("; ") || "matching event"}.`, { still_running: false, next: page.next, events: page.events, views, ...(page.more ? { more: true } : {}) })
 }
 

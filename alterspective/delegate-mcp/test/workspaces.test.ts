@@ -63,6 +63,19 @@ describe("workspaces: OpenCode's own scratch is ignored in the clone", () => {
   )
 })
 
+describe("workspaces: default git author identity (#138)", () => {
+  test(
+    "cloneAt sets default user.name and user.email so commits work out of the box",
+    async () => {
+      await fx.workspaces().open(fx.hostRepo, "identity-test")
+      const config = readFileSync(path.join(fx.boxClone("identity-test"), ".git", "config"), "utf8")
+      expect(config).toContain("name = OpenCode Delegate (Synapse)")
+      expect(config).toContain("email = opencode-delegate@users.noreply.github.com")
+    },
+    T,
+  )
+})
+
 describe("workspaces: host-executable changes are reported", () => {
   test(
     "paths, tool configs, agent files, package.json scripts, symlinks, submodules and exec bits are flagged",

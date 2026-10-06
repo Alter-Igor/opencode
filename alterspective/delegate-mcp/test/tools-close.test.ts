@@ -40,13 +40,13 @@ function context(): Fake {
 type Started = { key: string; sessionID: string; state: HostSessionState }
 
 /** A bound session of `supervisor` (default: this bridge), with the box answering for it. */
-async function start(f: Fake, options: { supervisor?: string; ageDays?: number; updatedDaysAgo?: number; track?: boolean } = {}): Promise<Started> {
+async function start(f: Fake, options: { supervisor?: string; ageDays?: number; updatedDaysAgo?: number; track?: boolean; caller?: string } = {}): Promise<Started> {
   serial++
   const key = `tc-${String(serial).padStart(6, "0")}`
   const sessionID = `ses_${String(serial).padStart(18, "1")}`
   const ws = fx.workspaces()
   const opened = await ws.open(fx.hostRepo, key)
-  let state = await ws.bindSession(key, { sessionID, profile: "standard", supervisor: options.supervisor ?? f.ctx.supervisor })
+  let state = await ws.bindSession(key, { sessionID, profile: "standard", supervisor: options.supervisor ?? f.ctx.supervisor, caller: options.caller })
   if (options.ageDays !== undefined) {
     state = { ...state, createdAt: new Date(Date.now() - options.ageDays * DAY).toISOString() }
     writeHostState(stateDir(), state)
@@ -57,7 +57,7 @@ async function start(f: Fake, options: { supervisor?: string; ageDays?: number; 
   f.api.on(`DELETE /session/${sessionID}`, { status: 200, data: true })
   f.api.on(`POST /session/${sessionID}/abort`, { status: 200, data: true })
   if (options.track !== false && (options.supervisor ?? f.ctx.supervisor) === f.ctx.supervisor)
-    f.ctx.sessions.set(sessionID, { sessionID, sessionKey: key, hostRepo: opened.hostRepo, boxPath: opened.boxPath, branch: opened.branch, profile: "standard", createdAt: state.createdAt, base: opened.base })
+    f.ctx.sessions.set(sessionID, { sessionID, sessionKey: key, hostRepo: opened.hostRepo, boxPath: opened.boxPath, branch: opened.branch, profile: "standard", createdAt: state.createdAt, base: opened.base, caller: options.caller })
   return { key, sessionID, state }
 }
 
@@ -82,7 +82,7 @@ describe("oc_close_session", () => {
   test("is registered with honest destructive annotations and the split flags", () => {
     const tools = allTools()
     for (const name of ["oc_close_session", "oc_cleanup"]) expect(tools.find((t) => t.name === name)?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true })
-    expect(Object.keys(closeSessionTool.input).sort()).toEqual(["abort", "deleteBranch", "discardWork", "sessionID"])
+    expect(Object.keys(closeSessionTool.input).sort()).toEqual(["abort", "deleteBranch", "discardWork", "force", "sessionID"])
   })
 
   test(
@@ -219,6 +219,23 @@ describe("oc_close_session", () => {
       expect(aborted(f, s.sessionID) || deleted(f, s.sessionID)).toBe(false)
       expect(readFileSync(recordFile(s.key), "utf8")).toBe(before)
       expect(fx.leftovers(s.key)).toEqual([s.key])
+    },
+    T,
+  )
+
+  test(
+    "#146: another caller's session refuses close unless force is true",
+    async () => {
+      const f = context()
+      f.ctx.caller = "agent-1"
+      const s = await start(f, { caller: "agent-2" })
+      const result = await invoke(closeSessionTool, { sessionID: s.sessionID }, f.ctx)
+      expect(data(result)).toMatchObject({ code: "policy_violation" })
+      expect(String(data(result).message)).toContain("agent-2")
+
+      const forced = await invoke(closeSessionTool, { sessionID: s.sessionID, force: true }, f.ctx)
+      expect(forced.isError).toBeUndefined()
+      expect(data(forced)).toMatchObject({ closed: true })
     },
     T,
   )

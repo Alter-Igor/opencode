@@ -41,14 +41,38 @@ function standard(): Rule[] {
  */
 const dynamicAllow = (): Rule => ({ permission: `${entryName(DYNAMIC_ID)}_*`, pattern: "*", action: "allow" })
 
+/**
+ * Safe read-only commands that review and inspection sessions need without interactive approval (#140).
+ */
+const READONLY_BASH_ALLOW = [
+  "git status*",
+  "git log*",
+  "git diff*",
+  "git show*",
+  "git branch*",
+  "git rev-parse*",
+  "cat *",
+  "head *",
+  "tail *",
+  "grep *",
+  "ls *",
+  "ls",
+  "pwd",
+  "find *",
+  "sed -n *",
+]
+
 function readonly(dynamicGated: boolean): Rule[] {
   return [
     ...standard(),
     { permission: "edit", pattern: "*", action: "deny" },
     { permission: "bash", pattern: "*", action: "ask" },
+    ...READONLY_BASH_ALLOW.map((pattern): Rule => ({ permission: "bash", pattern, action: "allow" })),
     // Keystone tools may change remote state, so a read-only session asks first
     // (review A-16). Last-match-wins: this overrides the standard `ks-*_*` allow above.
     { permission: "ks-*_*", pattern: "*", action: "ask" },
+    // #140: read-only Keystone connections like rag-read need no human approval
+    { permission: "ks-rag-read_*", pattern: "*", action: "allow" },
     ...(dynamicGated ? [dynamicAllow()] : []),
   ]
 }

@@ -86,6 +86,17 @@ describe("high-risk ids (R5-04)", () => {
     const wide = keystoneReport({ ...defaultConfig({ OPENCODE_DELEGATE_HOME: home }), keystoneAllowed: ["rag-read", "cas", "vault-global"] })
     expect(wide).toMatchObject({ highRisk: ["cas", "vault-global"], warnings: [expect.stringContaining("cas")] })
   })
+
+  test("#137: a saved set outside ceiling reports problem and fix without throwing", () => {
+    writeFileSync(path.join(home, "keystone.json"), JSON.stringify({ connections: ["rag-read", "m365"] }))
+    const report = keystoneReport(defaultConfig({ OPENCODE_DELEGATE_HOME: home }))
+    expect(report).toMatchObject({
+      connections: ["rag-read", "m365"],
+      source: "saved",
+      problem: expect.stringContaining("m365"),
+      fix: expect.stringContaining("rag-read"),
+    })
+  })
 })
 
 describe("stored sign-ins outside the set are removed (R5-01)", () => {

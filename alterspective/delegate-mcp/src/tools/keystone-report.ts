@@ -4,14 +4,14 @@
 // R5-03 / R5-04: also the owner's ceiling (launch env) and a warning for each high-risk id in the
 // ceiling or the set: one connection can relay to many services (mail agents, admin tools, vault).
 import { currentKeystone, type KeystoneConfig } from "../shared/config.ts"
-import { entryName, type KeystoneSource } from "../shared/keystone.ts"
+import { entryName, readKeystoneSet, type KeystoneSource } from "../shared/keystone.ts"
 import { CEILING_ENV, ceilingOf, highRiskIds } from "../shared/keystone-policy.ts"
 
 export type KeystoneEntry = { id: string; name: string; status: string }
 type Limits = { ceiling: string[]; highRisk: string[]; warnings: string[] }
 export type KeystoneReport =
-  | ({ connections: string[]; source: KeystoneSource; entries?: KeystoneEntry[] } & Limits)
-  | ({ unavailable: string } & Partial<Limits>)
+  | ({ connections: string[]; source: KeystoneSource; entries?: KeystoneEntry[]; problem?: string; fix?: string } & Limits)
+  | ({ unavailable: string; problem?: string; fix?: string } & Partial<Limits>)
 
 /** The ceiling and the high-risk ids in it or in `connections`; empty when the ceiling itself is invalid. */
 function limits(config: KeystoneConfig, connections: readonly string[]): Limits {
@@ -34,12 +34,37 @@ function limits(config: KeystoneConfig, connections: readonly string[]): Limits 
  * reported as unavailable (and every check that needs it fails closed elsewhere).
  */
 export function keystoneReport(config: KeystoneConfig, statuses?: ReadonlyMap<string, string>): KeystoneReport {
+  let ceiling: string[]
+  try {
+    ceiling = ceilingOf(config)
+  } catch {
+    ceiling = []
+  }
   try {
     const set = currentKeystone(config)
     const base = { connections: set.connections, source: set.source, ...limits(config, set.connections) }
     if (!statuses) return base
     return { ...base, entries: set.connections.map((id) => ({ id, name: entryName(id), status: statuses.get(entryName(id)) ?? "missing" })) }
   } catch (error) {
+    try {
+      const saved = readKeystoneSet(config.home, config.keystoneConnections)
+      const outside = ceiling.length > 0 ? saved.connections.filter((id) => !ceiling.includes(id)) : []
+      if (outside.length > 0) {
+        const problem = `The saved Keystone service choice contains ${outside.join(", ")} which ${outside.length === 1 ? "is" : "are"} outside the owner's ceiling (${ceiling.join(", ")}).`
+        const fix = `Pass an allowed keystone subset to oc_start_session (e.g. keystone: ${JSON.stringify(ceiling.filter((c) => saved.connections.includes(c)))}), or restart the box with oc_server_restart.`
+        const base = {
+          connections: saved.connections,
+          source: saved.source,
+          ...limits(config, saved.connections),
+          problem,
+          fix,
+        }
+        if (!statuses) return base
+        return { ...base, entries: saved.connections.map((id) => ({ id, name: entryName(id), status: statuses.get(entryName(id)) ?? "missing" })) }
+      }
+    } catch {
+      // ignore secondary read failures
+    }
     return { unavailable: error instanceof Error ? error.message : "the saved Keystone choice could not be read", ...limits(config, []) }
   }
 }

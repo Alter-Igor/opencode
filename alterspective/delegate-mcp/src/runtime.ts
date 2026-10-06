@@ -60,7 +60,7 @@ export async function readVersion(run: CommandRunner = hostRunner, env: NodeJS.P
   return { version: `${pkg}-dev+${sha}${dirty ? ".dirty" : ""}`, package: pkg, sha, dirty, built: env.APP_BUILD_DATE ?? null }
 }
 
-const hostRunner: CommandRunner = (argv, timeoutMs) => runCommand(argv, cleanEnv(), timeoutMs)
+const hostRunner: CommandRunner = (argv, timeoutMs, cwd) => runCommand(argv, cleanEnv(), timeoutMs, cwd)
 
 export type BoxManager = {
   box(): Promise<Box>
@@ -274,7 +274,7 @@ export async function createRuntime(options: RuntimeOptions = {}): Promise<Runti
     },
     onBox: (listener) => manager.onBox(listener),
     boxExec: (argv, timeoutMs) => runCommand(["docker", "exec", container, ...argv], cleanEnv(), timeoutMs ?? 60_000),
-    hostExec: (argv, timeoutMs) => hostRunner(argv, timeoutMs ?? 60_000),
+    hostExec: (argv, timeoutMs, cwd) => hostRunner(argv, timeoutMs ?? 60_000, cwd),
     sessions,
     synapse,
     ...(keystone ? { keystone } : {}),

@@ -28,7 +28,7 @@ export type SnapshotEntry = {
   directory?: string
 }
 /** `directory` is where the session was tracked; `reportedDirectory` is where the server says it lives now, when that differs (box data). */
-export type EntryView = { sessionID: string; directory: string; reportedDirectory?: string; state: Derived; detail?: string; since: number; pending: string[]; parentID?: string; lastError?: string }
+export type EntryView = { sessionID: string; directory: string; reportedDirectory?: string; state: Derived; detail?: string; since: number; pending: string[]; parentID?: string; lastError?: string; errorCode?: string; lastActiveAt?: number }
 export type Tracked = { sessionID: string; directory: string }
 
 export const NOT_STARTED_MS = 10_000
@@ -113,7 +113,11 @@ export class SessionTable {
     const view: EntryView = { sessionID, directory: e.home, state: e.state, detail: e.stateDetail, since: e.since, pending: this.pendingOf(e) }
     if (e.directory !== e.home) view.reportedDirectory = e.directory
     if (e.parentID) view.parentID = e.parentID
-    if (e.lastError) view.lastError = e.lastError.label
+    if (e.lastError) {
+      view.lastError = e.lastError.label
+      view.errorCode = e.lastError.label
+    }
+    if (e.lastActiveAt) view.lastActiveAt = e.lastActiveAt
     return view
   }
 

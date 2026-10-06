@@ -26,6 +26,8 @@ export type Metrics = {
   successRate: number | null
   durationMs: Durations
   dispositions: Dispositions
+  /** #148: tasks touching files outside allowedPaths. */
+  outOfScope: number
 }
 export type Group = Metrics & { name: string }
 export type Report = { since: string; totals: Metrics; groups: Group[]; recent: TaskRecord[] }
@@ -80,6 +82,7 @@ function metrics(records: readonly TaskRecord[]): Metrics {
       closedClean: disposed("closed_clean"),
       swept: disposed("swept"),
     },
+    outOfScope: records.filter((r) => (r.outOfScopeCount ?? 0) > 0).length,
   }
 }
 

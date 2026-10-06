@@ -10,6 +10,7 @@ import { stripUnsafe } from "./text.ts"
 export const SESSION_ERROR_CODES = [
   "budget_exhausted",
   "rate_limited",
+  "skipped_breaker",
   "no_tool_support",
   "model_not_found",
   "auth",
@@ -65,6 +66,7 @@ export function sessionErrorCode(error: unknown): SessionErrorCode {
   if (status === 401 || status === 403) return "auth"
   if (/context_length_exceeded|context window|maximum context/i.test(message)) return "context_overflow"
   if (noToolSupport(message)) return "no_tool_support"
+  if (/skipped_breaker|circuit[ _-]?breaker|breaker[ _-]?trip/i.test(message)) return "skipped_breaker"
   if (status === 402 || /budget_exhausted|insufficient|credit/i.test(message)) return "budget_exhausted"
   if (status === 429 || /rate_limited|rate limit/i.test(message)) return "rate_limited"
   if (status === 404 || /model_not_found|model_unavailable|model_not_available|model not found/i.test(message)) return "model_not_found"
