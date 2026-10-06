@@ -164,10 +164,18 @@ function fakeServices(f: Fake): Pick<ToolContext, "supervisorService" | "workspa
         f.collected.push(ws.sessionKey)
         return { branch: ws.branch, commits: 1, hostExecutableChanges: [] }
       },
+      sync: async (_ws, _ref) => ({ synced: true, head: BASE, commitsSynced: 1 }),
       bindSession: async (key, binding) => {
         const current = f.states.get(key)
         if (!current) throw new Error(`no state for ${key}`)
         const next = { ...current, ...binding }
+        f.states.set(key, next)
+        return next
+      },
+      updateSessionState: async (key, patch) => {
+        const current = f.states.get(key)
+        if (!current) throw new Error(`no state for ${key}`)
+        const next = { ...current, ...patch }
         f.states.set(key, next)
         return next
       },

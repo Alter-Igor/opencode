@@ -21,7 +21,7 @@ import { flagChanges, parseRawDiff } from "./workspaces-detect.ts"
 import { boxFailure, canonicalPath, invalidFolder, isUnder, runCommand, samePath, systemSubst, type Exec } from "./workspaces-exec.ts"
 import { copyOutBundle, dockerTarSource, type TarSource } from "./workspaces-copyout.ts"
 import { assertRegularFile, DEFAULT_MAX_BUNDLE_BYTES, planOutBundle, randomNonce, removeQuietly, reserveInBundle } from "./workspaces-handoff.ts"
-import { bindHostState, COMMIT_ID, listHostStates, readHostState, removeHostState, SESSION_KEY, writeHostState, type HostSessionState, type SessionBinding } from "./workspaces-state.ts"
+import { bindHostState, COMMIT_ID, listHostStates, readHostState, removeHostState, SESSION_KEY, updateHostState, writeHostState, type HostSessionState, type SessionBinding } from "./workspaces-state.ts"
 import { createSessionPruner, type MissingSession } from "./workspaces-prune.ts"
 import { closeCandidates, closeSession, inspectClose, type CandidateOptions, type CloseCandidates, type CloseDeps, type CloseHooks, type CloseOptions, type CloseOutcome, type CloseOwner, type ClosePlan } from "./workspaces-close.ts"
 
@@ -306,6 +306,56 @@ async function collect(ctx: Ctx, ws: Workspace) {
   return { branch, commits: Number(count.trim()), hostExecutableChanges }
 }
 
+export type SyncResult =
+  | { synced: true; head: string; commitsSynced: number }
+  | { synced: false; conflicts: string[]; reason: string }
+
+/** #143: Fetch a host ref into the session's copy and fast-forward/merge it. Refuses uncommitted changes. */
+async function sync(ctx: Ctx, ws: Workspace, ref: string): Promise<SyncResult> {
+  checkKey(ws.sessionKey)
+  const state = readState(ctx, ws.sessionKey)
+  if (!samePath(state.hostRepo, ws.hostRepo)) throw invalidFolder(ctx.roots, "The workspace does not match its host record.", ws.hostRepo)
+  const wsDir = `${ctx.boxSessions}/${ws.sessionKey}`
+  const status = await boxRun(ctx, ["git", "-C", wsDir, "status", "--porcelain"], "check workspace status")
+  if (status.trim().length > 0) {
+    throw new DelegateError("directory_busy", "The session workspace has uncommitted files, so it cannot be synced.", "Commit or stash changes before syncing.")
+  }
+  const targetSha = (await hostGit(ctx, ["-C", state.hostRepo, "rev-parse", "--verify", `${ref}^{commit}`], `resolve sync ref ${ref}`)).trim()
+  if (!COMMIT_ID.test(targetSha)) {
+    throw new DelegateError("invalid_input", `Ref ${ref} could not be resolved to a commit in the host repository.`, "Check the branch or commit name and retry.")
+  }
+  const nonce = ctx.nonce()
+  const tempRef = `refs/delegate-sync/${nonce}`
+  const bundle = reserveInBundle(ctx.handoffDir, ctx.boxHandoff, ws.sessionKey, nonce)
+  try {
+    await hostGit(ctx, ["-C", state.hostRepo, "update-ref", tempRef, targetSha], "create temp sync ref")
+    await hostGit(ctx, ["-C", state.hostRepo, "bundle", "create", bundle.hostPath, tempRef], "bundle the sync ref", "long")
+    assertRegularFile(bundle.hostPath, "sync bundle")
+    await boxRun(ctx, ["git", "-C", wsDir, "fetch", "--quiet", bundle.boxPath], "fetch sync bundle")
+    const countBefore = Number((await boxRun(ctx, ["git", "-C", wsDir, "rev-list", "--count", "HEAD"], "count commits before")).trim())
+    const mergeRes = await ctx.box(["git", "-C", wsDir, "merge", "--no-edit", "FETCH_HEAD"], { timeoutMs: ctx.timeouts.short })
+    if (mergeRes.code === 0) {
+      const head = (await boxRun(ctx, ["git", "-C", wsDir, "rev-parse", "HEAD"], "read new HEAD")).trim()
+      const countAfter = Number((await boxRun(ctx, ["git", "-C", wsDir, "rev-list", "--count", "HEAD"], "count commits after")).trim())
+      return { synced: true, head, commitsSynced: Math.max(0, countAfter - countBefore) }
+    }
+    const conflictFiles = (await boxRun(ctx, ["git", "-C", wsDir, "diff", "--name-only", "--diff-filter=U"], "read conflict files"))
+      .trim()
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .filter(Boolean)
+    await boxRun(ctx, ["git", "-C", wsDir, "merge", "--abort"], "abort conflicted merge")
+    return {
+      synced: false,
+      conflicts: conflictFiles,
+      reason: `Merge of ${ref} produced conflicts in ${conflictFiles.length} file(s); merge was aborted to keep workspace clean.`,
+    }
+  } finally {
+    await hostGit(ctx, ["-C", state.hostRepo, "update-ref", "-d", tempRef], "delete temp sync ref").catch(() => undefined)
+    removeQuietly(bundle.hostPath)
+  }
+}
+
 /** Per-call options: the caller's correlation id ties these log lines to its own (A-17). */
 export type CallOptions = { correlationId?: string }
 
@@ -313,9 +363,12 @@ export type CallOptions = { correlationId?: string }
 export type DelegateWorkspaces = Omit<Workspaces, "open" | "collect"> & {
   open(hostRepo: string, sessionKey: string, call?: CallOptions): Promise<OpenedWorkspace>
   collect(workspace: Workspace, call?: CallOptions): ReturnType<Workspaces["collect"]>
+  sync(workspace: Workspace, ref: string, call?: CallOptions): Promise<SyncResult>
   resolveRepo(hostRepo: string, call?: CallOptions): Promise<string>
   /** Record the OpenCode session a workspace became (W3C-01): the only source adoption trusts. */
   bindSession(sessionKey: string, binding: SessionBinding): Promise<HostSessionState>
+  /** #148: Update fields on an existing host record. */
+  updateSessionState(sessionKey: string, patch: Partial<HostSessionState>): Promise<HostSessionState>
   /** The host record for a session key; undefined when there is none (throws when damaged). */
   sessionState(sessionKey: string): Promise<HostSessionState | undefined>
   /** Every readable host record, newest first. */
@@ -384,8 +437,11 @@ export function createWorkspaces(options: WorkspacesOptions): DelegateWorkspaces
       traced(logger, "open", call, { sessionKey }, () => open(ctx, hostRepo, sessionKey), (ws) => ({ branch: ws.branch })),
     collect: (ws: Workspace, call?: CallOptions) =>
       traced(logger, "collect", call, { sessionKey: ws.sessionKey }, () => collect(ctx, ws), (r) => ({ branch: r.branch, commits: r.commits, hostExecutableChanges: r.hostExecutableChanges.length })),
+    sync: (ws: Workspace, ref: string, call?: CallOptions) =>
+      traced(logger, "sync", call, { sessionKey: ws.sessionKey, ref }, () => sync(ctx, ws, ref), (r) => ({ synced: r.synced, head: r.synced ? r.head : "" })),
     resolveRepo: (hostRepo: string, call?: CallOptions) => traced(logger, "resolveRepo", call, {}, () => resolveRepo(ctx, hostRepo)),
     bindSession: async (key, binding) => bindHostState(ctx.stateDir, key, { ...binding, boxProject }),
+    updateSessionState: async (key, patch) => updateHostState(ctx.stateDir, key, patch),
     sessionState: async (key) => readHostState(ctx.stateDir, key),
     listSessionStates: async () => listHostStates(ctx.stateDir),
     pruneSessionStates,

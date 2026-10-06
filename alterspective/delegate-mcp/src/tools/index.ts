@@ -14,6 +14,9 @@ import { restartTool } from "./restart.ts"
 import { resultTool } from "./result.ts"
 import { sendTool } from "./send.ts"
 import { abortTool, listSessionsTool, startSessionTool, statusTool } from "./sessions.ts"
+import { syncTool } from "./sync.ts"
+import { verifyTool } from "./verify.ts"
+import { landTool } from "./land.ts"
 import { eventsTool, waitTool } from "./wait.ts"
 
 type AnyTool = ToolSpec<z.ZodRawShape>
@@ -29,6 +32,9 @@ export const coreTools: AnyTool[] = [
   eventsTool,
   resultTool,
   collectTool,
+  syncTool,
+  verifyTool,
+  landTool,
   abortTool,
   listSessionsTool,
   closeSessionTool,

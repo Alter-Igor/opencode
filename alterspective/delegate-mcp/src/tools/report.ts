@@ -42,6 +42,7 @@ function row(r: TaskRecord) {
     collected: r.collected,
     disposition: r.disposition,
     ...(r.closedAt ? { closedAt: r.closedAt } : {}),
+    ...(r.outOfScopeCount !== undefined ? { outOfScopeCount: r.outOfScopeCount } : {}),
   }
 }
 
@@ -53,9 +54,10 @@ function summary(t: Metrics, days: number): string {
   if (!t.tasks) return `No tasks recorded in the last ${days} days.`
   const rate = t.successRate === null ? "no finished tasks yet" : `success rate ${Math.round(t.successRate * 100)}% of ${t.finished} finished`
   const d = t.dispositions
+  const outOfScope = t.outOfScope > 0 ? `; ${t.outOfScope} out-of-scope` : ""
   return (
     `${t.tasks} task${t.tasks === 1 ? "" : "s"} in the last ${days} days: ${t.completed} completed, ${t.error} error, ${t.aborted} aborted, ${t.unknown - t.notSent} unknown, ${t.running} running, ${t.notSent} never sent; ${rate}; ` +
-    `duration median ${seconds(t.durationMs.median)}, p90 ${seconds(t.durationMs.p90)}; ${d.collected} collected, ${d.closedDiscarded} discarded, ${d.open} open.`
+    `duration median ${seconds(t.durationMs.median)}, p90 ${seconds(t.durationMs.p90)}; ${d.collected} collected, ${d.closedDiscarded} discarded, ${d.open} open${outOfScope}.`
   )
 }
 

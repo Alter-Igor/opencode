@@ -50,6 +50,8 @@ export type TaskRecord = {
   collected: boolean
   disposition: Disposition
   closedAt?: string
+  /** #148: files touched outside allowedPaths. */
+  outOfScopeCount?: number
 }
 
 export const OUTCOMES: readonly Outcome[] = ["running", "completed", "error", "aborted", "unknown"]
@@ -149,6 +151,7 @@ export function parseTaskRecord(raw: string): TaskRecord | undefined {
     tokens: tokens(p.tokens),
     commitsCollected: count(p.commitsCollected),
     closedAt: str(p.closedAt, ISO_RE),
+    outOfScopeCount: count(p.outOfScopeCount),
   }
   const record: TaskRecord = { v: RECORD_VERSION, sessionID, key, bridge, repo, startedAt, sendCount: count(p.sendCount) ?? 0, outcome, collected: p.collected === true, disposition }
   for (const [name, value] of Object.entries(optional)) if (value !== undefined) (record as Record<string, unknown>)[name] = value

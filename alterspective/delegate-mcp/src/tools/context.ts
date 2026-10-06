@@ -30,6 +30,8 @@ export type SessionRecord = {
   keystone?: string[]
   /** #146: which caller started the session (callerName). */
   caller?: string
+  /** #148: allowed file path patterns (globs) for this session's tasks. */
+  allowedPaths?: string[]
 }
 
 export type Box = { target: ApiTarget; api: OpencodeApi; hub: DelegateHub }
@@ -38,7 +40,7 @@ export type RestartedBox = Box & { interrupted: number; keystone: string[] }
 
 /** Additive (Wave 3): result of one command run on the host or in the box. */
 export type CommandResult = { code: number; stdout: string; stderr: string; timedOut?: boolean }
-export type CommandRunner = (argv: string[], timeoutMs?: number) => Promise<CommandResult>
+export type CommandRunner = (argv: string[], timeoutMs?: number, cwd?: string) => Promise<CommandResult>
 
 export type ToolContext = {
   config: BridgeConfig
@@ -55,7 +57,7 @@ export type ToolContext = {
    * Wave 3: the contract plus `resolveRepo` (oc_start_session checks directory_busy before cloning)
    * and the host-only session records (W3C-01): adoption, "mine" and instruction reads trust only these.
    */
-  workspaces: Pick<DelegateWorkspaces, "open" | "collect" | "resolveRepo" | "bindSession" | "sessionState" | "listSessionStates" | "pruneSessionStates" | "discard" | "inspectClose" | "closeSession" | "closeCandidates">
+  workspaces: Pick<DelegateWorkspaces, "open" | "collect" | "sync" | "resolveRepo" | "bindSession" | "updateSessionState" | "sessionState" | "listSessionStates" | "pruneSessionStates" | "discard" | "inspectClose" | "closeSession" | "closeCandidates">
   inbox: BridgeInbox
   /** #104: the delegation gate's approvals (tool calls on /mcp/dynamic waiting for a decision). Absent in older test contexts. */
   gate?: GateApprovals

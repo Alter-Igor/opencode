@@ -138,6 +138,7 @@ export async function recordFromState(ctx: ToolContext, state: HostSessionState 
     ...(state.agent ? { agent: state.agent } : {}),
     ...(state.keystone ? { keystone: state.keystone } : {}),
     ...(state.caller ? { caller: state.caller } : {}),
+    ...(state.allowedPaths ? { allowedPaths: state.allowedPaths } : {}),
   }
 }
 

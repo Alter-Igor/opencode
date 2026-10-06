@@ -75,11 +75,12 @@ export const resultTool = defineTool({
       todos(box, record, correlationId),
       box.hub.view(record.sessionID),
     ])
-    recordResult(ctx, record, { state: view.state, at: view.since }, messages)
+    recordResult(ctx, record, { state: view.state, at: view.since }, messages, diff.outOfScope?.length)
     recordServed(ctx, record.sessionKey, record.sessionID)
     const n = diff.boxReportedCommits
     const commits = n === undefined ? "commit count unknown" : `${n} commit${n === 1 ? "" : "s"} (box-reported)`
-    return ok(`${record.sessionID} is ${view.state}; ${replies.length} repl${replies.length === 1 ? "y" : "ies"}; ${commits} on ${record.branch}.`, {
+    const outOfScopeNote = diff.outOfScope && diff.outOfScope.length > 0 ? ` Warning: ${diff.outOfScope.length} file(s) touched outside allowedPaths: ${diff.outOfScope.join(", ")}.` : ""
+    return ok(`${record.sessionID} is ${view.state}; ${replies.length} repl${replies.length === 1 ? "y" : "ies"}; ${commits} on ${record.branch}.${outOfScopeNote}`, {
       sessionID: record.sessionID,
       state: view.state,
       branch: record.branch,

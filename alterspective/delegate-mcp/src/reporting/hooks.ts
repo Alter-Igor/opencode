@@ -193,7 +193,7 @@ export function usageOf(messages: readonly unknown[]): { tokens?: Tokens } {
 const total = (t: Tokens | undefined) => (t ? t.input + t.output + t.reasoning + t.cacheRead + t.cacheWrite : -1)
 
 /** oc_result: tokens from the messages it fetched, and the state it read. */
-export function recordResult(ctx: Ctx, rec: SessionRecord, seen: { state: SessionState; at?: string }, messages: readonly unknown[]): void {
+export function recordResult(ctx: Ctx, rec: SessionRecord, seen: { state: SessionState; at?: string }, messages: readonly unknown[], outOfScopeCount?: number): void {
   return guarded(ctx, () =>
     reportsFor(ctx).update(rec.sessionKey, (current) => {
       if (!current) return undefined
@@ -201,7 +201,8 @@ export function recordResult(ctx: Ctx, rec: SessionRecord, seen: { state: Sessio
       const done = finish(current, { sessionID: rec.sessionID, ...seen }) ?? current
       // Repeated reads never lower the count (a later read may see a shorter window).
       const tokens = total(usage.tokens) > total(done.tokens) ? usage.tokens : done.tokens
-      const next: TaskRecord = { ...done, ...(tokens ? { tokens } : {}) }
+      const count = outOfScopeCount !== undefined ? Math.max(done.outOfScopeCount ?? 0, outOfScopeCount) : done.outOfScopeCount
+      const next: TaskRecord = { ...done, ...(tokens ? { tokens } : {}), ...(count !== undefined ? { outOfScopeCount: count } : {}) }
       return JSON.stringify(next) === JSON.stringify(current) ? undefined : next
     }),
   )

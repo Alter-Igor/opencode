@@ -27,8 +27,8 @@ const MAX_OUTPUT_BYTES = 64 * 1024 * 1024
  * even when a grandchild keeps the output pipes open. For `docker exec` the tree is the CLI on
  * the host; the process inside the box is ended by Docker when the exec session closes.
  */
-export async function runCommand(argv: readonly string[], env: NodeJS.ProcessEnv = cleanEnv(), timeoutMs?: number): Promise<ExecResult> {
-  const result = await runProcess(argv, { env, timeoutMs, maxBuffer: MAX_OUTPUT_BYTES })
+export async function runCommand(argv: readonly string[], env: NodeJS.ProcessEnv = cleanEnv(), timeoutMs?: number, cwd?: string): Promise<ExecResult> {
+  const result = await runProcess(argv, { env, timeoutMs, maxBuffer: MAX_OUTPUT_BYTES, cwd })
   if (result.timedOut) return { code: TIMEOUT_CODE, stdout: result.stdout, stderr: `timed out after ${timeoutMs} ms`, timedOut: true }
   // Could not start, or output over the cap: 127 with the reason (as before, via execFile).
   if (result.startError !== undefined) return { code: 127, stdout: "", stderr: result.startError }

@@ -8,6 +8,7 @@
 // host record of the session (W3C-01 / W3C-06), never from box metadata.
 import { DelegateError } from "../shared/errors.ts"
 import { stripUnsafe } from "../shared/text.ts"
+import { globToRegExp } from "../supervisor/identity.ts"
 import { COMMIT_ID } from "../supervisor/workspaces-state.ts"
 import type { SessionRecord, ToolContext } from "./context.ts"
 import { hostState } from "./core-session.ts"
@@ -112,20 +113,41 @@ export type DiffSummary = {
   /** `git diff --stat <base>` and `git status --porcelain` from the box clone: box output, untrusted. */
   stat?: { text: string; truncated: boolean }
   status?: { text: string; truncated: boolean }
+  /** #148: files touched outside allowedPaths. */
+  outOfScope?: string[]
   unavailable?: string
 }
 
 export async function diffSummary(ctx: ToolContext, record: SessionRecord): Promise<DiffSummary> {
   const base = record.base
   if (!base || !COMMIT_ID.test(base)) return { unavailable: "no recorded base commit" }
-  const [count, stat, status] = await Promise.all([
+  const [count, stat, status, names] = await Promise.all([
     boxGit(ctx, record, ["rev-list", "--count", `${base}..refs/heads/${record.branch}`]),
     boxGit(ctx, record, ["diff", "--stat", ...DIFF_FLAGS, base]),
     boxGit(ctx, record, ["status", "--porcelain"]),
+    record.allowedPaths && record.allowedPaths.length > 0 ? boxGit(ctx, record, ["diff", "--name-only", ...DIFF_FLAGS, base]) : Promise.resolve(undefined),
   ])
   if (count === undefined && stat === undefined && status === undefined) return { base, unavailable: "the box did not answer the git reads" }
   const commits = /^\d{1,9}$/.test(count?.trim() ?? "") ? Number(count?.trim()) : undefined
-  return { base, boxReportedCommits: commits, stat: untrusted(stat, 4000), status: untrusted(status, 4000) }
+  let outOfScope: string[] | undefined
+  if (record.allowedPaths && record.allowedPaths.length > 0) {
+    const committedFiles = (names?.split(/\r?\n/) ?? []).map((f) => f.trim()).filter(Boolean)
+    const uncommittedFiles = (status?.split(/\r?\n/) ?? [])
+      .map((l) => l.slice(3).trim())
+      .map((f) => (f.includes(" -> ") ? f.split(" -> ")[1]?.trim() ?? f : f))
+      .filter(Boolean)
+    const allTouched = [...new Set([...committedFiles, ...uncommittedFiles])]
+    const patterns = record.allowedPaths.map(globToRegExp)
+    const flagged = allTouched.filter((file) => !patterns.some((rx) => rx.test(file)))
+    if (flagged.length > 0) outOfScope = flagged
+  }
+  return {
+    base,
+    boxReportedCommits: commits,
+    stat: untrusted(stat, 4000),
+    status: untrusted(status, 4000),
+    ...(outOfScope ? { outOfScope } : {}),
+  }
 }
 
 const BUSY = new Set(["starting", "busy", "retry", "needs_input", "unknown"])
