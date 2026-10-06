@@ -383,15 +383,22 @@ describe("oc_report", () => {
     expect(recent[0]).not.toHaveProperty("servedModel")
   })
 
-  test("#132: groupBy caller names the session; recent rows carry the caller under untrusted", async () => {
+  test("#132 / #136: groupBy caller names the session; legacy caller-less record gives (unknown)", async () => {
     const f = context()
     const key = await started(f)
-    const result = await invoke(reportTool, { groupBy: "caller", recent: 1 }, f.ctx)
+    // #136: persist a caller-less (legacy) record too
+    const legacyRec = stored(f, key)
+    delete (legacyRec as { caller?: string }).caller
+    writeFileSync(path.join(dir(f), "legacy-key.json"), JSON.stringify({ ...legacyRec, key: "legacy-key" }))
+    const result = await invoke(reportTool, { groupBy: "caller", recent: 2 }, f.ctx)
     expect(result.isError).toBeUndefined()
     const d = data(result)
     expect(d.groupBy).toBe("caller")
-    expect((d.groups as Array<Record<string, unknown>>)[0]?.name).toEqual({ text: "test-caller", truncated: false })
-    expect((d.recent as Array<Record<string, unknown>>)[0]).toMatchObject({ key, bridge: "test-bridge", caller: { text: "test-caller", truncated: false } })
+    const groupNames = (d.groups as Array<{ name: { text: string } }>).map((g) => g.name.text)
+    expect(groupNames).toContain("test-caller")
+    expect(groupNames).toContain("(unknown)")
+    expect((d.recent as Array<Record<string, unknown>>).some((r) => r.key === key && (r.caller as { text: string })?.text === "test-caller")).toBe(true)
+    expect((d.recent as Array<Record<string, unknown>>).some((r) => r.key === "legacy-key" && !r.caller)).toBe(true)
     expect(reportTool.description).toContain("caller")
   })
 

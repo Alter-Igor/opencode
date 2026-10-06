@@ -1,6 +1,9 @@
 // MOD-04 oc_start_session, oc_list_sessions, oc_status, oc_abort.
+import { rm, writeFile } from "node:fs/promises"
+import path from "node:path"
 import { describe, expect, test } from "bun:test"
 import { abortTool, listSessionsTool, startSessionTool, statusTool } from "../src/tools/sessions.ts"
+import { authConfPath, writeAuthConf } from "../src/synapse/auth-conf.ts"
 import { BASE, OTHER_SID, SID, TARGET, data, fakeContext, invoke, okCmd, record, text, type Fake } from "./tools-core-fixture.ts"
 
 function canCreate(f: Fake) {
@@ -55,6 +58,30 @@ describe("oc_start_session", () => {
     expect(f.opened).toEqual([])
     const ok = await invoke(startSessionTool, { directory: "C:\\GitHub\\demo", model: "synapse/auto" }, f.ctx)
     expect(ok.isError).toBeUndefined()
+  })
+
+  test("#149: pre-flight check refuses unavailable model when Synapse is live", async () => {
+    const f = fakeContext()
+    canCreate(f)
+    const frontDir = path.join(f.ctx.config.home, "front")
+    const token = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJvd25lciJ9.c2lnbmF0dXJlLXZhbHVl"
+    await writeAuthConf(frontDir, token)
+    const origFetch = globalThis.fetch
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      if (String(input).includes("/v1/models")) {
+        return new Response(JSON.stringify({ object: "list", data: [{ id: "claude-sonnet-4-6", capabilities: { ops: ["chat"] } }] }), { status: 200 })
+      }
+      return origFetch(input)
+    }) as typeof fetch
+    try {
+      const res = await invoke(startSessionTool, { directory: "C:\\GitHub\\demo", model: "synapse/gpt-5-unserved" }, f.ctx)
+      expect(data(res)).toMatchObject({ code: "model_unavailable" })
+      expect(String(data(res).message)).toContain("not currently served by Synapse")
+      expect(f.opened).toEqual([])
+    } finally {
+      globalThis.fetch = origFetch
+      await rm(authConfPath(frontDir), { force: true })
+    }
   })
 
   test("readonly profile sends the readonly baseline", async () => {

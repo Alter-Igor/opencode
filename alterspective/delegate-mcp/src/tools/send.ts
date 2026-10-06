@@ -108,7 +108,7 @@ export const sendTool = defineTool({
     const box = await ctx.box()
     const { record, remote } = await ownSession(ctx, box, args.sessionID, cid, true)
     await checkPolicy(ctx, box, record, remote?.permission)
-    if (args.model) await requireModel(box.api, args.model, cid)
+    if (args.model) await requireModel(box.api, args.model, cid, ctx)
     const sent = await sendPrompt(ctx, box, record, { text: args.message, model: args.model, agent: args.agent, correlationId: cid })
     const warn =
       (sent.instructions.failed ? ` Warning: could not read ${sent.instructions.failed.join(", ")} from the repository, so it was not passed on.` : "") +

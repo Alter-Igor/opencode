@@ -92,6 +92,32 @@ describe("oc_wait and oc_events", () => {
     expect(f.hub.waits[0]?.timeoutMs).toBe(5000)
   })
 
+  test("#139: oc_wait reports error code and reason in summary and views", async () => {
+    const f = fakeContext()
+    f.ctx.sessions.set(SID, record())
+    f.hub.waitResult = {
+      events: [{ cursor: { epoch: "ep1", seq: 9 }, at: "t", type: "status", sessionID: SID, state: "error", code: "budget_exhausted", summary: "budget exhausted" }],
+      views: [{ sessionID: SID, directory: "/sessions/s-0000000001", state: "error", lastError: "budget_exhausted", errorCode: "budget_exhausted", since: "t" }],
+      next: { epoch: "ep1", seq: 9 },
+      timedOut: false,
+    }
+    const result = await invoke(waitTool, { sessionIDs: [SID] }, f.ctx)
+    expect(text(result)).toContain("budget_exhausted")
+    const views = data(result).views as Array<Record<string, unknown>>
+    expect(views[0]?.errorCode).toBe("budget_exhausted")
+  })
+
+  test("#141: oc_wait flags inactivity stall in the summary for long-busy sessions", async () => {
+    const f = fakeContext()
+    f.ctx.sessions.set(SID, record())
+    const fourMinAgo = new Date(Date.now() - 4 * 60_000).toISOString()
+    f.hub.views.set(SID, { sessionID: SID, directory: "/sessions/s-0000000001", state: "busy", since: fourMinAgo, lastActiveAt: fourMinAgo })
+    f.hub.waitResult = { events: [], next: { epoch: "ep1", seq: 10 }, timedOut: true }
+    const result = await invoke(waitTool, { sessionIDs: [SID], timeoutSec: 10 }, f.ctx)
+    expect(text(result)).toContain("no activity for 4 min")
+    expect(data(result)).toMatchObject({ still_running: true })
+  })
+
   test("waiting on a foreign session is refused", async () => {
     const f = fakeContext()
     f.api.on(`GET /session/${SID}`, { status: 404 })

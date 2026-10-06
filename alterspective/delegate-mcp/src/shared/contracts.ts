@@ -115,6 +115,10 @@ export type SessionView = {
   observedAt?: string
   parentID?: string
   lastError?: string
+  /** #139: normalized error code for failed sessions (budget_exhausted, skipped_breaker, rate_limited, etc.). */
+  errorCode?: string
+  /** #141: ISO timestamp of last seen model or tool activity. */
+  lastActiveAt?: string
 }
 
 export type WaitUntil = "idle" | "needs_input" | "error" | "message"

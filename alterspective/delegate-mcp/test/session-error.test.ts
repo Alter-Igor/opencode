@@ -27,9 +27,10 @@ describe("sessionErrorCode (#80)", () => {
     expect(sessionErrorCode({ name: "APIError", data: { message: '{"error":{"code":"model_not_available"}}', statusCode: 404 } })).toBe("model_not_found")
     expect(sessionErrorCode({ name: "APIError", data: { message: "context_length_exceeded: insufficient context window" } })).toBe("context_overflow")
     expect(sessionErrorCode({ name: "APIError", data: { message: "insufficient credit", statusCode: 401 } })).toBe("auth")
+    expect(sessionErrorCode({ name: "APIError", data: { message: "No provider rung was attempted (skipped_breaker)" } })).toBe("skipped_breaker")
     expect(sessionErrorCode({ name: "UnknownError", data: { message: "something odd" } })).toBe("other")
     expect(sessionErrorCode(undefined)).toBe("other")
-    for (const code of ["budget_exhausted", "rate_limited", "no_tool_support", "model_not_found", "auth", "other"]) expect(SESSION_ERROR_CODES as readonly string[]).toContain(code)
+    for (const code of ["budget_exhausted", "rate_limited", "skipped_breaker", "no_tool_support", "model_not_found", "auth", "other"]) expect(SESSION_ERROR_CODES as readonly string[]).toContain(code)
   })
 
   test("the detail is the provider message only, capped, with secrets scrubbed", () => {

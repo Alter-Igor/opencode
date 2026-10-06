@@ -6,10 +6,13 @@
 // #71: Synapse is the box's only provider, so only synapse/* ids are listed or accepted, and the
 // default is the box config's `model` (GET /config; synapse/auto unless the owner picked another
 // registered model), not OpenCode's per-provider "best model" sort (/config/providers `default`).
+import path from "node:path"
 import { z } from "zod"
 import { DelegateError } from "../shared/errors.ts"
 import type { OpencodeApi } from "../shared/opencode-api.ts"
 import { DEFAULT_MODEL, SYNAPSE_PROVIDER } from "../supervisor/profile.ts"
+import { registeredModels } from "../synapse/models.ts"
+import type { ToolContext } from "./context.ts"
 import { MODEL_RE, requireSynapseModel } from "./core-session.ts"
 import { defineTool } from "./define.ts"
 import { keystoneLine, keystoneReport } from "./keystone-report.ts"
@@ -73,11 +76,28 @@ export async function listModels(api: OpencodeApi, correlationId: string): Promi
  * (edge case 8). The ids are box data, so they are not put in the error message (W3C-09):
  * oc_list_models returns them as data.
  */
-export async function requireModel(api: OpencodeApi, model: string, correlationId: string): Promise<void> {
+export async function requireModel(api: OpencodeApi, model: string, correlationId: string, ctx?: Pick<ToolContext, "config">): Promise<void> {
   requireSynapseModel(model)
+  // #149: live pre-flight check if host has token
+  if (ctx && model !== DEFAULT_MODEL && model !== `${SYNAPSE_PROVIDER}/auto`) {
+    const live = await registeredModels({ frontDir: path.join(ctx.config.home, "front"), fetch }).catch(() => undefined)
+    if (live && live.source === "synapse") {
+      const bareId = model.startsWith(`${SYNAPSE_PROVIDER}/`) ? model.slice(SYNAPSE_PROVIDER.length + 1) : model
+      if (!live.models.includes(bareId) && !live.models.includes(model)) {
+        const alternatives = live.models.slice(0, 5).map((m) => `${SYNAPSE_PROVIDER}/${m}`).join(", ")
+        throw new DelegateError(
+          "model_unavailable",
+          `Model ${model} is not currently served by Synapse.`,
+          `Choose an active alternative, for example: ${alternatives || DEFAULT_MODEL}.`,
+          "not_served",
+        )
+      }
+    }
+  }
   const models = await fetchModels(api, correlationId)
-  if (models.includes(model)) return
-  throw new DelegateError("invalid_input", `The sandbox has no model ${model} (${models.length} Synapse model${models.length === 1 ? "" : "s"} available).`, `Call oc_list_models and pick one of its ids, for example ${DEFAULT_MODEL}.`)
+  if (!models.includes(model)) {
+    throw new DelegateError("invalid_input", `The sandbox has no model ${model} (${models.length} Synapse model${models.length === 1 ? "" : "s"} available).`, `Call oc_list_models and pick one of its ids, for example ${DEFAULT_MODEL}.`)
+  }
 }
 
 export const modelsTool = defineTool({
@@ -92,6 +112,14 @@ export const modelsTool = defineTool({
     const list = await listModels(box.api, correlationId)
     const models = args.provider ? list.models.filter((m) => m.startsWith(`${args.provider}/`)) : list.models
     const keystone = keystoneReport(ctx.config)
-    return ok(`${models.length} model${models.length === 1 ? "" : "s"}${args.provider ? ` from ${args.provider}` : ""}. ${keystoneLine(keystone)}.`, { models, defaults: list.defaults, keystone })
+    // #149: report live served models
+    const live = await registeredModels({ frontDir: path.join(ctx.config.home, "front"), fetch }).catch(() => undefined)
+    const served = live && live.source === "synapse" ? live.models.map((m) => `${SYNAPSE_PROVIDER}/${m}`) : undefined
+    return ok(`${models.length} model${models.length === 1 ? "" : "s"}${args.provider ? ` from ${args.provider}` : ""}. ${keystoneLine(keystone)}.`, {
+      models,
+      defaults: list.defaults,
+      ...(served ? { served } : {}),
+      keystone,
+    })
   },
 })

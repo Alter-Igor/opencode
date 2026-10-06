@@ -325,7 +325,8 @@ describe("dashboard page", () => {
     )({ createElement: () => new Node(), querySelector: () => new Node() }, async () => ({ ok: false }), () => 0) as { render(d: unknown, now: number): Node; formatDuration(ms: number): string }
     const empty = texts(made.render(dashboardData([], NOW, { boxRunning: false, bridge: "me" }), NOW)).join("|")
     for (const words of ["Box stopped", "0 tasks running", "Who is delegating", "Running now", "Nothing running.", "Recent tasks", "Models served (7 days)"]) expect(empty).toContain(words)
-    const full = texts(made.render(dashboardData([rec({ outcome: "running", repo: "<b>x</b>", caller: "proj-<i>", servedModels: { "m/a": 2 } })], NOW, extras), NOW)).join("|")
+    const rendered = made.render(dashboardData([rec({ outcome: "running", repo: "<b>x</b>", caller: "proj-<i>", servedModels: { "m/a": 2 } })], NOW, extras), NOW)
+    const full = texts(rendered).join("|")
     expect(full).toContain("<b>x</b>")
     expect(full).toContain("proj-<i>")
     expect(full).toContain("Session (project folder)")
@@ -334,6 +335,12 @@ describe("dashboard page", () => {
     expect(full).toContain("Running")
     expect(full).toContain("m/a (2 calls)")
     expect(made.formatDuration(3_725_000)).toBe("1 h 2 min")
+
+    // #136: assert the Session cell in "Running now" and "Recent tasks" separately (not only in flattened page text)
+    const runningTable = rendered.children[2]?.children[1]?.children[0]
+    expect(runningTable?.children[1]?.children[0]?.children[0]?.textContent).toBe("proj-<i>")
+    const recentTable = rendered.children[3]?.children[1]?.children[0]
+    expect(recentTable?.children[1]?.children[0]?.children[1]?.textContent).toBe("proj-<i>")
   })
 })
 

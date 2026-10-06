@@ -185,6 +185,9 @@ async function cloneAt(ctx: Ctx, bundle: string, tmp: string, key: string, base:
   await boxRun(ctx, ["sh", "-c", append, "sh", `${tmp}/.git/info/exclude`, ...WORKSPACE_EXCLUDES], "hide OpenCode scratch files from git")
   // -B, not -b: the clone already has delegate/<key> when that is the owner's checked-out branch.
   await boxRun(ctx, ["git", "-C", tmp, "checkout", "--quiet", "-B", `delegate/${key}`, base], "create the session branch", "long")
+  // #138: default git author identity so the delegated agent can commit without setup
+  await boxRun(ctx, ["git", "-C", tmp, "config", "user.name", "OpenCode Delegate (Synapse)"], "set session git author name")
+  await boxRun(ctx, ["git", "-C", tmp, "config", "user.email", "opencode-delegate@users.noreply.github.com"], "set session git author email")
 }
 
 /** Move the finished clone into place; a folder that appeared meanwhile is directory_busy. */

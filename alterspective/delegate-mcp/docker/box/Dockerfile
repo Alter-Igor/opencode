@@ -36,6 +36,8 @@ RUN useradd -m -u 10001 -s /bin/bash agent \
     && chown agent:agent /data /sessions /handoff/out \
     && git config --system safe.directory '*' \
     && git config --system init.defaultBranch main \
+    && git config --system user.name "OpenCode Delegate (Synapse)" \
+    && git config --system user.email "opencode-delegate@users.noreply.github.com" \
     && opencode --version
 ARG OPENCODE_VERSION=0.0.0-alterspective-local
 LABEL org.opencontainers.image.title="opencode-delegate-box" \

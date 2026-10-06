@@ -31,6 +31,8 @@ export const ErrorCode = [
   "uncollected_work",
   "upstream_error",
   "invalid_input",
+  // #149: requested model is registered in OpenCode but not currently served by Synapse
+  "model_unavailable",
 ] as const
 
 export type ErrorCode = (typeof ErrorCode)[number]

@@ -57,20 +57,27 @@ describe("permissionBaseline(readonly)", () => {
   const cases: Array<[string, string, Rule["action"]]> = [
     ["read", "src/a.ts", "allow"],
     ["edit", "src/a.ts", "deny"],
-    ["bash", "ls", "ask"],
+    ["bash", "ls", "allow"],
+    ["bash", "git status", "allow"],
+    ["bash", "git diff", "allow"],
+    ["bash", "git log -n 5", "allow"],
+    ["bash", "cat package.json", "allow"],
+    ["bash", "grep foo bar.ts", "allow"],
     ["bash", "git push", "ask"],
+    ["bash", "rm -rf /sessions/x", "ask"],
     ["external_directory", "/etc", "deny"],
     ["webfetch", "https://example.com", "ask"],
     ["ks-delegate_search-tools", "*", "ask"],
     ["ks-rag_rag-search", "*", "ask"],
+    ["ks-rag-read_rag_search", "*", "allow"],
   ]
 
   for (const [permission, pattern, action] of cases) {
     test(`${permission} ${pattern} → ${action}`, () => expect(evaluate(rules, permission, pattern)).toBe(action))
   }
 
-  test("ends with the Keystone-tools ask rule so it wins over the standard allow (A-16)", () => {
-    expect(rules[rules.length - 1]).toEqual({ permission: "ks-*_*", pattern: "*", action: "ask" })
+  test("places safe Keystone read rules after the general Keystone ask rule (#140)", () => {
+    expect(rules[rules.length - 1]).toEqual({ permission: "ks-rag-read_*", pattern: "*", action: "allow" })
   })
 
   test("keeps every standard rule", () => {
@@ -86,7 +93,8 @@ describe("#104: read-only sessions and the dynamic connection (owner decision A)
     expect(evaluate(rules, "ks-dynamic_search-tools", "*")).toBe("allow")
     expect(evaluate(rules, "ks-github_add_issue_comment", "*")).toBe("ask")
     expect(evaluate(rules, "edit", "src/a.ts")).toBe("deny")
-    expect(evaluate(rules, "bash", "ls")).toBe("ask")
+    expect(evaluate(rules, "bash", "ls")).toBe("allow")
+    expect(evaluate(rules, "bash", "git push")).toBe("ask")
   })
 
   test("not gated (approvals listed): ks-dynamic tools still ask", () => {

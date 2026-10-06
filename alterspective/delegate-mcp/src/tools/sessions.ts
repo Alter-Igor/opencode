@@ -93,7 +93,7 @@ export const startSessionTool = defineTool({
     const keystone = sessionKeystone(ctx, args.keystone)
     if (!args.allowShared) await refuseBusy(ctx, hostRepo, samePath)
     const box = await ctx.box()
-    if (args.model) await requireModel(box.api, args.model, correlationId)
+    if (args.model) await requireModel(box.api, args.model, correlationId, ctx)
     const ws = await ctx.workspaces.open(hostRepo, newSessionKey())
     const record = await startIn(ctx, box, { ...args, keystone }, ws, correlationId)
     ctx.sessions.set(record.sessionID, record)
