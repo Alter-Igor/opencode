@@ -9,9 +9,9 @@
 import { z } from "zod"
 import { SESSION_SUPERVISOR_KEY } from "../inbox/index.ts"
 import { recordStart } from "../reporting/hooks.ts"
-import { currentKeystone } from "../shared/config.ts"
+import { CEILING_ENV, ceilingOf, enforceCeiling } from "../shared/keystone-policy.ts"
 import { DelegateError } from "../shared/errors.ts"
-import { CONNECTION_ID, MAX_CONNECTIONS, keystoneIds } from "../shared/keystone.ts"
+import { CONNECTION_ID, MAX_CONNECTIONS, keystoneIds, readKeystoneSet } from "../shared/keystone.ts"
 import { expectOk } from "../shared/opencode-api.ts"
 import type { OpenedWorkspace } from "../supervisor/workspaces.ts"
 import { samePath } from "../supervisor/workspaces-exec.ts"
@@ -28,12 +28,33 @@ type StartArgs = { directory: string; title?: string; agent?: string; model?: st
 
 /** The narrowing list, checked to be a subset of the box-wide set in force now; undefined = no narrowing. */
 export function sessionKeystone(ctx: ToolContext, requested: readonly string[] | undefined): string[] | undefined {
-  if (requested === undefined) return undefined
+  const saved = readKeystoneSet(ctx.config.home, ctx.config.keystoneConnections)
+  let ceiling: string[]
+  try {
+    ceiling = ceilingOf(ctx.config)
+  } catch {
+    ceiling = []
+  }
+  const allowedInBox = saved.connections.filter((id) => ceiling.includes(id))
+
+  if (requested === undefined) {
+    const outside = saved.connections.filter((id) => !ceiling.includes(id))
+    if (outside.length) {
+      throw new DelegateError(
+        "policy_violation",
+        `The saved Keystone set in the sandbox contains connection${outside.length === 1 ? "" : "s"} (${outside.join(", ")}) outside the owner's allowed list (${CEILING_ENV}).`,
+        `To start a session without interrupting other bridges, pass keystone: [${allowedInBox.map((s) => `"${s}"`).join(", ")}] to oc_start_session. To change the box-wide set, call oc_server_restart {keystone: [...]}.`,
+        `outside ceiling: ${outside.join(", ")}`,
+      )
+    }
+    return undefined
+  }
+
   const ids = keystoneIds(requested)
-  const boxWide = currentKeystone(ctx.config).connections
-  const outside = ids.filter((id) => !boxWide.includes(id))
+  const outside = ids.filter((id) => !saved.connections.includes(id))
   if (outside.length)
-    throw new DelegateError("invalid_input", `The sandbox does not offer Keystone connection${outside.length === 1 ? "" : "s"} ${outside.join(", ")}.`, `Choose from ${boxWide.join(", ") || "(none)"}, or add them to the box with oc_server_restart {keystone}.`)
+    throw new DelegateError("invalid_input", `The sandbox does not offer Keystone connection${outside.length === 1 ? "" : "s"} ${outside.join(", ")}.`, `Choose from ${allowedInBox.join(", ") || "(none)"}, or add them to the box with oc_server_restart {keystone}.`)
+  enforceCeiling(ids, ctx.config)
   return ids
 }
 
@@ -59,7 +80,12 @@ async function startIn(ctx: ToolContext, box: Box, args: StartArgs, ws: OpenedWo
   let sessionID: string | undefined
   try {
     sessionID = await createSession(ctx, box, args, ws, correlationId)
-    const extra = { ...(args.model ? { model: args.model } : {}), ...(args.agent ? { agent: args.agent } : {}), ...(args.keystone ? { keystone: args.keystone } : {}) }
+    const extra = {
+      ...(args.model ? { model: args.model } : {}),
+      ...(args.agent ? { agent: args.agent } : {}),
+      ...(args.keystone ? { keystone: args.keystone } : {}),
+      ...(ctx.caller ? { caller: ctx.caller } : {}),
+    }
     const state = await ctx.workspaces.bindSession(ws.sessionKey, { sessionID, profile, supervisor: ctx.supervisor, ...extra })
     return { sessionID, sessionKey: ws.sessionKey, hostRepo: ws.hostRepo, boxPath: ws.boxPath, branch: ws.branch, profile, createdAt: state.createdAt, base: ws.base, ...extra }
   } catch (error) {
@@ -111,11 +137,22 @@ export const abortTool = defineTool({
   name: "oc_abort",
   title: "Stop a session's run",
   description: "Ask the sandbox to abort the current run of one of this bridge's sessions. The workspace and history are kept. Check the result with oc_status.",
-  input: { sessionID: sessionIdSchema },
+  input: {
+    sessionID: sessionIdSchema,
+    force: z.boolean().optional().describe("Abort even if owned by another caller. Default false."),
+  },
   annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   async run(args, ctx, correlationId) {
     const box = await ctx.box()
     const { record } = await ownSession(ctx, box, args.sessionID, correlationId)
+    if (record.caller && ctx.caller && record.caller !== ctx.caller && !args.force) {
+      throw new DelegateError(
+        "policy_violation",
+        `Session ${record.sessionID} belongs to caller "${record.caller}", not "${ctx.caller}".`,
+        "Pass force: true to abort another caller's session.",
+        `owned by ${record.caller}`,
+      )
+    }
     const res = await box.api.call<unknown>({ method: "POST", path: `/session/${record.sessionID}/abort`, directory: record.boxPath, correlationId })
     if (res.status === 404) throw new DelegateError("not_found", `Session ${record.sessionID} is gone: the sandbox no longer has it.`, "Start a new session with oc_start_session.", "HTTP 404")
     if (res.status < 200 || res.status >= 300) throw new DelegateError("upstream_error", "The delegate server failed to abort the session.", "Retry; check oc_status.", `HTTP ${res.status}`)

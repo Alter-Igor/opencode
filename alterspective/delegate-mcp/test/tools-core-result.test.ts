@@ -252,6 +252,21 @@ describe("oc_doctor, oc_login, oc_list_models, oc_server_restart", () => {
     expect(text(result)).toContain("1 other bridge had running sessions interrupted")
   })
 
+  test("#145: oc_server_restart is refused when another caller has an active session unless force is true", async () => {
+    const f = fakeContext()
+    f.ctx.caller = "agent-1"
+    f.ctx.sessions.set(SID, { ...record(), caller: "agent-2" })
+    f.hub.views.set(SID, { sessionID: SID, directory: "/sessions/s-0000000001", state: "busy", since: "2026-10-01T00:00:00.000Z" })
+    const refused = await invoke(restartTool, { confirm: true }, f.ctx)
+    expect(data(refused)).toMatchObject({ code: "policy_violation" })
+    expect(String(data(refused).message)).toContain("agent-2")
+    expect(f.started.restarts).toBe(0)
+
+    const forced = await invoke(restartTool, { confirm: true, force: true }, f.ctx)
+    expect(forced.isError).toBeUndefined()
+    expect(f.started.restarts).toBe(1)
+  })
+
   test("oc_server_restart keystone (R4-01): ids validated by the schema, passed on, and the new set reported", async () => {
     const f = fakeContext()
     const passed: Array<string[] | undefined> = []

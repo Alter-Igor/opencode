@@ -28,6 +28,8 @@ export type SessionRecord = {
   agent?: string
   /** Additive (R4-01): the Keystone connections this session was narrowed to (convenience, not a wall); undefined = the whole box-wide set. */
   keystone?: string[]
+  /** #146: which caller started the session (callerName). */
+  caller?: string
 }
 
 export type Box = { target: ApiTarget; api: OpencodeApi; hub: DelegateHub }

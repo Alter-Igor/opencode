@@ -84,14 +84,17 @@ function examples(paths: readonly string[]): string {
   return [...plain, ...(odd ? [`${odd} with unusual names`] : [])].join(", ")
 }
 
-function refusalError(sessionID: string, outcome: Pick<CloseOutcome, "refused" | "uncollectedCommits" | "uncommittedPaths" | "ignoredPaths" | "ignoredExamples">, canCollect: boolean): DelegateError {
+function refusalError(sessionID: string, outcome: Pick<CloseOutcome, "refused" | "uncollectedCommits" | "uncommittedPaths" | "ignoredPaths" | "ignoredExamples" | "checkError">, canCollect: boolean): DelegateError {
   if (outcome.refused === "ignored_files")
     return new DelegateError(
       "uncollected_work",
       `Session ${sessionID}'s copy has ${plural(outcome.ignoredPaths, "git-ignored path")} that oc_collect does not carry (${examples(outcome.ignoredExamples)}), so nothing was deleted.`,
       "Copy what you need out of the sandbox first, or pass discardWork: true to delete them. Dependency and cache folders (node_modules, .cache, .turbo, __pycache__, .pytest_cache, .venv, coverage) never block.",
     )
-  if (outcome.refused === "check_failed") return new DelegateError("upstream_error", `Could not check session ${sessionID}'s copy for uncollected work, so nothing was deleted.`, "Retry; if it repeats, run oc_doctor.")
+  if (outcome.refused === "check_failed") {
+    const detail = outcome.checkError ? ` (${outcome.checkError})` : ""
+    return new DelegateError("upstream_error", `Could not check session ${sessionID}'s copy for uncollected work${detail}, so nothing was deleted.`, "Retry; if it repeats, run oc_doctor.", outcome.checkError)
+  }
   const lost = [outcome.uncollectedCommits ? plural(outcome.uncollectedCommits, "uncollected commit") : "", outcome.uncommittedPaths ? plural(outcome.uncommittedPaths, "uncommitted file") : ""].filter(Boolean).join(" and ")
   const action = canCollect
     ? "Fetch them with oc_collect first (ask the agent to commit loose files), or pass discardWork: true to delete them."
@@ -197,14 +200,24 @@ export const closeSessionTool = defineTool({
     "deleteBranch: true also deletes the host branch delegate/<key>, only when another host branch contains it (discardWork: true deletes it unmerged); a branch checked out anywhere or a symbolic ref is never deleted, and no other branch is touched.",
   input: {
     sessionID: sessionIdSchema,
-    deleteBranch: z.boolean().optional().describe("Also delete the host branch delegate/<key> when another branch contains it. Default false."),
+    deleteBranch: z.boolean().optional().describe("Also delete the host branch delegate/<key> when another branch contains it (either by commit SHA or patch-equivalent git cherry). Default false."),
     abort: z.boolean().optional().describe("Stop a running session before closing it. Its work is still checked afterwards. Default false."),
     discardWork: z.boolean().optional().describe("Allow deleting commits no host branch has, uncommitted files and an unmerged delegate/<key>. Default false."),
+    force: z.boolean().optional().describe("Close even if owned by another caller. Default false."),
   },
   annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
   async run(args, ctx, correlationId) {
     const box = await ctx.box()
     const located = await locate(ctx, box, args.sessionID, correlationId)
+    const state = await hostState(ctx, located.sessionKey)
+    if (state?.caller && ctx.caller && state.caller !== ctx.caller && !args.force) {
+      throw new DelegateError(
+        "policy_violation",
+        `Session ${args.sessionID} belongs to caller "${state.caller}", not "${ctx.caller}".`,
+        "Pass force: true to close another caller's session.",
+        `owned by ${state.caller}`,
+      )
+    }
     return whileClosing(ctx, args.sessionID, () => closeOne(ctx, box, located, args, correlationId))
   },
 })

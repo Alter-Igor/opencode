@@ -9,7 +9,8 @@ import type { McpStatus, OpencodeApi } from "../shared/opencode-api.ts"
 import { KS_NAME } from "../guard/entries.ts"
 import { checkEgress, egressInput, type EgressCheck } from "../guard/egress-check.ts"
 import { currentKeystone, effectiveConfig } from "../shared/config.ts"
-import { DYNAMIC_ID } from "../shared/keystone.ts"
+import { DYNAMIC_ID, readKeystoneSet } from "../shared/keystone.ts"
+import { ceilingOf } from "../shared/keystone-policy.ts"
 import { reconnectTick } from "../keystone-auth/host-wiring.ts"
 import type { ToolContext } from "./context.ts"
 import { defineTool } from "./define.ts"
@@ -127,11 +128,17 @@ const egressSummary = (egress: EgressCheck) =>
 
 /** The egress check for the Keystone set in force now; a damaged saved choice is a failed check, never a throw. */
 function egressFor(ctx: ToolContext, keystone: KeystoneReport): EgressCheck {
-  if ("unavailable" in keystone) {
+  if ("unavailable" in keystone || keystone.problem) {
     const failed = checkEgress(egressInput({ ...ctx.config, keystoneConnections: [] }))
-    return { ...failed, ok: false, problems: [keystone.unavailable, ...failed.problems] }
+    const reason = "unavailable" in keystone ? keystone.unavailable : keystone.problem!
+    return { ...failed, ok: false, problems: [reason, ...failed.problems] }
   }
-  return checkEgress(egressInput(effectiveConfig(ctx.config)))
+  try {
+    return checkEgress(egressInput(effectiveConfig(ctx.config)))
+  } catch (error) {
+    const failed = checkEgress(egressInput({ ...ctx.config, keystoneConnections: [] }))
+    return { ...failed, ok: false, problems: [error instanceof Error ? error.message : "Keystone config error", ...failed.problems] }
+  }
 }
 
 /** Entry name → status from GET /mcp, for the Keystone report. */
@@ -145,7 +152,22 @@ async function inspect(ctx: ToolContext, start: boolean, correlationId: string) 
   // Review M1: with host-held tokens, reconnect signed-in entries on the box read here (held by any
   // bridge) before reporting them: OpenCode does not reconnect an oauth:false entry by itself.
   const keystone = ctx.keystone
-  if (api && keystone) await reconnectTick(() => api, (ids) => keystone.status(ids), () => currentKeystone(ctx.config).connections, ctx.log)
+  if (api && keystone) {
+    const safeConnections = () => {
+      try {
+        return currentKeystone(ctx.config).connections
+      } catch {
+        try {
+          const saved = readKeystoneSet(ctx.config.home, ctx.config.keystoneConnections)
+          const ceiling = ceilingOf(ctx.config)
+          return saved.connections.filter((c) => ceiling.includes(c))
+        } catch {
+          return []
+        }
+      }
+    }
+    await reconnectTick(() => api, (ids) => keystone.status(ids), safeConnections, ctx.log)
+  }
   const mcp = api ? await readMcp(api, correlationId) : undefined
   const verdict: Verdict = api ? await ctx.guard.checkRuntime(api, PROBE_DIRECTORY) : { ok: false, code: "policy_unverified", reason: "the sandbox is not running" }
   // R5-01 / R5-05: what is running, not what the labels say.

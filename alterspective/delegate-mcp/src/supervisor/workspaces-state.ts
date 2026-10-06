@@ -39,6 +39,8 @@ export type HostSessionState = {
   agent?: string
   /** R4-01: the Keystone connections the session was narrowed to; absent = the whole box-wide set. */
   keystone?: string[]
+  /** #146: which caller started the session (callerName); for filtering and caller isolation. */
+  caller?: string
   /**
    * #53: the compose project (OPENCODE_DELEGATE_PROJECT) of the box whose `sessions` volume holds the
    * clone, stamped at bind time. Absent on records from older bridges; those are never pruned.
@@ -47,7 +49,7 @@ export type HostSessionState = {
 }
 
 /** Written by oc_start_session right after POST /session; the workspaces layer adds `boxProject`. */
-export type SessionBinding = { sessionID: string; profile: SessionProfile; supervisor: string; model?: string; agent?: string; keystone?: string[]; boxProject?: string }
+export type SessionBinding = { sessionID: string; profile: SessionProfile; supervisor: string; model?: string; agent?: string; keystone?: string[]; boxProject?: string; caller?: string }
 
 /** A valid narrowing list (each a connection id, bounded), or undefined. */
 function keystoneList(value: unknown): string[] | undefined {
@@ -89,7 +91,8 @@ export function parseHostState(raw: string, key: string): HostSessionState | und
   const keystone = keystoneList(p.keystone)
   // A box name that does not parse is dropped: the record then counts as legacy and is never pruned.
   const boxProject = optional(p.boxProject, PROJECT_RE)
-  return { ...state, ...(model ? { model } : {}), ...(agent ? { agent } : {}), ...(keystone ? { keystone } : {}), ...(boxProject ? { boxProject } : {}) }
+  const caller = str(p.caller)?.slice(0, 128)
+  return { ...state, ...(model ? { model } : {}), ...(agent ? { agent } : {}), ...(keystone ? { keystone } : {}), ...(boxProject ? { boxProject } : {}), ...(caller ? { caller } : {}) }
 }
 
 function checkState(state: HostSessionState): void {
@@ -101,7 +104,8 @@ function checkState(state: HostSessionState): void {
     (state.model !== undefined && !MODEL_RE.test(state.model)) ||
     (state.agent !== undefined && !AGENT_RE.test(state.agent)) ||
     (state.keystone !== undefined && keystoneList(state.keystone) === undefined) ||
-    (state.boxProject !== undefined && !PROJECT_RE.test(state.boxProject))
+    (state.boxProject !== undefined && !PROJECT_RE.test(state.boxProject)) ||
+    (state.caller !== undefined && typeof state.caller !== "string")
   if (bad) throw new DelegateError("upstream_error", "The session's host record would not be valid, so it was not saved.", "Start the session again with oc_start_session.", "invalid host state")
 }
 

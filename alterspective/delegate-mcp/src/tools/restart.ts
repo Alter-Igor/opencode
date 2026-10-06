@@ -41,6 +41,38 @@ export const restartTool = defineTool({
   async run(args, ctx) {
     if (args.confirm !== true)
       throw new DelegateError("invalid_input", "The restart was not confirmed; nothing was stopped.", "Call oc_server_restart with confirm: true once running sessions may be interrupted.")
+    if (!args.force) {
+      const box = ctx.peekBox() ?? (await ctx.box().catch(() => undefined))
+      if (box) {
+        const states = await ctx.workspaces.listSessionStates().catch(() => [])
+        const activeOther: string[] = []
+        for (const s of states) {
+          if (!s.sessionID) continue
+          const isOther = Boolean(s.caller && (!ctx.caller || s.caller !== ctx.caller))
+          if (!isOther) continue
+          const view = await box.hub.view(s.sessionID).catch(() => undefined)
+          if (view && (view.state === "busy" || view.state === "starting" || view.state === "retry")) {
+            activeOther.push(`${s.sessionID} (${s.caller}: ${view.state})`)
+          }
+        }
+        for (const [id, rec] of ctx.sessions.entries()) {
+          const isOther = Boolean(rec.caller && (!ctx.caller || rec.caller !== ctx.caller))
+          if (!isOther) continue
+          if (states.some((s) => s.sessionID === id)) continue
+          const view = await box.hub.view(id).catch(() => undefined)
+          if (view && (view.state === "busy" || view.state === "starting" || view.state === "retry")) {
+            activeOther.push(`${id} (${rec.caller}: ${view.state})`)
+          }
+        }
+        if (activeOther.length > 0) {
+          throw new DelegateError(
+            "policy_violation",
+            `Other callers have active sessions: ${activeOther.join(", ")}.`,
+            "Wait for them to finish, or call oc_server_restart with force: true.",
+          )
+        }
+      }
+    }
     const box = await ctx.restartBox({ force: args.force === true, ...(args.keystone ? { keystone: args.keystone } : {}) })
     const status = await ctx.supervisorService.status()
     return ok(summaryOf(box.interrupted, box.keystone), {

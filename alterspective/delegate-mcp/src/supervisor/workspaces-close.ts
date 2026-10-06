@@ -52,6 +52,7 @@ export type ClosePlan = Counts & {
   /** Nothing would be lost and every check could be made. */
   safe: boolean
   reason?: CloseRefusal
+  checkError?: string
   branch: BranchPlan
 }
 
@@ -61,6 +62,7 @@ export type CloseOutcome = Counts & {
   /** Session, clone and record are all gone. */
   closed: boolean
   refused?: CloseRefusal
+  checkError?: string
   session: SessionRemoval | "kept"
   clone: "removed" | "absent" | "kept" | "failed"
   branch: "not_requested" | "absent" | "deleted" | "kept_unmerged" | "kept_checked_out" | "kept_symbolic" | "kept_unknown" | "failed"
@@ -81,7 +83,7 @@ export type CloseDeps = {
 }
 
 type Owned = { state: HostSessionState & { sessionID: string }; snapshot: NonNullable<ReturnType<typeof snapshotRecord>>; file: string }
-type CloneState = Counts & { clone: ClosePlan["clone"]; failed?: boolean }
+type CloneState = Counts & { clone: ClosePlan["clone"]; failed?: boolean; checkError?: string }
 type BranchState = { plan: BranchPlan; tip?: string; repo?: string }
 
 const notOurs = (key: string) =>
@@ -210,7 +212,7 @@ async function countLost(deps: CloseDeps, key: string, repo: string, base: strin
 }
 
 const NO_TREE: Tree = { uncommittedPaths: 0, ignoredPaths: 0, ignoredExamples: [] }
-const failedClone = (clone: ClosePlan["clone"], tree: Tree = NO_TREE): CloneState => ({ clone, uncollectedCommits: 0, discardedCommits: 0, ...tree, failed: true })
+const failedClone = (clone: ClosePlan["clone"], tree: Tree = NO_TREE, reason?: string): CloneState => ({ clone, uncollectedCommits: 0, discardedCommits: 0, ...tree, failed: true, checkError: reason })
 
 /** Which tips no host branch contains (undefined when git could not say). */
 async function splitTips(deps: CloseDeps, repo: string, tips: string[]): Promise<{ lost: string[]; collected: string[] } | undefined> {
@@ -228,30 +230,73 @@ async function inspectClone(deps: CloseDeps, state: HostSessionState): Promise<C
   const key = state.sessionKey
   const presence = await probeClone(deps, key)
   if (presence === "absent") return { clone: "absent", uncollectedCommits: 0, discardedCommits: 0, ...NO_TREE }
-  if (presence === "unknown") return failedClone("unknown")
+
+  // #144: Check if host repo and host branch exist. If copy in box is gone or unreadable after a restart,
+  // but the host branch delegate/<key> exists on the host, treat the host branch as the source of truth
+  // since nothing in the box can be lost.
+  const repo = await deps.resolveRepo(state.hostRepo).catch(() => undefined)
+  const hostTip = repo ? await hostBranchTip(deps, repo, key) : undefined
+  const hostBranchExists = hostTip !== undefined && hostTip !== "absent" && hostTip !== "symbolic" && hostTip !== null
+
+  if (presence === "unknown") {
+    if (hostBranchExists) return { clone: "absent", uncollectedCommits: 0, discardedCommits: 0, ...NO_TREE }
+    return failedClone("unknown", NO_TREE, "clone presence probe returned unknown")
+  }
+
   const [tips, tree] = [await cloneTips(deps, key), await worktreeCounts(deps, key)]
-  if (tips === undefined || tree === undefined) return failedClone("present", tree)
+  if (tips === undefined || tree === undefined) {
+    if (hostBranchExists) return { clone: "absent", uncollectedCommits: 0, discardedCommits: 0, ...NO_TREE }
+    const reason = tips === undefined ? "clone git tips unreadable" : "worktree status unreadable"
+    return failedClone("present", tree ?? NO_TREE, reason)
+  }
+
   const reflogOnly = numberOf(await boxGit(deps, key, ["rev-list", "--count", "--reflog", "--not", "--all", "HEAD", state.base]))
-  if (reflogOnly === undefined) return failedClone("present", tree)
+  if (reflogOnly === undefined) return failedClone("present", tree, "reflog count unreadable")
+
   const candidates = tips.filter((tip) => tip !== state.base)
   if (!candidates.length && reflogOnly === 0) return { clone: "present", uncollectedCommits: 0, discardedCommits: 0, ...tree }
-  const repo = await deps.resolveRepo(state.hostRepo).catch(() => undefined)
-  const split = repo ? await splitTips(deps, repo, candidates) : undefined
-  if (!repo || !split) return failedClone("present", tree)
+
+  if (!repo) return failedClone("present", tree, "host repository could not be resolved")
+  const split = await splitTips(deps, repo, candidates)
+  if (!split) return failedClone("present", tree, "could not check tips against host repository")
   if (!split.lost.length && reflogOnly === 0) return { clone: "present", uncollectedCommits: 0, discardedCommits: 0, ...tree }
+
   const counts = await countLost(deps, key, repo, state.base, split.lost, split.collected)
-  return counts === undefined ? failedClone("present", tree) : { clone: "present", ...counts, ...tree }
+  return counts === undefined ? failedClone("present", tree, "failed to count lost commits") : { clone: "present", ...counts, ...tree }
 }
 
 /** Contained by some OTHER real host branch (not delegate/<key>, not a symbolic ref, never HEAD alone). */
-async function mergedElsewhere(deps: CloseDeps, repo: string, key: string, tip: string): Promise<boolean | undefined> {
+async function mergedElsewhere(deps: CloseDeps, repo: string, key: string, tip: string, base?: string): Promise<boolean | undefined> {
   const result = await hostGit(deps, repo, ["for-each-ref", "--format=%(refname) %(symref)", "--contains", tip, "refs/heads/"])
   if (result.code !== 0) return undefined
   const own = `refs/heads/delegate/${key}`
-  return result.stdout.split(/\r?\n/).some((line) => {
+  const directMatch = result.stdout.split(/\r?\n/).some((line) => {
     const [ref, symref] = line.trim().split(" ")
     return !!ref && ref !== own && !symref
   })
+  if (directMatch) return true
+
+  // #144: Check patch-equivalence using git cherry against other host branches
+  // Callers often re-author collected commits, altering commit SHAs
+  const allRefs = await hostGit(deps, repo, ["for-each-ref", "--format=%(refname) %(symref)", "refs/heads/"])
+  if (allRefs.code !== 0) return undefined
+  const candidateBranches: string[] = allRefs.stdout
+    .split(/\r?\n/)
+    .map((l) => l.trim().split(" "))
+    .filter(([ref, symref]) => Boolean(ref && ref !== own && !symref))
+    .map(([ref]) => ref!)
+
+  for (const branch of candidateBranches) {
+    const cherryArgs = base ? ["cherry", branch, own, base] : ["cherry", branch, own]
+    const cherry = await hostGit(deps, repo, cherryArgs)
+    if (cherry.code === 0 && cherry.stdout.trim().length > 0) {
+      const lines = cherry.stdout.trim().split(/\r?\n/).map((l) => l.trim()).filter(Boolean)
+      if (lines.length > 0 && lines.every((line) => line.startsWith("-"))) {
+        return true
+      }
+    }
+  }
+  return false
 }
 
 /** Whether delegate/<key> may be deleted: merged into another branch, and checked out nowhere. */
@@ -265,7 +310,7 @@ async function inspectBranch(deps: CloseDeps, state: HostSessionState): Promise<
   if (worktrees.code !== 0) return { plan: "unknown", repo, tip }
   const ref = `branch refs/heads/delegate/${state.sessionKey}`
   if (worktrees.stdout.split(/\r?\n/).some((line) => line.trim() === ref)) return { plan: "checked_out", repo, tip }
-  const merged = await mergedElsewhere(deps, repo, state.sessionKey, tip)
+  const merged = await mergedElsewhere(deps, repo, state.sessionKey, tip, state.base)
   return { plan: merged === undefined ? "unknown" : merged ? "merged" : "unmerged", repo, tip }
 }
 
@@ -283,7 +328,7 @@ export async function inspectClose(deps: CloseDeps, key: string, owner: CloseOwn
   const clone = await inspectClone(deps, o.state)
   const branch: BranchPlan = options.deleteBranch ? (await inspectBranch(deps, o.state)).plan : "not_requested"
   const reason = reasonOf(clone)
-  return { sessionKey: key, sessionID: o.state.sessionID, clone: clone.clone, ...countsOf(clone), safe: reason === undefined, ...(reason ? { reason } : {}), branch }
+  return { sessionKey: key, sessionID: o.state.sessionID, clone: clone.clone, ...countsOf(clone), safe: reason === undefined, ...(reason ? { reason } : {}), ...(clone.checkError ? { checkError: clone.checkError } : {}), branch }
 }
 
 /** rm the clone (path from the validated key only), then prove it is gone. */
@@ -324,7 +369,7 @@ async function hook<T>(fn: () => Promise<T>, what: string): Promise<T> {
 }
 
 function kept(o: Owned, clone: CloneState, session: CloseOutcome["session"], refused?: CloseRefusal): CloseOutcome {
-  return { sessionKey: o.state.sessionKey, sessionID: o.state.sessionID, closed: false, ...(refused ? { refused } : {}), session, clone: "kept", branch: "not_requested", record: "kept", ...countsOf(clone) }
+  return { sessionKey: o.state.sessionKey, sessionID: o.state.sessionID, closed: false, ...(refused ? { refused } : {}), ...(clone.checkError ? { checkError: clone.checkError } : {}), session, clone: "kept", branch: "not_requested", record: "kept", ...countsOf(clone) }
 }
 
 /**
