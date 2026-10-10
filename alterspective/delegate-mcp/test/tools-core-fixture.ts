@@ -114,6 +114,8 @@ export type Fake = {
   order: string[]
   box: Box
   boxCmds: string[][]
+  /** cwd values the fixture's boxExec was asked to run in (D6 collect-verify runs in the box workspace). */
+  boxCwds: string[]
   hostCmds: string[][]
   opened: Array<[string, string]>
   collected: string[]
@@ -126,6 +128,8 @@ export type Fake = {
   setHost(fn: (argv: string[]) => CommandResult): void
   setBox(fn: (argv: string[]) => CommandResult): void
   status: { value: SupervisorStatus }
+  /** The delegation gate the context gets; doctor tests can make pending() answer or throw. */
+  gate: { pending(): Promise<never[]>; decide(): Promise<never> }
   /** What supervisor.verifyLive() reports (R5-01, R5-05); all checks pass by default. */
   live: { value: LiveChecks }
 }
@@ -208,10 +212,11 @@ export function fakeContext(options: { boxHeld?: boolean } = {}): Fake {
   let host = (_argv: string[]) => ({ code: 128, stdout: "", stderr: "fatal: path not in tree" }) as CommandResult
   let inBox = (argv: string[]) => (argv.includes("rev-parse") ? okCmd(`${BASE}\n`) : okCmd(""))
   const f: Fake = {
-    api, hub, order, box, boxCmds: [], hostCmds: [], opened: [], collected: [], states: new Map(), discarded: [], started: { count: 0, restarts: 0 }, restart: { forced: [], interrupted: 0 },
+    api, hub, order, box, boxCmds: [], boxCwds: [], hostCmds: [], opened: [], collected: [], states: new Map(), discarded: [], started: { count: 0, restarts: 0 }, restart: { forced: [], interrupted: 0 },
     setHost: (fn) => (host = fn),
     setBox: (fn) => (inBox = fn),
     status: { value: { state: "running", target: TARGET, imageTag: "img:1", startedBy: "other", health: "healthy", policyVerified: true, frontMatches: true, imageMatches: true } },
+    gate: { pending: async () => [], decide: async () => { throw new Error("not used") } },
     live: { value: LIVE_OK },
     ctx: undefined as unknown as ToolContext,
   }
@@ -239,8 +244,9 @@ export function fakeContext(options: { boxHeld?: boolean } = {}): Fake {
       return { ...box, interrupted: f.restart.interrupted, keystone: options?.keystone ?? [] }
     },
     onBox: () => () => {},
-    boxExec: async (argv) => {
+    boxExec: async (argv, timeoutMs, cwd) => {
       f.boxCmds.push(argv)
+      if (cwd !== undefined) f.boxCwds.push(cwd)
       return inBox(argv)
     },
     hostExec: async (argv) => {
@@ -248,6 +254,7 @@ export function fakeContext(options: { boxHeld?: boolean } = {}): Fake {
       return host(argv)
     },
     sessions: new Map(),
+    gate: f.gate,
     correlationId: () => "cid-test",
   }
   return f

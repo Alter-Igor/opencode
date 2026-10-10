@@ -39,6 +39,32 @@ export function untrusted(text: string | undefined, max = MAX_UNTRUSTED_CHARS): 
   return clean.length > max ? { text: clean.slice(0, max), truncated: true } : { text: clean, truncated: false }
 }
 
+/**
+ * A long reply cut from the FRONT loses its ending, and the ending is where verdicts live
+ * (live finding 2026-10-10: a review arrived without its conclusion). Keep the opening and the
+ * close, name the gap, and point at the page. `clean` must already be stripUnsafe'd so offsets
+ * are stable across calls.
+ */
+export function headTail(clean: string, max: number): { text: string; truncated: boolean } {
+  if (clean.length <= max) return { text: clean, truncated: false }
+  // 40% head, 60% tail after reserving the marker: the verdict end matters more than the intro.
+  // 256 covers any lengths/offsets the marker can print, so the result never exceeds `max`.
+  const markerRoom = 256
+  const body = Math.max(200, max - markerRoom)
+  const headLen = Math.floor(body * 0.4)
+  const tailLen = body - headLen
+  const omitted = clean.length - headLen - tailLen
+  const marker = `\n\n[oc_result: ${omitted} of ${clean.length} characters omitted from the middle; page with messageID and textOffset ${headLen}]\n\n`
+  return { text: `${clean.slice(0, headLen)}${marker}${clean.slice(clean.length - tailLen)}`, truncated: true }
+}
+
+/** One page of a cleaned reply, from `offset`. `next` is the offset after the kept window. */
+export function windowText(clean: string, offset: number, max: number): { text: string; truncated: boolean; next: number } {
+  const at = Math.min(offset, clean.length)
+  const slice = clean.slice(at, at + max)
+  return { text: slice, truncated: at + slice.length < clean.length, next: at + slice.length }
+}
+
 /** Keep whole items, in order, while their JSON fits `budgetChars` (one extra char per separator). */
 export function fitList<T>(items: readonly T[], budgetChars: number, size: (item: T) => number = jsonLength): { kept: T[]; omitted: number } {
   let used = 0

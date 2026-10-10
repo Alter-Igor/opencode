@@ -228,3 +228,26 @@ describe("workspaces: only the current branch is bundled, and the host record (W
     expect(state?.supervisor).toBeUndefined()
   })
 })
+
+describe("workspaces: sync fetches the bundled ref by name (#143)", () => {
+  test(
+    "the box fetch names refs/delegate-sync/<nonce>, so a bundle without HEAD still lands",
+    async () => {
+      const nonce = "beefbeefbeefbeef"
+      const workspaces = fx.workspaces({ nonce: () => nonce })
+      const ws = await workspaces.open(fx.hostRepo, "sync-refspec")
+      writeFileSync(path.join(fx.hostRepo, "host-note.txt"), "from the host\n")
+      await git(fx.hostRepo, ["add", "host-note.txt"])
+      await git(fx.hostRepo, ["commit", "-q", "-m", "host work"])
+      const expectedSha = await git(fx.hostRepo, ["rev-parse", "HEAD"])
+      const fetches: string[][] = []
+      fx.boxOverride = (argv) => (argv.includes("fetch") ? (fetches.push([...argv]), undefined) : undefined)
+      const result = await workspaces.sync(ws, "main")
+      expect(result).toEqual({ synced: true, head: expectedSha, commitsSynced: 1 })
+      expect(fetches).toHaveLength(1)
+      expect(fetches[0]?.at(-1)).toBe("refs/delegate-sync/beefbeefbeefbeef")
+      expect(await fx.boxGit("sync-refspec", ["rev-parse", "HEAD"])).toBe(expectedSha)
+    },
+    T,
+  )
+})

@@ -11,7 +11,7 @@ import { z } from "zod"
 import { DelegateError } from "../shared/errors.ts"
 import type { OpencodeApi } from "../shared/opencode-api.ts"
 import { DEFAULT_MODEL, SYNAPSE_PROVIDER } from "../supervisor/profile.ts"
-import { registeredModels } from "../synapse/models.ts"
+import { registeredModels, type Suitability } from "../synapse/models.ts"
 import type { ToolContext } from "./context.ts"
 import { MODEL_RE, requireSynapseModel } from "./core-session.ts"
 import { defineTool } from "./define.ts"
@@ -72,6 +72,40 @@ export async function listModels(api: OpencodeApi, correlationId: string): Promi
 }
 
 /**
+ * D4 stage 1 (owner decision 2026-10-10): pick the best model for a task role from Synapse's live
+ * suitability data. The role vocabulary is whatever Synapse publishes (no hardcoded list here).
+ * Only models the box also offers are candidates (a hint cannot resurrect a retired model).
+ * Deterministic: highest score wins; ties by id sort (the list arrives sorted).
+ */
+export function bestForRole(role: string, offered: readonly string[], suitability: Record<string, Record<string, number>>): { model: string; score: number } | undefined {
+  let best: { model: string; score: number } | undefined
+  for (const id of offered) {
+    if (id === DEFAULT_MODEL || id === `${SYNAPSE_PROVIDER}/auto`) continue
+    const score = suitability[id.slice(SYNAPSE_PROVIDER.length + 1)]?.[role]
+    if (score === undefined) continue
+    if (!best || score > best.score) best = { model: id, score }
+  }
+  return best
+}
+
+export type RolePick = { model: string; score: number } | { none: string }
+
+/**
+ * Pick live: reads Synapse's current list (host token, the #149 path). Never throws and never
+ * blocks a send: no token, unreadable list, role unknown or no offered model has fit data all
+ * come back as { none } with the reason - the caller sends the default model and says so.
+ */
+export async function pickRoleModel(ctx: Pick<ToolContext, "config">, role: string, offered: readonly string[]): Promise<RolePick> {
+  const live = await registeredModels({ frontDir: path.join(ctx.config.home, "front"), fetch }).catch(() => undefined)
+  if (!live || live.source !== "synapse") return { none: `no live model data from Synapse${live && "reason" in live ? ` (${live.reason})` : ""}; the default model was sent` }
+  if (!live.suitability) return { none: "Synapse publishes no per-role fit data yet; the default model was sent" }
+  const known = [...new Set(Object.values(live.suitability).flatMap((s) => Object.keys(s)))]
+  if (!known.includes(role)) return { none: `Synapse has no fit data for role "${role}" (known: ${known.join(", ") || "none"}); the default model was sent` }
+  const best = bestForRole(role, [...offered].sort(), live.suitability)
+  return best ?? { none: `no offered model carries fit data for role "${role}"; the default model was sent` }
+}
+
+/**
  * #71: a model outside Synapse is refused without asking the box; then an unknown one is refused
  * (edge case 8). The ids are box data, so they are not put in the error message (W3C-09):
  * oc_list_models returns them as data.
@@ -100,11 +134,29 @@ export async function requireModel(api: OpencodeApi, model: string, correlationI
   }
 }
 
+/** D4: the fit table Synapse is publishing right now - per known role, the best offered models.
+ *  Bounded (3 per role, 20 roles); empty when no data. The roles are discovered, never listed here. */
+export function rolesTable(suitability: Record<string, Suitability> | undefined, offered: readonly string[]): Record<string, Array<{ model: string; score: number }>> | undefined {
+  if (!suitability) return undefined
+  const models = offered.filter((m) => m !== DEFAULT_MODEL && m !== `${SYNAPSE_PROVIDER}/auto`)
+  const roles = [...new Set(Object.values(suitability).flatMap((s) => Object.keys(s)))].sort().slice(0, 20)
+  const out: Record<string, Array<{ model: string; score: number }>> = {}
+  for (const role of roles) {
+    const ranked = models
+      .map((m) => ({ model: m, score: suitability[m.slice(SYNAPSE_PROVIDER.length + 1)]?.[role] }))
+      .filter((e): e is { model: string; score: number } => e.score !== undefined)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 3)
+    if (ranked.length) out[role] = ranked
+  }
+  return Object.keys(out).length ? out : undefined
+}
+
 export const modelsTool = defineTool({
   name: "oc_list_models",
   title: "List sandbox models",
   description:
-    "List the models the sandbox can use: only Synapse models (synapse/<id>, the models registered in Synapse when the sandbox started; default synapse/auto), as provider/model ids (pass one as `model` to oc_start_session or oc_send), and the Keystone services it can use (`keystone.connections`: pass a subset as `keystone` to oc_start_session; change the set with oc_server_restart). Starts the sandbox if it is not running.",
+    "List the models the sandbox can use: only Synapse models (synapse/<id>, the models registered in Synapse when the sandbox started; default synapse/auto), as provider/model ids (pass one as `model` to oc_start_session or oc_send), and the Keystone services it can use (`keystone.connections`: pass a subset as `keystone` to oc_start_session; change the set with oc_server_restart). When Synapse publishes per-role benchmark fit (D4), `roles` shows the role names Synapse knows and the best offered models for each: pass `taskRole` to oc_send/oc_start_session and the bridge picks from that live table. Starts the sandbox if it is not running.",
   input: { provider: z.string().regex(PROVIDER_RE).optional().describe("Only this provider, e.g. synapse.") },
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   async run(args, ctx, correlationId) {
@@ -115,10 +167,13 @@ export const modelsTool = defineTool({
     // #149: report live served models
     const live = await registeredModels({ frontDir: path.join(ctx.config.home, "front"), fetch }).catch(() => undefined)
     const served = live && live.source === "synapse" ? live.models.map((m) => `${SYNAPSE_PROVIDER}/${m}`) : undefined
-    return ok(`${models.length} model${models.length === 1 ? "" : "s"}${args.provider ? ` from ${args.provider}` : ""}. ${keystoneLine(keystone)}.`, {
+    const roles = rolesTable(live?.source === "synapse" ? live.suitability : undefined, list.models)
+    const roleNote = roles ? ` Roles with fit data: ${Object.keys(roles).join(", ")} (pass taskRole to oc_send).` : ""
+    return ok(`${models.length} model${models.length === 1 ? "" : "s"}${args.provider ? ` from ${args.provider}` : ""}. ${keystoneLine(keystone)}.${roleNote}`, {
       models,
       defaults: list.defaults,
       ...(served ? { served } : {}),
+      ...(roles ? { roles } : {}),
       keystone,
     })
   },

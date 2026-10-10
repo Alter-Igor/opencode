@@ -35,14 +35,18 @@ export const MAX_BODY_BYTES = 1024 * 1024
 const BEARER_RE = /set \$synapse_auth "Bearer ([A-Za-z0-9._-]+)";/
 
 export type ModelLimit = { context: number; output: number }
+/** D4 (Synapse contract, stage 1): per-role benchmark fit, 0..1, published per model entry as
+ *  `capabilities.suitability`. The role vocabulary is Synapse's: the bridge discovers the keys it
+ *  finds and hardcodes none. Absent or malformed: the model has no fit data (fail open). */
+export type Suitability = Record<string, number>
 
 export type RegisteredModels =
-  | { models: string[]; limits: Record<string, ModelLimit>; source: "synapse" }
-  | { models: string[]; limits: Record<string, ModelLimit>; source: "fallback"; reason: string }
+  | { models: string[]; limits: Record<string, ModelLimit>; suitability?: Record<string, Suitability>; source: "synapse" }
+  | { models: string[]; limits: Record<string, ModelLimit>; suitability?: Record<string, Suitability>; source: "fallback"; reason: string }
 
 export type ModelsDeps = { frontDir: string; fetch: typeof fetch; timeoutMs?: number }
 
-type Entry = { id: string; chat: boolean; limit?: ModelLimit }
+type Entry = { id: string; chat: boolean; limit?: ModelLimit; suitability?: Suitability }
 
 const fallback = (reason: string): RegisteredModels => ({ models: [...FALLBACK_MODELS], limits: {}, source: "fallback", reason })
 
@@ -63,7 +67,9 @@ export async function registeredModels(deps: ModelsDeps): Promise<RegisteredMode
   if (!ids.length && !entries.some((entry) => entry.id === AUTO_MODEL)) return fallback("Synapse listed no usable model ids")
   const limits: Record<string, ModelLimit> = {}
   for (const entry of usable) if (entry.limit && ids.includes(entry.id)) limits[entry.id] = entry.limit
-  return { models: [AUTO_MODEL, ...ids], limits, source: "synapse" }
+  const suitability: Record<string, Suitability> = {}
+  for (const entry of usable) if (entry.suitability && ids.includes(entry.id)) suitability[entry.id] = entry.suitability
+  return { models: [AUTO_MODEL, ...ids], limits, ...(Object.keys(suitability).length > 0 ? { suitability } : {}), source: "synapse" }
 }
 
 type Reply = { status: number; text: string } | "timeout" | "unreachable" | "too_large"
@@ -124,6 +130,19 @@ async function hostToken(frontDir: string): Promise<string | undefined> {
   return BEARER_RE.exec(text)?.[1]
 }
 
+/**
+ * capabilities.suitability: string keys, 0..1 numbers only. Anything malformed is dropped
+ * (a hint must never break a read). Empty after filtering: undefined.
+ */
+function parseSuitability(value: unknown): Suitability | undefined {
+  if (!isRecord(value)) return undefined
+  const out: Suitability = {}
+  for (const [role, score] of Object.entries(value)) {
+    if (typeof score === "number" && Number.isFinite(score) && score >= 0 && score <= 1 && role.length > 0 && role.length <= 64) out[role] = score
+  }
+  return Object.keys(out).length > 0 ? out : undefined
+}
+
 /** OpenAI's list shape, { data: [{ id, ... }] }, with Synapse's catalogue fields. Anything else is undefined. */
 function parseEntries(text: string): Entry[] | undefined {
   let body: unknown
@@ -137,7 +156,8 @@ function parseEntries(text: string): Entry[] | undefined {
   return data.flatMap((item: unknown): Entry[] => {
     if (!isRecord(item) || typeof item.id !== "string") return []
     const limit = positiveInt(item.contextWindow) && positiveInt(item.maxOutput) ? { context: item.contextWindow, output: item.maxOutput } : undefined
-    return [{ id: item.id, chat: chatCapable(item.capabilities) && toolCapable(item.capabilities), ...(limit ? { limit } : {}) }]
+    const suitability = isRecord(item.capabilities) ? parseSuitability(item.capabilities.suitability) : undefined
+    return [{ id: item.id, chat: chatCapable(item.capabilities) && toolCapable(item.capabilities), ...(limit ? { limit } : {}), ...(suitability ? { suitability } : {}) }]
   })
 }
 

@@ -2,15 +2,18 @@
 // starts the box (and never takes a lease) unless called with start:true; a box another bridge
 // started is read through its status() target. Names and errors the box reports are box data.
 import { z } from "zod"
+import { readdir, readFile, stat } from "node:fs/promises"
+import path from "node:path"
 import type { LiveChecks } from "../supervisor/live.ts"
 import type { SupervisorStatus } from "../supervisor/status.ts"
+import { processAlive } from "../supervisor/process.ts"
 import type { Verdict } from "../shared/contracts.ts"
 import type { McpStatus, OpencodeApi } from "../shared/opencode-api.ts"
 import { KS_NAME } from "../guard/entries.ts"
 import { checkEgress, egressInput, type EgressCheck } from "../guard/egress-check.ts"
 import { currentKeystone, effectiveConfig } from "../shared/config.ts"
 import { DYNAMIC_ID, readKeystoneSet } from "../shared/keystone.ts"
-import { ceilingOf } from "../shared/keystone-policy.ts"
+import { CEILING_ENV, ceilingOf } from "../shared/keystone-policy.ts"
 import { reconnectTick } from "../keystone-auth/host-wiring.ts"
 import type { ToolContext } from "./context.ts"
 import { defineTool } from "./define.ts"
@@ -61,6 +64,7 @@ function boxReport(status: SupervisorStatus): Record<string, unknown> {
     health: status.health,
     startedBy: status.startedBy,
     baseUrl: status.target.baseUrl,
+    ...(status.ceilingMismatch && status.ceilingMismatch.length > 0 ? { ceilingMismatch: status.ceilingMismatch } : {}),
   }
 }
 
@@ -110,6 +114,11 @@ function notRunning(status: Exclude<SupervisorStatus, { state: "running" }>): st
 /** Bridge words only: MCP entries are named only when they are ks-* entries (W3C-09); others are counted. */
 function summaryOf(status: SupervisorStatus, mcp: McpReport | undefined, verdict: Verdict, verified: boolean): string {
   if (status.state !== "running") return notRunning(status)
+  // A ceiling mismatch means the box is genuinely running but this bridge may not use it. Say
+  // that, not "sandbox running with mismatches" and never "not running" (live-verified 2026-10-10:
+  // a healthy gate was reported dead because a bridge's ceiling excluded the saved `dynamic`).
+  if (status.ceilingMismatch && status.ceilingMismatch.length > 0)
+    return `NOT verified: the sandbox IS RUNNING (${status.imageTag}, health ${status.health}), but this bridge cannot use it: the saved Keystone set leaves its ceiling (${status.ceilingMismatch.join(", ")}). Either restart the box with an allowed set (oc_server_restart {confirm: true, keystone: [...]}) or raise the ceiling (${CEILING_ENV} in this server's env, then restart the client).`
   const built = `image built from ${status.imageBuiltFrom ?? "unknown"}, bridge at ${status.bridgeAt ?? "unknown"}`
   const checks = `Docker health ${status.health}, image ${status.imageMatches ? "ok" : "MISMATCH"} (${built}), policy ${status.policyVerified ? "ok" : "MISMATCH"}, front ${status.frontMatches ? "ok" : "MISMATCH"}`
   const ks = ksEntries(mcp)
@@ -148,6 +157,8 @@ async function inspect(ctx: ToolContext, start: boolean, correlationId: string) 
   if (start && !ctx.peekBox()) await ctx.box()
   const status = await ctx.supervisorService.status()
   const held = ctx.peekBox()
+  // A box outside this bridge's ceiling is diagnostics-read only (GET /mcp, guard check, gate):
+  // writing tools (login, send, restart) keep refusing because ensure()/replace() fail closed.
   const api = held?.api ?? (status.state === "running" ? ctx.apiFor(status.target) : undefined)
   // Review M1: with host-held tokens, reconnect signed-in entries on the box read here (held by any
   // bridge) before reporting them: OpenCode does not reconnect an oauth:false entry by itself.
@@ -215,13 +226,48 @@ export function synapseLine(report: SynapseReport): string {
 async function gateReport(ctx: ToolContext, connections: readonly string[], running: boolean): Promise<{ ok: boolean; line: string; report: Record<string, unknown> }> {
   if (!connections.includes(DYNAMIC_ID)) return { ok: true, line: "", report: { used: false } }
   const profile = ctx.config.dynamicProfile === "" ? "default (every tool; risky tools wait for approval)" : "custom (OPENCODE_DELEGATE_DYNAMIC_PROFILE)"
-  if (!running || ctx.gate === undefined) return { ok: false, line: " Delegation gate: not checked (the sandbox is not running).", report: { used: true, profile, reachable: false } }
+  if (!running) return { ok: false, line: " Delegation gate: not checked (the sandbox is not running).", report: { used: true, profile, reachable: false } }
+  if (ctx.gate === undefined) return { ok: false, line: " Delegation gate: not checked (this bridge has no gate client).", report: { used: true, profile, reachable: false } }
   try {
     const waiting = (await ctx.gate.pending()).length
     return { ok: true, line: ` Delegation gate: ok, profile ${profile}, ${waiting} call(s) waiting for approval.`, report: { used: true, profile, reachable: true, waitingApprovals: waiting } }
   } catch (error) {
     const reason = error instanceof Error ? error.message.slice(0, 200) : "unreachable"
     return { ok: false, line: ` Delegation gate: NOT reachable (${reason}).`, report: { used: true, profile, reachable: false, reason } }
+  }
+}
+
+/**
+ * Bridge leases in this home (<home>/leases, one file per bridge): which bridges hold or held the
+ * box, with PID, last heartbeat and liveness. An old lease of a dead or idle bridge explains log
+ * spam and stale event streams (live finding 2026-10-10: two zombie bridges spammed "event stream
+ * dropped" for days). Read-only; at most 20, newest heartbeat first; never throws.
+ */
+async function leaseReport(home: string, nowMs: number = Date.now()): Promise<Record<string, unknown>> {
+  const dir = path.join(home, "leases")
+  try {
+    const files = (await readdir(dir)).filter((name) => /^[A-Za-z0-9_-]{1,64}$/.test(name))
+    const items = await Promise.all(
+      files.map(async (name) => {
+        const file = path.join(dir, name)
+        const [text, st] = await Promise.all([readFile(file, "utf8").catch(() => undefined), stat(file).catch(() => undefined)])
+        const record = (text === undefined ? undefined : (JSON.parse(text) as { pid?: unknown; bridgeId?: unknown })) ?? {}
+        const pid = typeof record.pid === "number" ? record.pid : undefined
+        const heartbeatMs = st?.mtimeMs
+        return {
+          bridgeId: typeof record.bridgeId === "string" ? record.bridgeId : name,
+          ...(pid === undefined ? {} : { pid, alive: processAlive(pid) }),
+          heartbeat: heartbeatMs === undefined ? "unknown" : new Date(heartbeatMs).toISOString(),
+          idleSec: heartbeatMs === undefined ? undefined : Math.max(0, Math.floor((nowMs - heartbeatMs) / 1000)),
+        }
+      }),
+    )
+    const newestFirst = items.sort((a, b) => (a.idleSec ?? Number.MAX_SAFE_INTEGER) - (b.idleSec ?? Number.MAX_SAFE_INTEGER)).slice(0, 20)
+    return { count: items.length, leases: newestFirst }
+  } catch (error) {
+    // A home with no leases folder yet (never started a box) is empty, not unreadable.
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { count: 0, leases: [] }
+    return { unavailable: "the lease folder could not be read" }
   }
 }
 
@@ -239,9 +285,11 @@ export const doctorTool = defineTool({
     const synapse = await ctx.synapse.status()
     const keystoneAuth = await keystoneAuthReport(ctx, keystone, live)
     const gate = await gateReport(ctx, "connections" in keystone ? keystone.connections : [], status.state === "running")
+    const leases = await leaseReport(ctx.config.home)
     const verified = isVerified(status, mcp, verdict) && egress.ok && keystoneEntriesOk(keystone) && live?.ok === true && synapse.ok && (!keystoneAuth.enabled || keystoneAuth.ok) && gate.ok
     return ok(`${summaryOf(status, mcp, verdict, verified)} ${keystoneLine(keystone)}.${keystoneEntriesHint(keystone, ctx.keystone !== undefined)}${egressSummary(egress)}${liveSummary(live, keystoneAuth.enabled)}${synapseLine(synapse)}${keystoneAuthLine(keystoneAuth)}${gate.line}`, {
       verified,
+      leases,
       synapse,
       keystoneAuth,
       gate: gate.report,

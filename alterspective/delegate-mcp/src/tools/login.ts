@@ -88,7 +88,10 @@ async function runningApi(ctx: ToolContext): Promise<OpencodeApi | undefined> {
   const held = ctx.peekBox()
   if (held) return held.api
   const status = await ctx.supervisorService.status()
-  return status.state === "running" ? ctx.apiFor(status.target) : undefined
+  // A box whose saved set leaves this bridge's ceiling is running but NOT this bridge's to use:
+  // signing in through it would hand a box entry outside the ceiling a working token.
+  if (status.state !== "running" || status.ceilingMismatch?.length) return undefined
+  return ctx.apiFor(status.target)
 }
 
 /** Connect one box entry; "not_running" without a running box, "unknown" when anything failed. */

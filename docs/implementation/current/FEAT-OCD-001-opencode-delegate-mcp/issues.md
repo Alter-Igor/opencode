@@ -38,3 +38,19 @@
 | #60 | Medium: a sent nginx reload and disk dump could falsely attest a running config. | Fixed in branch delegate-hardening with immutable copies and a unique worker acknowledgement; live delayed/timeout/same-content proof passed. Awaiting PR review and owner merge. |
 
 Reproductions, second checks and exact validation are in [the fresh review](evidence/pr58-fresh-review.md). Accepted residuals from PR #58 are unchanged.
+
+## Owner field report — 2026-10-10 (full text and live root-causes: [evidence/owner-feedback-2026-10-10.md](evidence/owner-feedback-2026-10-10.md))
+
+| ID | Type | Description | Status |
+|---|---|---|---|
+| OB-1 | Bug (High) | "Gate unreachable" is two failures: (a) a bridge whose ceiling excludes the saved set's `dynamic` gets the whole box `state:"unavailable"` and `gate.reachable:false` from the doctor, though the gate container is healthy — a ceiling mismatch masquerading as a dead gate; (b) the owner's own bridge: the box's `GET /permission` fails (500/upstream_error) under load, and `oc_answer` cannot answer without a fresh `oc_pending` listing, so a session waiting on a permission is stuck. The stuck session was only freed by `oc_close_session` (abort). | Open |
+| OB-2 | Bug (Medium) | `oc_send {syncRef}` fails 100% of the time: `sync()` fetches the bundle with no refspec (`workspaces.ts:334`), so git resolves `HEAD` in the bundle → "fatal: couldn't find remote ref HEAD". Fix: fetch `refs/delegate-sync/<nonce>` explicitly. (#143 shipped broken.) | Open — root cause found |
+| OB-3 | Bug (Medium) | Box recreated 2026-10-08 04:53Z mid-task; sessions and clones survived, but `oc_wait` returned an empty event page (SSE died with the old instance; no terminal event). | Open — partly mitigated by #150 (wait now formats `lastError` / no-activity) |
+| OB-4 | Gap (Medium) | Box has no repo `node_modules`, no pnpm on PATH; builders self-report "tests passed" from partial runs. The npm/bun/PyPI caches ARE reachable, so a documented "install deps then verify" step is possible; `oc_verify` exists but is not wired into the builder's flow or a pre-collect gate. | Open |
+| OB-5 | Decision (Low) | "Synapse requires login" inside the box for the built-in self-review: expected — the box holds no credential (#48) and `front` allows only the two model routes. The self-review step should be off/removed in the box (or run host-side via `oc_verify`/buddy), not discovered at build time. | Open — docs/behaviour |
+| OB-6 | Improvement | Model defaults: `synapse/auto` was poor for coding (8 lines in 32 min); `openai/gpt-6-astra` did #852 end-to-end in ~10 min; kimi-k3 QA found 4 missed write paths. Default code tasks to a named coder model or publish a model↔task fit table in README. | Open |
+| OB-7 | Improvement | readonly bash allow-list (#140) is missing `rg` (and wc/sort/uniq/nl/stat/du/file/git blame). | Open — one-line |
+| OB-8 | Improvement | Decouple `oc_answer` from `oc_pending`: directory and ownership already exist in the host record; the fresh listing should not gate the reply (keep prefix + shape checks). | Open |
+| OB-9 | Improvement | `oc_result` truncation cuts the verdict off the end of long reviews: prefer head+tail for a single reply, or page by messageID. | Open |
+| OB-10 | Improvement | Long waits: bridge cap is 240 s but the client tool timeout is ~120 s, so a 20-min build needs ~10 calls. One idle notification (channels already exist, off by default), and fix the gate's Bun.serve default 10 s idleTimeout (seen: "request timed out after 10 seconds" — kills long-polls). | Open |
+| OB-11 | Decision | `dynamic` should leave the default/allowed set until its scenario runs (owner improvement #6; matches the doctor's high-risk warning). The ceiling mismatch (OB-1a) also needs a distinct doctor verdict: "box reachable, this bridge's set differs" instead of `unavailable`. | Open |

@@ -53,8 +53,11 @@ export function startFromEnv(env: Env, log = stdoutLog): Started {
   const store = InboxStore.open({ dir: env.INBOX_DATA_DIR ?? "/data" })
   let handlers: Handlers | undefined
   const unready = () => new Response("", { status: 503 })
-  const box = Bun.serve({ port: boxPort, hostname: env.INBOX_HOST ?? "0.0.0.0", maxRequestBodySize: MAX_REQUEST_BODY, fetch: (r) => handlers?.box(r) ?? unready() })
-  const admin = Bun.serve({ port: adminPort, hostname: env.INBOX_ADMIN_HOST ?? "127.0.0.1", maxRequestBodySize: MAX_REQUEST_BODY, fetch: (r) => handlers?.admin(r) ?? unready() })
+  // Bun's default idleTimeout is 10s and kills idle SSE (oc_wait long-polls) mid-stream; 130 sits
+  // above the bridge's 10s client timeout and the 120s client-tool window. Bun caps it to 0-255.
+  const INBOX_IDLE_TIMEOUT_SEC = 130
+  const box = Bun.serve({ port: boxPort, hostname: env.INBOX_HOST ?? "0.0.0.0", maxRequestBodySize: MAX_REQUEST_BODY, idleTimeout: INBOX_IDLE_TIMEOUT_SEC, fetch: (r) => handlers?.box(r) ?? unready() })
+  const admin = Bun.serve({ port: adminPort, hostname: env.INBOX_ADMIN_HOST ?? "127.0.0.1", maxRequestBodySize: MAX_REQUEST_BODY, idleTimeout: INBOX_IDLE_TIMEOUT_SEC, fetch: (r) => handlers?.admin(r) ?? unready() })
   const ports = { box: box.port ?? boxPort, admin: admin.port ?? adminPort }
   handlers = createHandlers({ store, adminToken: token, log, ...hostsFor(env, ports.box, ports.admin) })
   log({ level: "info", event: "started", port: ports.box, adminPort: ports.admin, lastId: store.lastId, skippedLines: store.skippedLines, newEpoch: store.newEpoch })

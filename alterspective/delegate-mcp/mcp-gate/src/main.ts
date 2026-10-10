@@ -40,6 +40,9 @@ const failed = (error: unknown) => {
   return new Response(JSON.stringify({ error: "the delegation gate could not reach Keystone" }), { status: 502, headers: { "content-type": "application/json" } })
 }
 
-Bun.serve({ hostname: env.GATE_HOST || "127.0.0.1", port: Number(env.GATE_PORT || 8090), fetch: front, error: failed })
-Bun.serve({ hostname: env.GATE_ADMIN_HOST || "127.0.0.1", port: Number(env.GATE_ADMIN_PORT || 8091), fetch: admin, error: failed })
+// Bun's default idleTimeout is 10s and kills idle SSE mid-stream; 130 sits above the bridge's
+// 10s client timeout and the 120s client-tool window. Bun caps idleTimeout to the 0-255 range.
+const GATE_IDLE_TIMEOUT_SEC = 130
+Bun.serve({ hostname: env.GATE_HOST || "127.0.0.1", port: Number(env.GATE_PORT || 8090), fetch: front, error: failed, idleTimeout: GATE_IDLE_TIMEOUT_SEC })
+Bun.serve({ hostname: env.GATE_ADMIN_HOST || "127.0.0.1", port: Number(env.GATE_ADMIN_PORT || 8091), fetch: admin, error: failed, idleTimeout: GATE_IDLE_TIMEOUT_SEC })
 log({ event: "started", upstream, profile: Object.keys(profile).length === 0 ? "default" : "custom" })

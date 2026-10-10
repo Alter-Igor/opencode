@@ -2,9 +2,11 @@
 // { state: "unavailable", reason } and logged with its code and detail.
 // The running state also says whether the box's MCP allow policy (the fork patch input) and
 // image match this bridge, and the Docker health status.
-import { effectiveConfig, mcpAllowPolicy } from "../shared/config.ts"
+import { effectiveConfig, mcpAllowPolicy, type KeystoneConfig } from "../shared/config.ts"
 import type { BoxState, Supervisor } from "../shared/contracts.ts"
-import { DelegateError } from "../shared/errors.ts"
+import { DelegateError, isDelegateError } from "../shared/errors.ts"
+import { readKeystoneSet } from "../shared/keystone.ts"
+import { ceilingOf } from "../shared/keystone-policy.ts"
 import type { ApiTarget } from "../shared/opencode-api.ts"
 import { INSPECT_ENV, MCP_ALLOW_ENV, PASSWORD_ENV } from "./compose-env.ts"
 import { LABEL, builtFrom, inspectBox, requireDocker, type BoxInspect } from "./docker.ts"
@@ -29,6 +31,12 @@ export type SupervisorStatus =
       imageBuiltFrom?: string
       /** Information only: the git sha of the checkout this bridge runs from. */
       bridgeAt?: string
+      /**
+       * The box runs a Keystone set whose ids leave this bridge's ceiling (R5-03), so this bridge
+       * cannot use it. The box is still running (health, image and startedBy are truthful); only
+       * the policy and front comparisons are forced to false because they cannot be computed.
+       */
+      ceilingMismatch?: string[]
     })
 
 /** `keystone`: a new box-wide Keystone set (connection ids), saved in the bridge home (R4-01). */
@@ -60,6 +68,16 @@ export function targetOf(box: BoxInspect, project: string): ApiTarget {
   return { baseUrl: `http://127.0.0.1:${port}`, password }
 }
 
+/** The saved set's ids outside this bridge's ceiling (read + ceiling only, never the enforce). */
+function savedOutsideCeiling(config: KeystoneConfig): string[] {
+  try {
+    const ceiling = ceilingOf(config)
+    return readKeystoneSet(config.home, config.keystoneConnections).connections.filter((id) => !ceiling.includes(id))
+  } catch {
+    return []
+  }
+}
+
 export async function statusOf(run: Run): Promise<SupervisorStatus> {
   const { deps } = run
   try {
@@ -67,19 +85,38 @@ export async function statusOf(run: Run): Promise<SupervisorStatus> {
     const box = await inspectBox(deps.exec, INSPECT_ENV, run.container)
     if (!box?.running) return { state: "stopped" }
     const image = box.labels[LABEL.image]
-    const config = effectiveConfig(deps.config)
     const front = await inspectBox(deps.exec, [], `${run.container}-front`)
-    return {
-      state: "running",
-      target: targetOf(box, deps.config.project),
+    const base = {
+      state: "running" as const,
       imageTag: image ?? box.image,
-      startedBy: run.state.startedHere ? "this-bridge" : "other",
+      startedBy: run.state.startedHere ? ("this-bridge" as const) : ("other" as const),
       health: box.health,
-      policyVerified: box.env[MCP_ALLOW_ENV] === mcpAllowPolicy(config),
-      frontMatches: front?.labels[LABEL.frontConfig] === frontFilesFor(config).hash,
       imageMatches: image === deps.image,
       imageBuiltFrom: builtFrom(box.labels),
       bridgeAt: deps.buildSha,
+    }
+    let config
+    try {
+      config = effectiveConfig(deps.config)
+      const target = targetOf(box, deps.config.project)
+      return {
+        ...base,
+        target,
+        policyVerified: box.env[MCP_ALLOW_ENV] === mcpAllowPolicy(config),
+        frontMatches: front?.labels[LABEL.frontConfig] === frontFilesFor(config).hash,
+      }
+    } catch (error) {
+      // The box is running, but this bridge's ceiling excludes the saved set (R5-03): the box is
+      // not dead, it is unusable by this bridge (live-verified 2026-10-10). Say so; a policy
+      // violation is the only error that means "running but mismatched" — a missing bridge setting
+      // or any other failure still reads as an unavailable box. The comparisons cannot be computed,
+      // so they fail closed to false.
+      if (isDelegateError(error) && error.code === "policy_violation") {
+        const outside = savedOutsideCeiling(deps.config)
+        const target = targetOf(box, deps.config.project)
+        return { ...base, target, policyVerified: false, frontMatches: false, ...(outside.length > 0 ? { ceilingMismatch: outside } : {}) }
+      }
+      throw error
     }
   } catch (error) {
     const failure = toDelegateError(error)

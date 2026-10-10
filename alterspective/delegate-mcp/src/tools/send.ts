@@ -13,7 +13,7 @@ import { closingError, isClosing } from "./closing.ts"
 import { CORRELATION_RE, agentSchema, formatCursor, modelSchema, ownSession, parseModel, requireSynapseModel, sameRules, sessionGone, sessionIdSchema } from "./core-session.ts"
 import { DEFAULT_MODEL, SYNAPSE_PROVIDER } from "../supervisor/profile.ts"
 import { defineTool } from "./define.ts"
-import { boxDefault, fetchModels, requireModel } from "./models.ts"
+import { boxDefault, fetchModels, pickRoleModel, requireModel } from "./models.ts"
 import { ok } from "./shape.ts"
 
 export const MAX_MESSAGE_CHARS = 100_000
@@ -98,7 +98,8 @@ export const sendTool = defineTool({
   input: {
     sessionID: sessionIdSchema,
     message: z.string().min(1).max(MAX_MESSAGE_CHARS),
-    model: modelSchema.optional().describe("synapse/<id> for this send (see oc_list_models); default the session's model, else synapse/auto."),
+    model: modelSchema.optional().describe("synapse/<id> for this send (see oc_list_models); default the session's model, else synapse/auto. Ignored when taskRole resolves a model (model wins if both)."),
+    taskRole: z.string().min(1).max(64).optional().describe("D4: what kind of work this is (e.g. code, qa, architecture). The bridge picks Synapse's best-fit model for the role from live benchmark data; falls back to the normal default when Synapse has no fit data yet. oc_list_models shows the roles Synapse knows."),
     agent: agentSchema.optional(),
     correlationId: z.string().regex(CORRELATION_RE).optional().describe("Your id for this task; sent as X-Correlation-ID and logged."),
     allowedPaths: z.array(z.string().min(1).max(256)).max(50).optional().describe("File path globs the session is allowed to edit (#148). Edits outside these are flagged in oc_result."),
@@ -125,16 +126,32 @@ export const sendTool = defineTool({
       record.allowedPaths = args.allowedPaths
     }
     if (args.model) await requireModel(box.api, args.model, cid, ctx)
-    const sent = await sendPrompt(ctx, box, record, { text: args.message, model: args.model, agent: args.agent, correlationId: cid })
+    // D4: with no explicit model, a task role picks Synapse's best-fit live model from the
+    // offered list. No data, unknown role, unreadable: the pick says so and the normal default
+    // path stands (a hint never blocks a send, never guesses a model).
+    let taskPick: { role: string; model: string; score: number } | { role: string; fellBack: string } | undefined
+    let model = args.model
+    if (!model && args.taskRole) {
+      const offered = await fetchModels(box.api, cid)
+      const pick = await pickRoleModel(ctx, args.taskRole, offered)
+      if ("model" in pick) {
+        model = pick.model
+        taskPick = { role: args.taskRole, model: pick.model, score: pick.score }
+      } else {
+        taskPick = { role: args.taskRole, fellBack: pick.none }
+      }
+    }
+    const sent = await sendPrompt(ctx, box, record, { text: args.message, model, agent: args.agent, correlationId: cid })
     const warn =
       (sent.instructions.failed ? ` Warning: could not read ${sent.instructions.failed.join(", ")} from the repository, so it was not passed on.` : "") +
       (sent.modelFallback ? ` Warning: ${sent.modelFallback}` : "")
-    return ok(`Accepted by ${record.sessionID}. Call oc_wait with this cursor.${warn}`, {
+    return ok(`Accepted by ${record.sessionID}. Call oc_wait with this cursor.${taskPick && "model" in taskPick ? ` Model for role "${taskPick.role}": ${taskPick.model} (Synapse fit ${taskPick.score.toFixed(2)}).` : ""}${warn}`, {
       accepted: true,
       sessionID: record.sessionID,
       cursor: sent.cursor,
       correlationId: cid,
       instructions: instructionReport(sent.instructions),
+      ...(taskPick ? { taskPick } : {}),
       ...(sent.modelFallback ? { modelFallback: sent.modelFallback } : {}),
     })
   },
