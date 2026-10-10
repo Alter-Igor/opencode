@@ -77,6 +77,26 @@
       "command": ["node", "C:/GitHub/vault-mcp/dist/index.js"],
       "enabled": true,
     },
+    // opencode-delegate: hand coding tasks to sandboxed OpenCode sessions (FEAT-OCD-001).
+    // MUST match how the running box was started by claude-main (~/.claude.json): host-held
+    // Keystone tokens (OCD_KEYSTONE_HOST_AUTH=1 - any other value is refused), the same dynamic
+    // profile, ceiling incl. dynamic (owner decision B, 2026-10-10: dynamic stays on the shared
+    // box, it is NOT limited). Verified by doctor run 2026-10-10: box running, gate reachable,
+    // all four connections signed in through the shared host token store; only imageMatches is
+    // false (box built at 515344a, checkouts now ahead) - the first box restart rebuilds it and
+    // both bridges then verify. Distinct bridge name keeps session ownership clean.
+    "opencode-delegate": {
+      "type": "local",
+      "command": ["bun", "X:/opencode/alterspective/delegate-mcp/src/cli.ts", "mcp"],
+      "environment": {
+        "OPENCODE_DELEGATE_NAME": "opencodealt",
+        "OPENCODE_DELEGATE_KEYSTONE_ALLOWED": "rag-read,github,seqlogs,dynamic",
+        "OPENCODE_DELEGATE_ROOTS": "C:\\GitHub;X:\\",
+        "OCD_KEYSTONE_HOST_AUTH": "1",
+        "OPENCODE_DELEGATE_DYNAMIC_PROFILE": "{\"deniedToolPatterns\":[\"*__delete_*\"]}",
+      },
+      "enabled": true,
+    },
     // azure-devops removed 2026-09-19: local npx server died without AZURE_DEVOPS_PAT
     // (-32000). Follow-up: onboard Azure DevOps as a Keystone credential provider +
     // AI Connection so it is reached via keystone-dynamic (BFA-007), not a per-repo PAT.
