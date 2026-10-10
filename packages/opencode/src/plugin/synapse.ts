@@ -80,12 +80,30 @@ export const OAUTH_PORT = 1459
 export const OAUTH_REDIRECT_PATH = "/auth/callback"
 export const ACCESS_TOKEN_REFRESH_SKEW_MS = 120_000
 
+export const CORRELATION_ID_HEADER = "X-Correlation-Id"
+export const CORRELATION_CLIENT_PREFIX = "opencode"
+export const CORRELATION_ID_MAX_LENGTH = 128
+
+/**
+ * Creates an X-Correlation-Id following Alterspective standard WEBSTA-001-OBSERVABILITY-STANDARDS
+ * OBS-ID-01..06 in the shape `<client>:<unit-id>:<entropy>` capped at 128 characters.
+ */
+export function createCorrelationId(sessionKey?: string): string {
+  const cleanKey = (sessionKey ?? "global").replace(/[^a-zA-Z0-9_-]/g, "_")
+  const entropy = crypto.randomUUID().replace(/-/g, "").slice(0, 12)
+  const full = `${CORRELATION_CLIENT_PREFIX}:${cleanKey}:${entropy}`
+  if (full.length <= CORRELATION_ID_MAX_LENGTH) return full
+  const maxKeyLen = CORRELATION_ID_MAX_LENGTH - (CORRELATION_CLIENT_PREFIX.length + 1 + entropy.length + 1)
+  return `${CORRELATION_CLIENT_PREFIX}:${cleanKey.slice(0, maxKeyLen)}:${entropy}`
+}
+
 export interface SynapseServingTelemetry {
   model: string
   provider?: string
   costUsd?: string
   latencyMs?: string
   timestamp: number
+  correlationId?: string
 }
 
 let latestSynapseServing: SynapseServingTelemetry | undefined
@@ -1046,7 +1064,9 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
             let requestBodyJson: any = null
             let sanitizedBody = init?.body
             // AIESC-02: escalation is observer-owned; key by session when known.
-            const sessionKey = new Headers(init?.headers as HeadersInit).get("x-opencode-session") || input.directory
+            const incomingHeaders = new Headers(init?.headers as HeadersInit)
+            const sessionKey = incomingHeaders.get("x-opencode-session") || input.directory
+            const correlationId = incomingHeaders.get("x-correlation-id") || createCorrelationId(sessionKey)
             // #80: resend a failed pinned-model request once with `auto` (opt out: OPENCODE_SYNAPSE_PINNED_FALLBACK=0).
             const pinnedFallbackOn = options?.pinnedFallback ?? pinnedFallbackEnabled()
             if (typeof init?.body === "string") {
@@ -1067,7 +1087,10 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                   {
                     timestamp: new Date().toISOString(),
                     type: "INFERENCE_REQUEST",
+                    sessionId: sessionKey,
+                    correlationId,
                     details: {
+                      correlationId,
                       model: requestBodyJson.model,
                       messagesCount: requestBodyJson.messages?.length,
                       toolsCount: requestBodyJson.tools?.length,
@@ -1101,6 +1124,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                       "Content-Type": "application/json",
                       Accept: "application/json, text/event-stream",
                       Authorization: `Bearer ${activeToken}`,
+                      [CORRELATION_ID_HEADER]: correlationId,
                     },
                     body: JSON.stringify({
                       jsonrpc: "2.0",
@@ -1264,11 +1288,15 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                     parsedContent = `[Notice: the requested model was unavailable. Switched to Synapse auto (local-only).]\n\n${parsedContent}`
                   }
 
+                  const mcpCorrelationId = mcpRes.headers.get("x-correlation-id") || correlationId
                   sessionObserver.logDiagnostic(
                     {
                       timestamp: new Date().toISOString(),
                       type: "INFERENCE_RESPONSE",
+                      sessionId: sessionKey,
+                      correlationId: mcpCorrelationId,
                       details: {
+                        correlationId: mcpCorrelationId,
                         model: servedModel,
                         contentLength: parsedContent.length,
                         contentSnippet: parsedContent.slice(0, 200),
@@ -1281,6 +1309,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                   latestSynapseServing = {
                     model: servedModel,
                     timestamp: Date.now(),
+                    correlationId: mcpCorrelationId,
                   }
 
                   const extracted = extractToolCallsFromModelOutput(parsedContent)
@@ -1475,6 +1504,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
             headers.set("x-api-key", activeToken)
             headers.set("x-task-type", "code")
             headers.set("User-Agent", `opencode/${InstallationVersion}`)
+            if (!headers.has("x-correlation-id")) headers.set(CORRELATION_ID_HEADER, correlationId)
             // #101: set last, so no provider or request header can remove or widen it.
             if (privacyTier) headers.set("x-privacy-tier", privacyTier)
 
@@ -1509,6 +1539,20 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
 
             let response = await fetch(requestInput, { ...init, body: sanitizedBody, headers }).catch((err: unknown) => {
               escalations.recordFailure(sessionKey, "provider-error")
+              sessionObserver.logDiagnostic(
+                {
+                  timestamp: new Date().toISOString(),
+                  type: "INFERENCE_ERROR",
+                  sessionId: sessionKey,
+                  correlationId: headers.get("x-correlation-id") || correlationId,
+                  details: {
+                    correlationId: headers.get("x-correlation-id") || correlationId,
+                    error: String(err),
+                  },
+                  error: String(err),
+                },
+                input.directory,
+              )
               throw err
             })
             // #80: a pinned model that cannot serve this request is resent ONCE with `auto`
@@ -1575,8 +1619,11 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                   {
                     timestamp: new Date().toISOString(),
                     type: "INFERENCE_ERROR",
+                    sessionId: sessionKey,
+                    correlationId: response.headers.get("x-correlation-id") || headers.get("x-correlation-id") || correlationId,
                     error: `HTTP ${pinnedFailure.status}: ${pinnedFailure.errorBody || pinnedFailure.statusText}`,
                     details: {
+                      correlationId: response.headers.get("x-correlation-id") || headers.get("x-correlation-id") || correlationId,
                       status: pinnedFailure.status,
                       statusText: pinnedFailure.statusText,
                       errorBody: pinnedFailure.errorBody,
@@ -1590,8 +1637,11 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                 {
                   timestamp: new Date().toISOString(),
                   type: "INFERENCE_ERROR",
+                  sessionId: sessionKey,
+                  correlationId: response.headers.get("x-correlation-id") || headers.get("x-correlation-id") || correlationId,
                   error: `HTTP ${response.status}: ${errorBody || response.statusText}`,
                   details: {
+                    correlationId: response.headers.get("x-correlation-id") || headers.get("x-correlation-id") || correlationId,
                     status: response.status,
                     statusText: response.statusText,
                     errorBody,
@@ -1608,6 +1658,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
             const costUsd = response.headers.get("x-synapse-cost-usd")
             const routedProvider = response.headers.get("x-synapse-routed-provider")
             const latencyMs = response.headers.get("x-synapse-latency-ms")
+            const echoedCorrelationId = response.headers.get("x-correlation-id") || headers.get("x-correlation-id") || correlationId
 
             if (servedModel) {
               latestSynapseServing = {
@@ -1616,6 +1667,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                 costUsd: costUsd ?? undefined,
                 latencyMs: latencyMs ?? undefined,
                 timestamp: Date.now(),
+                correlationId: echoedCorrelationId,
               }
             }
 
@@ -1796,6 +1848,9 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
     // is a quality failure the HTTP-level hooks cannot see. Charge it here.
     "chat.headers": async (headerInput, headerOutput) => {
       headerOutput.headers["x-opencode-session"] = headerInput.sessionID
+      if (!headerOutput.headers[CORRELATION_ID_HEADER] && !headerOutput.headers["x-correlation-id"]) {
+        headerOutput.headers[CORRELATION_ID_HEADER] = createCorrelationId(headerInput.sessionID)
+      }
     },
     "tool.execute.after": async (toolInput, output) => {
       // #95: core calls this hook with no output when a tool fails (a failed subtask, for one).

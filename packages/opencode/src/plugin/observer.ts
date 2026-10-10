@@ -38,6 +38,7 @@ export interface SessionRetrospective {
     provider?: string
     costUsd?: string
     latencyMs?: string
+    correlationId?: string
   }
 }
 
@@ -45,6 +46,7 @@ export interface DiagnosticLogEntry {
   timestamp: string
   type: "INFERENCE_REQUEST" | "ESCALATION" | "INFERENCE_RESPONSE" | "INFERENCE_ERROR" | "TOOL_EXECUTION" | "AUTH_EVENT" | "FALLBACK_TRIGGERED"
   sessionId?: string
+  correlationId?: string
   details: Record<string, any>
   error?: string
 }
@@ -254,6 +256,7 @@ class SessionObserverManager {
             provider: serving.provider,
             costUsd: serving.costUsd,
             latencyMs: serving.latencyMs,
+            correlationId: serving.correlationId,
           }
         : undefined,
     }
