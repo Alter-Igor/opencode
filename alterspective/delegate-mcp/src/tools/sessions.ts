@@ -19,7 +19,7 @@ import type { Box, SessionRecord, ToolContext } from "./context.ts"
 import { refuseBusy } from "./core-box.ts"
 import { SESSION_ID_RE, agentSchema, modelSchema, newSessionKey, ownSession, sessionIdSchema, webUrl, type SessionMetadata } from "./core-session.ts"
 import { defineTool } from "./define.ts"
-import { requireModel } from "./models.ts"
+import { fetchModels, pickRoleModel, requireModel } from "./models.ts"
 import { ok } from "./shape.ts"
 
 export { listSessionsTool, statusTool } from "./sessions-list.ts"
@@ -104,7 +104,8 @@ export const startSessionTool = defineTool({
     directory: z.string().min(1).max(1024).describe("The owner's repository (a folder under the allowed roots, e.g. C:\\GitHub\\my-repo)."),
     title: z.string().max(200).optional(),
     agent: agentSchema.optional().describe("OpenCode agent for the session, e.g. build (default) or plan."),
-    model: modelSchema.optional().describe("Default model for this session's sends: a Synapse model from oc_list_models (synapse/<id>). Default: the sandbox's default, synapse/auto."),
+    model: modelSchema.optional().describe("Default model for this session's sends: a Synapse model from oc_list_models (synapse/<id>). Default: the sandbox's default, synapse/auto. Ignored when taskRole resolves a model (model wins if both)."),
+    taskRole: z.string().min(1).max(64).optional().describe("D4: what this session is for (e.g. code, qa, architecture). The bridge sets the session's default model to Synapse's best-fit for that role from live benchmark data (see oc_list_models `roles`); falls back to the normal default when there is no fit data yet."),
     profile: z.enum(["standard", "readonly"]).optional().describe("Permission profile. readonly denies edits and asks before any shell command and Keystone tool call (except the dynamic connection when the delegation gate asks before risky tools). Default standard."),
     allowShared: z.boolean().optional().describe("Allow this session while another one of ours is still working in the same repo (each has its own copy)."),
     keystone: z
@@ -120,14 +121,30 @@ export const startSessionTool = defineTool({
     if (!args.allowShared) await refuseBusy(ctx, hostRepo, samePath)
     const box = await ctx.box()
     if (args.model) await requireModel(box.api, args.model, correlationId, ctx)
+    // D4: with no explicit model, a task role sets the session's default to Synapse's best-fit
+    // from live benchmark data. No data / unknown role / unreadable: the normal default stands and
+    // the result says why (a hint never blocks a start, never guesses a model).
+    let model = args.model
+    let taskPick: { role: string; model: string; score: number } | { role: string; fellBack: string } | undefined
+    if (!model && args.taskRole) {
+      const offered = await fetchModels(box.api, correlationId)
+      const pick = await pickRoleModel(ctx, args.taskRole, offered)
+      if ("model" in pick) {
+        model = pick.model
+        taskPick = { role: args.taskRole, model: pick.model, score: pick.score }
+      } else {
+        taskPick = { role: args.taskRole, fellBack: pick.none }
+      }
+    }
     const ws = await ctx.workspaces.open(hostRepo, newSessionKey())
-    const record = await startIn(ctx, box, { ...args, keystone }, ws, correlationId)
+    const record = await startIn(ctx, box, { ...args, model, keystone }, ws, correlationId)
     ctx.sessions.set(record.sessionID, record)
     box.hub.track(record.sessionID, ws.boxPath)
     recordStart(ctx, record)
-    return ok(`Session ${record.sessionID} started on ${ws.branch}. Next: oc_send, then oc_wait.`, {
+    return ok(`Session ${record.sessionID} started on ${ws.branch}. Next: oc_send, then oc_wait.${taskPick && "model" in taskPick ? ` Model for role "${taskPick.role}": ${taskPick.model} (Synapse fit ${taskPick.score.toFixed(2)}).` : ""}`, {
       sessionID: record.sessionID, sessionKey: ws.sessionKey, branch: ws.branch, boxPath: ws.boxPath, hostRepo: ws.hostRepo, profile: record.profile, base: ws.base,
       ...(keystone ? { keystone } : {}),
+      ...(taskPick ? { taskPick } : {}),
       webUrl: webUrl(box.target, ws.boxPath, record.sessionID),
     })
   },

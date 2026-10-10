@@ -4,7 +4,7 @@
 // session cannot be traced back to one of ours is left out, so oc_answer can never be pointed at a
 // request id copied out of session text (FM-4). Nothing here answers anything.
 import { REQUEST_ID_RE, isObj } from "../events/normalise.ts"
-import { readSession } from "../events/server.ts"
+import { readSession, reason } from "../events/server.ts"
 import { DelegateError } from "../shared/errors.ts"
 import { expectOk, type OpencodeApi } from "../shared/opencode-api.ts"
 import { currentKeystone } from "../shared/config.ts"
@@ -29,11 +29,14 @@ export type PendingItem = {
   directory: string
   /** Questions in a question request (oc_answer needs one answer per question). */
   questionCount?: number
-  untrusted: PermissionText | QuestionText
+  /** The listed text (permission patterns / question bodies), under untrusted. Absent on a
+   *  host-record fallback: the listing did not show this id, so the bridge never read its text. */
+  untrusted?: PermissionText | QuestionText
 }
 
 /** `partial`: the raw list was capped or the time budget ran out, so some requests were not looked at (W3C-12). */
-export type PendingList = { items: PendingItem[]; unresolved: number; partial: boolean }
+/** `failed`: directories (or a kind within a directory) that could not be read at all; items from those are missing, so oc_answer cannot look them up (fail-closed). */
+export type PendingList = { items: PendingItem[]; unresolved: number; partial: boolean; failed: string[] }
 
 export { SESSION_ID_RE }
 /** Raw requests per list read before any owner lookup (each lookup can cost a server read). */
@@ -82,14 +85,25 @@ function questionText(body: Record<string, unknown>): QuestionText {
   }
 }
 
+/**
+ * One GET /permission or /question read. A failed read returns [] and records a short reason in
+ * out.failed instead of throwing: the listing keeps going (like the event rebuild), but the
+ * failure stays visible — oc_answer only answers ids a successful listing actually showed, so a
+ * failed directory's requests must be refused, not guessed at.
+ */
 async function readList(api: OpencodeApi, directory: string, kind: PendingKind, out: PendingList): Promise<Raw[]> {
-  const data = expectOk(await api.call<unknown>({ path: kind === "permission" ? "/permission" : "/question", directory }), `list pending ${kind}s`)
-  if (!Array.isArray(data)) throw new DelegateError("upstream_error", `The delegate server gave an unreadable list of pending ${kind}s.`, "Retry; if it repeats, run oc_doctor.")
-  if (data.length > MAX_RAW) out.partial = true
-  return data.slice(0, MAX_RAW).flatMap((value) => {
-    const item = rawItem(value, kind)
-    return item ? [item] : []
-  })
+  try {
+    const data = expectOk(await api.call<unknown>({ path: kind === "permission" ? "/permission" : "/question", directory }), `list pending ${kind}s`)
+    if (!Array.isArray(data)) throw new DelegateError("upstream_error", `The delegate server gave an unreadable list of pending ${kind}s.`, "Retry; if it repeats, run oc_doctor.")
+    if (data.length > MAX_RAW) out.partial = true
+    return data.slice(0, MAX_RAW).flatMap((value) => {
+      const item = rawItem(value, kind)
+      return item ? [item] : []
+    })
+  } catch (error) {
+    out.failed.push(reason(error))
+    return []
+  }
 }
 
 /** Maps a session id to the bridge session it belongs to (walking parentID), or undefined. */
@@ -147,7 +161,9 @@ async function listDirectory(api: OpencodeApi, directory: string, ownerOf: Owner
 }
 
 /**
- * Pending requests of this bridge's sessions, read fresh. A failed read throws (never "none").
+ * Pending requests of this bridge's sessions, read fresh. A directory (or a kind within one) that
+ * cannot be read is recorded in `failed` and marked `partial`, never "none": oc_answer can only
+ * answer ids a successful listing actually showed.
  * `sessionID` narrows to one of our sessions or one of their subagents.
  */
 export async function listPending(ctx: ToolContext, box: Box, sessionID?: string, correlationId = "pending", budget: Budget = budgetFrom()): Promise<PendingList> {
@@ -156,7 +172,7 @@ export async function listPending(ctx: ToolContext, box: Box, sessionID?: string
   if (sessionID !== undefined) owner = await findOwner(ctx, box, ownerOf, sessionID, correlationId)
   const records = [...ctx.sessions.values()]
   const directories = [...new Set((owner ? records.filter((r) => r.sessionID === owner) : records).map((r) => r.boxPath))]
-  const out: PendingList = { items: [], unresolved: 0, partial: false }
+  const out: PendingList = { items: [], unresolved: 0, partial: false, failed: [] }
   for (const directory of directories) {
     if (budget.now() >= budget.deadline) {
       out.partial = true
@@ -164,6 +180,7 @@ export async function listPending(ctx: ToolContext, box: Box, sessionID?: string
     }
     await listDirectory(box.api, directory, ownerOf, out, budget)
   }
+  if (out.failed.length > 0) out.partial = true
   if (sessionID !== undefined) out.items = out.items.filter((item) => item.sessionID === sessionID || (sessionID === owner && item.ownerSessionID === owner))
   return out
 }
@@ -231,12 +248,20 @@ export const ocPending = defineTool({
     const shown = list.items.slice(0, MAX_ITEMS)
     const more = list.items.length - shown.length
     const note = list.unresolved > 0 ? ` ${list.unresolved} request(s) could not be traced to a session of this bridge and are not listed.` : ""
-    const partial = list.partial ? " PARTIAL: the list was too long or took too long to check in full; narrow it with sessionID or call again." : ""
+    // Failed directory reads surface as codes only (no box paths): clients never see directory
+    // names from this tool (publicItem strips them).
+    const failedReads = { count: list.failed.length, codes: list.failed.slice(0, 10).map((entry) => entry.slice(0, 120)) }
+    // A failed read may hide requests we cannot count, so the note never says "none": it says the
+    // ids in those directories cannot be answered until it recovers (oc_answer fails closed on them).
+    const failed = failedReads.count > 0
+      ? ` PARTIAL: some requests could not be verified because ${failedReads.count} directory read(s) failed (${failedReads.codes.join("; ")}); ids in those directories cannot be answered until it recovers.`
+      : ""
+    const partial = list.partial && failedReads.count === 0 ? " PARTIAL: the list was too long or took too long to check in full; narrow it with sessionID or call again." : ""
     const gate = args.sessionID === undefined ? await gateApprovals(ctx) : { items: [] }
     const approvals = gate.items.length > 0 ? ` ${gate.items.length} tool call(s) wait for an approval (kind approval; answer with oc_answer kind approval, reply once or reject).` : ""
     const gateError = gate.error ? ` The delegation gate could not be read (${gate.error}); approvals may be waiting.` : ""
-    const summary = `${list.items.length} pending request(s) for this bridge's sessions${more > 0 ? ` (first ${shown.length} shown)` : ""}.${note}${partial}${approvals}${gateError}`
-    return ok(summary, { pending: [...shown.map(publicItem), ...gate.items], more: more > 0, unresolved: list.unresolved, partial: list.partial, ...(gate.error ? { gateError: gate.error } : {}) })
+    const summary = `${list.items.length} pending request(s) for this bridge's sessions${more > 0 ? ` (first ${shown.length} shown)` : ""}.${note}${failed}${partial}${approvals}${gateError}`
+    return ok(summary, { pending: [...shown.map(publicItem), ...gate.items], more: more > 0, unresolved: list.unresolved, partial: list.partial, failedReads, ...(gate.error ? { gateError: gate.error } : {}) })
   },
 })
 

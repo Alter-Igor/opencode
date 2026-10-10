@@ -273,7 +273,7 @@ export async function createRuntime(options: RuntimeOptions = {}): Promise<Runti
       return manager.restart(options)
     },
     onBox: (listener) => manager.onBox(listener),
-    boxExec: (argv, timeoutMs) => runCommand(["docker", "exec", container, ...argv], cleanEnv(), timeoutMs ?? 60_000),
+    boxExec: (argv, timeoutMs, cwd) => runCommand(["docker", "exec", ...(cwd ? ["-w", cwd] : []), container, ...argv], cleanEnv(), timeoutMs ?? 60_000),
     hostExec: (argv, timeoutMs, cwd) => hostRunner(argv, timeoutMs ?? 60_000, cwd),
     sessions,
     synapse,

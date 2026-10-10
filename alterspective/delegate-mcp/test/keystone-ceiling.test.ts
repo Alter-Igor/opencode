@@ -9,7 +9,7 @@ import { DelegateError } from "../src/shared/errors.ts"
 import { CEILING_ENV, ceilingOf, enforceCeiling, highRiskIds } from "../src/shared/keystone-policy.ts"
 import { restartTool } from "../src/tools/restart.ts"
 import { keystoneReport } from "../src/tools/keystone-report.ts"
-import { deps, fail, fakeDocker, home, recorder, supervisor, writeOwner, type Call, useSupervisorFixture } from "./supervisor-lifecycle-fixture.ts"
+import { L, deps, fail, fakeDocker, home, recorder, supervisor, writeOwner, type Call, useSupervisorFixture } from "./supervisor-lifecycle-fixture.ts"
 
 useSupervisorFixture()
 
@@ -66,6 +66,28 @@ describe("owner ceiling (R5-03)", () => {
     const error = await fail(supervisor(deps(fakeDocker({ running: false, labels: {}, env: [] }, calls))).ensure())
     expect(error.code).toBe("policy_violation")
     expect(composeCalls(calls, "up")).toEqual([])
+  })
+
+  // Live-verified 2026-10-10: a healthy box running a set outside this bridge's ceiling was
+  // reported "unavailable", and the doctor then told the owner the gate was dead. The box IS
+  // running; only this bridge may not use it. status() must say so and keep every comparison false.
+  test("a running box outside this ceiling: status reports running + ceilingMismatch, not unavailable", async () => {
+    await writeOwner()
+    const state = { running: false, labels: {}, env: [] as string[] }
+    const calls: Call[] = []
+    const d = deps(fakeDocker(state, calls))
+    const wide = supervisor({ ...d, config: { ...d.config, keystoneAllowed: ["rag-read", "github", "seqlogs", "m365"] } })
+    await wide.replace({ force: true, keystone: ["m365"] }) // saves the set and starts the box
+    const narrow = supervisor(d) // default ceiling: m365 is outside
+    const status = await narrow.status()
+    expect(status.state).toBe("running")
+    if (status.state !== "running") throw new Error("unreachable")
+    expect(status.ceilingMismatch).toEqual(["m365"])
+    expect(status.policyVerified).toBe(false)
+    expect(status.frontMatches).toBe(false)
+    expect(status.health).toBe("healthy")
+    const error = await fail(narrow.ensure())
+    expect(error.code).toBe("policy_violation") // still fails closed for anything that USES the box
   })
 
   test("the tool says one connection can relay to other services and names the ceiling", () => {

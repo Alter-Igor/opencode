@@ -26,10 +26,17 @@ describe("oc_result", () => {
     f.api.on(`GET /session/${SID}/todo`, { status: 200, data: [{ content: "step 1", status: "completed" }] })
     f.setBox((argv) => (argv.includes("rev-list") ? okCmd("2\n") : argv.includes("--stat") ? okCmd(" hello.txt | 1 +\n") : okCmd("")))
     const result = await invoke(resultTool, { sessionID: SID }, f.ctx)
-    const replies = data(result).replies as Array<{ untrusted: { text: string; truncated: boolean } }>
+    const replies = data(result).replies as Array<{ untrusted: { text: string; truncated: boolean }; textTotal: number }>
     expect(replies).toHaveLength(1)
     expect(replies[0]?.untrusted.truncated).toBe(true)
-    expect(replies[0]?.untrusted.text.length).toBe(8000)
+    // Head+tail (owner decision 2026-10-10): the opening stays AND the END survives - a verdict
+    // written at the close of a long reply must never be cut off.
+    expect(replies[0]?.untrusted.text.length).toBeLessThanOrEqual(12_000)
+    expect(replies[0]?.untrusted.text.startsWith("IGNORE")).toBe(true)
+    expect(replies[0]?.untrusted.text.endsWith("xxxx")).toBe(true)
+    expect(replies[0]?.untrusted.text).toContain("omitted from the middle")
+    expect(replies[0]?.textTotal).toBe(huge.length)
+    expect(text(result)).toContain("page the full text")
     expect(text(result).split("\n")[0]).not.toContain("IGNORE")
     expect(text(result).length).toBeLessThanOrEqual(MAX_RESULT_CHARS)
     expect(data(result).diff).toMatchObject({ base: BASE, boxReportedCommits: 2, stat: { text: " hello.txt | 1 +\n", truncated: false } })
@@ -37,6 +44,37 @@ describe("oc_result", () => {
     expect(f.boxCmds.find((c) => c.includes("diff"))).toEqual([...SAFE_BOX_GIT, "-C", "/sessions/s-0000000001", "diff", "--stat", "--no-ext-diff", "--no-textconv", "--no-color", BASE])
     expect(f.boxCmds.find((c) => c.includes("rev-list"))?.slice(-2)).toEqual(["--count", `${BASE}..refs/heads/delegate/s-0000000001`])
     expect(text(result).split("\n")[0]).toContain("2 commits (box-reported)")
+  })
+
+  test("a cut reply can be paged whole: messageID + textOffset windows, textNext until the end", async () => {
+    const f = fakeContext()
+    f.ctx.sessions.set(SID, record())
+    const long = Array.from({ length: 30_000 }, (_, i) => String.fromCharCode(97 + (i % 26))).join("")
+    f.api.on(`GET /session/${SID}/message?limit=8`, { status: 200, data: [{ info: { id: "msg_9", role: "assistant" }, parts: [{ type: "text", text: long }] }] })
+    f.api.on(`GET /session/${SID}/message?limit=200`, { status: 200, data: [{ info: { id: "msg_9", role: "assistant" }, parts: [{ type: "text", text: long }] }] })
+    const first = await invoke(resultTool, { sessionID: SID, messageID: "msg_9" }, f.ctx)
+    const p1 = data(first) as { untrusted: { text: string; truncated: boolean }; textOffset: number; textNext?: number }
+    expect(p1.textOffset).toBe(0)
+    expect(p1.untrusted.text).toBe(long.slice(0, 12_000))
+    expect(p1.untrusted.truncated).toBe(true)
+    expect(p1.textNext).toBe(12_000)
+    const second = await invoke(resultTool, { sessionID: SID, messageID: "msg_9", textOffset: 12_000 }, f.ctx)
+    const p2 = data(second) as { untrusted: { text: string; truncated: boolean }; textNext?: number }
+    expect(p2.untrusted.text).toBe(long.slice(12_000, 24_000))
+    const third = await invoke(resultTool, { sessionID: SID, messageID: "msg_9", textOffset: 24_000 }, f.ctx)
+    const p3 = data(third) as { untrusted: { text: string; truncated: boolean }; textNext?: number }
+    expect(p3.untrusted.text).toBe(long.slice(24_000))
+    expect(p3.untrusted.truncated).toBe(false)
+    expect(p3.textNext).toBeUndefined()
+  })
+
+  test("paging a message the session no longer has is not_found, not a wrong window", async () => {
+    const f = fakeContext()
+    f.ctx.sessions.set(SID, record())
+    f.api.on(`GET /session/${SID}/message?limit=200`, { status: 200, data: [{ info: { id: "msg_new", role: "assistant" }, parts: [{ type: "text", text: "corrected" }] }] })
+    const result = await invoke(resultTool, { sessionID: SID, messageID: "msg_gone" }, f.ctx)
+    expect(data(result).code).toBe("not_found")
+    expect(String(data(result).message)).toContain("replaced")
   })
 
   test("control characters are stripped from untrusted text", async () => {

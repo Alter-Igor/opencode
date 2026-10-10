@@ -25,6 +25,20 @@ function box(): Fixture {
   return f
 }
 
+// #1411 reproduction: DIR_B's GET /permission 500s while DIR_A is healthy.
+const DIR_B = "/sessions/key-b"
+const SES_B = "ses_bbbbbbbb1"
+function partialBox(): Fixture {
+  const f = fixture([record(SES_A, DIR_A), record(SES_B, DIR_B)])
+  f.api
+    .route("GET", "/permission", { status: 200, data: [PERMISSIONS[0]] }, DIR_A)
+    .route("GET", "/question", { status: 200, data: [] }, DIR_A)
+    .route("GET", "/permission", { status: 500 }, DIR_B)
+    .route("GET", "/question", { status: 200, data: [] }, DIR_B)
+    .on((c) => (c.method === "POST" ? { status: 200, data: true } : undefined))
+  return f
+}
+
 let close: (() => Promise<void>) | undefined
 afterEach(async () => {
   await close?.()
@@ -64,13 +78,30 @@ describe("oc_pending", () => {
     expect(other.data.code).toBe("not_found")
   })
 
-  test("a failed list is an error, never an empty list", async () => {
+  // #1411: a failed directory read no longer fails the whole listing (it used to throw
+  // upstream_error); it is reported as partial with the code, so "none" is never silent.
+  test("a failed list is reported as partial with the code, never an error and never a silent 'none'", async () => {
     const f = fixture([record(SES_A, DIR_A)])
     f.api.route("GET", "/permission", { status: 500 }).route("GET", "/question", { status: 200, data: [] })
     const c = await client(f)
     const result = await c.call("oc_pending", {})
-    expect(result.isError).toBe(true)
-    expect(result.data.code).toBe("upstream_error")
+    expect(result.isError).toBe(false)
+    expect(result.data.partial).toBe(true)
+    expect(result.data.failedReads).toEqual({ count: 1, codes: ["upstream_error HTTP 500"] })
+    expect(result.data.pending).toEqual([])
+    expect(result.text).toContain("could not be verified")
+  })
+
+  test("one failing directory does not hide a healthy one: items listed, partial and failedReads reported", async () => {
+    const f = partialBox()
+    const c = await client(f)
+    const result = await c.call("oc_pending", {})
+    expect(result.isError).toBe(false)
+    expect((result.data.pending as Array<{ requestID: string }>).map((p) => p.requestID)).toEqual(["per_mine0001"])
+    expect(result.data.partial).toBe(true)
+    expect(result.data.failedReads).toEqual({ count: 1, codes: ["upstream_error HTTP 500"] })
+    expect(result.text).toContain("PARTIAL: some requests could not be verified because 1 directory read(s) failed (upstream_error HTTP 500)")
+    expect(result.text).toContain("cannot be answered until it recovers")
   })
 })
 
@@ -157,5 +188,79 @@ describe("oc_answer", () => {
     const c = await client(f)
     const result = await c.call("oc_answer", { requestID: "per_mine0001", kind: "permission", reply: "reject" })
     expect(result.data.code).toBe("not_found")
+  })
+
+  // #1411: one directory's failed read must not block answers to requests a healthy directory showed.
+  test("answers a healthy session's request while another directory's read fails", async () => {
+    const f = partialBox()
+    const c = await client(f)
+    const result = await c.call("oc_answer", { requestID: "per_mine0001", kind: "permission", reply: "once" })
+    expect(result.isError).toBe(false)
+    const [post] = f.api.posts()
+    expect(post?.path).toBe("/permission/per_mine0001/reply")
+    expect(post?.directory).toBe(DIR_A)
+  })
+
+  // Fail-closed: an id that only exists in the unreadable directory cannot be answered — the
+  // bridge never saw it in a successful listing, so it has no directory to post to, and guessing
+  // one could answer a different instance's request.
+  test("an id only present in the failing directory is refused, not answered", async () => {
+    const f = partialBox()
+    const c = await client(f)
+    const result = await c.call("oc_answer", { requestID: "per_bdead001", kind: "permission", reply: "once" })
+    expect(result.isError).toBe(true)
+    expect(result.data.code).toBe("not_found")
+    expect(result.text).toContain("checked in part")
+    expect(result.text).toContain("upstream_error HTTP 500")
+    expect(result.data.action).toContain("oc_doctor")
+    expect(f.api.posts()).toHaveLength(0)
+  })
+
+  // #1411 fallback (owner decision 2026-10-10): the listing is partial, so the id is not in it -
+  // but the request is real. With the session's sessionID, ownership comes from the host record
+  // and the box POST is the liveness proof; the answer reaches the failing directory's session.
+  test("the same id IS answered when the caller names the session: host record + box POST", async () => {
+    const f = partialBox()
+    const c = await client(f)
+    const result = await c.call("oc_answer", { requestID: "per_bdead001", kind: "permission", reply: "once", sessionID: SES_B })
+    expect(result.isError).toBe(false)
+    expect(result.data.via).toBe("session")
+    expect(result.text).toContain("host record")
+    const [post] = f.api.posts()
+    expect(post?.path).toBe("/permission/per_bdead001/reply")
+    expect(post?.directory).toBe(DIR_B) // the session's own directory, not the healthy one
+  })
+
+  test("the fallback needs a session this bridge owns: another session's id is not_found", async () => {
+    const f = partialBox()
+    const c = await client(f)
+    const result = await c.call("oc_answer", { requestID: "per_notmine01", kind: "permission", reply: "once", sessionID: SES_OTHER })
+    expect(result.data.code).toBe("not_found")
+    expect(f.api.posts()).toHaveLength(0) // ownSession refuses before any POST
+  })
+
+  // The box POST is the liveness proof: the host record says the session is ours, but a request
+  // the box no longer holds answers 404 and is reported, never silently "answered".
+  test("the fallback cannot answer a request the box no longer holds (POST 404)", async () => {
+    const f = fixture([record(SES_A, DIR_A)])
+    f.api
+      .route("GET", "/permission", { status: 500 })
+      .route("GET", "/question", { status: 500 })
+      .route("POST", "/permission/per_gonest001/reply", { status: 404 })
+    const c = await client(f)
+    const result = await c.call("oc_answer", { requestID: "per_gonest001", kind: "permission", reply: "once", sessionID: SES_A })
+    expect(result.data.code).toBe("not_found")
+    expect(result.text).toContain("no longer pending")
+  })
+
+  test("question answers stay listing-bound: a guessed count must never post wrong answers", async () => {
+    const f = partialBox()
+    const c = await client(f)
+    const result = await c.call("oc_answer", { requestID: "que_mine0001", kind: "question", answers: [["A"]], sessionID: SES_A })
+    expect(result.data.code).toBe("invalid_input")
+    expect(f.api.posts()).toHaveLength(0)
+    // A question of a session whose listing failed: with sessionID only a reject is accepted.
+    const rejected = await c.call("oc_answer", { requestID: "que_gonest001", kind: "question", reply: "reject", sessionID: SES_B })
+    expect(rejected.isError).toBe(false)
   })
 })

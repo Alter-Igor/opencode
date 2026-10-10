@@ -76,7 +76,7 @@ export type ToolContext = {
   restartBox(options?: ReplaceOptions): Promise<RestartedBox>
   /** Additive (Wave 3): called with every new Box (first start and after a restart). Returns an unsubscribe. */
   onBox(listener: (box: Box) => void): () => void
-  /** Additive (Wave 3): run a command inside the box container (`docker exec <box> ...`). Output is untrusted. */
+  /** Additive (Wave 3): run a command inside the box container (`docker exec <box> ...`). Output is untrusted. `cwd` runs it in that path inside the box (`-w`). */
   boxExec: CommandRunner
   /** Additive (Wave 3): run a command on the host with a clean environment (git in the owner's repo). */
   hostExec: CommandRunner

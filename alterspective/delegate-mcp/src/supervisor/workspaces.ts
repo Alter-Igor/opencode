@@ -331,7 +331,7 @@ async function sync(ctx: Ctx, ws: Workspace, ref: string): Promise<SyncResult> {
     await hostGit(ctx, ["-C", state.hostRepo, "update-ref", tempRef, targetSha], "create temp sync ref")
     await hostGit(ctx, ["-C", state.hostRepo, "bundle", "create", bundle.hostPath, tempRef], "bundle the sync ref", "long")
     assertRegularFile(bundle.hostPath, "sync bundle")
-    await boxRun(ctx, ["git", "-C", wsDir, "fetch", "--quiet", bundle.boxPath], "fetch sync bundle")
+    await boxRun(ctx, ["git", "-C", wsDir, "fetch", "--quiet", bundle.boxPath, tempRef], "fetch sync bundle")
     const countBefore = Number((await boxRun(ctx, ["git", "-C", wsDir, "rev-list", "--count", "HEAD"], "count commits before")).trim())
     const mergeRes = await ctx.box(["git", "-C", wsDir, "merge", "--no-edit", "FETCH_HEAD"], { timeoutMs: ctx.timeouts.short })
     if (mergeRes.code === 0) {

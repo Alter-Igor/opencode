@@ -51,6 +51,8 @@ const READONLY_BASH_ALLOW = [
   "git show*",
   "git branch*",
   "git rev-parse*",
+  "git blame*",
+  "git describe*",
   "cat *",
   "head *",
   "tail *",
@@ -60,6 +62,14 @@ const READONLY_BASH_ALLOW = [
   "pwd",
   "find *",
   "sed -n *",
+  "rg *",
+  "wc *",
+  "sort *",
+  "uniq *",
+  "nl *",
+  "stat *",
+  "du *",
+  "file *",
 ]
 
 function readonly(dynamicGated: boolean): Rule[] {
