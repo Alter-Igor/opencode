@@ -210,6 +210,61 @@ describe("startInboxPoller", () => {
     expect(f.inbox.reads[1]?.cursor).toBeUndefined()
     stop()
   })
+
+  // #158's pattern: a long outage must not write one warn line per retry tick forever into the
+  // shared bridge log. One line per change of code; recovery names the streak length.
+  test("repeated failures of one code log once, and recovery reports the streak", async () => {
+    const t = manualTimers(Date.parse("2026-10-01T10:00:00Z"))
+    const f = fixture()
+    const lines: string[] = []
+    const ctx = { ...f.ctx, log: { log: (_l: string, _c: string, msg: string, fields?: Record<string, unknown>) => void lines.push(`${msg}:${String(fields?.failures ?? "-")}`) } }
+    f.inbox.pages = [
+      new DelegateError("inbox_unavailable", "down", "retry"),
+      new DelegateError("inbox_unavailable", "down", "retry"),
+      new DelegateError("inbox_unavailable", "down", "retry"),
+      { messages: [], next: "0123456789abcdef.1", truncated: false },
+    ]
+    const stop = startInboxPoller(ctx, f.hub, { intervalMs: 1000, timers: t.timers })
+    t.advance(0)
+    await flush()
+    t.advance(2_000)
+    await flush()
+    t.advance(4_000)
+    await flush()
+    expect(lines.filter((l) => l.startsWith("inbox poll failed"))).toEqual(["inbox poll failed; will retry:1"])
+    t.advance(8_000)
+    await flush()
+    expect(lines.filter((l) => l.startsWith("inbox poll failed")).length).toBe(1)
+    expect(lines).toContain("inbox polling recovered after repeated failures:3")
+    stop()
+    expect(t.pending()).toBe(0)
+  })
+
+  // CodeRabbit #159: each code's warn line counts only its own failures; a run that never repeats
+  // one code recovers with no summary at all.
+  test("a mixed-code failure run logs each code once with its own count and no recovery summary", async () => {
+    const t = manualTimers(Date.parse("2026-10-01T10:00:00Z"))
+    const f = fixture()
+    const lines: string[] = []
+    const ctx = { ...f.ctx, log: { log: (_l: string, _c: string, msg: string, fields?: Record<string, unknown>) => void lines.push(`${msg}:${String(fields?.code ?? "-")}:${String(fields?.failures ?? "-")}`) } }
+    f.inbox.pages = [
+      new DelegateError("inbox_unavailable", "down", "retry"),
+      new DelegateError("upstream_error", "other", "retry"),
+      { messages: [], next: "0123456789abcdef.1", truncated: false },
+    ]
+    const stop = startInboxPoller(ctx, f.hub, { intervalMs: 1000, timers: t.timers })
+    t.advance(0)
+    await flush()
+    t.advance(2_000)
+    await flush()
+    t.advance(4_000)
+    await flush()
+    expect(lines).toEqual([
+      "inbox poll failed; will retry:inbox_unavailable:1",
+      "inbox poll failed; will retry:upstream_error:1",
+    ])
+    stop()
+  })
 })
 
 describe("startInteraction", () => {
