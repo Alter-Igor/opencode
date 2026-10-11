@@ -10,9 +10,11 @@ import path from "node:path"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { isDelegateError } from "./shared/errors.ts"
 import { scrub } from "./shared/log.ts"
-import { flushReports, reportsFor } from "./reporting/hooks.ts"
+import { flushReports, reportsFor, servingHistoryFor } from "./reporting/hooks.ts"
 import { outcomeRows } from "./reporting/export.ts"
 import { parseScorecardSnapshot, scorecard, scoreDelta, type ModelScore, type Scorecard } from "./reporting/scorecard.ts"
+import { qualityReport, type ModelRate } from "./reporting/role-quality.ts"
+import { registeredModels } from "./synapse/models.ts"
 import { createRuntime, readVersion, shutdownSignal, type Runtime, type VersionInfo } from "./runtime.ts"
 import { createServer } from "./server.ts"
 import { doctorTool } from "./tools/doctor.ts"
@@ -42,6 +44,11 @@ Usage:
                                          (the loop check-in): success-rate and task-count changes, new
                                          and gone models, new ghosts. Saves a snapshot under the bridge
                                          home; the first run shows the table only. Never starts the sandbox.
+  opencode-delegate role-quality [--json]
+                                         The guard for the Synapse deal (#1918/#1926/#1928): compare the
+                                         LIVE suitability table against our measured outcomes per role.
+                                         "all baked" = the client-side serving-history tie-break can be
+                                         retired next; otherwise it names why per role. Never starts the sandbox.
   opencode-delegate --version [--json]   Print the version
   opencode-delegate -h | --help | help   Show this help
 
@@ -72,6 +79,7 @@ export type Command =
   | { kind: "login"; server: "synapse" }
   | { kind: "outcomes"; days: number; redact: boolean }
   | { kind: "scorecard"; days: number; json: boolean }
+  | { kind: "role-quality"; days: number; json: boolean }
   | { kind: "version"; json: boolean }
   | { kind: "help" }
   | { kind: "error"; message: string }
@@ -112,6 +120,11 @@ export function parseCli(argv: string[]): Command {
   if (command === "login") return flagArgs.length === 1 && flagArgs[0] === "synapse" ? { kind: "login", server: "synapse" } : { kind: "error", message: "Usage: login synapse" }
   if (command === "outcomes") return parseOutcomes(flagArgs)
   if (command === "scorecard") return parseScorecard(flagArgs)
+  if (command === "role-quality") {
+    const parsed = parseFlags(flagArgs, ["--json"])
+    if ("error" in parsed) return { kind: "error", message: parsed.error }
+    return { kind: "role-quality", days: 30, json: parsed.flags.has("--json") }
+  }
   return { kind: "error", message: `Unknown command: ${printable(command)}. Run with --help.` }
 }
 
@@ -380,6 +393,45 @@ export async function runScorecard(io: Io, days: number, json: boolean, make: ()
   }
 }
 
+/**
+ * `role-quality`: the standing deal with Synapse (#1918/#1926/#1928) made checkable: is the LIVE
+ * published suitability table already good enough that the bridge's serving-history tie-break can
+ * be dropped? Compares the table against our measured outcomes (scorecard rates + the dead-route
+ * list). allBaked=true means "retire the tie-break in rankedForRole next"; false names why per
+ * role. Never starts the sandbox: the offered set comes from the live Synapse list, not the box.
+ */
+export async function runRoleQuality(io: Io, days: number, json: boolean, make: () => Promise<Runtime> = createRuntime): Promise<number> {
+  const runtime = await make()
+  try {
+    await flushReports()
+    const records = reportsFor(runtime.ctx).list()
+    const now = Date.now()
+    const rates: ModelRate[] = scorecard(records, now, days).models.filter((m) => m.kind === "served").map((m) => ({ model: m.model, successRate: m.successRate, tasks: m.tasks }))
+    const history = servingHistoryFor(runtime.ctx, now)
+    const live = await registeredModels({ frontDir: path.join(runtime.ctx.config.home, "front"), fetch }).catch(() => undefined)
+    if (!live || live.source !== "synapse") {
+      io.out(`role-quality: no live table (${live && "reason" in live ? live.reason : "Synapse unreadable"}) - keep the tie-break, nothing to compare.`)
+      return EXIT.ok
+    }
+    if (!live.suitability) {
+      io.out("role-quality: Synapse publishes no suitability table - keep the tie-break (the pick itself falls back to the default model).")
+      return EXIT.ok
+    }
+    const report = qualityReport(live.suitability, rates, history?.dead ?? [], live.models)
+    if (json) {
+      io.out(JSON.stringify({ allBaked: report.allBaked, deadInTable: report.deadInTable, roles: report.roles }))
+      return EXIT.ok
+    }
+    io.out(`role-quality (table vs measured, last ${days}d):`)
+    for (const v of report.roles) io.out(`  ${v.baked ? "baked " : "not   "} ${v.role.padEnd(12)} ${v.reason}`)
+    for (const ghost of report.deadInTable) io.out(`  ghost ${ghost} - dead route still in the published table`)
+    io.out(report.allBaked ? "all baked: retire the serving-history tie-break in rankedForRole next (the dead firewall and box-offer filter stay)." : "not all baked: keep the client tie-break (Synapse #1926 ingest is the fix).")
+    return EXIT.ok
+  } finally {
+    await runtime.shutdown("role-quality done")
+  }
+}
+
 function runWatch(args: string[]): Promise<number> {
   const script = path.join(import.meta.dir, "cli", "watch.ts")
   return new Promise((resolve) => {
@@ -413,6 +465,8 @@ export async function main(argv: string[], io: Io = processIo): Promise<number> 
       return runOutcomes(io, command.days, command.redact)
     case "scorecard":
       return runScorecard(io, command.days, command.json)
+    case "role-quality":
+      return runRoleQuality(io, command.days, command.json)
     case "mcp":
       return runMcp(command.channels)
   }
