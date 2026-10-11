@@ -11,7 +11,7 @@ import { DASHBOARD_CSS } from "./style.ts"
 import { DASHBOARD_APP_JS } from "./app.ts"
 import { DASHBOARD_ASSETS } from "./assets.ts"
 
-export const CSP = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+export const CSP = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
 
 export type Dashboard = { url: string; port: number; stop(): void }
 

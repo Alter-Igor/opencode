@@ -3,10 +3,20 @@
 // declared in the page's own :root (WEBSTA-001-UX-QUALITY-STANDARDS UX-BRAND-08a - the six brand
 // constants never redefined per theme; only the semantic tokens swap), so the file is theme-safe
 // and the contrast rules are stated once. Colour is never the only signal: state cells pair colour
-// with text and weight, the rate number is always printed beside its bar, and re-routed rows keep
-// a dashed border (UX-AX-06). Motion: transitions are the brand's 150-200 ms and are clamped under
-// prefers-reduced-motion (portal /motion).
+// with text and weight, the rate number is always printed beside its bar, and the re-routed row
+// keeps a dashed border (UX-AX-06). Motion: transitions are the brand's 150-200 ms and are clamped
+// under prefers-reduced-motion (portal /motion).
+// Brand type (UX-BRAND-07a): the page declares its own first-party @font-face from files served on
+// this same token-gated server (assets/fonts/, woff2 cuts of the licensed .otf/.ttf from the brand
+// guide - never inherited from a third-party stylesheet). Chronicle Display only at 400/600 and
+// only for the 36px+ heading; Montserrat 400/500/600/700 for everything else (TYPO-002/003).
 export const DASHBOARD_CSS = `
+@font-face { font-family: "Chronicle Display"; src: url("fonts/chronicle-display-roman.woff2") format("woff2"); font-weight: 400; font-style: normal; font-display: swap; }
+@font-face { font-family: "Chronicle Display"; src: url("fonts/chronicle-display-semibold.woff2") format("woff2"); font-weight: 600; font-style: normal; font-display: swap; }
+@font-face { font-family: "Montserrat"; src: url("fonts/montserrat-regular.woff2") format("woff2"); font-weight: 400; font-style: normal; font-display: swap; }
+@font-face { font-family: "Montserrat"; src: url("fonts/montserrat-medium.woff2") format("woff2"); font-weight: 500; font-style: normal; font-display: swap; }
+@font-face { font-family: "Montserrat"; src: url("fonts/montserrat-semibold.woff2") format("woff2"); font-weight: 600; font-style: normal; font-display: swap; }
+@font-face { font-family: "Montserrat"; src: url("fonts/montserrat-bold.woff2") format("woff2"); font-weight: 700; font-style: normal; font-display: swap; }
 * { box-sizing: border-box; }
 html, body { margin: 0; max-width: 100%; overflow-x: hidden; }
 body {

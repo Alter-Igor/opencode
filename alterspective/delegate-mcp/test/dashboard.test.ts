@@ -260,7 +260,7 @@ describe("dashboard server", () => {
   })
 
   test("CSP is the exact policy asked for", () => {
-    expect(CSP).toBe("default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+    expect(CSP).toBe("default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
   })
 
   test("the brand assets serve through the same token gate, and unknown names 404", async () => {
@@ -280,8 +280,21 @@ describe("dashboard server", () => {
         expect(text).toContain('stroke="currentColor"')
         expect(text).not.toMatch(/#[0-9a-fA-F]{3,8}/)
       }
+      // brand fonts: first-party woff2 (UX-BRAND-07a) served on the same gated server
+      for (const face of ["chronicle-display-roman", "chronicle-display-semibold", "montserrat-regular", "montserrat-medium", "montserrat-semibold", "montserrat-bold"]) {
+        const res = await fetch(`${d.url}fonts/${face}.woff2`)
+        expect(res.status).toBe(200)
+        expect(res.headers.get("content-type")).toBe("font/woff2")
+        const head = new Uint8Array((await res.arrayBuffer()).slice(0, 4))
+        expect(String.fromCharCode(...head)).toBe("wOF2")
+      }
+      expect(DASHBOARD_CSS).toContain('@font-face')
+      expect(DASHBOARD_CSS).toContain('url("fonts/chronicle-display-roman.woff2")')
+      expect(CSP).toContain("font-src 'self'")
       // names outside the fixed registry never resolve, with or without the token
       expect((await fetch(`${d.url}../server.ts`)).status).toBe(404)
+      expect((await fetch(`${d.url}fonts/../../server.ts`)).status).toBe(404)
+      expect((await fetch(`${d.url}fonts/anything.woff2`)).status).toBe(404)
       expect((await fetch(`${d.url}secrets.png`)).status).toBe(404)
       expect((await fetch(`${base}/logo.png`)).status).toBe(404)
     })
