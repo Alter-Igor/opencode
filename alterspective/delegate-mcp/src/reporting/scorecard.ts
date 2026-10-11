@@ -189,3 +189,86 @@ export function servingHistory(records: readonly TaskRecord[], now: number, days
   }
   return { wins, dead: [...ghostErrors].filter((model) => !servedSomewhere.has(model)).sort() }
 }
+
+/** One model's movement between two scorecards (the loop check-in delta). `new`/`gone` are the
+ *  row appearing/disappearing between runs; `lowN` means under five finished tasks, where a rate
+ *  move is mostly noise (display-only: ghost rows are inherently small-n, so they are flagged,
+ *  never filtered - dropping them would kill the "an ask died unrouted" signal). */
+export type DeltaLine = {
+  model: string
+  kind: ModelScore["kind"]
+  rateFrom: number | null
+  rateTo: number | null
+  tasksFrom: number
+  tasksTo: number
+  new: boolean
+  gone: boolean
+  lowN: boolean
+}
+
+export type ScoreDelta = { firstRun: boolean; windowMismatch: boolean; daysFrom: number | null; lines: DeltaLine[] }
+
+const finishedOf = (s: ModelScore | undefined): number => s === undefined ? 0 : s.completed + s.error + s.aborted + s.unknown
+/** A share-weighted task count moves by at least this much before it is called a change. */
+const MIN_TASK_MOVE = 0.5
+const rowKey = (m: ModelScore) => `${m.kind} ${m.model}`
+
+/**
+ * What moved between the previous scorecard and this one. A different window is not comparable
+ * (a 7d delta against a 30d table is mostly the window itself), so it says so and lists nothing.
+ */
+export function scoreDelta(current: Scorecard, previous: Scorecard | null): ScoreDelta {
+  if (previous === null) return { firstRun: true, windowMismatch: false, daysFrom: null, lines: [] }
+  if (previous.days !== current.days) return { firstRun: false, windowMismatch: true, daysFrom: previous.days, lines: [] }
+  const nowByKey = new Map(current.models.map((m) => [rowKey(m), m]))
+  const lines = current.models.flatMap((to): DeltaLine[] => {
+    const from = previous.models.find((m) => rowKey(m) === rowKey(to))
+    if (from === undefined) return [{ model: to.model, kind: to.kind, rateFrom: null, rateTo: to.successRate, tasksFrom: 0, tasksTo: to.tasks, new: true, gone: false, lowN: finishedOf(to) < 5 }]
+    // a row only in `previous` is handled below as gone; here `to` always exists in current
+    const rateChanged = from.successRate !== to.successRate
+    const tasksMoved = Math.abs(to.tasks - from.tasks) >= MIN_TASK_MOVE
+    if (!rateChanged && !tasksMoved) return []
+    return [{ model: to.model, kind: to.kind, rateFrom: from.successRate, rateTo: to.successRate, tasksFrom: from.tasks, tasksTo: to.tasks, new: false, gone: false, lowN: Math.min(finishedOf(from), finishedOf(to)) < 5 }]
+  })
+  const goneLines = previous.models
+    .filter((m) => !nowByKey.has(rowKey(m)))
+    .map((from): DeltaLine => ({ model: from.model, kind: from.kind, rateFrom: from.successRate, rateTo: null, tasksFrom: from.tasks, tasksTo: 0, new: false, gone: true, lowN: finishedOf(from) < 5 }))
+  return { firstRun: false, windowMismatch: false, daysFrom: previous.days, lines: [...lines, ...goneLines] }
+}
+
+/** A persisted snapshot re-read from disk: only the fields the delta needs are validated, and
+ *  anything else (corrupt, wrong shape, hostile) reads as `null` = first run, never a crash. */
+export function parseScorecardSnapshot(data: unknown): Scorecard | null {
+  if (typeof data !== "object" || data === null) return null
+  const d = data as Record<string, unknown>
+  if (typeof d.days !== "number" || !Number.isFinite(d.days) || typeof d.tasks !== "number" || !Number.isFinite(d.tasks)) return null
+  if (!Array.isArray(d.models)) return null
+  const models: ModelScore[] = []
+  for (const raw of d.models) {
+    if (typeof raw !== "object" || raw === null) return null
+    const m = raw as Record<string, unknown>
+    if (typeof m.model !== "string" || (m.kind !== "served" && m.kind !== "requested-only")) return null
+    if (typeof m.tasks !== "number" || !Number.isFinite(m.tasks)) return null
+    if (m.successRate !== null && (typeof m.successRate !== "number" || !Number.isFinite(m.successRate))) return null
+    const num = (v: unknown) => typeof v === "number" && Number.isFinite(v) ? v : 0
+    models.push({
+      model: m.model,
+      kind: m.kind,
+      tasks: m.tasks,
+      completed: num(m.completed),
+      error: num(m.error),
+      aborted: num(m.aborted),
+      unknown: num(m.unknown),
+      running: num(m.running),
+      successRate: m.successRate === null ? null : (m.successRate as number),
+      medianMs: null,
+      p90Ms: null,
+      tokensIn: 0,
+      tokensOut: 0,
+      repos: 0,
+      errorKinds: {},
+    })
+  }
+  const text = (v: unknown, fallback: string) => (typeof v === "string" ? v : fallback)
+  return { generatedAt: text(d.generatedAt, ""), days: d.days, since: text(d.since, ""), tasks: d.tasks, models }
+}
