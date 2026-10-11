@@ -461,6 +461,7 @@ export async function refreshDue(deps: KeystoneAuthDeps, connectionIds?: readonl
  */
 export function startKeystoneRefreshLoop(deps: KeystoneAuthDeps, connectionIds?: () => readonly string[] | undefined, tickMs = TICK_MS): () => void {
   let running = false
+  let listStreak: { reason: string; count: number } | undefined
   const tick = async () => {
     if (running) return
     running = true
@@ -470,9 +471,18 @@ export function startKeystoneRefreshLoop(deps: KeystoneAuthDeps, connectionIds?:
         ids = connectionIds?.()
       } catch (error) {
         // A failing list must not stop renewal for good: log, skip this tick, try again next one.
-        safeLog(deps.log, "warn", COMPONENT, "keystone connection list failed; skipping this tick", { reason: error instanceof Error ? error.name : "error" })
+        // Repeats of the same reason are silent (#158's pattern: 3,290 identical lines in two days);
+        // a good tick reports how many were swallowed. A change of reason starts a new streak.
+        const reason = error instanceof Error ? error.name : "error"
+        if (listStreak?.reason === reason) listStreak.count++
+        else {
+          listStreak = { reason, count: 1 }
+          safeLog(deps.log, "warn", COMPONENT, "keystone connection list failed; skipping this tick", { reason })
+        }
         return
       }
+      if (listStreak !== undefined && listStreak.count > 1) safeLog(deps.log, "info", COMPONENT, "keystone connection list recovered after repeated failures", { reason: listStreak.reason, ticks: listStreak.count })
+      listStreak = undefined
       await refreshDue(deps, ids)
     } finally {
       running = false

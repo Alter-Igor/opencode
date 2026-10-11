@@ -191,19 +191,38 @@ test("a stale lock left by a dead process does not stop the refresh", async () =
   expect(h.keystone.calls.refresh).toBe(1)
 })
 
-test("the loop survives a throwing connection list and keeps ticking", async () => {
-  const h = await harness()
-  let calls = 0
-  const stop = startKeystoneRefreshLoop(h.deps, () => {
-    calls++
-    if (calls === 1) throw new Error("test list failure")
-    return []
-  }, 5)
-  await new Promise((r) => setTimeout(r, 80))
-  stop()
-  expect(calls >= 2).toBe(true)
-  expect(h.log.lines.some((l) => l.includes("connection list"))).toBe(true)
-})
+  test("the loop survives a throwing connection list and keeps ticking", async () => {
+    const h = await harness()
+    let calls = 0
+    const stop = startKeystoneRefreshLoop(h.deps, () => {
+      calls++
+      if (calls === 1) throw new Error("test list failure")
+      return []
+    }, 5)
+    await new Promise((r) => setTimeout(r, 80))
+    stop()
+    expect(calls >= 2).toBe(true)
+    expect(h.log.lines.some((l) => l.includes("connection list"))).toBe(true)
+  })
+
+  // #158's pattern for the shared log: a list that keeps failing logs one warn line, not one per
+  // 15-second tick (3,290 identical lines in two days); the first good tick reports the streak.
+  test("a failing connection list logs once per reason and reports recovery with the streak", async () => {
+    const h = await harness()
+    let calls = 0
+    const stop = startKeystoneRefreshLoop(h.deps, () => {
+      calls++
+      if (calls <= 3) throw new Error("test list failure")
+      return []
+    }, 5)
+    await new Promise((r) => setTimeout(r, 120))
+    stop()
+    const drops = h.log.lines.filter((l) => l.includes("skipping this tick"))
+    const recovered = h.log.lines.filter((l) => l.includes("recovered after repeated failures"))
+    expect(drops.length).toBe(1)
+    expect(recovered.length).toBe(1)
+    expect(recovered[0]).toContain('"ticks":3')
+  })
 
 /** Bridge A whose store refuses writes until `fixed` is set; same store value as the harness. */
 function flakyHolder(h: Harness) {

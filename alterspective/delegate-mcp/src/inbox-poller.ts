@@ -57,6 +57,8 @@ class InboxPoller {
   private cursor: string | undefined
   private since: number
   private failures = 0
+  /** The code of the current failure streak: one warn line per change of code, silent while repeating. */
+  private warnedCode: string | undefined
   private stopped = false
   private cancel: () => void = () => {}
 
@@ -109,8 +111,15 @@ class InboxPoller {
       safeLog(this.ctx.log, "warn", "inbox", "inbox cursor expired; restarting from the oldest message", {})
       return
     }
+    const code = isDelegateError(error) ? error.code : "unexpected"
     this.failures++
-    safeLog(this.ctx.log, "warn", "inbox", "inbox poll failed; will retry", { code: isDelegateError(error) ? error.code : "unexpected", failures: this.failures })
+    // The shared bridge log must stay readable: a bridge whose inbox is unreachable retries every
+    // tick forever (#158's pattern, 3,453 identical lines). One line per change of code; the
+    // recovery line on the next good drain names the streak length.
+    if (this.warnedCode !== code) {
+      this.warnedCode = code
+      safeLog(this.ctx.log, "warn", "inbox", "inbox poll failed; will retry", { code, failures: this.failures })
+    }
   }
 
   private delay(): number {
@@ -120,7 +129,9 @@ class InboxPoller {
   private async tick(): Promise<void> {
     try {
       await this.drain()
+      if (this.failures > 1 && this.warnedCode !== undefined) safeLog(this.ctx.log, "info", "inbox", "inbox polling recovered after repeated failures", { code: this.warnedCode, failures: this.failures })
       this.failures = 0
+      this.warnedCode = undefined
     } catch (error) {
       this.onFailure(error)
     }
