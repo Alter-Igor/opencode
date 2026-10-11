@@ -90,6 +90,25 @@ describe("event hub over SSE", () => {
     expect(all(h).filter((e) => e.type === "resync").length).toBeGreaterThanOrEqual(1)
   })
 
+  // The shared bridge log must stay readable: a bridge whose box is gone re-drops every backoff
+  // tick forever (9k identical warn lines hid everything else). One line per kind, then a summary.
+  test("repeated drops of one kind log once, and the reconnect reports the count", async () => {
+    const seen: Array<{ msg: string; kind?: string; drops?: number }> = []
+    const h = make({ log: { log: (_level, _component, msg, fields) => void seen.push({ msg, kind: fields?.kind as string | undefined, drops: fields?.drops as number | undefined }) } })
+    await box.down()
+    await h.start()
+    h.track("ses_1", DIR)
+    await until(() => seen.some((s) => s.msg === "event stream dropped"), 3000, "first drop")
+    // the backoff loop re-drops silently at 20/40/50/100 ms; let it accumulate, then recover
+    await Bun.sleep(350)
+    await box.up()
+    await until(() => seen.some((s) => s.msg === "event stream reconnected after repeated drops"), 8000, "recovery summary")
+    expect(seen.filter((s) => s.msg === "event stream dropped").length).toBe(1)
+    expect(seen.some((s) => s.msg === "event stream dropped" && s.kind === "unreachable")).toBe(true)
+    expect(seen.find((s) => s.msg === "event stream reconnected after repeated drops")?.drops).toBeGreaterThanOrEqual(3)
+    expect(seen.some((s) => s.msg === "event stream connected; rebuilding state")).toBe(true)
+  })
+
   test("a heartbeat-less stream is dropped as stale after the watchdog and reconnected", async () => {
     const h = make({ staleMs: 200 })
     await h.start()
