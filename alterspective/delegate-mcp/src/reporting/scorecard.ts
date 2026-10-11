@@ -162,3 +162,30 @@ export function scoreForMainServed(records: readonly TaskRecord[], now: number, 
     return score(model, "served", bucket)
   })
 }
+
+/** Proven serving for role picks: wins = share of completed tasks a model carried; dead = an id
+ *  that errored tasks while never serving a single call AND never served a call on ANY task in the
+ *  window (the unroutable-catalogue-row pattern, e.g. Synapse's ghost claude-opus-5 404). Serving
+ *  one call anywhere clears the flag: that model is flaky, not dead (CodeRabbit #156) - a route
+ *  that starts working heals the exclusion on the next record, so only positive evidence gates. */
+export type ServingHistory = { wins: Record<string, number>; dead: string[] }
+
+export function servingHistory(records: readonly TaskRecord[], now: number, days = 30): ServingHistory {
+  const since = now - days * DAY_MS
+  const wins: Record<string, number> = {}
+  const servedSomewhere = new Set<string>()
+  const ghostErrors = new Set<string>()
+  for (const record of records) {
+    if (Date.parse(record.startedAt) < since) continue
+    for (const [model, calls] of Object.entries(record.servedModels ?? {})) if (calls > 0) servedSomewhere.add(model)
+    if (record.outcome === "completed") {
+      for (const model of Object.keys(record.servedModels ?? {})) wins[model] = (wins[model] ?? 0) + servedShare(record, model)
+    }
+    const requested = record.requestedModel === undefined ? undefined : strip(record.requestedModel)
+    // servedModels present + the asked id absent + the task errored: the request never reached the model.
+    if (record.outcome === "error" && requested !== undefined && requested !== "auto" && record.servedModels !== undefined && !(requested in record.servedModels)) {
+      ghostErrors.add(requested)
+    }
+  }
+  return { wins, dead: [...ghostErrors].filter((model) => !servedSomewhere.has(model)).sort() }
+}

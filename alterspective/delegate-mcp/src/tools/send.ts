@@ -5,7 +5,7 @@
 // checkPolicy and sendPrompt are shared with oc_post's wake (inbox-tools.ts, W3A-19).
 import { z } from "zod"
 import type { Verdict } from "../shared/contracts.ts"
-import { recordSend } from "../reporting/hooks.ts"
+import { recordSend, servingHistoryFor } from "../reporting/hooks.ts"
 import { DelegateError } from "../shared/errors.ts"
 import type { Box, SessionRecord, ToolContext } from "./context.ts"
 import { readInstructions, type Instructions } from "./core-box.ts"
@@ -127,16 +127,18 @@ export const sendTool = defineTool({
     }
     if (args.model) await requireModel(box.api, args.model, cid, ctx)
     // D4: with no explicit model, a task role picks Synapse's best-fit live model from the
-    // offered list. No data, unknown role, unreadable: the pick says so and the normal default
-    // path stands (a hint never blocks a send, never guesses a model).
-    let taskPick: { role: string; model: string; score: number } | { role: string; fellBack: string } | undefined
+    // offered list. Serving history (proven wins, dead-route exclusions) breaks ties and dodges
+    // unroutable catalogue ghosts. No data, unknown role, unreadable: the pick says so and the
+    // normal default path stands (a hint never blocks a send, never guesses a model).
+    let taskPick: { role: string; model: string; score: number; historyBased?: true } | { role: string; fellBack: string } | undefined
     let model = args.model
     if (!model && args.taskRole) {
       const offered = await fetchModels(box.api, cid)
-      const pick = await pickRoleModel(ctx, args.taskRole, offered)
+      const history = servingHistoryFor(ctx)
+      const pick = await pickRoleModel(ctx, args.taskRole, offered, history)
       if ("model" in pick) {
         model = pick.model
-        taskPick = { role: args.taskRole, model: pick.model, score: pick.score }
+        taskPick = { role: args.taskRole, model: pick.model, score: pick.score, ...(history ? { historyBased: true as const } : {}) }
       } else {
         taskPick = { role: args.taskRole, fellBack: pick.none }
       }

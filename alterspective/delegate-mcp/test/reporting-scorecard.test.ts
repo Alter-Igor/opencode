@@ -1,7 +1,7 @@
 // Per-model scorecard: share-weighting, ghost (requested-not-served) rows kept separate,
 // successRate over settled tasks only, and the mainServed view. Pure function over TaskRecord[].
 import { describe, expect, test } from "bun:test"
-import { scorecard, scoreForMainServed } from "../src/reporting/scorecard.ts"
+import { scorecard, scoreForMainServed, servingHistory } from "../src/reporting/scorecard.ts"
 import type { TaskRecord } from "../src/reporting/record.ts"
 
 const NOW = Date.parse("2026-10-11T00:00:00.000Z")
@@ -89,5 +89,47 @@ describe("scorecard", () => {
     ], NOW)
     expect(rows.find((m) => m.model === "astra")?.tasks).toBe(1)
     expect(rows.find((m) => m.model === "kimi")?.tasks).toBe(1)
+  })
+})
+
+describe("servingHistory", () => {
+  test("completed tasks credit wins by served share", () => {
+    const h = servingHistory([rec({ key: "w", servedModels: { astra: 3, kimi: 1 }, outcome: "completed" })], NOW)
+    expect(h.wins.astra).toBeCloseTo(0.75)
+    expect(h.wins.kimi).toBeCloseTo(0.25)
+    expect(h.dead).toEqual([])
+  })
+
+  test("an errored task whose asked model never served a call is a dead route (the ghost 404 class)", () => {
+    const h = servingHistory([
+      rec({ key: "d1", requestedModel: "synapse/claude-opus-5", servedModels: { qwen: 2 }, outcome: "error", errorCode: "other" }),
+      rec({ key: "d2", requestedModel: "synapse/claude-opus-5", servedModels: { qwen: 1 }, outcome: "error", errorCode: "other" }),
+    ], NOW)
+    expect(h.dead).toEqual(["claude-opus-5"])
+  })
+
+  test("positive evidence outranks suspicion: a dead-route id with any win in the window is not dead", () => {
+    const h = servingHistory([
+      rec({ key: "e", requestedModel: "synapse/maybe", servedModels: { other: 1 }, outcome: "error" }),
+      rec({ key: "c", servedModels: { maybe: 4 }, outcome: "completed" }),
+    ], NOW)
+    expect(h.dead).toEqual([])
+  })
+
+  test("a model that served a call on an errored task is flaky, not dead: no completed wins still clears the flag", () => {
+    const h = servingHistory([
+      rec({ key: "e1", requestedModel: "synapse/ghosty", servedModels: { astra: 2 }, outcome: "error" }),
+      rec({ key: "e2", requestedModel: "synapse/ghosty", servedModels: { ghosty: 1 }, outcome: "error" }),
+    ], NOW)
+    expect(h.dead).toEqual([])
+  })
+
+  test("auto never flags; error tasks WITH the asked model present are not dead; old records age out", () => {
+    const h = servingHistory([
+      rec({ key: "a", requestedModel: "synapse/auto", servedModels: { astra: 1 }, outcome: "error" }),
+      rec({ key: "b", requestedModel: "synapse/astra", servedModels: { astra: 1 }, outcome: "error" }),
+      rec({ key: "c", requestedModel: "synapse/stale-ghost", servedModels: {}, outcome: "error", startedAt: new Date(NOW - 40 * DAY).toISOString() }),
+    ], NOW)
+    expect(h.dead).toEqual([])
   })
 })

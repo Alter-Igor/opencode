@@ -8,7 +8,7 @@
 // of the box-wide set (oc_server_restart {keystone} sets that, and front enforces it).
 import { z } from "zod"
 import { SESSION_SUPERVISOR_KEY } from "../inbox/index.ts"
-import { recordStart } from "../reporting/hooks.ts"
+import { recordStart, servingHistoryFor } from "../reporting/hooks.ts"
 import { CEILING_ENV, ceilingOf, enforceCeiling } from "../shared/keystone-policy.ts"
 import { DelegateError } from "../shared/errors.ts"
 import { CONNECTION_ID, MAX_CONNECTIONS, keystoneIds, readKeystoneSet } from "../shared/keystone.ts"
@@ -125,13 +125,14 @@ export const startSessionTool = defineTool({
     // from live benchmark data. No data / unknown role / unreadable: the normal default stands and
     // the result says why (a hint never blocks a start, never guesses a model).
     let model = args.model
-    let taskPick: { role: string; model: string; score: number } | { role: string; fellBack: string } | undefined
+    let taskPick: { role: string; model: string; score: number; historyBased?: true } | { role: string; fellBack: string } | undefined
     if (!model && args.taskRole) {
       const offered = await fetchModels(box.api, correlationId)
-      const pick = await pickRoleModel(ctx, args.taskRole, offered)
+      const history = servingHistoryFor(ctx)
+      const pick = await pickRoleModel(ctx, args.taskRole, offered, history)
       if ("model" in pick) {
         model = pick.model
-        taskPick = { role: args.taskRole, model: pick.model, score: pick.score }
+        taskPick = { role: args.taskRole, model: pick.model, score: pick.score, ...(history ? { historyBased: true as const } : {}) }
       } else {
         taskPick = { role: args.taskRole, fellBack: pick.none }
       }
