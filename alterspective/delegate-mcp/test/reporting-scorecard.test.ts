@@ -116,6 +116,14 @@ describe("servingHistory", () => {
     expect(h.dead).toEqual([])
   })
 
+  test("a model that served a call on an errored task is flaky, not dead: no completed wins still clears the flag", () => {
+    const h = servingHistory([
+      rec({ key: "e1", requestedModel: "synapse/ghosty", servedModels: { astra: 2 }, outcome: "error" }),
+      rec({ key: "e2", requestedModel: "synapse/ghosty", servedModels: { ghosty: 1 }, outcome: "error" }),
+    ], NOW)
+    expect(h.dead).toEqual([])
+  })
+
   test("auto never flags; error tasks WITH the asked model present are not dead; old records age out", () => {
     const h = servingHistory([
       rec({ key: "a", requestedModel: "synapse/auto", servedModels: { astra: 1 }, outcome: "error" }),

@@ -111,6 +111,7 @@ async function main(): Promise<void> {
   await waitUntil([sidA], ["idle", "error"], String(sentLong.cursor))
   const longRes = sc(await call("oc_result", { sessionID: sidA }))
   const reply = (longRes.replies as Array<{ untrusted: { text: string; truncated: boolean }; textTotal: number; messageID?: string }>)[0]
+  check("long reply exceeds the budget (else the task prompt was not honoured)", (reply?.textTotal ?? 0) > 12_000, `textTotal=${reply?.textTotal}`)
   if (reply && reply.textTotal > 12_000) {
     check("long reply truncated with marker", reply.untrusted.truncated === true && reply.untrusted.text.includes("omitted from the middle"))
     check("tail survives: VERDICT present (D3)", reply.untrusted.text.trimEnd().includes("VERDICT: KEEP"), `textTotal=${reply.textTotal}`)
@@ -118,24 +119,25 @@ async function main(): Promise<void> {
     const page = sc(await call("oc_result", { sessionID: sidA, messageID: reply.messageID, textOffset: Math.max(0, reply.textTotal - 60) }))
     const pageText = (page.untrusted as { text: string })?.text ?? ""
     check("paging returns the tail window", pageText.includes("VERDICT: KEEP") && page.textNext === undefined, JSON.stringify(page).slice(0, 140))
-  } else {
-    say(`WARN  reply too short to exercise paging (textTotal=${reply?.textTotal})`)
   }
 
-  // 4. taskRole fallback (D4 stage 1: no Synapse suitability data yet -> default + reason)
+  // 4. taskRole (D4): picks from Synapse's live suitability with serving history, or falls back
+  // with a stated reason - either shape is fine, a missing taskPick or a silent failure is not.
   const sentRole = sc(await call("oc_send", { sessionID: sidA, message: "Reply PONG only.", taskRole: "code" }))
   const pick = sentRole.taskPick as { model?: string; fellBack?: string } | undefined
-  check("taskRole send accepted with taskPick fallback note", sentRole.accepted === true && pick !== undefined && pick.fellBack !== undefined, JSON.stringify(pick ?? "").slice(0, 200))
+  check("taskRole send accepted with a taskPick (model or reason)", sentRole.accepted === true && pick !== undefined && (pick.model !== undefined || pick.fellBack !== undefined), JSON.stringify(pick ?? "").slice(0, 200))
   await waitUntil([sidA], ["idle", "error"], String(sentRole.cursor))
 
   // 5. oc_collect verify (D6): pass, then fail, then the branch still lands
   const v1 = sc(await call("oc_collect", { sessionID: sidA, verify: ["bun --version"] }))
   check("verify pass reports bridge-observed exit 0", (v1.verify as { passed: boolean })?.passed === true && (v1.verify as { rows: Array<{ exitCode: number }> }).rows[0]?.exitCode === 0)
-  const v2 = sc(await call("oc_collect", { sessionID: sidA, verify: ["bun -e process.exit(7)"] }))
+  const v2r = await call("oc_collect", { sessionID: sidA, verify: ["bun -e process.exit(7)"] })
+  const v2 = sc(v2r)
   check("verify fail marks claim unproven but still fetched", (v2.verify as { passed: boolean })?.passed === false && (v2.verify as { rows: Array<{ exitCode: number }> }).rows[0]?.exitCode === 7 && typeof v2.branch === "string", JSON.stringify(v2).slice(0, 200))
-  check("failed verify summary says FAILED", String(sc(await call("oc_status", { sessionID: sidA })).state ?? "").length >= 0)
+  const firstLine = ((v2r.content as Array<{ text?: string }> | undefined)?.[0]?.text ?? "").split("\n")[0] ?? ""
+  check("failed verify summary says VERIFICATION FAILED and names unproven", firstLine.includes("VERIFICATION FAILED") && firstLine.includes("unproven"), firstLine.slice(0, 180))
   const branchFiles = git(repoA, "ls-tree", "--name-only", String(v2.branch))
-  check("collected branch carries the session commit", branchFiles.includes("marker.txt") || branchFiles.length > 0, branchFiles.slice(0, 80))
+  check("collected branch carries the synced marker commit", branchFiles.includes("marker.txt"), branchFiles.slice(0, 80))
 
   // 6. readonly session + permission + oc_answer {sessionID} (D1 live path)
   const repoB = makeRepo("v-b")

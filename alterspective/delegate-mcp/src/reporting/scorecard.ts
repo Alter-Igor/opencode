@@ -164,17 +164,20 @@ export function scoreForMainServed(records: readonly TaskRecord[], now: number, 
 }
 
 /** Proven serving for role picks: wins = share of completed tasks a model carried; dead = an id
- *  that errored tasks while never serving a single call and has zero wins (the unroutable-catalogue
- *  -row pattern, e.g. Synapse's ghost claude-opus-5 404). Positive evidence only: a model with any
- *  win in the window is never dead, so a fix at the gateway heals the pick. */
+ *  that errored tasks while never serving a single call AND never served a call on ANY task in the
+ *  window (the unroutable-catalogue-row pattern, e.g. Synapse's ghost claude-opus-5 404). Serving
+ *  one call anywhere clears the flag: that model is flaky, not dead (CodeRabbit #156) - a route
+ *  that starts working heals the exclusion on the next record, so only positive evidence gates. */
 export type ServingHistory = { wins: Record<string, number>; dead: string[] }
 
 export function servingHistory(records: readonly TaskRecord[], now: number, days = 30): ServingHistory {
   const since = now - days * DAY_MS
   const wins: Record<string, number> = {}
+  const servedSomewhere = new Set<string>()
   const ghostErrors = new Set<string>()
   for (const record of records) {
     if (Date.parse(record.startedAt) < since) continue
+    for (const [model, calls] of Object.entries(record.servedModels ?? {})) if (calls > 0) servedSomewhere.add(model)
     if (record.outcome === "completed") {
       for (const model of Object.keys(record.servedModels ?? {})) wins[model] = (wins[model] ?? 0) + servedShare(record, model)
     }
@@ -184,5 +187,5 @@ export function servingHistory(records: readonly TaskRecord[], now: number, days
       ghostErrors.add(requested)
     }
   }
-  return { wins, dead: [...ghostErrors].filter((model) => (wins[model] ?? 0) === 0).sort() }
+  return { wins, dead: [...ghostErrors].filter((model) => !servedSomewhere.has(model)).sort() }
 }
