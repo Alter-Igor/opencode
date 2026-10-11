@@ -388,11 +388,19 @@ The bridge keeps one small record per task on your PC, at `<home>/workspaces/rep
 
 ## Dashboard
 
-`oc_dashboard` returns a link to a read-only web page, "Delegated work", for you to open in a browser. It shows, across every bridge sharing this bridge home: whether the box is running and how many tasks are running; which sessions delegated (#132: the caller, the project folder of each Claude Code session, or `OPENCODE_DELEGATE_CALLER`; a task recorded before 0.5.1 is listed under its bridge name) with running, last 24 hours and last 7 days; the tasks running now; the 200 most recent tasks of the last 7 days (session, bridge, repo, model sent, model Synapse served, state, duration); and the models served over 7 days. It reads the same task records as `oc_report` (see "Reporting") and refreshes every 5 seconds.
+`oc_dashboard` returns a link to a read-only web page, "Delegated work", for you to open in a browser. It shows, across every bridge sharing this bridge home: whether the box is running and how many tasks are running; which sessions delegated (#132: the caller, the project folder of each Claude Code session, or `OPENCODE_DELEGATE_CALLER`; a task recorded before 0.5.1 is listed under its bridge name) with running, last 24 hours and last 7 days; the tasks running now; the 200 most recent tasks of the last 7 days (session, bridge, repo, model sent, model Synapse served, state, duration); the models served over 7 days; and a **per-model scorecard** over 30 days (#153 follow-up): each model's tasks (share-weighted by the calls it served), success rate as a bar, median/p90 minutes, token-in, repos touched, and its failure signature. A model that was *requested but served by nobody* (Synapse re-routed or 404'd it) is shown as a distinct "re-routed" row - that is the routing-health signal, kept separate so it never inflates a real server's rate. It reads the same task records as `oc_report` (see "Reporting") and refreshes every 5 seconds.
 
 - **Local only.** The page is served on `127.0.0.1` at a random port, behind a random path token in the link. Only GET is answered, and a request whose `Host` header is not `127.0.0.1:<port>` is refused. The link works only on this machine.
 - **Stops with the bridge.** It starts on the first `oc_dashboard` call (a second call returns the same link) and never keeps the bridge running.
 - **Read-only.** It never starts the box and never calls Docker. Repo and model names are shown as plain text.
+
+## Outcomes export (feeding the model-quality loop)
+
+`bun <checkout>\alterspective\delegate-mcp\src\cli.ts outcomes [--days N] [--no-redact]` prints one JSON line per **settled** task to stdout (default: last 90 days): the models that served it and how many calls each, the outcome (`completed` / `error` + code / `aborted`), duration, tokens, and whether the work was collected or discarded. This is benchmark material for Synapse's per-role suitability (#1918): an outcome label with an acceptance signal (`collected`/`closed_clean` vs `closed_discarded`) that a model call alone cannot give.
+
+- **Never starts the sandbox**; reads only the host-side task records (`<home>/workspaces/reports`, the same store `oc_report` and the dashboard read).
+- **Redacted by default**: `repo` and `caller` become a salted hash (a random `report-salt` in the bridge home, so names stay stable per machine and unlinkable elsewhere). `--no-redact` prints them verbatim for your own eyes; the raw export always stays on this PC.
+- No prompt, answer, file content or error body is ever in a row - only the metadata already on disk.
 
 ## Troubleshooting
 

@@ -4,10 +4,13 @@
 // logs go to stderr + <home>/logs (D-1).
 // Exit codes (CLI-UX-22): 0 ok, 1 error, 2 bad arguments; `watch` passes on its own codes.
 import { spawn } from "node:child_process"
+import { randomBytes } from "node:crypto"
 import path from "node:path"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { isDelegateError } from "./shared/errors.ts"
 import { scrub } from "./shared/log.ts"
+import { flushReports, reportsFor } from "./reporting/hooks.ts"
+import { outcomeRows } from "./reporting/export.ts"
 import { createRuntime, readVersion, shutdownSignal, type Runtime, type VersionInfo } from "./runtime.ts"
 import { createServer } from "./server.ts"
 import { doctorTool } from "./tools/doctor.ts"
@@ -22,6 +25,11 @@ Usage:
   opencode-delegate watch [options]      One line per session event that needs attention (see: watch --help)
   opencode-delegate doctor               Print the oc_doctor report as JSON (never starts the sandbox; exit 1 unless verified)
   opencode-delegate login synapse        Sign in to Synapse on this computer (browser), like oc_login {server:"synapse"}
+  opencode-delegate outcomes [--days N] [--no-redact]
+                                         Settled task outcomes as JSONL on stdout (benchmark material, D7):
+                                         one line per finished task - models that served it, outcome,
+                                         duration, tokens, collected/discarded. Repo/caller names are
+                                         hashed unless --no-redact. Never starts the sandbox.
   opencode-delegate --version [--json]   Print the version
   opencode-delegate -h | --help | help   Show this help
 
@@ -49,6 +57,7 @@ export type Command =
   | { kind: "watch"; args: string[] }
   | { kind: "doctor" }
   | { kind: "login"; server: "synapse" }
+  | { kind: "outcomes"; days: number; redact: boolean }
   | { kind: "version"; json: boolean }
   | { kind: "help" }
   | { kind: "error"; message: string }
@@ -83,7 +92,27 @@ export function parseCli(argv: string[]): Command {
     return "error" in parsed ? { kind: "error", message: parsed.error } : { kind: "doctor" }
   }
   if (command === "login") return flagArgs.length === 1 && flagArgs[0] === "synapse" ? { kind: "login", server: "synapse" } : { kind: "error", message: "Usage: login synapse" }
+  if (command === "outcomes") return parseOutcomes(flagArgs)
   return { kind: "error", message: `Unknown command: ${printable(command)}. Run with --help.` }
+}
+
+const MAX_OUTCOME_DAYS = 365
+
+function parseOutcomes(args: string[]): Command {
+  let days = 90
+  let redact = true
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!
+    if (arg === "--no-redact") { redact = false; continue }
+    if (arg === "--days") {
+      const value = Number(args[++i])
+      if (!Number.isInteger(value) || value < 1 || value > MAX_OUTCOME_DAYS) return { kind: "error", message: "--days needs an integer 1..365" }
+      days = value
+      continue
+    }
+    return { kind: "error", message: `Unknown argument: ${printable(arg)}. Run with --help.` }
+  }
+  return { kind: "outcomes", days, redact }
 }
 
 export type Io = { out(text: string): void; err(text: string): void }
@@ -152,6 +181,31 @@ export async function runLogin(io: Io, make: () => Promise<Runtime> = createRunt
   }
 }
 
+/** The redaction salt: random per bridge home, kept on disk so hashed names stay stable across runs. */
+async function reportSalt(home: string): Promise<string> {
+  const file = path.join(home, "report-salt")
+  const existing = await Bun.file(file).text().catch(() => "")
+  if (/^[a-f0-9]{32,}$/.test(existing.trim())) return existing.trim()
+  const salt = randomBytes(16).toString("hex")
+  await Bun.write(file, salt)
+  return salt
+}
+
+/** D7: settled task outcomes as JSONL on stdout (one line per row); exit 0 even when there are none. */
+export async function runOutcomes(io: Io, days: number, redact: boolean, make: () => Promise<Runtime> = createRuntime): Promise<number> {
+  const runtime = await make()
+  try {
+    await flushReports()
+    const records = reportsFor(runtime.ctx).list()
+    const rows = outcomeRows(records, { now: Date.now(), days, salt: await reportSalt(runtime.ctx.config.home), redactNames: redact })
+    for (const row of rows) io.out(JSON.stringify(row))
+    io.err(`opencode-delegate: ${rows.length} outcome row(s) of ${records.length} record(s) (last ${days}d, ${redact ? "names hashed" : "names verbatim"})`)
+    return EXIT.ok
+  } finally {
+    await runtime.shutdown("outcomes done")
+  }
+}
+
 function runWatch(args: string[]): Promise<number> {
   const script = path.join(import.meta.dir, "cli", "watch.ts")
   return new Promise((resolve) => {
@@ -179,6 +233,8 @@ export async function main(argv: string[], io: Io = processIo): Promise<number> 
       return runDoctor(io)
     case "login":
       return runLogin(io)
+    case "outcomes":
+      return runOutcomes(io, command.days, command.redact)
     case "mcp":
       return runMcp(command.channels)
   }
