@@ -7,7 +7,7 @@ import os from "node:os"
 import path from "node:path"
 import { outcomeRows, redact, EXPORT_VERSION } from "../src/reporting/export.ts"
 import type { TaskRecord } from "../src/reporting/record.ts"
-import { parseCli, runOutcomes, EXIT, type Io } from "../src/cli.ts"
+import { parseCli, runOutcomes, runScorecard, EXIT, type Io } from "../src/cli.ts"
 import type { Runtime } from "../src/runtime.ts"
 import { fakeContext, record } from "./tools-core-fixture.ts"
 
@@ -97,5 +97,69 @@ describe("cli outcomes", () => {
     const out = io()
     expect(await runOutcomes(out, 90, true, await runtimeWith([]))).toBe(EXIT.ok)
     expect(out.lines).toEqual([])
+  })
+})
+
+describe("cli scorecard", () => {
+  test("parse: default 30d, --days, --json, bad input", () => {
+    expect(parseCli(["scorecard"])).toEqual({ kind: "scorecard", days: 30, json: false })
+    expect(parseCli(["scorecard", "--days", "7", "--json"])).toEqual({ kind: "scorecard", days: 7, json: true })
+    expect(parseCli(["scorecard", "--days", "0"])).toMatchObject({ kind: "error" })
+    expect(parseCli(["scorecard", "--bogus"])).toMatchObject({ kind: "error" })
+  })
+
+  test("first run prints the table + none-yet note and saves a snapshot; an identical second run says nothing moved", async () => {
+    const live = new Date(Date.now() - 60_000).toISOString()
+    const make = await runtimeWith([rec({ key: "s-0000000001", startedAt: live })])
+    const first = io()
+    expect(await runScorecard(first, 30, false, make)).toBe(EXIT.ok)
+    expect(first.lines[0]).toContain("scorecard (last 30d")
+    expect(first.lines.join("\n")).toContain("openai/gpt-6-astra")
+    expect(first.lines.join("\n")).toContain("delta: none yet")
+    const second = io()
+    expect(await runScorecard(second, 30, false, make)).toBe(EXIT.ok)
+    expect(second.lines.join("\n")).toContain("delta: nothing moved.")
+  })
+
+  test("a failed task recorded between runs moves the rate: the delta line shows old → new", async () => {
+    const live = new Date(Date.now() - 60_000).toISOString()
+    const f = fakeContext()
+    f.ctx.config.home = await mkdtemp(path.join(os.tmpdir(), "ocd-score-"))
+    const dir = path.join(f.ctx.config.home, "workspaces", "reports")
+    await mkdir(dir, { recursive: true })
+    const make = async () => ({ ctx: f.ctx, versionInfo: { version: "v", package: "0", sha: "x", dirty: false, built: null }, name: "cli-test", shutdown: async () => {} }) as unknown as Runtime
+    await Bun.write(path.join(dir, "s-0000000001.json"), JSON.stringify(rec({ key: "s-0000000001", startedAt: live })))
+    const out = io()
+    expect(await runScorecard(out, 30, false, make)).toBe(EXIT.ok)
+    await Bun.write(path.join(dir, "s-0000000002.json"), JSON.stringify(rec({ key: "s-0000000002", startedAt: live, outcome: "error", errorCode: "other", servedModels: { "openai/gpt-6-astra": 1 } })))
+    const out2 = io()
+    expect(await runScorecard(out2, 30, false, make)).toBe(EXIT.ok)
+    expect(out2.lines.join("\n")).toContain("rate 100% → 50%")
+    expect(out2.lines.join("\n")).toContain("(low n)")
+  })
+
+  test("--json prints one scorecard+delta object; a corrupt snapshot reads as a first run (never a crash)", async () => {
+    const live = new Date(Date.now() - 60_000).toISOString()
+    const make = await runtimeWith([rec({ key: "s-0000000001", startedAt: live })])
+    const out = io()
+    expect(await runScorecard(out, 30, true, make)).toBe(EXIT.ok)
+    const obj = JSON.parse(out.lines.join("")) as { scorecard: { models: unknown[] }; delta: { firstRun: boolean } }
+    expect(Array.isArray(obj.scorecard.models)).toBe(true)
+    expect(obj.delta.firstRun).toBe(true)
+    // poison the snapshot the run just saved
+    const home = (await make()).ctx.config.home
+    await Bun.write(path.join(home, "scorecard-last.json"), "{not json{{{")
+    const out2 = io()
+    expect(await runScorecard(out2, 30, true, make)).toBe(EXIT.ok)
+    expect((JSON.parse(out2.lines.join("")) as { delta: { firstRun: boolean } }).delta.firstRun).toBe(true)
+  })
+
+  test("a different window than the saved snapshot is not comparable and says so", async () => {
+    const live = new Date(Date.now() - 60_000).toISOString()
+    const make = await runtimeWith([rec({ key: "s-0000000001", startedAt: live })])
+    expect(await runScorecard(io(), 30, false, make)).toBe(EXIT.ok)
+    const out = io()
+    expect(await runScorecard(out, 7, false, make)).toBe(EXIT.ok)
+    expect(out.lines.join("\n")).toContain("last run used --days 30")
   })
 })

@@ -5,12 +5,14 @@
 // Exit codes (CLI-UX-22): 0 ok, 1 error, 2 bad arguments; `watch` passes on its own codes.
 import { spawn } from "node:child_process"
 import { randomBytes } from "node:crypto"
+import { renameSync, unlinkSync } from "node:fs"
 import path from "node:path"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { isDelegateError } from "./shared/errors.ts"
 import { scrub } from "./shared/log.ts"
 import { flushReports, reportsFor } from "./reporting/hooks.ts"
 import { outcomeRows } from "./reporting/export.ts"
+import { parseScorecardSnapshot, scorecard, scoreDelta, type ModelScore, type Scorecard } from "./reporting/scorecard.ts"
 import { createRuntime, readVersion, shutdownSignal, type Runtime, type VersionInfo } from "./runtime.ts"
 import { createServer } from "./server.ts"
 import { doctorTool } from "./tools/doctor.ts"
@@ -30,6 +32,11 @@ Usage:
                                          one line per finished task - models that served it, outcome,
                                          duration, tokens, collected/discarded. Repo/caller names are
                                          hashed unless --no-redact. Never starts the sandbox.
+  opencode-delegate scorecard [--days N] [--json]
+                                         Per-model scorecard table plus what moved since the last run
+                                         (the loop check-in): success-rate and task-count changes, new
+                                         and gone models, new ghosts. Saves a snapshot under the bridge
+                                         home; the first run shows the table only. Never starts the sandbox.
   opencode-delegate --version [--json]   Print the version
   opencode-delegate -h | --help | help   Show this help
 
@@ -58,6 +65,7 @@ export type Command =
   | { kind: "doctor" }
   | { kind: "login"; server: "synapse" }
   | { kind: "outcomes"; days: number; redact: boolean }
+  | { kind: "scorecard"; days: number; json: boolean }
   | { kind: "version"; json: boolean }
   | { kind: "help" }
   | { kind: "error"; message: string }
@@ -93,6 +101,7 @@ export function parseCli(argv: string[]): Command {
   }
   if (command === "login") return flagArgs.length === 1 && flagArgs[0] === "synapse" ? { kind: "login", server: "synapse" } : { kind: "error", message: "Usage: login synapse" }
   if (command === "outcomes") return parseOutcomes(flagArgs)
+  if (command === "scorecard") return parseScorecard(flagArgs)
   return { kind: "error", message: `Unknown command: ${printable(command)}. Run with --help.` }
 }
 
@@ -113,6 +122,23 @@ function parseOutcomes(args: string[]): Command {
     return { kind: "error", message: `Unknown argument: ${printable(arg)}. Run with --help.` }
   }
   return { kind: "outcomes", days, redact }
+}
+
+function parseScorecard(args: string[]): Command {
+  let days = 30
+  let json = false
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!
+    if (arg === "--json") { json = true; continue }
+    if (arg === "--days") {
+      const value = Number(args[++i])
+      if (!Number.isInteger(value) || value < 1 || value > MAX_OUTCOME_DAYS) return { kind: "error", message: "--days needs an integer 1..365" }
+      days = value
+      continue
+    }
+    return { kind: "error", message: `Unknown argument: ${printable(arg)}. Run with --help.` }
+  }
+  return { kind: "scorecard", days, json }
 }
 
 export type Io = { out(text: string): void; err(text: string): void }
@@ -206,6 +232,105 @@ export async function runOutcomes(io: Io, days: number, redact: boolean, make: (
   }
 }
 
+const SNAPSHOT_FILE = "scorecard-last.json"
+const SNAPSHOT_RETRY_MS = [20, 40, 80, 160]
+
+/** The previous run's scorecard, or null (first run, unreadable or corrupt file - the delta is
+ *  reporting only, so a bad snapshot must never fail the command). */
+async function loadSnapshot(home: string): Promise<Scorecard | null> {
+  const text = await Bun.file(path.join(home, SNAPSHOT_FILE)).text().catch(() => "")
+  if (!text) return null
+  return parseScorecardSnapshot(safeSnapshotJson(text))
+}
+
+function safeSnapshotJson(text: string): unknown {
+  try {
+    return JSON.parse(text)
+  } catch {
+    return null
+  }
+}
+
+/** temp file + rename (the store.ts pattern, whole-file only): a crash leaves a stale .tmp, never a
+ *  torn snapshot; a Windows EPERM/EBUSY on the rename (an antivirus or reader holding the file) is
+ *  retried with backoff. Failure is reported, never thrown. */
+async function saveSnapshot(home: string, current: Scorecard): Promise<string | undefined> {
+  const file = path.join(home, SNAPSHOT_FILE)
+  const tmp = `${file}.${process.pid}.tmp`
+  try {
+    await Bun.write(tmp, JSON.stringify(current))
+    for (let attempt = 0; ; attempt++) {
+      try {
+        renameSync(tmp, file)
+        return undefined
+      } catch (error) {
+        const code = (error as { code?: string }).code
+        if (attempt >= SNAPSHOT_RETRY_MS.length || code === undefined || !["EPERM", "EBUSY", "EACCES"].includes(code)) throw error
+        await Bun.sleep(SNAPSHOT_RETRY_MS[attempt]!)
+      }
+    }
+  } catch (error) {
+    try {
+      unlinkSync(tmp)
+    } catch {
+      // already gone
+    }
+    return (error as { code?: string }).code ?? "write failed"
+  }
+}
+
+const pct = (rate: number | null): string => (rate === null ? "-" : `${Math.round(rate * 100)}%`)
+const n1 = (value: number): string => (value >= 10 ? value.toFixed(0) : value.toFixed(1))
+
+function fmtMs(ms: number | null): string {
+  if (ms === null) return "-"
+  if (ms < 60_000) return `${Math.round(ms / 1000)}s`
+  if (ms < 3_600_000) return `${(ms / 60_000).toFixed(1)}m`
+  return `${(ms / 3_600_000).toFixed(1)}h`
+}
+
+export function formatScorecardTable(card: Scorecard): string[] {
+  const header = "model".padEnd(28) + "kind".padEnd(15) + "tasks".padStart(7) + "rate".padStart(6) + "med".padStart(8) + "p90".padStart(8) + "err".padStart(6)
+  const rows = card.models.map((m: ModelScore) =>
+    m.model.padEnd(28) + m.kind.padEnd(15) + n1(m.tasks).padStart(7) + pct(m.successRate).padStart(6) + fmtMs(m.medianMs).padStart(8) + fmtMs(m.p90Ms).padStart(8) + (m.error >= 1 ? n1(m.error).padStart(6) : m.error > 0 ? "<1".padStart(6) : "".padStart(6)),
+  )
+  return [`scorecard (last ${card.days}d, ${card.tasks} tasks, since ${card.since.slice(0, 10)}):`, header, ...rows]
+}
+
+export function formatDelta(delta: ReturnType<typeof scoreDelta>): string[] {
+  if (delta.firstRun) return ["delta: none yet (first run - snapshot saved, the next run compares)."]
+  if (delta.windowMismatch) return [`delta: none (last run used --days ${delta.daysFrom}; the window must match to compare).`]
+  if (delta.lines.length === 0) return ["delta: nothing moved."]
+  return [
+    `delta vs snapshot (${delta.daysFrom}d window):`,
+    ...delta.lines.map((d) => {
+      const tag = d.kind === "requested-only" ? "ghost " : ""
+      if (d.new) return `  ${tag}${d.model} NEW: ${n1(d.tasksTo)} tasks${d.lowN ? " (low n)" : ""}`
+      if (d.gone) return `  ${tag}${d.model} GONE (was ${pct(d.rateFrom)}, ${n1(d.tasksFrom)} tasks)`
+      return `  ${tag}${d.model} rate ${pct(d.rateFrom)} → ${pct(d.rateTo)}  tasks ${n1(d.tasksFrom)} → ${n1(d.tasksTo)}${d.lowN ? " (low n)" : ""}`
+    }),
+  ]
+}
+
+/** `scorecard`: the table plus what moved since the last run; saves a snapshot for the next diff. */
+export async function runScorecard(io: Io, days: number, json: boolean, make: () => Promise<Runtime> = createRuntime): Promise<number> {
+  const runtime = await make()
+  try {
+    await flushReports()
+    const records = reportsFor(runtime.ctx).list()
+    const current = scorecard(records, Date.now(), days)
+    const previous = await loadSnapshot(runtime.ctx.config.home)
+    const delta = scoreDelta(current, previous)
+    const saved = await saveSnapshot(runtime.ctx.config.home, current)
+    if (json) io.out(JSON.stringify({ scorecard: current, delta }))
+    else for (const line of [...formatScorecardTable(current), ...formatDelta(delta)]) io.out(line)
+    if (saved !== undefined) io.err(`opencode-delegate: snapshot not saved (${saved}) - next run shows no delta.`)
+    return EXIT.ok
+  } finally {
+    await runtime.shutdown("scorecard done")
+  }
+}
+
 function runWatch(args: string[]): Promise<number> {
   const script = path.join(import.meta.dir, "cli", "watch.ts")
   return new Promise((resolve) => {
@@ -235,6 +360,8 @@ export async function main(argv: string[], io: Io = processIo): Promise<number> 
       return runLogin(io)
     case "outcomes":
       return runOutcomes(io, command.days, command.redact)
+    case "scorecard":
+      return runScorecard(io, command.days, command.json)
     case "mcp":
       return runMcp(command.channels)
   }
