@@ -32,6 +32,15 @@ describe("scorecard", () => {
     expect(server?.errorKinds.other).toBe(2 / 2)
   })
 
+  test("synapse/auto is never a re-routed ghost: it is a routing alias, not an ask that died", () => {
+    const card = scorecard([
+      rec({ key: "a1", requestedModel: "synapse/auto", servedModels: { "openai/gpt-6-astra": 3 }, outcome: "completed" }),
+      rec({ key: "a2", requestedModel: "synapse/auto", servedModels: { kimi: 2 }, outcome: "completed" }),
+    ], NOW)
+    expect(card.models.find((m) => m.model === "auto")).toBeUndefined()
+    expect(card.models.find((m) => m.model === "openai/gpt-6-astra")?.kind).toBe("served")
+  })
+
   test("successRate counts settled tasks only (running excluded), sorted by tasks desc", () => {
     const card = scorecard([
       rec({ key: "c1", servedModels: { astra: 5 }, outcome: "completed" }),
