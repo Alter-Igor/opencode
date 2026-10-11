@@ -25,12 +25,13 @@ describe("outcomeRows", () => {
     expect(rows[0]).toMatchObject({ v: EXPORT_VERSION, outcome: "completed", mainModel: "openai/gpt-6-astra", sendCount: 2, collected: true })
   })
 
-  test("running, aborted, unsent-unknown and no-model tasks are not exported", () => {
+  test("running, aborted, unsent-unknown, empty-served and no-model tasks are not exported", () => {
     const rows = outcomeRows([
       rec({ key: "run", outcome: "running" }),
       rec({ key: "ab", outcome: "aborted" }),
       rec({ key: "unsent", outcome: "unknown", sendCount: 0 }),
       rec({ key: "nomodel", servedModels: undefined }),
+      rec({ key: "empty", servedModels: {} }),
     ], { now: NOW, salt: "s" })
     expect(rows).toEqual([])
   })
@@ -81,7 +82,9 @@ describe("cli outcomes", () => {
   })
 
   test("writes one JSON line per settled record and exits 0", async () => {
-    const make = await runtimeWith([rec({ key: "s-0000000001" }), rec({ key: "s-0000000002", outcome: "running" })])
+    // relative to the real clock: runOutcomes windows on Date.now(), so a fixed NOW would age out
+    const live = new Date(Date.now() - 60_000).toISOString()
+    const make = await runtimeWith([rec({ key: "s-0000000001", startedAt: live }), rec({ key: "s-0000000002", startedAt: live, outcome: "running" })])
     const out = io()
     expect(await runOutcomes(out, 90, true, make)).toBe(EXIT.ok)
     expect(out.lines).toHaveLength(1)

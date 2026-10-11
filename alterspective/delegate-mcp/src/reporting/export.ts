@@ -10,8 +10,8 @@ import { mainServedModel } from "./served.ts"
 
 export const EXPORT_VERSION = 1 as const
 const DAY_MS = 24 * 60 * 60 * 1000
-/** Settled tasks only: outcome is finished (summary.ts rule) and at least one model served a call. */
-const isExportable = (r: TaskRecord) => r.outcome !== "running" && r.outcome !== "aborted" && (r.outcome !== "unknown" || r.sendCount > 0) && r.servedModels !== undefined
+/** Settled tasks only: outcome is finished (summary.ts rule) and at least one model served a call (an empty map would export a row with no model, useless for scoring). */
+const isExportable = (r: TaskRecord) => r.outcome !== "running" && r.outcome !== "aborted" && (r.outcome !== "unknown" || r.sendCount > 0) && Object.values(r.servedModels ?? {}).some((calls) => calls > 0)
 
 export type OutcomeRow = {
   v: typeof EXPORT_VERSION

@@ -126,7 +126,9 @@ export function scorecard(records: readonly TaskRecord[], now: number, days = 30
     }
     // a task whose servedModels is empty cannot attribute any model - counted once, unscored
     const requested = record.requestedModel === undefined ? undefined : strip(record.requestedModel)
-    if (requested !== undefined && record.servedModels !== undefined && !(requested in record.servedModels)) {
+    // "auto" is Synapse's routing alias: it never appears as a served name, so it must not
+    // become a re-routed ghost for every auto-routed task (the ghost means "an ask died unrouted").
+    if (requested !== undefined && requested !== "auto" && record.servedModels !== undefined && !(requested in record.servedModels)) {
       const bucket = ghostBuckets.get(requested) ?? emptyBucket()
       ghostBuckets.set(requested, bucket)
       add(bucket, record, 1)
