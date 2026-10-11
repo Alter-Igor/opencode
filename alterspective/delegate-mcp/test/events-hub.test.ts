@@ -192,6 +192,78 @@ describe("event hub over SSE", () => {
     expect((await h.view("ses_1")).state).toBe("server_down")
     await box.up()
   })
+
+  // OB-3 (owner report 2026-10-10): a box recreate left oc_wait callers idling through the full
+  // timeout - after the first server_down, no new event ever arrives (state dedup), so a cursor
+  // wait that accepts failures must read the current state up front instead of long-polling it.
+  test("cursor wait(error) with the link already down returns the server_down views at once", async () => {
+    const h = make()
+    await h.start()
+    h.track("ses_1", DIR)
+    box.send(status("busy"))
+    await until(() => seq(h).includes("status:busy"))
+    await box.down()
+    await until(() => seq(h).includes("status:server_down"), 3000, "server_down")
+    const began = Date.now()
+    const result = await h.wait({ sessionIDs: ["ses_1"], until: ["error"], timeoutMs: 30_000, cursor: h.cursor() })
+    expect(Date.now() - began).toBeLessThan(10_000)
+    expect(result.timedOut).toBe(false)
+    expect(result.views?.[0]).toMatchObject({ sessionID: "ses_1", state: "server_down" })
+    await box.up()
+  })
+
+  // CodeRabbit #157: a cursor taken BEFORE the drop has a real server_down event waiting in the
+  // ring. It must be delivered (with an advanced cursor), not replaced by a static view a repeat
+  // wait would hand back forever without moving on.
+  test("cursor wait(error) from before the drop gets the buffered server_down event, not a stale view", async () => {
+    const h = make()
+    await h.start()
+    h.track("ses_1", DIR)
+    box.send(status("busy"))
+    await until(() => seq(h).includes("status:busy"))
+    const before = h.cursor()
+    await box.down()
+    await until(() => seq(h).includes("status:server_down"), 3000, "server_down")
+    const first = await h.wait({ sessionIDs: ["ses_1"], until: ["error"], timeoutMs: 3000, cursor: before })
+    expect(first.timedOut).toBe(false)
+    expect(first.events[0]).toMatchObject({ type: "status", state: "server_down", sessionID: "ses_1" })
+    expect(first.next.seq).toBeGreaterThan(before.seq)
+    expect(first.views).toBeUndefined()
+    // the event advanced the cursor: the next wait has nothing buffered, so the down link makes it
+    // short-circuit on the current view instead of idling the full timeout
+    const again = Date.now()
+    const second = await h.wait({ sessionIDs: ["ses_1"], until: ["error"], timeoutMs: 3000, cursor: first.next })
+    expect(second.views?.[0]?.state).toBe("server_down")
+    expect(Date.now() - again).toBeLessThan(3000)
+    await box.up()
+  })
+
+  test("the same down link does not wake a wait(idle) early: server_down matches neither idle nor message", async () => {
+    const h = make()
+    await h.start()
+    h.track("ses_1", DIR)
+    await box.down()
+    await until(() => seq(h).includes("status:server_down"), 3000, "server_down")
+    const result = await h.wait({ sessionIDs: ["ses_1"], until: ["idle"], timeoutMs: 2000, cursor: h.cursor() })
+    expect(result.timedOut).toBe(true)
+    expect(result.views).toBeUndefined()
+    await box.up()
+  })
+
+  test("a foreign-epoch cursor still fails closed as cursor_expired while the link is down", async () => {
+    const h = make()
+    await h.start()
+    h.track("ses_1", DIR)
+    await box.down()
+    await until(() => seq(h).includes("status:server_down"), 3000, "server_down")
+    try {
+      await h.wait({ sessionIDs: ["ses_1"], until: ["error"], timeoutMs: 3000, cursor: { epoch: "other-run", seq: 1 } })
+      expect.unreachable("the foreign cursor must throw")
+    } catch (error) {
+      expect((error as { code?: string }).code).toBe("cursor_expired")
+    }
+    await box.up()
+  })
 })
 
 const permission = (id: string, sessionID = "ses_1") => ({ type: "permission.asked", properties: { id, sessionID, permission: "bash", patterns: ["ls"], metadata: {}, always: [] } })
