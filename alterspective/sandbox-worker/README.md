@@ -52,13 +52,19 @@ Containers are named `sbxw-<id>`, labelled `alterspective.sandbox-worker=spike`,
 ```json
 {
   "taskId": "sbxw-…",
+  "privacyTier": "local-only",
   "model": { "baseURL": "https://…/v1", "headers": { "x-task-type": "code" }, "onPremDefault": ["qwen3.8-27b-dflash2"] },
-  "modelPolicy": { "cell": { "modelIds": ["…"] }, "effectivePolicyVersion": "…" },
+  "modelPolicy": { "cell": { "modelIds": ["…"], "residency": "local-only", "privacyTier": "local-only" }, "effectivePolicyVersion": "…" },
   "repo": { "bundle": "/run/sbxw/input/repo.bundle", "ref": "optional", "sha256": "<bundle file SHA-256>", "treeSha": "<tree of the commit to work on>", "dependencies": "/work/.sbxw-deps/node_modules" },
   "permission": { "*": "allow", "external_directory": "deny" },
   "listen": { "hostname": "127.0.0.1", "port": 4096 }
 }
 ```
+
+Optional top-level `privacyTier`: the task's privacy tier, set only by svc-coding-agent from its
+own residency decision (svc#322). Only the exact string `"cloud-ok"` is honoured; absent or
+anything else is `local-only` (#161). The cell's `privacyTier` inside `modelPolicy` is recorded
+with the policy but never sets the tier.
 
 ## Harness check: hidden acceptance tests (#121)
 
@@ -123,9 +129,11 @@ decision 7). The sandbox does not fetch them:
 4. The result, with `effectivePolicyVersion` or the fallback reason, is written to
    `/run/sbxw/state.json`.
 
-The tier stays `local-only` whatever the cell says (#101). If a cell names a cloud model, the
-request asks Synapse for that model at `local-only`. We expect Synapse to refuse it, and then the
-fork's pinned-model fallback (#80) resends with `auto`. Not checked live yet.
+The tier comes from the manifest's optional top-level `privacyTier` field (#161): `cloud-ok` only
+when the manifest carries exactly that string; anything else, including absent, is `local-only`
+(#101). If a cell names a cloud model under a local tier, the request asks Synapse for that model
+at `local-only`. We expect Synapse to refuse it, and then the fork's pinned-model fallback (#80)
+resends with `auto`. Not checked live yet.
 
 ## What protects what, honestly
 
@@ -139,8 +147,18 @@ fork's pinned-model fallback (#80) resends with `auto`. Not checked live yet.
   server, so it can still read the server's environment through `/proc`.
 - **The model whitelist is a convenience, not a boundary.** The gateway is meant to enforce the
   resolved cell server-side (ADR-042). Until then, the box can only be trusted to stay on-prem
-  because of the `local-only` tier.
-- **Model calls stay on-prem (#101).** The `synapse` provider always sends `x-privacy-tier: local-only`, set after the manifest headers, so a manifest cannot remove or widen it. The supervisor also sets `SYNAPSE_PRIVACY_TIER=local-only` for `opencode serve`, so the fork's Synapse plugin puts the tier on every Synapse call it makes (chat, model list, MCP bridge, `synapse_buddy_review`). CAS ADR-042 requires this for the opencodealt engine.
+  when the manifest leaves the tier `local-only` (#161).
+- **Model calls get the manifest's privacy tier, `local-only` by default (#101, #161).** The
+  manifest's top-level `privacyTier` is the only input: svc-coding-agent sets it from its own
+  residency decision (svc#322) and sends `cloud-ok` only for non-client repos after CAS amends
+  ADR-042. The tier is `cloud-ok` only when that field is exactly the string `"cloud-ok"`; absent,
+  misspelled or otherwise, the tier is `local-only`. The header `x-privacy-tier` is set from the
+  resolved tier after every spelling of a manifest tier header is stripped, and
+  `SYNAPSE_PRIVACY_TIER` is set after the spread of the inherited environment, so neither the
+  manifest headers, the model policy, the model ids nor an inherited environment value can widen
+  or remove it. The fork's Synapse plugin puts the tier on every Synapse call it makes (chat,
+  model list, MCP bridge, `synapse_buddy_review`). CAS ADR-042 requires this for the opencodealt
+  engine.
 - **The box works on the bundle the service sent (#108).** When the manifest gives `repo.sha256`
   and `repo.treeSha`, the supervisor checks the bundle file before cloning and the checked-out tree
   after, and exits (code 2, nothing served) on a mismatch. The service should always send both;
