@@ -192,6 +192,52 @@ describe("event hub over SSE", () => {
     expect((await h.view("ses_1")).state).toBe("server_down")
     await box.up()
   })
+
+  // OB-3 (owner report 2026-10-10): a box recreate left oc_wait callers idling through the full
+  // timeout - after the first server_down, no new event ever arrives (state dedup), so a cursor
+  // wait that accepts failures must read the current state up front instead of long-polling it.
+  test("cursor wait(error) with the link already down returns the server_down views at once", async () => {
+    const h = make()
+    await h.start()
+    h.track("ses_1", DIR)
+    box.send(status("busy"))
+    await until(() => seq(h).includes("status:busy"))
+    await box.down()
+    await until(() => seq(h).includes("status:server_down"), 3000, "server_down")
+    const began = Date.now()
+    const result = await h.wait({ sessionIDs: ["ses_1"], until: ["error"], timeoutMs: 30_000, cursor: h.cursor() })
+    expect(Date.now() - began).toBeLessThan(10_000)
+    expect(result.timedOut).toBe(false)
+    expect(result.views?.[0]).toMatchObject({ sessionID: "ses_1", state: "server_down" })
+    await box.up()
+  })
+
+  test("the same down link does not wake a wait(idle) early: server_down matches neither idle nor message", async () => {
+    const h = make()
+    await h.start()
+    h.track("ses_1", DIR)
+    await box.down()
+    await until(() => seq(h).includes("status:server_down"), 3000, "server_down")
+    const result = await h.wait({ sessionIDs: ["ses_1"], until: ["idle"], timeoutMs: 2000, cursor: h.cursor() })
+    expect(result.timedOut).toBe(true)
+    expect(result.views).toBeUndefined()
+    await box.up()
+  })
+
+  test("a foreign-epoch cursor still fails closed as cursor_expired while the link is down", async () => {
+    const h = make()
+    await h.start()
+    h.track("ses_1", DIR)
+    await box.down()
+    await until(() => seq(h).includes("status:server_down"), 3000, "server_down")
+    try {
+      await h.wait({ sessionIDs: ["ses_1"], until: ["error"], timeoutMs: 3000, cursor: { epoch: "other-run", seq: 1 } })
+      expect.unreachable("the foreign cursor must throw")
+    } catch (error) {
+      expect((error as { code?: string }).code).toBe("cursor_expired")
+    }
+    await box.up()
+  })
 })
 
 const permission = (id: string, sessionID = "ses_1") => ({ type: "permission.asked", properties: { id, sessionID, permission: "bash", patterns: ["ls"], metadata: {}, always: [] } })

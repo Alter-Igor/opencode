@@ -90,6 +90,11 @@ export class EventBuffer {
     return this.ring.slice(Math.max(0, after - first + 1))
   }
 
+  /** True when wait() with this cursor would be valid rather than throw cursor_expired. */
+  accepts(cursor: Cursor): boolean {
+    return cursor.epoch === this.epoch && this.after(Math.min(cursor.seq, this.seq)) !== undefined
+  }
+
   page(cursor: Cursor | undefined, filter: Filter = {}, limit: number = DEFAULT_PAGE): Page {
     const size = Math.max(1, Math.min(MAX_PAGE, Math.floor(limit)))
     if (cursor && cursor.epoch !== this.epoch) return { events: [], next: this.head(), expired: true }

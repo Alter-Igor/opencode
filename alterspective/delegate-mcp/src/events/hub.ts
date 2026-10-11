@@ -146,10 +146,19 @@ class Hub implements DelegateHub {
     return this.buffer.page(cursor, filter, limit)
   }
 
-  /** Events first; without a cursor, and again before a timeout, the current state (W2A-05/06). */
+  /**
+   * Events first; without a cursor, and again before a timeout, the current state (W2A-05/06).
+   * With a cursor, the link is already down, and the wait accepts failures, the current state is
+   * checked up front too: the event reporting the death died with the connection, so waiting the
+   * full timeout on it is a black hole (live finding 2026-10-08: a box recreate left oc_wait
+   * callers idling through timeouts while every session was already server_down). An expired or
+   * foreign cursor keeps failing closed through buffer.wait (resync first), and a wait that only
+   * wants idle or message is unchanged: server_down matches neither.
+   */
   async wait(input: WaitInput): Promise<WaitResult> {
     const cursor = input.cursor ?? this.buffer.head()
-    if (!input.cursor) {
+    const linkDown = input.cursor !== undefined && input.until.includes("error") && this.table.linkState().kind === "down" && this.buffer.accepts(input.cursor)
+    if (!input.cursor || linkDown) {
       const views = await this.matchingViews(input)
       if (views.length) return { events: [], next: cursor, timedOut: false, views }
     }
