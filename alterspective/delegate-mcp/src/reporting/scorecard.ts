@@ -162,3 +162,27 @@ export function scoreForMainServed(records: readonly TaskRecord[], now: number, 
     return score(model, "served", bucket)
   })
 }
+
+/** Proven serving for role picks: wins = share of completed tasks a model carried; dead = an id
+ *  that errored tasks while never serving a single call and has zero wins (the unroutable-catalogue
+ *  -row pattern, e.g. Synapse's ghost claude-opus-5 404). Positive evidence only: a model with any
+ *  win in the window is never dead, so a fix at the gateway heals the pick. */
+export type ServingHistory = { wins: Record<string, number>; dead: string[] }
+
+export function servingHistory(records: readonly TaskRecord[], now: number, days = 30): ServingHistory {
+  const since = now - days * DAY_MS
+  const wins: Record<string, number> = {}
+  const ghostErrors = new Set<string>()
+  for (const record of records) {
+    if (Date.parse(record.startedAt) < since) continue
+    if (record.outcome === "completed") {
+      for (const model of Object.keys(record.servedModels ?? {})) wins[model] = (wins[model] ?? 0) + servedShare(record, model)
+    }
+    const requested = record.requestedModel === undefined ? undefined : strip(record.requestedModel)
+    // servedModels present + the asked id absent + the task errored: the request never reached the model.
+    if (record.outcome === "error" && requested !== undefined && requested !== "auto" && record.servedModels !== undefined && !(requested in record.servedModels)) {
+      ghostErrors.add(requested)
+    }
+  }
+  return { wins, dead: [...ghostErrors].filter((model) => (wins[model] ?? 0) === 0).sort() }
+}

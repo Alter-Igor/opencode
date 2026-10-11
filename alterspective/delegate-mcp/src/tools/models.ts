@@ -12,6 +12,8 @@ import { DelegateError } from "../shared/errors.ts"
 import type { OpencodeApi } from "../shared/opencode-api.ts"
 import { DEFAULT_MODEL, SYNAPSE_PROVIDER } from "../supervisor/profile.ts"
 import { registeredModels, type Suitability } from "../synapse/models.ts"
+import { servingHistoryFor } from "../reporting/hooks.ts"
+import type { ServingHistory } from "../reporting/scorecard.ts"
 import type { ToolContext } from "./context.ts"
 import { MODEL_RE, requireSynapseModel } from "./core-session.ts"
 import { defineTool } from "./define.ts"
@@ -75,17 +77,21 @@ export async function listModels(api: OpencodeApi, correlationId: string): Promi
  * D4 stage 1 (owner decision 2026-10-10): pick the best model for a task role from Synapse's live
  * suitability data. The role vocabulary is whatever Synapse publishes (no hardcoded list here).
  * Only models the box also offers are candidates (a hint cannot resurrect a retired model).
- * Deterministic: highest score wins; ties by id sort (the list arrives sorted).
+ * Rank: score desc; ties by proven serving (completed-task share), then id order. A `dead` id
+ * (errored tasks while never serving a call, no wins: the unroutable-catalogue-row pattern, e.g.
+ * Synapse's ghost claude-opus-5 that 404s at every call yet scores 1.00) is excluded outright.
  */
-export function bestForRole(role: string, offered: readonly string[], suitability: Record<string, Record<string, number>>): { model: string; score: number } | undefined {
-  let best: { model: string; score: number } | undefined
-  for (const id of offered) {
-    if (id === DEFAULT_MODEL || id === `${SYNAPSE_PROVIDER}/auto`) continue
-    const score = suitability[id.slice(SYNAPSE_PROVIDER.length + 1)]?.[role]
-    if (score === undefined) continue
-    if (!best || score > best.score) best = { model: id, score }
-  }
-  return best
+export function rankedForRole(role: string, offered: readonly string[], suitability: Record<string, Suitability>, history?: ServingHistory): Array<{ model: string; score: number }> {
+  const bare = (id: string) => id.slice(SYNAPSE_PROVIDER.length + 1)
+  return offered
+    .filter((id) => id.startsWith(`${SYNAPSE_PROVIDER}/`) && id !== DEFAULT_MODEL && bare(id) !== "auto" && !(history?.dead ?? []).includes(bare(id)))
+    .map((id) => ({ model: id, score: suitability[bare(id)]?.[role] }))
+    .filter((e): e is { model: string; score: number } => e.score !== undefined)
+    .sort((a, b) => b.score - a.score || (history?.wins[bare(b.model)] ?? 0) - (history?.wins[bare(a.model)] ?? 0) || a.model.localeCompare(b.model))
+}
+
+export function bestForRole(role: string, offered: readonly string[], suitability: Record<string, Suitability>, history?: ServingHistory): { model: string; score: number } | undefined {
+  return rankedForRole(role, offered, suitability, history)[0]
 }
 
 export type RolePick = { model: string; score: number } | { none: string }
@@ -94,14 +100,16 @@ export type RolePick = { model: string; score: number } | { none: string }
  * Pick live: reads Synapse's current list (host token, the #149 path). Never throws and never
  * blocks a send: no token, unreadable list, role unknown or no offered model has fit data all
  * come back as { none } with the reason - the caller sends the default model and says so.
+ * `history` (servingHistory from the task records) is optional: without it the pick is exactly
+ * score-then-id-order as before - a hint never blocks a send, and missing history never guesses.
  */
-export async function pickRoleModel(ctx: Pick<ToolContext, "config">, role: string, offered: readonly string[]): Promise<RolePick> {
+export async function pickRoleModel(ctx: Pick<ToolContext, "config">, role: string, offered: readonly string[], history?: ServingHistory): Promise<RolePick> {
   const live = await registeredModels({ frontDir: path.join(ctx.config.home, "front"), fetch }).catch(() => undefined)
   if (!live || live.source !== "synapse") return { none: `no live model data from Synapse${live && "reason" in live ? ` (${live.reason})` : ""}; the default model was sent` }
   if (!live.suitability) return { none: "Synapse publishes no per-role fit data yet; the default model was sent" }
   const known = [...new Set(Object.values(live.suitability).flatMap((s) => Object.keys(s)))]
   if (!known.includes(role)) return { none: `Synapse has no fit data for role "${role}" (known: ${known.join(", ") || "none"}); the default model was sent` }
-  const best = bestForRole(role, [...offered].sort(), live.suitability)
+  const best = bestForRole(role, [...offered].sort(), live.suitability, history)
   return best ?? { none: `no offered model carries fit data for role "${role}"; the default model was sent` }
 }
 
@@ -134,19 +142,15 @@ export async function requireModel(api: OpencodeApi, model: string, correlationI
   }
 }
 
-/** D4: the fit table Synapse is publishing right now - per known role, the best offered models.
- *  Bounded (3 per role, 20 roles); empty when no data. The roles are discovered, never listed here. */
-export function rolesTable(suitability: Record<string, Suitability> | undefined, offered: readonly string[]): Record<string, Array<{ model: string; score: number }>> | undefined {
+/** D4: the fit table Synapse is publishing right now - per known role, the top 3 offered models
+ *  ranked exactly as the pick ranks them (rankedForRole). 20 roles max; empty when no data.
+ *  The roles are discovered, never listed here. */
+export function rolesTable(suitability: Record<string, Suitability> | undefined, offered: readonly string[], history?: ServingHistory): Record<string, Array<{ model: string; score: number }>> | undefined {
   if (!suitability) return undefined
-  const models = offered.filter((m) => m !== DEFAULT_MODEL && m !== `${SYNAPSE_PROVIDER}/auto`)
   const roles = [...new Set(Object.values(suitability).flatMap((s) => Object.keys(s)))].sort().slice(0, 20)
   const out: Record<string, Array<{ model: string; score: number }>> = {}
   for (const role of roles) {
-    const ranked = models
-      .map((m) => ({ model: m, score: suitability[m.slice(SYNAPSE_PROVIDER.length + 1)]?.[role] }))
-      .filter((e): e is { model: string; score: number } => e.score !== undefined)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 3)
+    const ranked = rankedForRole(role, [...offered].sort(), suitability, history).slice(0, 3)
     if (ranked.length) out[role] = ranked
   }
   return Object.keys(out).length ? out : undefined
@@ -167,7 +171,7 @@ export const modelsTool = defineTool({
     // #149: report live served models
     const live = await registeredModels({ frontDir: path.join(ctx.config.home, "front"), fetch }).catch(() => undefined)
     const served = live && live.source === "synapse" ? live.models.map((m) => `${SYNAPSE_PROVIDER}/${m}`) : undefined
-    const roles = rolesTable(live?.source === "synapse" ? live.suitability : undefined, list.models)
+    const roles = rolesTable(live?.source === "synapse" ? live.suitability : undefined, list.models, servingHistoryFor(ctx))
     const roleNote = roles ? ` Roles with fit data: ${Object.keys(roles).join(", ")} (pass taskRole to oc_send).` : ""
     return ok(`${models.length} model${models.length === 1 ? "" : "s"}${args.provider ? ` from ${args.provider}` : ""}. ${keystoneLine(keystone)}.${roleNote}`, {
       models,

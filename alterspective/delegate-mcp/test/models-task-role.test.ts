@@ -9,6 +9,7 @@ import { authConfPath, writeAuthConf } from "../src/synapse/auth-conf.ts"
 import { registeredModels } from "../src/synapse/models.ts"
 import { modelsTool } from "../src/tools/models.ts"
 import { bestForRole, pickRoleModel, rolesTable } from "../src/tools/models.ts"
+import type { ServingHistory } from "../src/reporting/scorecard.ts"
 import { sendTool } from "../src/tools/send.ts"
 import { startSessionTool } from "../src/tools/sessions.ts"
 import { SID, data, fakeContext, invoke, okCmd, ours, record, remoteSession, text, type Fake } from "./tools-core-fixture.ts"
@@ -60,6 +61,22 @@ describe("bestForRole (pure pick)", () => {
   test("a model not offered by the box is never picked (hints cannot resurrect a retired model)", () => {
     expect(bestForRole("code", ["synapse/auto", "synapse/other"], { other: { code: 0.1 }, gone: { code: 1 } })).toEqual({ model: "synapse/other", score: 0.1 })
     expect(bestForRole("code", ["synapse/auto"], { gone: { code: 1 } })).toBeUndefined()
+  })
+
+  test("a proven-dead route is excluded even at the top score (the ghost claude-opus-5 404 class)", () => {
+    // the live shape: only the ghost carries suitability, so without history it wins outright
+    const SUITED = { "claude-opus-5": { code: 1 }, "openai/gpt-6-astra": { code: 0.9 } }
+    const all = [...offered, "synapse/claude-opus-5"]
+    expect(bestForRole("code", all, SUITED)?.model).toBe("synapse/claude-opus-5")
+    const history: ServingHistory = { wins: { "openai/gpt-6-astra": 4 }, dead: ["claude-opus-5"] }
+    expect(bestForRole("code", all, SUITED, history)?.model).toBe("synapse/openai/gpt-6-astra")
+  })
+
+  test("on a score tie, the model with more proven serving wins; equal wins keep id order", () => {
+    const SUITED = { "openai/gpt-6-astra": { code: 1 }, "moonshotai/kimi-k3": { code: 1 } }
+    expect(bestForRole("code", offered, SUITED)?.model).toBe("synapse/moonshotai/kimi-k3") // id order
+    const history: ServingHistory = { wins: { "openai/gpt-6-astra": 10 }, dead: [] }
+    expect(bestForRole("code", offered, SUITED, history)?.model).toBe("synapse/openai/gpt-6-astra")
   })
 })
 
@@ -137,6 +154,19 @@ function readySend(f: Fake, offeredModels: string[]) {
   f.api.on("GET /config/providers", { status: 200, data: { providers: [{ id: "synapse", models: Object.fromEntries(offeredModels.map((m) => [m, { id: m }])) }] } })
   f.api.on("GET /config", { status: 200, data: { model: "synapse/auto" } })
 }
+
+describe("rolesTable ranking (D4 history layer)", () => {
+  test("a dead route drops out even at the top score; ties prefer proven serving; no history keeps the plain order", () => {
+    const suitability = { "claude-opus-5": { code: 1 }, "anthropic/claude-opus-5": { code: 1 }, "openai/gpt-6-astra": { code: 0.9 } }
+    const offered = ["synapse/anthropic/claude-opus-5", "synapse/auto", "synapse/claude-opus-5", "synapse/openai/gpt-6-astra"]
+    const history: ServingHistory = { wins: { "anthropic/claude-opus-5": 3 }, dead: ["claude-opus-5"] }
+    expect(rolesTable(suitability, offered, history)?.code?.map((r) => r.model)).toEqual(["synapse/anthropic/claude-opus-5", "synapse/openai/gpt-6-astra"])
+    expect(rolesTable(suitability, offered)?.code?.[0]?.model).toBe("synapse/anthropic/claude-opus-5")
+    const onlyGhost = { "claude-opus-5": { code: 1 }, "openai/gpt-6-astra": { code: 0.9 } }
+    expect(rolesTable(onlyGhost, offered)?.code?.[0]?.model).toBe("synapse/claude-opus-5")
+    expect(rolesTable(onlyGhost, offered, { wins: { "openai/gpt-6-astra": 2 }, dead: ["claude-opus-5"] })?.code?.[0]?.model).toBe("synapse/openai/gpt-6-astra")
+  })
+})
 
 describe("oc_send taskRole D4", () => {
   test("the pick is sent as the model and reported in taskPick", async () => {

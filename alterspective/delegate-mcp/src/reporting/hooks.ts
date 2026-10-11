@@ -11,6 +11,7 @@ import { safeLog } from "../shared/log.ts"
 import { MODEL_RE } from "../supervisor/workspaces-state.ts"
 import type { SessionRecord, ToolContext } from "../tools/context.ts"
 import { errorCode, newTaskRecord, repoName, type Disposition, type Outcome, type TaskRecord, type Tokens } from "./record.ts"
+import { servingHistory, type ServingHistory } from "./scorecard.ts"
 import { keepServed } from "./served.ts"
 import { createReportStore, type ReportStore } from "./store.ts"
 
@@ -42,6 +43,28 @@ const reads = new Set<Promise<unknown>>()
 export async function flushReports(): Promise<void> {
   await Promise.all([...reads].map((r) => r.catch(() => undefined)))
   await Promise.all([...stores.values()].map((s) => s.flush()))
+}
+
+const HISTORY_TTL_MS = 60_000
+const historyByHome = new Map<string, { at: number; history: ServingHistory }>()
+
+/**
+ * Serving history for role picks (tie-break by proven serving; dead-route exclusion). Reading the
+ * store costs up to 2000 small file reads, so it is memoised per home for a minute; a failed read
+ * is not cached and gives undefined - the pick then uses the plain score-then-id order, which is
+ * exactly the pre-history behaviour (a hint never blocks or misdirects a send).
+ */
+export function servingHistoryFor(ctx: Pick<ToolContext, "config" | "log">, now: number = Date.now()): ServingHistory | undefined {
+  const cached = historyByHome.get(ctx.config.home)
+  if (cached && now - cached.at < HISTORY_TTL_MS) return cached.history
+  try {
+    const history = servingHistory(reportsFor(ctx).list(), now)
+    historyByHome.set(ctx.config.home, { at: now, history })
+    return history
+  } catch (error) {
+    safeLog(ctx.log, "warn", "reporting", "serving history read failed; role picks use the plain order", { code: error instanceof Error ? error.name : "unknown" })
+    return undefined
+  }
 }
 
 let hookFailureLogged = false
