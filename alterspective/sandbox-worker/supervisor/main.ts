@@ -3,7 +3,7 @@
 // bundle, and runs `opencode serve`. Phase 2 adds the outbound control link to the gateway.
 import { $ } from "bun"
 import path from "path"
-import { PRIVACY_TIER, PRIVACY_TIER_ENV, renderConfig, type Manifest } from "./config"
+import { PRIVACY_TIER_ENV, resolvePrivacyTier, renderConfig, serveEnv, type Manifest } from "./config"
 import { checkBundleFile, checkDependenciesDir, checkTree } from "./bundle"
 import { checkUnreachable } from "./egress-guard"
 import { parseResolveBody } from "./policy"
@@ -31,10 +31,13 @@ const repoDir = "/work/repo"
 // #102: svc-coding-agent resolved and froze this for the task; the box makes no policy call and
 // holds no CAS credential. Missing or unusable means `auto`, local-only.
 const policy = parseResolveBody(manifest.modelPolicy, manifest.model.onPremDefault)
+// #161: the tier is computed once from the manifest read at start. The policy, headers and model
+// ids never change it.
+const tier = resolvePrivacyTier(manifest)
 console.log(
   policy.source === "cas"
     ? `[sbxw] model policy: CAS version ${policy.effectivePolicyVersion}, models ${policy.modelIds.join(", ")}`
-    : `[sbxw] model policy: fallback (${policy.reason}), models ${policy.modelIds.join(", ")}, ${PRIVACY_TIER}`,
+    : `[sbxw] model policy: fallback (${policy.reason}), models ${policy.modelIds.join(", ")}, ${tier}`,
 )
 const config = renderConfig(manifest, policy.modelIds)
 
@@ -112,7 +115,7 @@ await Bun.write(
     startedAt: new Date().toISOString(),
     // #102: which policy this task ran under (ADR-042: effectivePolicyVersion frozen at task start).
     modelPolicy: policy,
-    privacyTier: PRIVACY_TIER,
+    privacyTier: tier,
     // #121: recorded only; the harness never reads this file (the agent can write it).
     harnessRequired: manifest.harness?.required === true,
   }),
@@ -120,7 +123,9 @@ await Bun.write(
 
 const hostname = manifest.listen?.hostname ?? "127.0.0.1"
 const port = manifest.listen?.port ?? 4096
-const { SBXW_SERVER_PASSWORD: _drop, SBXW_MANIFEST: _manifest, ...env } = process.env
+// #161: serveEnv strips the secret manifest vars, spreads the rest, and sets the tier AFTER the
+// spread so an inherited SYNAPSE_PRIVACY_TIER cannot override the manifest-resolved tier.
+const env = serveEnv(process.env, tier)
 console.log(
   `[sbxw] task ${manifest.taskId}: build ${buildSha}, base ${baseSha || "(empty repo)"}, ` +
     `bundle sha256 ${verified.sha256 ? "verified" : "not checked"}, tree ${verified.tree ? "verified" : "not checked"}, ` +
@@ -137,8 +142,9 @@ const child = Bun.spawn(["opencode", "serve", "--hostname", hostname, "--port", 
     ...env,
     OPENCODE_SERVER_PASSWORD: password,
     SYNAPSE_BASE_URL: manifest.model.baseURL,
-    // #101: the Synapse plugin adds the tier to every Synapse call, not only the chat route.
-    [PRIVACY_TIER_ENV]: PRIVACY_TIER,
+    // #161: the Synapse plugin adds the tier to every Synapse call, not only the chat route. The
+    // tier comes from the manifest, local-only by default.
+    [PRIVACY_TIER_ENV]: tier,
     OPENCODE_AUTH_CONTENT: JSON.stringify(auth),
   },
   stdio: ["ignore", "inherit", "inherit"],
