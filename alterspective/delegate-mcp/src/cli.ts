@@ -223,15 +223,22 @@ export async function runDashboard(
   wait: () => Promise<void> = () => new Promise<void>((resolve) => process.once("SIGINT", () => resolve())),
 ): Promise<number> {
   const runtime = await make()
-  const dashboard = ensureDashboard(runtime.ctx)
-  io.out(`Dashboard: ${dashboard.url}`)
-  io.out("Read-only, local (127.0.0.1), stops with Ctrl-C. It never starts the sandbox.")
+  // The dashboard server unrefs itself (correct for `mcp`: a browser tab must not keep the bridge
+  // alive). Here the opposite matters: the only other handle is the SIGINT listener, and with
+  // nothing ref'd the loop parks and accepted connections are never answered (found live: curl
+  // hung 8 s with the port listening). This interval keeps the foreground command pumping until
+  // Ctrl-C (the listener resolves `wait`, so SIGINT is ours, not a hard process kill).
+  const keep = setInterval(() => {}, 60_000)
   try {
+    const dashboard = ensureDashboard(runtime.ctx)
+    io.out(`Dashboard: ${dashboard.url}`)
+    io.out("Read-only, local (127.0.0.1), stops with Ctrl-C. It never starts the sandbox.")
     if (open) await openDashboardOnce(runtime.ctx)
     else io.err("opencode-delegate: --no-open: the browser was not opened and the first-run marker was not written.")
     await wait()
     return EXIT.ok
   } finally {
+    clearInterval(keep)
     stopDashboard(runtime.ctx)
     await runtime.shutdown("dashboard done")
   }
