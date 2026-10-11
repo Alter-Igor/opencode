@@ -13,7 +13,9 @@ import { Filesystem } from "@/util/filesystem"
 // declare the goal met. It does nothing until a person starts a goal.
 
 export const GOAL_COMMAND = "goal"
-export const GOAL_DEFAULTS = { turns: 20, minutes: 120, timeoutSeconds: 600, stall: 3 }
+// `turnRetries`: a turn whose model reply failed (not a user abort) is retried this many times in a
+// row before the loop pauses (svc-coding-agent#327: one transient UnknownError ended a whole stage).
+export const GOAL_DEFAULTS = { turns: 20, minutes: 120, timeoutSeconds: 600, stall: 3, turnRetries: 2 }
 const OUTPUT_TAIL = 2_000
 
 // AIMETH-018 terminal run states, as the portable harness defines them.
@@ -44,6 +46,8 @@ export type GoalState = {
   reason?: string
   lastFailure?: string
   repeats: number
+  /** Failed model replies retried in a row (#327); absent in loops saved before it means 0. */
+  turnErrors?: number
 }
 
 export type GoalArgs =
@@ -126,12 +130,19 @@ export function parseGoalArgs(text: string): GoalArgs {
   }
 }
 
-/** How the last turn ended: a user abort or error pauses the loop, and so does GOAL_BLOCKED. */
-export function readLastTurn(messages: { info: Message; parts: Part[] }[]) {
+/**
+ * How the last turn ended: a user abort or GOAL_BLOCKED pauses the loop; a failed model reply is
+ * reported as `failed` (the error name and its message, cut) so the loop can retry it (#327).
+ */
+export function readLastTurn(messages: { info: Message; parts: Part[] }[]): { pause?: string; failed?: string } {
   const last = messages.findLast((m) => m.info.role === "assistant")
   if (!last || last.info.role !== "assistant") return {}
   if (last.info.error?.name === "MessageAbortedError") return { pause: "aborted by the user" }
-  if (last.info.error) return { pause: `the turn failed (${last.info.error.name})` }
+  if (last.info.error) {
+    const message = (last.info.error as { data?: { message?: unknown } }).data?.message
+    const detail = typeof message === "string" && message.trim() ? `: ${message.trim().replace(/\s+/g, " ").slice(0, 200)}` : ""
+    return { failed: `${last.info.error.name}${detail}` }
+  }
   const blocked = last.parts
     .flatMap((part) => (part.type === "text" && !part.synthetic ? [part.text] : []))
     .join("\n")
@@ -335,6 +346,27 @@ export async function GoalLoopPlugin(
       })
       return
     }
+    // #327: a failed model reply (a transient provider or GPU error) is retried up to
+    // GOAL_DEFAULTS.turnRetries times in a row through the normal continue path, so the turn and
+    // time budgets still bound it. Past that the loop pauses and names the error.
+    if (turn.failed) {
+      const failed = turn.failed
+      const retry = await exclusive(sessionID, async () => {
+        const state = await load(sessionID)
+        if (!state || state.status !== "active" || state.startedAt !== started.startedAt) return false
+        const errors = (state.turnErrors ?? 0) + 1
+        if (errors > GOAL_DEFAULTS.turnRetries) {
+          const reason = `the turn failed (${failed}) ${errors} times in a row`
+          await save({ ...state, status: "paused", reason, turnErrors: errors })
+          await notify(state, `Paused: ${reason}. Type /goal resume to carry on, or /goal stop.`, "warning")
+          return false
+        }
+        await save({ ...state, turnErrors: errors })
+        await notify(state, `The turn failed (${failed}); retrying (${errors} of ${GOAL_DEFAULTS.turnRetries}).`, "warning")
+        return true
+      })
+      if (!retry) return
+    }
 
     const [checked, recorded] = await Promise.all([check(started), record(started)])
     // Decide and save from the state as it is now: the person may have stopped, paused,
@@ -364,6 +396,8 @@ export async function GoalLoopPlugin(
         turns: state.turns + 1,
         repeats: step.failure !== undefined && step.failure === state.lastFailure ? state.repeats + 1 : 0,
         lastFailure: step.failure,
+        // #327: a reply that worked resets the run of failed ones.
+        turnErrors: turn.failed ? state.turnErrors : 0,
       }
       await save(next)
       const user = messages.data?.findLast((m) => m.info.role === "user")?.info
@@ -410,7 +444,7 @@ export async function GoalLoopPlugin(
         if (args.action !== "start") {
           if (!current || current.status !== "paused")
             return `[goal-loop] Nothing to resume. ${describeGoal(current)}\nTell the user this in one line. Do no other work.`
-          const resumed: GoalState = { ...current, status: "active", reason: undefined, repeats: 0 }
+          const resumed: GoalState = { ...current, status: "active", reason: undefined, repeats: 0, turnErrors: 0 }
           await save(resumed)
           return continuePrompt(resumed, {})
         }

@@ -34,9 +34,12 @@ function goalState(overrides: Partial<GoalState> = {}): GoalState {
   }
 }
 
-function assistant(input: { error?: { name: string }; text?: string; synthetic?: boolean } = {}) {
+function assistant(input: { error?: { name: string; message?: string }; text?: string; synthetic?: boolean } = {}) {
+  const error = input.error
+    ? { name: input.error.name, data: input.error.message === undefined ? {} : { message: input.error.message } }
+    : undefined
   return {
-    info: { role: "assistant", ...(input.error ? { error: { ...input.error, data: {} } } : {}) } as unknown as Message,
+    info: { role: "assistant", ...(error ? { error } : {}) } as unknown as Message,
     parts: input.text
       ? ([{ type: "text", text: input.text, ...(input.synthetic ? { synthetic: true } : {}) }] as unknown as Part[])
       : [],
@@ -125,8 +128,13 @@ describe("readLastTurn", () => {
     )
   })
 
-  test("a failed turn pauses", () => {
-    expect(readLastTurn([user(), assistant({ error: { name: "APIError" } })]).pause).toContain("APIError")
+  test("a failed turn is reported as failed, with its message cut, not as a pause (#327)", () => {
+    const turn = readLastTurn([user(), assistant({ error: { name: "UnknownError", message: "upstream  503\n busy" } })])
+    expect(turn.pause).toBeUndefined()
+    expect(turn.failed).toBe("UnknownError: upstream 503 busy")
+    expect(readLastTurn([user(), assistant({ error: { name: "APIError" } })]).failed).toBe("APIError")
+    const long = readLastTurn([user(), assistant({ error: { name: "UnknownError", message: "x".repeat(500) } })])
+    expect(long.failed).toBe(`UnknownError: ${"x".repeat(200)}`)
   })
 
   test("GOAL_BLOCKED on its own line pauses with the reason", () => {
@@ -331,6 +339,39 @@ describe("GoalLoopPlugin", () => {
     const text = await run(hooks, "resume")
     expect(text).toContain("The goal is not met yet")
     expect((await load()).status).toBe("active")
+  })
+
+  test("a failed reply is retried through the continue path, and a good reply resets the count (#327)", async () => {
+    const hooks = await plugin()
+    await run(hooks, 'parser tests pass --check "bun test"')
+    messages = [user(), assistant({ error: { name: "UnknownError", message: "gpu busy" } })]
+    await idle(hooks)
+    expect((await load()).status).toBe("active")
+    expect((await load()).turnErrors).toBe(1)
+    expect(prompts.filter((p) => !p.body.noReply)).toHaveLength(1)
+    expect(prompts.some((p) => p.body.noReply && p.body.parts[0].text.includes("retrying (1 of 2)"))).toBe(true)
+
+    messages = [user(), assistant({ text: "Wrote the test." })]
+    await idle(hooks)
+    expect((await load()).turnErrors).toBe(0)
+  })
+
+  test("failed replies past the retry budget pause and name the error (#327)", async () => {
+    const hooks = await plugin()
+    await run(hooks, 'parser tests pass --check "bun test"')
+    messages = [user(), assistant({ error: { name: "UnknownError", message: "gpu busy" } })]
+    for (let i = 0; i < GOAL_DEFAULTS.turnRetries; i++) await idle(hooks)
+    expect((await load()).status).toBe("active")
+    const before = checkCalls
+    await idle(hooks)
+    const state = await load()
+    expect(state.status).toBe("paused")
+    expect(state.reason).toBe(`the turn failed (UnknownError: gpu busy) ${GOAL_DEFAULTS.turnRetries + 1} times in a row`)
+    expect(checkCalls).toBe(before)
+
+    const text = await run(hooks, "resume")
+    expect(text).toContain("The goal is not met yet")
+    expect((await load()).turnErrors).toBe(0)
   })
 
   test("the loop stops after the turn budget", async () => {
