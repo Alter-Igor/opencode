@@ -148,17 +148,25 @@ class Hub implements DelegateHub {
 
   /**
    * Events first; without a cursor, and again before a timeout, the current state (W2A-05/06).
-   * With a cursor, the link is already down, and the wait accepts failures, the current state is
-   * checked up front too: the event reporting the death died with the connection, so waiting the
-   * full timeout on it is a black hole (live finding 2026-10-08: a box recreate left oc_wait
-   * callers idling through timeouts while every session was already server_down). An expired or
-   * foreign cursor keeps failing closed through buffer.wait (resync first), and a wait that only
-   * wants idle or message is unchanged: server_down matches neither.
+   * With a cursor, the link already down, and a wait that accepts failures, the buffer is still
+   * drained first: onDrop appends a server_down status event, so if the cursor precedes the drop
+   * that event must be delivered (advancing the cursor) rather than answered by a static view -
+   * otherwise repeat wait(error) calls would keep returning the same view and never move on
+   * (CodeRabbit #157). Only when no buffered event matches does the current state short-circuit the
+   * long-poll: after a recreate the state dedups, so no NEW event ever arrives and waiting the full
+   * timeout is a black hole (live finding 2026-10-08: callers idled through timeouts on a dead box).
+   * An expired/foreign cursor keeps failing closed through buffer.wait, and a wait that only wants
+   * idle/message is untouched (server_down matches neither).
    */
   async wait(input: WaitInput): Promise<WaitResult> {
     const cursor = input.cursor ?? this.buffer.head()
-    const linkDown = input.cursor !== undefined && input.until.includes("error") && this.table.linkState().kind === "down" && this.buffer.accepts(input.cursor)
-    if (!input.cursor || linkDown) {
+    if (!input.cursor) {
+      const views = await this.matchingViews(input)
+      if (views.length) return { events: [], next: cursor, timedOut: false, views }
+    }
+    if (this.linkDownForError(input)) {
+      const buffered = await this.buffer.wait({ ...input, cursor, timeoutMs: 0 })
+      if (!buffered.timedOut) return buffered
       const views = await this.matchingViews(input)
       if (views.length) return { events: [], next: cursor, timedOut: false, views }
     }
@@ -166,6 +174,11 @@ class Hub implements DelegateHub {
     if (!result.timedOut || this.closed) return result
     const views = await this.matchingViews(input)
     return views.length ? { ...result, timedOut: false, views } : result
+  }
+
+  /** A cursor wait that accepts failures, on this run's still-valid cursor, with the link known down. */
+  private linkDownForError(input: WaitInput): boolean {
+    return input.cursor !== undefined && input.until.includes("error") && this.table.linkState().kind === "down" && this.buffer.accepts(input.cursor)
   }
 
   subscribe(listener: Listener): () => void {

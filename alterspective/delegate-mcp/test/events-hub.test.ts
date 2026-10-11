@@ -212,6 +212,32 @@ describe("event hub over SSE", () => {
     await box.up()
   })
 
+  // CodeRabbit #157: a cursor taken BEFORE the drop has a real server_down event waiting in the
+  // ring. It must be delivered (with an advanced cursor), not replaced by a static view a repeat
+  // wait would hand back forever without moving on.
+  test("cursor wait(error) from before the drop gets the buffered server_down event, not a stale view", async () => {
+    const h = make()
+    await h.start()
+    h.track("ses_1", DIR)
+    box.send(status("busy"))
+    await until(() => seq(h).includes("status:busy"))
+    const before = h.cursor()
+    await box.down()
+    await until(() => seq(h).includes("status:server_down"), 3000, "server_down")
+    const first = await h.wait({ sessionIDs: ["ses_1"], until: ["error"], timeoutMs: 3000, cursor: before })
+    expect(first.timedOut).toBe(false)
+    expect(first.events[0]).toMatchObject({ type: "status", state: "server_down", sessionID: "ses_1" })
+    expect(first.next.seq).toBeGreaterThan(before.seq)
+    expect(first.views).toBeUndefined()
+    // the event advanced the cursor: the next wait has nothing buffered, so the down link makes it
+    // short-circuit on the current view instead of idling the full timeout
+    const again = Date.now()
+    const second = await h.wait({ sessionIDs: ["ses_1"], until: ["error"], timeoutMs: 3000, cursor: first.next })
+    expect(second.views?.[0]?.state).toBe("server_down")
+    expect(Date.now() - again).toBeLessThan(3000)
+    await box.up()
+  })
+
   test("the same down link does not wake a wait(idle) early: server_down matches neither idle nor message", async () => {
     const h = make()
     await h.start()
