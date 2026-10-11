@@ -145,7 +145,56 @@ describe("dashboardData", () => {
 
   test("no records: empty lists, nothing busy", () => {
     const d = dashboardData([], NOW, extras)
-    expect(d).toMatchObject({ busy: 0, callers: [], running: [], recent: [], servedModels: [] })
+    expect(d).toMatchObject({ busy: 0, callers: [], running: [], recent: [], servedModels: [], scorecard: { models: [], tasks: 0 } })
+  })
+
+  test("scorecard: the 30-day per-model rollup from scorecard() with the right row shape", () => {
+    const d = dashboardData(
+      [
+        rec({ servedModels: { "a/m": 3, "b/m": 1 }, outcome: "completed", durationMs: 120_000, tokens: { input: 9_500, output: 100, reasoning: 0, cacheRead: 0, cacheWrite: 0 } }),
+        rec({ servedModels: { "b/m": 1 }, outcome: "error", errorCode: "rate_limited", durationMs: 180_000, tokens: { input: 500, output: 50, reasoning: 0, cacheRead: 0, cacheWrite: 0 } }),
+        rec({ servedModels: { "b/m": 1 }, outcome: "running" }),
+      ],
+      NOW,
+      extras,
+    )
+    expect(d.scorecard).toMatchObject({ days: 30, since: new Date(NOW - 30 * DAY).toISOString(), tasks: 3 })
+    expect(d.scorecard.generatedAt).toBe(new Date(NOW).toISOString())
+    expect(d.scorecard.models.map((m) => m.model)).toEqual(["b/m", "a/m"])
+    expect(d.scorecard.models[0]).toEqual({
+      model: "b/m",
+      kind: "served",
+      tasks: 2.25,
+      completed: 0.25,
+      error: 1,
+      aborted: 0,
+      unknown: 0,
+      running: 1,
+      successRate: 0.2,
+      medianMs: 150_000,
+      p90Ms: 180_000,
+      tokensIn: 2_875,
+      tokensOut: 75,
+      repos: 1,
+      errorKinds: { rate_limited: 1 },
+    })
+    expect(d.scorecard.models[1]).toMatchObject({ model: "a/m", kind: "served", tasks: 0.75, successRate: 1, tokensIn: 7_125, medianMs: 120_000 })
+  })
+
+  test("scorecard: a requested-but-unserved model is a distinct requested-only row", () => {
+    const d = dashboardData(
+      [
+        rec({ requestedModel: "synapse/ghost", servedModels: { "a/m": 2 }, outcome: "error", errorCode: "other" }),
+        rec({ startedAt: ago(31 * DAY), requestedModel: "synapse/ghost" }),
+      ],
+      NOW,
+      extras,
+    )
+    expect(d.scorecard.models).toEqual([
+      expect.objectContaining({ model: "a/m", kind: "served", tasks: 1 }),
+      expect.objectContaining({ model: "ghost", kind: "requested-only", tasks: 1, error: 1 }),
+    ])
+    expect(d.scorecard.tasks).toBe(1)
   })
 })
 
@@ -341,6 +390,87 @@ describe("dashboard page", () => {
     expect(runningTable?.children[1]?.children[0]?.children[0]?.textContent).toBe("proj-<i>")
     const recentTable = rendered.children[3]?.children[1]?.children[0]
     expect(recentTable?.children[1]?.children[0]?.children[1]?.textContent).toBe("proj-<i>")
+  })
+
+  test("the scorecard renders a successRate:null row as 'no data yet' without crashing", () => {
+    // A DOM double like the one above, plus a `style` bag so rate bars with a number can set widths.
+    class Node {
+      children: Node[] = []
+      textContent = ""
+      className = ""
+      hidden = false
+      style: Record<string, string> = {}
+      appendChild(n: Node) {
+        this.children.push(n)
+        return n
+      }
+      replaceChildren(...n: Node[]) {
+        this.children = n
+      }
+    }
+    const texts = (n: Node): string[] => [n.textContent, ...n.children.flatMap(texts)].filter(Boolean)
+    const made = new Function(
+      "document",
+      "fetch",
+      "setInterval",
+      `${DASHBOARD_JS.replace('"use strict";', "")}\nreturn { render };`,
+    )({ createElement: () => new Node(), querySelector: () => new Node() }, async () => ({ ok: false }), () => 0) as { render(d: unknown, now: number): Node }
+    const d = dashboardData([rec({ servedModels: { "b/m": 1 }, outcome: "running" })], NOW, extras)
+    const rendered = made.render(d, NOW)
+    const full = texts(rendered).join("|")
+    expect(full).toContain("Model scorecard (30 days)")
+    expect(full).toContain("the owner's on-prem tuning signal")
+    expect(full).toContain("b/m")
+    expect(full).toContain("no data yet")
+  })
+
+  test("a scorecard model name that is markup is only ever text", () => {
+    class Node {
+      children: Node[] = []
+      textContent = ""
+      className = ""
+      hidden = false
+      style: Record<string, string> = {}
+      appendChild(n: Node) {
+        this.children.push(n)
+        return n
+      }
+      replaceChildren(...n: Node[]) {
+        this.children = n
+      }
+    }
+    const texts = (n: Node): string[] => [n.textContent, ...n.children.flatMap(texts)].filter(Boolean)
+    const made = new Function(
+      "document",
+      "fetch",
+      "setInterval",
+      `${DASHBOARD_JS.replace('"use strict";', "")}\nreturn { render };`,
+    )({ createElement: () => new Node(), querySelector: () => new Node() }, async () => ({ ok: false }), () => 0) as { render(d: unknown, now: number): Node }
+    const d = dashboardData([rec({ servedModels: { "b/m": 1 }, outcome: "running" })], NOW, extras)
+    d.scorecard.models.push({
+      model: "<img src=x onerror=alert(1)>",
+      kind: "requested-only",
+      tasks: 1,
+      completed: 0,
+      error: 1,
+      aborted: 0,
+      unknown: 0,
+      running: 0,
+      successRate: null,
+      medianMs: null,
+      p90Ms: null,
+      tokensIn: 0,
+      tokensOut: 0,
+      repos: 1,
+      errorKinds: { other: 1 },
+    })
+    const rendered = made.render(d, NOW)
+    const full = texts(rendered).join("|")
+    // The markup survives only as text (a cell's textContent), never as a parsed element: no new node
+    // is ever created for the attribute or the tag, so nothing renders as an <img> or a handler.
+    expect(full).toContain("<img src=x onerror=alert(1)>")
+    expect(full).toContain("re-routed")
+    expect(full).toContain("no data yet")
   })
 })
 

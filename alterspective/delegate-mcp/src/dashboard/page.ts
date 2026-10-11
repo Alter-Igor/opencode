@@ -52,6 +52,28 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .state-running { color: Highlight; }
 .state-error { text-decoration: underline; }
 .empty { margin: 0; padding: 4px 0; color: GrayText; }
+.badge {
+  border: 1px solid color-mix(in srgb, CanvasText 40%, Canvas);
+  border-radius: 6px;
+  padding: 0 6px;
+  color: GrayText;
+  white-space: nowrap;
+}
+.badge-rerouted { border-style: dashed; font-weight: 600; color: CanvasText; background: color-mix(in srgb, Highlight 15%, Canvas); }
+.track {
+  display: inline-block;
+  vertical-align: middle;
+  width: 90px;
+  height: 8px;
+  border-radius: 4px;
+  border: 1px solid color-mix(in srgb, CanvasText 25%, Canvas);
+  background: color-mix(in srgb, CanvasText 8%, Canvas);
+}
+.fill { display: block; height: 100%; border-radius: 4px; }
+.fill-good { background: color-mix(in srgb, green 55%, Canvas); }
+.fill-mid { background: color-mix(in srgb, orange 60%, Canvas); }
+.fill-bad { background: color-mix(in srgb, red 55%, Canvas); }
+.bar-none { display: inline-block; vertical-align: middle; width: 90px; height: 8px; border-radius: 4px; border: 1px dashed color-mix(in srgb, CanvasText 30%, Canvas); }
 </style>
 </head>
 <body>
@@ -95,6 +117,49 @@ function modelsText(served) {
   var names = Object.keys(served);
   if (!names.length) return "not known yet";
   return names.map(function (name) { return name + " (" + served[name] + (served[name] === 1 ? " call)" : " calls)"); }).join(", ");
+}
+
+function minutesText(ms) {
+  if (typeof ms !== "number" || !isFinite(ms)) return "n/a";
+  var m = ms / 60000;
+  return (m < 0.1 ? m.toFixed(2) : m < 10 ? m.toFixed(1) : Math.round(m)) + " min";
+}
+
+function percentText(fraction) {
+  if (typeof fraction !== "number" || !isFinite(fraction)) return "n/a";
+  return Math.round(fraction * 100) + "%";
+}
+
+function formatTokensK(n) {
+  if (typeof n !== "number" || !isFinite(n) || n <= 0) return "0k";
+  var k = n / 1000;
+  return (k < 10 ? k.toFixed(1) : Math.round(k)) + "k";
+}
+
+function rateBar(rate) {
+  var wrap = el("td");
+  if (rate === null || typeof rate !== "number" || !isFinite(rate)) {
+    wrap.appendChild(el("span", null, "bar-none"));
+    wrap.appendChild(el("span", " no data yet", "muted"));
+    return wrap;
+  }
+  var cls = rate >= 0.85 ? "good" : rate >= 0.6 ? "mid" : "bad";
+  var bar = el("span", null, "track");
+  var fill = el("span", null, "fill fill-" + cls);
+  fill.style.width = Math.round(rate * 100) + "%";
+  bar.appendChild(fill);
+  wrap.appendChild(bar);
+  wrap.appendChild(el("span", " " + percentText(rate), "muted"));
+  return wrap;
+}
+
+function kindBadge(kind) {
+  if (kind === "requested-only") {
+    var b = el("span", "re-routed", "badge badge-rerouted");
+    b.title = "Requested but never served - Synapse re-routed or 404'd it. The routing-health signal.";
+    return b;
+  }
+  return el("span", "served", "badge");
 }
 
 function stateCell(outcome) {
@@ -161,6 +226,19 @@ function render(data, now) {
     [{ label: "Model" }, { label: "Calls", num: true }],
     data.servedModels.map(function (m) { return [m.model, m.calls]; }),
     "No served models recorded in the last 7 days.")));
+
+  var card = data.scorecard;
+  var score = section("Model scorecard (30 days)", table(
+    [{ label: "Model" }, { label: "Rate" }, { label: "Tasks", num: true }, { label: "Err", num: true }, { label: "Median", num: true }, { label: "P90", num: true }, { label: "Tok in", num: true }, { label: "Repos", num: true }],
+    card.models.map(function (m) {
+      var model = el("td", m.model);
+      model.appendChild(kindBadge(m.kind));
+      var finished = m.completed + m.error + m.aborted + m.unknown;
+      return [model, rateBar(m.successRate), m.tasks.toFixed(1), percentText(finished > 0 ? m.error / finished : 0), minutesText(m.medianMs), minutesText(m.p90Ms), formatTokensK(m.tokensIn), m.repos];
+    }),
+    "No model activity in the last 30 days."));
+  score.appendChild(el("p", "Models are grouped by the share of calls they served. 'Re-routed' rows are asks Synapse did not serve (e.g. a retired or unserved model) - the owner's on-prem tuning signal.", "muted"));
+  root.appendChild(score);
   return root;
 }
 

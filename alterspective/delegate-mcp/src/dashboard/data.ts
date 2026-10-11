@@ -3,6 +3,7 @@
 // strings are data that a client or the box chose; they are cut here and the page never treats them as markup.
 import type { Outcome, TaskRecord } from "../reporting/record.ts"
 import { mainServedModel } from "../reporting/served.ts"
+import { scorecard, type Scorecard } from "../reporting/scorecard.ts"
 
 export const DAY_MS = 24 * 60 * 60 * 1000
 export const MAX_RECENT_TASKS = 200
@@ -46,6 +47,8 @@ export type DashboardData = {
   running: RunningRow[]
   recent: RecentRow[]
   servedModels: ServedRow[]
+  /** Per-model rollup over the last 30 days (src/reporting/scorecard.ts), rows sorted by tasks desc. */
+  scorecard: Scorecard
 }
 
 const cut = (text: string) => text.slice(0, MAX_FIELD_CHARS)
@@ -108,5 +111,6 @@ export function dashboardData(records: readonly TaskRecord[], now: number, extra
       }
     }),
     servedModels: [...totals].map(([model, calls]) => ({ model, calls })).sort((a, b) => b.calls - a.calls || byName(a.model, b.model)),
+    scorecard: scorecard(records, now),
   }
 }
