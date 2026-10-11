@@ -1,10 +1,18 @@
 // #129 dashboard: the pure data function, the local server, the constant page and oc_dashboard.
 import { describe, expect, test } from "bun:test"
+import { mkdtemp, writeFile } from "node:fs/promises"
+import os from "node:os"
+import path from "node:path"
 import { dashboardData } from "../src/dashboard/data.ts"
-import { DASHBOARD_HTML, DASHBOARD_JS } from "../src/dashboard/page.ts"
+import { DASHBOARD_HTML } from "../src/dashboard/page.ts"
+import { DASHBOARD_APP_JS } from "../src/dashboard/app.ts"
+import { DASHBOARD_CSS } from "../src/dashboard/style.ts"
+import { dashboardOpenedBefore } from "../src/dashboard/open-once.ts"
 import { CSP, startDashboard, type Dashboard } from "../src/dashboard/server.ts"
+import { EXIT, parseCli, runDashboard } from "../src/cli.ts"
+import type { Runtime } from "../src/runtime.ts"
 import type { TaskRecord } from "../src/reporting/record.ts"
-import { dashboardTool, stopDashboard } from "../src/tools/dashboard.ts"
+import { dashboardTool, openDashboardOnce, stopDashboard } from "../src/tools/dashboard.ts"
 import { allTools, coreTools } from "../src/tools/index.ts"
 import { data as dataOf, fakeContext, invoke } from "./tools-core-fixture.ts"
 
@@ -242,12 +250,41 @@ describe("dashboard server", () => {
       expect(js.status).toBe(200)
       expect(js.headers.get("content-type")).toContain("javascript")
       expect(js.headers.get("cache-control")).toBe("no-store")
-      expect(await js.text()).toBe(DASHBOARD_JS)
+      expect(await js.text()).toBe(DASHBOARD_APP_JS)
+      const css = await fetch(`${d.url}styles.css`)
+      expect(css.status).toBe(200)
+      expect(css.headers.get("content-type")).toContain("text/css")
+      expect(css.headers.get("cache-control")).toBe("no-store")
+      expect(await css.text()).toBe(DASHBOARD_CSS)
     })
   })
 
   test("CSP is the exact policy asked for", () => {
     expect(CSP).toBe("default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+  })
+
+  test("the brand assets serve through the same token gate, and unknown names 404", async () => {
+    await withServer(async (d, base) => {
+      const logo = await fetch(`${d.url}logo.png`)
+      expect(logo.status).toBe(200)
+      expect(logo.headers.get("content-type")).toContain("image/png")
+      expect(logo.headers.get("cache-control")).toBe("no-store")
+      expect((await logo.arrayBuffer()).byteLength).toBeGreaterThan(1000)
+      expect((await fetch(`${d.url}logo-reversed.png`)).status).toBe(200)
+      for (const icon of ["icon_sustain", "icon_build", "icon_validate", "icon_discover"]) {
+        const res = await fetch(`${d.url}${icon}.svg`)
+        expect(res.status).toBe(200)
+        expect(res.headers.get("content-type")).toContain("image/svg")
+        const text = await res.text()
+        // the shipped vectors: outlined, currentColor, and no colour literal of their own (ICON-001)
+        expect(text).toContain('stroke="currentColor"')
+        expect(text).not.toMatch(/#[0-9a-fA-F]{3,8}/)
+      }
+      // names outside the fixed registry never resolve, with or without the token
+      expect((await fetch(`${d.url}../server.ts`)).status).toBe(404)
+      expect((await fetch(`${d.url}secrets.png`)).status).toBe(404)
+      expect((await fetch(`${base}/logo.png`)).status).toBe(404)
+    })
   })
 
   test("wrong token and no token are 404 with an empty body", async () => {
@@ -322,41 +359,178 @@ describe("dashboard server", () => {
 })
 
 describe("dashboard page", () => {
-  const both = DASHBOARD_HTML + "\n" + DASHBOARD_JS
+  const page = DASHBOARD_HTML
+  const script = DASHBOARD_APP_JS
 
   test("the script never writes markup or evaluates text", () => {
-    for (const banned of ["innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function"]) expect(DASHBOARD_JS).not.toContain(banned)
-    expect(DASHBOARD_JS).toContain("textContent")
-    expect(DASHBOARD_JS).toContain("createElement")
+    for (const banned of ["innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function"]) expect(script).not.toContain(banned)
+    expect(script).toContain("textContent")
+    expect(script).toContain("createElement")
   })
 
-  test("one timer only, no reload button, no inline script", () => {
-    expect(DASHBOARD_JS.match(/setInterval\(/g)).toHaveLength(1)
-    expect(DASHBOARD_JS).not.toContain("setTimeout(")
-    expect(DASHBOARD_HTML.toLowerCase()).not.toContain("<button")
-    expect(DASHBOARD_HTML.match(/<script/g)).toHaveLength(1)
-    expect(DASHBOARD_HTML).toContain('<script src="app.js"></script>')
-    expect(DASHBOARD_HTML).toContain("<title>Delegated work</title>")
+  test("one timer only, no reload button in the static page, no inline script", () => {
+    expect(script.match(/setInterval\(/g)).toHaveLength(1)
+    expect(page.toLowerCase()).not.toContain("<button")
+    expect(page.match(/<script/g)).toHaveLength(1)
+    expect(page).toContain('<script src="app.js"></script>')
+    expect(page).toContain("<title>Delegated work</title>")
+    // iter-8: no new escape channel either - the static page carries no forms and no links.
+    expect(page.toLowerCase()).not.toContain("<form")
+    expect(page.toLowerCase()).not.toContain("<a ")
   })
 
-  test("only system colours: no hex, rgb(), hsl() or named colours", () => {
-    expect(both).not.toMatch(/#[0-9a-fA-F]{3,8}\b/)
-    expect(both).not.toContain("rgb(")
-    expect(both).not.toContain("rgba(")
-    expect(both).not.toContain("hsl(")
-    expect(DASHBOARD_HTML).toContain("color-scheme: light dark")
-    expect(DASHBOARD_HTML).toContain("color-mix(")
-    const css = DASHBOARD_HTML.slice(DASHBOARD_HTML.indexOf("<style>"), DASHBOARD_HTML.indexOf("</style>"))
-    for (const named of ["red", "green", "blue", "white", "black", "gray", "orange", "yellow"]) expect(css).not.toMatch(new RegExp(`:\\s*${named}\\b`, "i"))
+  test("brand token discipline: hexes live only in the :root block, CSS is var()/color-mix() only", () => {
+    const tokens = DASHBOARD_HTML.slice(DASHBOARD_HTML.indexOf("<style>"), DASHBOARD_HTML.indexOf("</style>"))
+    const hexes = (text: string) => [...text.matchAll(/#[0-9a-fA-F]{6}\b/g)].map((m) => m[0].toUpperCase()).sort()
+    const brand = ["#075156", "#2C8248", "#ABDD65", "#17232D", "#E5EEEF", "#FFFFFF", "#F59E0B", "#BA1A1A", "#6B7280", "#0F171D", "#1A2530", "#E5EEEF", "#D0D8DC"]
+    // every hex in the :root is a brand or dark-mode token (WEBSTA-001-UX-QUALITY UX-BRAND-08a)
+    for (const hex of hexes(tokens)) expect(brand).toContain(hex)
+    // and nowhere else: outside the style block the page, the script and the stylesheet carry no colour literal
+    const outside = DASHBOARD_HTML.slice(0, DASHBOARD_HTML.indexOf("<style>")) + DASHBOARD_HTML.slice(DASHBOARD_HTML.indexOf("</style>")) + script + DASHBOARD_CSS
+    expect(outside).not.toMatch(/#[0-9a-fA-F]{3,8}\b/)
+    expect(outside).not.toContain("rgb(")
+    expect(outside).not.toContain("rgba(")
+    expect(outside).not.toContain("hsl(")
+    expect(DASHBOARD_CSS).toContain("color-mix(")
+    // brand constants (the --as-*) are never redefined: each appears exactly once, in the token block
+    for (const token of ["--as-marine", "--as-green", "--as-citrus", "--as-navy", "--as-pale-blue", "--as-white"]) {
+      expect(tokens.match(new RegExp(`${token}:`, "g"))).toHaveLength(1)
+    }
   })
 
-  test("the script's render builds the sections from data without a browser", () => {
-    // A tiny DOM double: enough to run render() as a pure function of (data, now).
+  test("logo, tablist and four static views are in the page: a small app, not one long page", () => {
+    // LOGO-004: a real img, at least 120px wide; LOGO-001: it is not centred (flex bar, first child).
+    expect(page).toContain('<img class="logo"')
+    expect(page).toContain('alt="Alterspective"')
+    expect(Number(page.match(/width="(\d+)"/)?.[1])).toBeGreaterThanOrEqual(120)
+    expect(page).toContain('role="tablist"')
+    expect(page).toContain('data-role="tabs"')
+    for (const view of ["overview", "tasks", "models", "about"]) expect(page).toContain(`data-view="${view}"`)
+    expect((page.match(/role="tabpanel"/g))?.length).toBe(4)
+    expect(page).toContain("hidden><div data-role=\"body-tasks\"")
+  })
+
+  test("the stylesheet themes both ways and names every state beyond colour", () => {
+    // A11Y-002 / UX-BRAND-08: explicit colours under both themes, never inherited.
+    expect(page).toContain('[data-theme="dark"]')
+    expect(page).toContain("@media (prefers-color-scheme: dark)")
+    expect(DASHBOARD_CSS).toContain("prefers-reduced-motion")
+    // colour is never the only signal: states are underlined/weight-styled, the re-routed row is dashed
+    expect(DASHBOARD_CSS).toContain("text-decoration: underline")
+    expect(DASHBOARD_CSS).toContain("border-style: dashed")
+    // citrus is never a text colour on dark: the token appears only in a warning-border use
+    expect(DASHBOARD_CSS).not.toContain("var(--as-citrus)")
+    expect(DASHBOARD_CSS).not.toMatch(/:\s*(red|green|blue|white|black|gray|orange|yellow)\b/i)
+  })
+
+  test("boot wires the tabs: click and arrows switch views, the theme cycle re-skins and swaps the logo", async () => {
+    // A DOM double rich enough for boot() to run: the tabs node answers addEventListener (the guard),
+    // fetch serves one data.json, setInterval is captured but never fired.
+    class E {
+      children: E[] = []
+      textContent = ""
+      className = ""
+      id = ""
+      hidden = false
+      attrs: Record<string, string> = {}
+      style: Record<string, unknown> = { setProperty: (k: string, v: string) => void ((this as { css?: Record<string, string> }).css = { ...(this as { css?: Record<string, string> }).css, [k]: v }) }
+      listeners: Record<string, ((event?: { key?: string }) => void)[]> = {}
+      setAttribute(k: string, v: string) {
+        this.attrs[k] = v
+      }
+      getAttribute(k: string) {
+        return this.attrs[k] ?? null
+      }
+      removeAttribute(k: string) {
+        delete this.attrs[k]
+      }
+      addEventListener(type: string, fn: (event?: { key?: string }) => void) {
+        ;(this.listeners[type] ??= []).push(fn)
+      }
+      focus() {}
+      appendChild(n: E) {
+        this.children.push(n)
+        return n
+      }
+      replaceChildren(...n: E[]) {
+        this.children = n
+      }
+      fire(type: string, event?: { key?: string }) {
+        for (const fn of this.listeners[type] ?? []) fn(event)
+      }
+    }
+    const bySelector = new Map<string, E>()
+    const tabs = new E()
+    bySelector.set("[data-role=tabs]", tabs)
+    for (const v of ["overview", "tasks", "models", "about"]) {
+      bySelector.set(`#view-${v}`, new E())
+      bySelector.set(`[data-role=body-${v}]`, new E())
+    }
+    const asof = new E()
+    const notice = new E()
+    const logo = new E()
+    bySelector.set("[data-role=asof]", asof)
+    bySelector.set("[data-role=notice]", notice)
+    bySelector.set("[data-role=logo]", logo)
+    const documentElement = new E()
+    const doc = {
+      createElement: () => new E(),
+      querySelector: (sel: string) => bySelector.get(sel) ?? null,
+      documentElement,
+    }
+    const data = dashboardData([rec({ outcome: "running" })], NOW, extras)
+    const fetchFake = async () => ({ ok: true, json: async () => data })
+    let tick: (() => Promise<void>) | undefined
+    const setIntervalFake = (fn: () => Promise<void>) => {
+      tick = fn
+      return 0 as unknown as ReturnType<typeof setInterval>
+    }
+    const localStorageFake = { store: new Map<string, string>(), getItem(k: string) { return this.store.get(k) ?? null }, setItem(k: string, v: string) { this.store.set(k, v) } }
+    new Function("document", "fetch", "setInterval", "localStorage", "matchMedia", "AbortSignal", DASHBOARD_APP_JS)(doc, fetchFake, setIntervalFake, localStorageFake, () => ({ matches: false, addEventListener: () => {} }), AbortSignal)
+    // the script's first tick() is already running; let it land, then drive one more
+    await new Promise((r) => setTimeout(r, 20))
+    await tick?.()
+    // four brand-iconed tabs plus the theme control
+    expect(tabs.children.map((b) => b.attrs.role)).toEqual(["tab", "tab", "tab", "tab", undefined])
+    const flat = (n: E): string => [n.textContent, ...n.children.flatMap(flat)].filter(Boolean).join("")
+    expect(tabs.children.slice(0, 4).map(flat)).toEqual(["Overview", "Tasks", "Models", "About"])
+    for (const b of tabs.children.slice(0, 4)) expect(((b.children[0] as E) as unknown as { css: Record<string, string> }).css["--icon"]).toContain(".svg")
+    expect(logo.getAttribute("src")).toBe("logo.png")
+    // click Models: only the models panel stays visible, the body carries the scorecard
+    tabs.children[2]!.fire("click")
+    expect(bySelector.get("#view-models")!.hidden).toBe(false)
+    expect(bySelector.get("#view-overview")!.hidden).toBe(true)
+    expect((bySelector.get("[data-role=body-models]") as E).children[0]!.children.length).toBeGreaterThan(0)
+    // arrow from the active tab wraps to the next
+    tabs.children[2]!.fire("keydown", { key: "ArrowRight" })
+    expect(bySelector.get("#view-about")!.hidden).toBe(false)
+    expect(bySelector.get("#view-models")!.hidden).toBe(true)
+    // theme cycle: system -> light -> dark, with the reversed logo and localStorage keeping the choice
+    tabs.children[4]!.fire("click")
+    expect(documentElement.getAttribute("data-theme")).toBe("light")
+    expect(logo.getAttribute("src")).toBe("logo.png")
+    tabs.children[4]!.fire("click")
+    expect(documentElement.getAttribute("data-theme")).toBe("dark")
+    expect(logo.getAttribute("src")).toBe("logo-reversed.png")
+    expect(localStorageFake.getItem("oc-dash-theme")).toBe("dark")
+    // a notice path: a failing fetch says so without touching the views
+    notice.hidden = true
+    await new Function("document", "fetch", "setInterval", "localStorage", "matchMedia", "AbortSignal", DASHBOARD_APP_JS)(doc, async () => { throw new Error("down") }, setIntervalFake, localStorageFake, () => ({ matches: false, addEventListener: () => {} }), AbortSignal)
+    await tick?.()
+    expect(notice.hidden).toBe(false)
+    expect(notice.textContent).toContain("bridge may have stopped")
+  })
+
+  test("the script's render builds the four views from data without a browser", () => {
+    // A tiny DOM double: enough to run render() as a pure function of (data, now). render() returns a
+    // root div holding the four view panels in order (overview, tasks, models, about).
     class Node {
       children: Node[] = []
       textContent = ""
       className = ""
       hidden = false
+      style: Record<string, unknown> = { setProperty: () => {} }
+      setAttribute() {}
       appendChild(n: Node) {
         this.children.push(n)
         return n
@@ -370,10 +544,11 @@ describe("dashboard page", () => {
       "document",
       "fetch",
       "setInterval",
-      `${DASHBOARD_JS.replace('"use strict";', "")}\nreturn { render, formatDuration };`,
-    )({ createElement: () => new Node(), querySelector: () => new Node() }, async () => ({ ok: false }), () => 0) as { render(d: unknown, now: number): Node; formatDuration(ms: number): string }
+      `${DASHBOARD_APP_JS.replace('"use strict";', "")}\nreturn { render, renderView, formatDuration, VIEWS };`,
+    )({ createElement: () => new Node(), querySelector: () => new Node() }, async () => ({ ok: false }), () => 0) as { render(d: unknown, now: number): Node; renderView(v: string, d: unknown, now: number): Node; formatDuration(ms: number): string; VIEWS: Array<{ id: string; label: string }> }
     const empty = texts(made.render(dashboardData([], NOW, { boxRunning: false, bridge: "me" }), NOW)).join("|")
-    for (const words of ["Box stopped", "0 tasks running", "Who is delegating", "Running now", "Nothing running.", "Recent tasks", "Models served (7 days)"]) expect(empty).toContain(words)
+    for (const words of ["Box stopped", "0 tasks running", "Who is delegating", "Running now", "Nothing running.", "Recent tasks", "Models served (7 days)", "Model scorecard (30 days)", "About this page"]) expect(empty).toContain(words)
+    expect(made.VIEWS.map((v) => v.id)).toEqual(["overview", "tasks", "models", "about"])
     const rendered = made.render(dashboardData([rec({ outcome: "running", repo: "<b>x</b>", caller: "proj-<i>", servedModels: { "m/a": 2 } })], NOW, extras), NOW)
     const full = texts(rendered).join("|")
     expect(full).toContain("<b>x</b>")
@@ -385,21 +560,22 @@ describe("dashboard page", () => {
     expect(full).toContain("m/a (2 calls)")
     expect(made.formatDuration(3_725_000)).toBe("1 h 2 min")
 
-    // #136: assert the Session cell in "Running now" and "Recent tasks" separately (not only in flattened page text)
-    const runningTable = rendered.children[2]?.children[1]?.children[0]
+    // #136 kept: the Session cell in the running and recent tables, reached by structure not flat text.
+    const tasksView = rendered.children[1]
+    const runningTable = tasksView?.children[0]?.children[1]?.children[0]
     expect(runningTable?.children[1]?.children[0]?.children[0]?.textContent).toBe("proj-<i>")
-    const recentTable = rendered.children[3]?.children[1]?.children[0]
+    const recentTable = tasksView?.children[1]?.children[1]?.children[0]
     expect(recentTable?.children[1]?.children[0]?.children[1]?.textContent).toBe("proj-<i>")
   })
 
   test("the scorecard renders a successRate:null row as 'no data yet' without crashing", () => {
-    // A DOM double like the one above, plus a `style` bag so rate bars with a number can set widths.
     class Node {
       children: Node[] = []
       textContent = ""
       className = ""
       hidden = false
-      style: Record<string, string> = {}
+      style: Record<string, unknown> = { setProperty: () => {} }
+      setAttribute() {}
       appendChild(n: Node) {
         this.children.push(n)
         return n
@@ -413,11 +589,10 @@ describe("dashboard page", () => {
       "document",
       "fetch",
       "setInterval",
-      `${DASHBOARD_JS.replace('"use strict";', "")}\nreturn { render };`,
+      `${DASHBOARD_APP_JS.replace('"use strict";', "")}\nreturn { render };`,
     )({ createElement: () => new Node(), querySelector: () => new Node() }, async () => ({ ok: false }), () => 0) as { render(d: unknown, now: number): Node }
     const d = dashboardData([rec({ servedModels: { "b/m": 1 }, outcome: "running" })], NOW, extras)
-    const rendered = made.render(d, NOW)
-    const full = texts(rendered).join("|")
+    const full = texts(made.render(d, NOW)).join("|")
     expect(full).toContain("Model scorecard (30 days)")
     expect(full).toContain("the owner's on-prem tuning signal")
     expect(full).toContain("b/m")
@@ -430,7 +605,8 @@ describe("dashboard page", () => {
       textContent = ""
       className = ""
       hidden = false
-      style: Record<string, string> = {}
+      style: Record<string, unknown> = { setProperty: () => {} }
+      setAttribute() {}
       appendChild(n: Node) {
         this.children.push(n)
         return n
@@ -444,7 +620,7 @@ describe("dashboard page", () => {
       "document",
       "fetch",
       "setInterval",
-      `${DASHBOARD_JS.replace('"use strict";', "")}\nreturn { render };`,
+      `${DASHBOARD_APP_JS.replace('"use strict";', "")}\nreturn { render };`,
     )({ createElement: () => new Node(), querySelector: () => new Node() }, async () => ({ ok: false }), () => 0) as { render(d: unknown, now: number): Node }
     const d = dashboardData([rec({ servedModels: { "b/m": 1 }, outcome: "running" })], NOW, extras)
     d.scorecard.models.push({
@@ -464,8 +640,7 @@ describe("dashboard page", () => {
       repos: 1,
       errorKinds: { other: 1 },
     })
-    const rendered = made.render(d, NOW)
-    const full = texts(rendered).join("|")
+    const full = texts(made.render(d, NOW)).join("|")
     // The markup survives only as text (a cell's textContent), never as a parsed element: no new node
     // is ever created for the attribute or the tag, so nothing renders as an <img> or a handler.
     expect(full).toContain("<img src=x onerror=alert(1)>")
@@ -505,4 +680,65 @@ describe("oc_dashboard", () => {
       stopDashboard(f.ctx)
     }
   })
+
+  test("openDashboardOnce: first call opens and marks, a second never opens again, and oc_dashboard still works", async () => {
+    const f = fakeContext({ boxHeld: false })
+    f.ctx.config.home = await mkdtemp(path.join(os.tmpdir(), "ocd-first-"))
+    const opened: string[] = []
+    try {
+      expect(await openDashboardOnce(f.ctx, (url) => opened.push(url))).toBe(true)
+      expect(opened).toHaveLength(1)
+      expect(await dashboardOpenedBefore(f.ctx.config.home)).toBe(true)
+      const before = opened.length
+      expect(await openDashboardOnce(f.ctx, (url) => opened.push(url))).toBe(false)
+      expect(opened).toHaveLength(before)
+      // the page from the first call still answers
+      const res = await fetch(`${opened[0]}data.json`)
+      expect(res.status).toBe(200)
+    } finally {
+      stopDashboard(f.ctx)
+    }
+  })
+
+  test("openDashboardOnce does not start the dashboard when the home was already opened", async () => {
+    const f = fakeContext({ boxHeld: false })
+    f.ctx.config.home = await mkdtemp(path.join(os.tmpdir(), "ocd-already-"))
+    await writeFile(path.join(f.ctx.config.home, "dashboard-opened"), "2026-10-11T00:00:00.000Z earlier\n")
+    const opened: string[] = []
+    expect(await openDashboardOnce(f.ctx, (url) => opened.push(url))).toBe(false)
+    expect(opened).toEqual([])
+    expect(f.started.count).toBe(0)
+  })
 })
+
+describe("cli dashboard", () => {
+  test("parse: default opens the browser, --no-open turns it off, bad flags refused", () => {
+    expect(parseCli(["dashboard"])).toEqual({ kind: "dashboard", open: true })
+    expect(parseCli(["dashboard", "--no-open"])).toEqual({ kind: "dashboard", open: false })
+    expect(parseCli(["dashboard", "--bogus"]).kind).toBe("error")
+  })
+
+  test("runDashboard prints the local link, serves data, stops with Ctrl-C, and never starts the box", async () => {
+    const f = fakeContext({ boxHeld: false })
+    f.ctx.config.home = await mkdtemp(path.join(os.tmpdir(), "ocd-clidash-"))
+    const lines: string[] = []
+    const errs: string[] = []
+    let released = false
+    const make = async () => ({ ctx: f.ctx, versionInfo: { version: "v", package: "0", sha: "x", dirty: false, built: null }, name: "cli-test", shutdown: async () => { released = true } }) as unknown as Runtime
+    try {
+      const code = await runDashboard({ out: (t) => lines.push(t), err: (t) => errs.push(t) }, false, make, () => Promise.resolve())
+      expect(code).toBe(EXIT.ok)
+      expect(lines[0]).toMatch(/^Dashboard: http:\/\/127\.0\.0\.1:\d+\/[0-9a-f]{32}\/$/)
+      expect(lines.join("\n")).toContain("never starts the sandbox")
+      expect(errs.join("")).toContain("--no-open")
+      // --no-open: the marker was not written and the box was never touched
+      expect(await dashboardOpenedBefore(f.ctx.config.home)).toBe(false)
+      expect(released).toBe(true)
+      expect(f.started.count).toBe(0)
+      expect(f.boxCmds).toEqual([])
+    } finally {
+      stopDashboard(f.ctx)
+    }
+  })
+})
+

@@ -17,6 +17,7 @@ import { createRuntime, readVersion, shutdownSignal, type Runtime, type VersionI
 import { createServer } from "./server.ts"
 import { doctorTool } from "./tools/doctor.ts"
 import { loginTool } from "./tools/login.ts"
+import { ensureDashboard, openDashboardOnce, stopDashboard } from "./tools/dashboard.ts"
 
 export const EXIT = { ok: 0, failed: 1, usage: 2 } as const
 
@@ -26,6 +27,10 @@ Usage:
   opencode-delegate [mcp] [--channels]   Run the stdio MCP server (what an AI client starts)
   opencode-delegate watch [options]      One line per session event that needs attention (see: watch --help)
   opencode-delegate doctor               Print the oc_doctor report as JSON (never starts the sandbox; exit 1 unless verified)
+  opencode-delegate dashboard [--no-open]
+                                         Start the read-only dashboard, print its local link, keep it up until
+                                         Ctrl-C. The first bridge run opens it automatically (marker under the
+                                         bridge home); --no-open never opens the browser and never writes it.
   opencode-delegate login synapse        Sign in to Synapse on this computer (browser), like oc_login {server:"synapse"}
   opencode-delegate outcomes [--days N] [--no-redact]
                                          Settled task outcomes as JSONL on stdout (benchmark material, D7):
@@ -63,6 +68,7 @@ export type Command =
   | { kind: "mcp"; channels: boolean }
   | { kind: "watch"; args: string[] }
   | { kind: "doctor" }
+  | { kind: "dashboard"; open: boolean }
   | { kind: "login"; server: "synapse" }
   | { kind: "outcomes"; days: number; redact: boolean }
   | { kind: "scorecard"; days: number; json: boolean }
@@ -98,6 +104,10 @@ export function parseCli(argv: string[]): Command {
   if (command === "doctor") {
     const parsed = parseFlags(flagArgs, [])
     return "error" in parsed ? { kind: "error", message: parsed.error } : { kind: "doctor" }
+  }
+  if (command === "dashboard") {
+    const parsed = parseFlags(flagArgs, ["--no-open"])
+    return "error" in parsed ? { kind: "error", message: parsed.error } : { kind: "dashboard", open: !parsed.flags.has("--no-open") }
   }
   if (command === "login") return flagArgs.length === 1 && flagArgs[0] === "synapse" ? { kind: "login", server: "synapse" } : { kind: "error", message: "Usage: login synapse" }
   if (command === "outcomes") return parseOutcomes(flagArgs)
@@ -171,6 +181,10 @@ async function runMcp(channels: boolean): Promise<number> {
   const stopped = shutdownSignal(process)
   await server.connect(new StdioServerTransport())
   runtime.ctx.log.log("info", "cli", "MCP server listening on stdio", { bridge: runtime.name, channels })
+  // iter-8: the owner gets the dashboard in the browser once per bridge home. Fire-and-forget: it
+  // reads one marker file, opens a detached tab, writes the marker back; nothing here can block or
+  // take down the bridge, and every later start is a single file read.
+  void openDashboardOnce(runtime.ctx)
   // WS2 (#48): renew the owner's Synapse token on the host while this bridge runs.
   const stopRefresh = runtime.synapse?.start() ?? (() => {})
   // #67 step 4: with OCD_KEYSTONE_HOST_AUTH=1, renew the owner's Keystone connection tokens too.
@@ -192,6 +206,34 @@ export async function runDoctor(io: Io, make: () => Promise<Runtime> = createRun
     return !result.isError && result.structuredContent?.verified === true ? EXIT.ok : EXIT.failed
   } finally {
     await runtime.shutdown("doctor done")
+  }
+}
+
+/**
+ * iter-8 `dashboard`: the read-only page on its own (no MCP client needed). Prints the local link
+ * and stays up until Ctrl-C. Never starts the box (the dashboard reads host records only). Without
+ * --no-open it opens the browser the first time per home - the same marker `mcp` uses, so a bridge
+ * that already opened the page here does not open it again on its next start, and vice versa.
+ * `wait` stops the wait (Ctrl-C in production; a resolved promise in tests).
+ */
+export async function runDashboard(
+  io: Io,
+  open: boolean,
+  make: () => Promise<Runtime> = createRuntime,
+  wait: () => Promise<void> = () => new Promise<void>((resolve) => process.once("SIGINT", () => resolve())),
+): Promise<number> {
+  const runtime = await make()
+  const dashboard = ensureDashboard(runtime.ctx)
+  io.out(`Dashboard: ${dashboard.url}`)
+  io.out("Read-only, local (127.0.0.1), stops with Ctrl-C. It never starts the sandbox.")
+  try {
+    if (open) await openDashboardOnce(runtime.ctx)
+    else io.err("opencode-delegate: --no-open: the browser was not opened and the first-run marker was not written.")
+    await wait()
+    return EXIT.ok
+  } finally {
+    stopDashboard(runtime.ctx)
+    await runtime.shutdown("dashboard done")
   }
 }
 
@@ -356,6 +398,8 @@ export async function main(argv: string[], io: Io = processIo): Promise<number> 
       return runWatch(command.args)
     case "doctor":
       return runDoctor(io)
+    case "dashboard":
+      return runDashboard(io, command.open)
     case "login":
       return runLogin(io)
     case "outcomes":

@@ -3,8 +3,12 @@
 // which Synapse served, and each task's state and duration. The server (src/dashboard) binds
 // 127.0.0.1 only, starts once per bridge process and stops with it. The page reads the same host-side
 // task records as oc_report; it never starts the box and never calls Docker.
+// iter-8: the same page is the first-run view - openDashboardOnce starts it and opens the owner's
+// browser once per bridge home (marker under the home), used from `mcp` start and the CLI command.
 import { dashboardData } from "../dashboard/data.ts"
 import { startDashboard, type Dashboard } from "../dashboard/server.ts"
+import { ensureDashboardOpened, dashboardOpenedBefore } from "../dashboard/open-once.ts"
+import { defaultOpener } from "../supervisor/login.ts"
 import { flushReports, reportsFor } from "../reporting/hooks.ts"
 import type { ToolContext } from "./context.ts"
 import { defineTool } from "./define.ts"
@@ -28,6 +32,25 @@ export const dashboardTool = defineTool({
     return ok(`Dashboard: ${dashboard.url}`, { url: dashboard.url, note: NOTE })
   },
 })
+
+/** The bridge's dashboard, started on first use (idempotent; never touches the box). */
+export function ensureDashboard(ctx: ToolContext): Dashboard {
+  return running.get(ctx) ?? start(ctx)
+}
+
+/** Open the dashboard in the owner's browser the first time this bridge home runs a bridge.
+ *  With the marker already written it does nothing at all - the page stays lazy (oc_dashboard).
+ *  Never throws: a failed open must not take down the bridge. `open` is the launcher; tests inject one. */
+export async function openDashboardOnce(ctx: ToolContext, open: (url: string) => void = defaultOpener): Promise<boolean> {
+  if (await dashboardOpenedBefore(ctx.config.home)) return false
+  try {
+    const dashboard = ensureDashboard(ctx)
+    const label = ctx.supervisor.replace(/^supervisor:/, "")
+    return await ensureDashboardOpened({ home: ctx.config.home, label, url: dashboard.url, log: ctx.log, open })
+  } catch {
+    return false
+  }
+}
 
 function start(ctx: ToolContext): Dashboard {
   const bridge = ctx.supervisor.replace(/^supervisor:/, "")

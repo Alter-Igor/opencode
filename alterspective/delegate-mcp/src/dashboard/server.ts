@@ -1,10 +1,15 @@
 // #129: the dashboard's HTTP server. Local only: it binds 127.0.0.1 on a random port, answers GET
 // only, hides every route behind a random path token, and rejects any Host header other than
-// 127.0.0.1:<port> (DNS rebinding). It serves two constant files and one JSON document; no data is
-// ever put into the HTML. It never keeps the process alive.
+// 127.0.0.1:<port> (DNS rebinding). It serves the constant page/script/style, the fixed brand
+// asset set (assets.ts - an exact-name registry, nothing else resolves), and one JSON document;
+// no data is ever put into the HTML. It never keeps the process alive.
 import { timingSafeEqual } from "node:crypto"
+import path from "node:path"
 import type { DashboardData } from "./data.ts"
-import { DASHBOARD_HTML, DASHBOARD_JS } from "./page.ts"
+import { DASHBOARD_HTML } from "./page.ts"
+import { DASHBOARD_CSS } from "./style.ts"
+import { DASHBOARD_APP_JS } from "./app.ts"
+import { DASHBOARD_ASSETS } from "./assets.ts"
 
 export const CSP = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
 
@@ -34,20 +39,33 @@ export function startDashboard(getData: () => Promise<DashboardData> | Dashboard
         })
       if (request.headers.get("host") !== `127.0.0.1:${server.port}`) return reply(null, 403)
       if (request.method !== "GET") return reply(null, 405, undefined, { allow: "GET" })
-      const path = new URL(request.url).pathname
-      if (!path.startsWith(prefix) || !sameToken(path.slice(1, prefix.length - 1), token)) return reply(null, 404)
-      switch (path.slice(prefix.length)) {
+      const route = new URL(request.url).pathname
+      if (!route.startsWith(prefix) || !sameToken(route.slice(1, prefix.length - 1), token)) return reply(null, 404)
+      switch (route.slice(prefix.length)) {
         case "":
           return reply(DASHBOARD_HTML, 200, "text/html; charset=utf-8", { "content-security-policy": CSP })
         case "app.js":
-          return reply(DASHBOARD_JS, 200, "text/javascript; charset=utf-8")
+          return reply(DASHBOARD_APP_JS, 200, "text/javascript; charset=utf-8")
+        case "styles.css":
+          return reply(DASHBOARD_CSS, 200, "text/css; charset=utf-8")
         case "data.json":
           return Promise.resolve(getData()).then(
             (data) => reply(JSON.stringify(data), 200, "application/json; charset=utf-8"),
             () => reply(null, 500),
           )
-        default:
-          return reply(null, 404)
+        default: {
+          const asset = DASHBOARD_ASSETS[route.slice(prefix.length) as keyof typeof DASHBOARD_ASSETS]
+          if (!asset) return reply(null, 404)
+          return new Response(Bun.file(path.join(import.meta.dir, asset.file)), {
+            status: 200,
+            headers: {
+              "cache-control": "no-store",
+              "x-content-type-options": "nosniff",
+              "referrer-policy": "no-referrer",
+              "content-type": asset.type,
+            },
+          })
+        }
       }
     },
   })

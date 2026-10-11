@@ -1,9 +1,9 @@
-// The dashboard's "Model scorecard" section: how DASHBOARD_JS renders scorecard() rows - the rate
+// The dashboard's "Model scorecard" section: how the app script renders scorecard() rows - the rate
 // bar width/colour thresholds, the "no data yet" state, re-routed badges, and the number formats.
-// Runs the real DASHBOARD_JS render() against a tiny DOM double, like test/dashboard.test.ts.
+// Runs the real DASHBOARD_APP_JS render() against a tiny DOM double, like test/dashboard.test.ts.
 import { describe, expect, test } from "bun:test"
 import { dashboardData } from "../src/dashboard/data.ts"
-import { DASHBOARD_JS } from "../src/dashboard/page.ts"
+import { DASHBOARD_APP_JS } from "../src/dashboard/app.ts"
 import type { TaskRecord } from "../src/reporting/record.ts"
 
 const NOW = Date.parse("2026-10-05T12:00:00.000Z")
@@ -34,7 +34,8 @@ class Node {
   textContent = ""
   className = ""
   hidden = false
-  style: Record<string, string> = {}
+  style: Record<string, unknown> = { setProperty: () => {} }
+  setAttribute() {}
   appendChild(n: Node) {
     this.children.push(n)
     return n
@@ -51,12 +52,12 @@ function makeRender() {
     "document",
     "fetch",
     "setInterval",
-    `${DASHBOARD_JS.replace('"use strict";', "")}\nreturn { render };`,
+    `${DASHBOARD_APP_JS.replace('"use strict";', "")}\nreturn { render };`,
   )({ createElement: () => new Node(), querySelector: () => new Node() }, async () => ({ ok: false }), () => 0) as { render(d: unknown, now: number): Node }
 }
 
-/** The scorecard section: the last <section> of the render root. */
-const scorecardSection = (root: Node): Node => root.children.at(-1) ?? new Node()
+/** The Models view panel (render()'s third child): served table then the scorecard section. */
+const scorecardSection = (root: Node): Node => root.children[2]?.children[1] ?? new Node()
 
 const served = (model: string, outcome: TaskRecord["outcome"]) => rec({ servedModels: { [model]: 1 }, outcome, ...(outcome === "error" ? { errorCode: "other" } : {}) })
 const repeat = (n: number, make: () => TaskRecord) => Array.from({ length: n }, make)
