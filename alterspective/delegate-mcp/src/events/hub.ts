@@ -73,6 +73,8 @@ class Hub implements DelegateHub {
   private resyncPending = false
   private linkKind: Link["kind"] = "gap"
   private warnedCap = false
+  /** The current run of identical drops: logged once, counted, summarised when the stream next opens. */
+  private dropStreak: { kind: Drop["kind"]; count: number } | undefined
   private queue: Queue | undefined
   private scope: Scope | undefined
   private cause = "rebuild"
@@ -240,7 +242,10 @@ class Hub implements DelegateHub {
   }
 
   private onOpen(): void {
+    const streak = this.dropStreak
+    this.dropStreak = undefined
     this.resyncPending = this.opened
+    if (streak !== undefined && streak.count > 1) safeLog(this.log, "info", "events", "event stream reconnected after repeated drops", { kind: streak.kind, drops: streak.count })
     safeLog(this.log, "info", "events", "event stream connected; rebuilding state", { sessions: this.table.size() })
     this.beginRebuild("all", "rebuild")
   }
@@ -311,8 +316,15 @@ class Hub implements DelegateHub {
     this.queue = undefined
     this.scope = undefined
     const link = drop.kind === "unreachable" ? { kind: "down" as const, detail: `server unreachable (${drop.detail})` } : { kind: "gap" as const, detail: `${drop.kind}: ${drop.detail}` }
-    const loud = drop.kind === "unreachable" || drop.kind === "http"
-    safeLog(this.log, loud ? "warn" : "info", "events", "event stream dropped", { kind: drop.kind, detail: drop.detail })
+    // A bridge whose box is gone re-drops on every backoff forever (9k identical warn lines over
+    // two days hid everything else in the shared log). One line per change of kind, counted; the
+    // next onOpen writes the recovery summary. Events and link state are untouched - only the log.
+    if (this.dropStreak?.kind === drop.kind) this.dropStreak.count++
+    else {
+      this.dropStreak = { kind: drop.kind, count: 1 }
+      const loud = drop.kind === "unreachable" || drop.kind === "http"
+      safeLog(this.log, loud ? "warn" : "info", "events", "event stream dropped", { kind: drop.kind, detail: drop.detail })
+    }
     const changes = this.table.setLink(link)
     this.linkChanged()
     this.emitChanges(changes, `stream ${drop.kind}`)
