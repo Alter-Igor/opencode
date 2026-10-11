@@ -1,7 +1,7 @@
 // MOD-03 T3.4: watch CLI — arguments, attention filter, line format, stdout/stderr split, exit codes.
 import { EventEmitter } from "node:events"
 import { afterEach, describe, expect, test } from "bun:test"
-import { EXIT, HELP, clean, formatLine, isAttention, parseArgs, stopSignal, useColor, watch, type SignalSource, type WatchDeps } from "../src/cli/watch.ts"
+import { EXIT, HELP, clean, formatLine, isAttention, parseArgs, parseSessionList, stopSignal, useColor, watch, type SignalSource, type WatchDeps } from "../src/cli/watch.ts"
 import { createHub, type DelegateHub } from "../src/events/hub.ts"
 import type { BoxState, HubEvent } from "../src/shared/contracts.ts"
 import { DelegateError } from "../src/shared/errors.ts"
@@ -10,17 +10,27 @@ import { fakeApi, startFakeBox, until, type FakeBox } from "./events-fake.ts"
 
 const ev = (x: Partial<HubEvent>): HubEvent => ({ cursor: { epoch: "e", seq: 1 }, at: "2026-10-01T00:00:00.000Z", type: "status", summary: "s", ...x })
 const SES = "ses_watch00000001"
+const SES2 = "ses_watch00000002"
+type SnapshotRow = { sessionID: string; directory: string; state: string; since: string; observedAt: string; pending: string[] }
 
 describe("watch helpers", () => {
   test("parseArgs: --session takes only an OpenCode session id (W2C-04)", () => {
-    expect(parseArgs([])).toEqual({ kind: "run", json: false, noColor: false })
-    expect(parseArgs(["-s", SES, "--json"])).toEqual({ kind: "run", session: SES, json: true, noColor: false })
+    expect(parseArgs([])).toEqual({ kind: "run", once: false, json: false, noColor: false })
+    expect(parseArgs(["-s", SES, "--json"])).toEqual({ kind: "run", session: SES, once: false, json: true, noColor: false })
+    expect(parseArgs(["--once"])).toEqual({ kind: "run", once: true, json: false, noColor: false })
     expect(parseArgs(["--session"]).kind).toBe("error")
     expect(parseArgs(["--session", "bad id;"]).kind).toBe("error")
     expect(parseArgs(["--session", "ses_short"]).kind).toBe("error")
     expect(parseArgs(["--session", "abc_0123456789"]).kind).toBe("error")
     expect(parseArgs(["--bogus"]).kind).toBe("error")
     expect(parseArgs(["-h"]).kind).toBe("help")
+  })
+
+  test("parseSessionList: rows without a valid id or box directory are dropped; a non-array throws", () => {
+    expect(parseSessionList([{ id: SES, directory: "/sessions/a" }, { id: "bad", directory: "/sessions/a" }, { id: "ses_other000001", directory: "/etc/passwd" }, { id: "ses_second00001", directory: "/sessions/b" }]))
+      .toEqual([{ id: SES, directory: "/sessions/a" }, { id: "ses_second00001", directory: "/sessions/b" }])
+    expect(() => parseSessionList({})).toThrow()
+    expect(() => parseSessionList(undefined)).toThrow()
   })
 
   test("attention events only; stream gaps and link changes are printed (W2A-11)", () => {
@@ -73,7 +83,7 @@ describe("watch helpers", () => {
 })
 
 type Captured = { out: string[]; err: string[]; stop(): void; deps: WatchDeps; hubs: DelegateHub[] }
-type CaptureOptions = { backoffMs?: number[]; api?: OpencodeApi; beforeStart?: () => void }
+type CaptureOptions = { backoffMs?: number[]; api?: OpencodeApi; beforeStart?: () => void; sessions?: () => Promise<Array<{ id: string; directory: string }>> }
 
 function capture(box: BoxState, options: CaptureOptions = {}): Captured {
   let stop = () => {}
@@ -91,6 +101,7 @@ function capture(box: BoxState, options: CaptureOptions = {}): Captured {
       c.hubs.push(h)
       return h
     },
+    sessions: options.sessions ?? (async () => []),
     out: (l) => c.out.push(l),
     err: (l) => c.err.push(l),
     stopped: () => stopped,
@@ -166,5 +177,51 @@ describe("watch", () => {
     expect(await run).toBe(EXIT.ok)
     expect(c.err.some((l) => l.includes(`${SES} is busy now`))).toBe(true)
     expect(c.out.some((l) => / idle +ses_watch00000001 session ses_watch00000001 is idle \(read after connecting\)$/.test(l))).toBe(true)
+  })
+
+  test("--once: snapshot every root session, exit 0, no stream opened", async () => {
+    box = startFakeBox()
+    box.sessions.set(SES, { id: SES, directory: "/sessions/a" })
+    box.sessions.set(SES2, { id: SES2, directory: "/sessions/a" })
+    const c = capture(running(box), { sessions: async () => [{ id: SES, directory: "/sessions/a" }, { id: SES2, directory: "/sessions/a" }] })
+    expect(await watch(["--once"], c.deps)).toBe(EXIT.ok)
+    expect(c.out).toHaveLength(2)
+    expect(c.out[0]).toMatch(/^\d{4}-\d\d-\d\dT[\d:.]+Z idle        ses_watch00000001 ses_watch00000001 is idle$/)
+    expect(c.out[1]).toMatch(/^\d{4}-\d\d-\d\dT[\d:.]+Z idle        ses_watch00000002 ses_watch00000002 is idle$/)
+    expect(box.connects()).toBe(0) // --once opens no event stream
+  })
+
+  test("--once --json: rows carry state, directory, since=observedAt, empty pending; a session missing from the box reads not_found, exit stays 0", async () => {
+    box = startFakeBox()
+    box.sessions.set(SES, { id: SES, directory: "/sessions/a" })
+    const c = capture(running(box), { sessions: async () => [{ id: SES, directory: "/sessions/a" }, { id: SES2, directory: "/sessions/b" }] })
+    expect(await watch(["--once", "--json"], c.deps)).toBe(EXIT.ok)
+    const rows = c.out.map((l) => JSON.parse(l) as SnapshotRow)
+    expect(rows.map((r) => `${r.sessionID}:${r.state}`)).toEqual([`${SES}:idle`, `${SES2}:not_found`])
+    expect(rows[0]?.directory).toBe("/sessions/a")
+    expect(rows[0]?.since === rows[0]?.observedAt).toBe(true)
+    expect(rows[0]?.pending).toEqual([])
+  })
+
+  test("--once: a read that comes back server_down fails the whole snapshot with exit 2", async () => {
+    const api = fakeApi({ [`/session/${SES}`]: new DelegateError("server_down", "down", "Run oc_doctor.", "ConnectionRefused") })
+    const c = capture({ state: "running", target: { baseUrl: "http://127.0.0.1:9", password: "x" }, imageTag: "t", startedBy: "other" }, { api, sessions: async () => [{ id: SES, directory: "/sessions/a" }] })
+    expect(await watch(["--once", "--json"], c.deps)).toBe(EXIT.boxDown)
+    expect((JSON.parse(c.out[0] ?? "{}") as SnapshotRow).state).toBe("server_down")
+  })
+
+  test("--once --session: a missing session is still reported (row printed) and exits 3", async () => {
+    box = startFakeBox()
+    const c = capture(running(box))
+    expect(await watch(["--once", "--json", "--session", "ses_missing00001"], c.deps)).toBe(EXIT.notFound)
+    const rows = c.out.map((l) => JSON.parse(l) as SnapshotRow)
+    expect(rows.map((r) => `${r.sessionID}:${r.state}`)).toEqual(["ses_missing00001:not_found"])
+  })
+
+  test("--once: a failing listing is thrown up (never treated as an empty box)", async () => {
+    box = startFakeBox()
+    const c = capture(running(box), { sessions: async () => { throw new DelegateError("upstream_error", "listing failed", "Retry.") } })
+    expect(watch(["--once"], c.deps)).rejects.toThrow("listing failed")
+    expect(c.out).toEqual([])
   })
 })
