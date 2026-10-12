@@ -1,0 +1,19 @@
+Send a message to another AI agent, session, harness, or supervisor.
+
+Use this tool to communicate between OpenCode sessions or to external AI systems.
+
+Recipients supported:
+- "parent": Send a message back to the parent session that launched this subagent.
+- "session:<id>": Send a message directly to any other OpenCode session by its session ID.
+- "agent:<name>": Send a message to a subagent of the specified type (e.g. "explore", "plan").
+- "supervisor": Send a message to the external orchestrator or bridge supervisor (e.g. in opencode-delegate).
+- "http://..." or "https://...": Send a message to an external AI harness or webhook (e.g. Antigravity, Claude, or a remote agent).
+
+Delivery modes:
+- "fire_and_forget" (default): Sends the message and returns immediately.
+- "wait_reply": Sends the message and waits for the recipient agent or harness to reply.
+
+When to use:
+- To report progress, findings, or questions back to the parent session before completing a task.
+- To coordinate work with peer subagents or external harnesses.
+- To notify an external supervisor of important events or blockers.
