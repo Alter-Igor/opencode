@@ -1,6 +1,6 @@
 import { afterEach, describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Effect, Cause } from "effect"
+import { Effect, Cause, Exit } from "effect"
 import { Agent } from "../../src/agent/agent"
 import { BackgroundJob } from "@/background/job"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -50,6 +50,9 @@ function mockAssistantResponse(text: string): SessionV1.WithParts {
       agent: "build",
       modelID: "mock-model" as any,
       providerID: "mock-provider" as any,
+      parentID: MessageID.ascending(),
+      mode: "build",
+      path: { cwd: "/", root: "/" },
       cost: 0,
       tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
       time: { created: Date.now() },
@@ -90,9 +93,11 @@ describe("tool.send_message", () => {
         tool.execute({ recipient: "parent", message: "Hello parent!" }, ctx),
       )
 
-      expect(result._tag).toBe("Failure")
-      const err = Cause.pretty(result.cause)
-      expect(err).toContain("has no parent session")
+      expect(Exit.isFailure(result)).toBe(true)
+      if (Exit.isFailure(result)) {
+        const err = Cause.pretty(result.cause)
+        expect(err).toContain("has no parent session")
+      }
     }),
   )
 
@@ -197,11 +202,11 @@ describe("tool.send_message", () => {
 
       const s = yield* sessions.create({ title: "Webhook Sender Session" })
 
-      let receivedPayload: Record<string, unknown> | null = null
+      let rawPayload: unknown = null
       const server = Bun.serve({
         port: 0,
         fetch: async (req) => {
-          receivedPayload = (await req.json()) as Record<string, unknown>
+          rawPayload = await req.json()
           return new Response(JSON.stringify({ status: "acknowledged", agent: "Antigravity" }), {
             headers: { "content-type": "application/json" },
           })
@@ -232,10 +237,11 @@ describe("tool.send_message", () => {
           ctx,
         )
 
-        expect(receivedPayload).not.toBeNull()
-        expect(receivedPayload?.message).toBe("Hello from OpenCode!")
-        expect(receivedPayload?.correlation_id).toBe("thread-xyz")
-        expect(receivedPayload?.from).toBe(`session:${s.id}`)
+        const payload = rawPayload as Record<string, unknown> | null
+        expect(payload).not.toBeNull()
+        expect(payload?.message).toBe("Hello from OpenCode!")
+        expect(payload?.correlation_id).toBe("thread-xyz")
+        expect(payload?.from).toBe(`session:${s.id}`)
 
         expect(res.output).toContain("Antigravity")
         expect(res.metadata.status).toBe("replied")
@@ -253,12 +259,12 @@ describe("tool.send_message", () => {
 
       const s = yield* sessions.create({ title: "Supervisor Sender" })
 
-      let inboxPayload: Record<string, unknown> | null = null
+      let rawInboxPayload: unknown = null
       const server = Bun.serve({
         port: 0,
         fetch: async (req) => {
           if (req.url.endsWith("/v1/post")) {
-            inboxPayload = (await req.json()) as Record<string, unknown>
+            rawInboxPayload = await req.json()
             return new Response(
               JSON.stringify({ message: { id: "msg_1", hops: 0, verified: false } }),
               { status: 201, headers: { "content-type": "application/json" } },
@@ -291,10 +297,11 @@ describe("tool.send_message", () => {
           ctx,
         )
 
-        expect(inboxPayload).not.toBeNull()
-        expect(inboxPayload?.text).toBe("Blocker encountered in test step 3")
-        expect(inboxPayload?.to).toBe("supervisor")
-        expect(inboxPayload?.correlationId).toBe("blocker-1")
+        const payload = rawInboxPayload as Record<string, unknown> | null
+        expect(payload).not.toBeNull()
+        expect(payload?.text).toBe("Blocker encountered in test step 3")
+        expect(payload?.to).toBe("supervisor")
+        expect(payload?.correlationId).toBe("blocker-1")
 
         expect(res.output).toContain("mode=\"inbox_posted\"")
       } finally {

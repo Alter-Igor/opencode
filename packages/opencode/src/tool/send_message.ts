@@ -21,10 +21,6 @@ export const Parameters = Schema.Struct({
     description:
       "Delivery mode: 'fire_and_forget' (default, posts message and returns immediately) or 'wait_reply' (waits for recipient to respond)",
   }),
-  delivery: Schema.optional(Schema.Literals(["steer", "queue"])).annotate({
-    description:
-      "Delivery boundary for session messaging: 'steer' (default, injects at next turn boundary) or 'queue' (waits until recipient is idle)",
-  }),
   correlation_id: Schema.optional(Schema.String).annotate({
     description: "Optional conversation or correlation tracking ID",
   }),
@@ -64,6 +60,15 @@ export const SendMessageTool = Tool.define(
 
       // 1. External Webhook (http:// or https://)
       if (recipient.startsWith("http://") || recipient.startsWith("https://")) {
+        yield* ctx.ask({
+          permission: "webfetch",
+          patterns: [recipient],
+          always: ["*"],
+          metadata: {
+            url: recipient,
+          },
+        })
+
         const payload = {
           from: `session:${ctx.sessionID}`,
           recipient,
@@ -72,6 +77,8 @@ export const SendMessageTool = Tool.define(
           timestamp: new Date().toISOString(),
         }
 
+        const timeoutSignal = AbortSignal.any([ctx.abort, AbortSignal.timeout(30_000)])
+
         if (mode === "wait_reply") {
           const res = yield* Effect.tryPromise({
             try: async () => {
@@ -79,7 +86,7 @@ export const SendMessageTool = Tool.define(
                 method: "POST",
                 headers: { "content-type": "application/json" },
                 body: JSON.stringify(payload),
-                signal: ctx.abort,
+                signal: timeoutSignal,
               })
               const text = await r.text().catch(() => "")
               return { ok: r.ok, status: r.status, text }
@@ -105,6 +112,7 @@ export const SendMessageTool = Tool.define(
               method: "POST",
               headers: { "content-type": "application/json" },
               body: JSON.stringify(payload),
+              signal: timeoutSignal,
             })
           } catch {
             // Background fire-and-forget ignores network delivery errors
@@ -131,6 +139,8 @@ export const SendMessageTool = Tool.define(
             ? process.env.ANTIGRAVITY_WEBHOOK_URL
             : undefined)
 
+        const supervisorTimeoutSignal = AbortSignal.any([ctx.abort, AbortSignal.timeout(15_000)])
+
         if (inboxUrl) {
           const postUrl = `${inboxUrl}/v1/post`
           const toAddress = recipient.startsWith("supervisor:") ? recipient : "supervisor"
@@ -145,7 +155,7 @@ export const SendMessageTool = Tool.define(
                   text: params.message,
                   correlationId: params.correlation_id,
                 }),
-                signal: ctx.abort,
+                signal: supervisorTimeoutSignal,
               })
               const data = await r.json().catch(() => ({}))
               return { ok: r.ok, status: r.status, data }
@@ -177,7 +187,7 @@ export const SendMessageTool = Tool.define(
                   message: params.message,
                   correlation_id: params.correlation_id,
                 }),
-                signal: ctx.abort,
+                signal: supervisorTimeoutSignal,
               })
               const text = await r.text().catch(() => "")
               return { ok: r.ok, status: r.status, text }
@@ -226,14 +236,25 @@ export const SendMessageTool = Tool.define(
         if (!targetAgent) {
           return yield* Effect.fail(new Error(`Agent "${agentName}" does not exist.`))
         }
-        // Create child session for this agent
-        const child = yield* sessions.create({
-          parentID: ctx.sessionID,
-          title: `Subagent @${targetAgent.name} (message recipient)`,
-          agent: targetAgent.name,
-        })
-        targetSessionID = child.id
-        targetAgentName = targetAgent.name
+
+        // Check if an existing subagent child session exists under this parent
+        const allSessions = yield* sessions.list()
+        const existing = allSessions.find(
+          (c) => c.parentID === ctx.sessionID && c.agent === targetAgent.name,
+        )
+
+        if (existing) {
+          targetSessionID = existing.id
+          targetAgentName = existing.agent
+        } else {
+          const child = yield* sessions.create({
+            parentID: ctx.sessionID,
+            title: `Subagent @${targetAgent.name}`,
+            agent: targetAgent.name,
+          })
+          targetSessionID = child.id
+          targetAgentName = targetAgent.name
+        }
       } else {
         // Assume raw session ID or alias
         targetSessionID = SessionID.make(recipient)
