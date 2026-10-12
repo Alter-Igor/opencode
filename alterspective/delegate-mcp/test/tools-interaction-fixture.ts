@@ -1,6 +1,9 @@
 // Test helpers for the Wave 3 interaction tools: a scripted OpenCode API that records every call,
 // a fake hub, a fake inbox, a ToolContext built from them, and an in-memory MCP client/server pair
 // so tools are exercised through the real SDK (zod validation included).
+import { mkdtempSync } from "node:fs"
+import os from "node:os"
+import path from "node:path"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js"
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
@@ -115,20 +118,25 @@ export type Fixture = {
   boxes: { started: boolean; listeners: Set<(box: Box) => void> }
 }
 
+/** A throw-away bridge home: task-record flushes (reportsFor keys off config.home) must never
+ *  reach the operator's real ~/.local/share/opencode-delegate. */
+export const INTERACTION_HOME = mkdtempSync(path.join(os.tmpdir(), "ocd-interaction-"))
+
 export function fixture(sessions: SessionRecord[] = []): Fixture {
   const api = new ScriptedApi()
   const hub = new FakeHub()
   const inbox = new FakeInbox()
   const runtime: Fixture["runtime"] = { verdict: { ok: true }, checked: [] }
   const boxes: Fixture["boxes"] = { started: false, listeners: new Set() }
-  const guard = { ...createGuard(defaultConfig({})), checkRuntime: async (_api: OpencodeApi, directory: string) => (runtime.checked.push(directory), runtime.verdict) }
+  const config = { ...defaultConfig({}), home: INTERACTION_HOME }
+  const guard = { ...createGuard(config), checkRuntime: async (_api: OpencodeApi, directory: string) => (runtime.checked.push(directory), runtime.verdict) }
   let n = 0
   const box: Box = { target: { baseUrl: "http://127.0.0.1:1", password: "unused-in-tests" }, api, hub: hub.asHub() }
   const unused = async (): Promise<never> => {
     throw new Error("unused in these tests")
   }
   const ctx: ToolContext = {
-    config: defaultConfig({}),
+    config,
     supervisor: "supervisor:test",
     bridgeId: "bridge-test",
     version: "0.0.0-test",
