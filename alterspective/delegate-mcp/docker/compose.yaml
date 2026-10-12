@@ -110,6 +110,8 @@ services:
       OCD_INBOX_URL: http://inbox:8080
       npm_config_registry: http://npm-cache:4873/
       BUN_CONFIG_REGISTRY: http://npm-cache:4873/
+      # pnpm 11 does not read npm_config_* from the environment; it went straight to npmjs (#167).
+      pnpm_config_registry: http://npm-cache:4873/
       npm_config_audit: "false"
       npm_config_fund: "false"
       npm_config_update_notifier: "false"
@@ -119,6 +121,10 @@ services:
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
       UV_DEFAULT_INDEX: http://pypi-cache:5000/index/
       UV_INSECURE_HOST: pypi-cache
+      # corepack fetches package managers from registry.npmjs.org unless told otherwise, and the
+      # box cannot reach it (#167). Point it at the same read-only cache. No prompt: there is no user.
+      COREPACK_NPM_REGISTRY: http://npm-cache:4873
+      COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
       OPENCODE_DISABLE_MODELS_FETCH: "1"
       OPENCODE_DISABLE_AUTOUPDATE: "1"
       # The fork's retrospective POST has no authenticated route in the box (#55).
@@ -312,9 +318,14 @@ services:
     restart: unless-stopped
     tmpfs: ["/tmp:mode=1777,nosuid,nodev,noexec"]
     volumes: ["npm-storage:/verdaccio/storage"]
+    # #167: big packuments (vite, typescript, @types/node) ran Verdaccio out of heap at 512m
+    # ("Reached heap limit", 10 restarts in one day), which broke installs mid-way. The heap is
+    # set below the container limit so Node, not the kernel, decides when to collect.
+    environment:
+      NODE_OPTIONS: --max-old-space-size=1536
     pids_limit: 256
-    mem_limit: 512m
-    memswap_limit: 512m
+    mem_limit: 2g
+    memswap_limit: 2g
     cpus: 1
 
   pypi-cache:

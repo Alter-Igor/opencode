@@ -28,6 +28,11 @@ FROM node:22-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git curl ca-certificates python3 python3-pip python3-venv \
     && rm -rf /var/lib/apt/lists/*
+# pnpm for pnpm repositories (#167). Pinned; installed at build time, when the build has a network.
+# In the box it reads through npm-cache (pnpm_config_registry; pnpm 11 ignores npm_config_*). A repo that pins another pnpm in
+# `packageManager` gets that version through the same cache. Bump the version on purpose only.
+RUN npm install -g --no-audit --no-fund pnpm@11.28.2 \
+    && pnpm --version
 # Root-owned, not writable by the agent user (review N1).
 COPY --from=build --chown=root:root --chmod=0755 /src/packages/opencode/dist/opencode-linux-x64/bin/opencode /usr/local/bin/opencode
 COPY --from=build --chown=root:root --chmod=0755 /usr/local/bin/bun /usr/local/bin/bun

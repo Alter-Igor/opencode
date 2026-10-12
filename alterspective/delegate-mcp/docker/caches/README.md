@@ -14,6 +14,7 @@ Why the caches exist: review finding N3. If the box could reach the public regis
 
 - `sealed` is `internal: true` (no route out). The box joins **only** `sealed`.
 - None of the three publishes a host port.
+- `npm-cache` has 2 GB of memory and a 1536 MB Node heap (`NODE_OPTIONS`). At 512 MB it ran out of heap on big packuments (`vite`, `typescript`, `@types/node`) and restarted in the middle of installs, which agents reported as "no network" (#167).
 - All three run as non-root: uid 101 (front and pypi-cache, nginx), uid 10001 (verdaccio).
 - `docker/compose.yaml` also gives all three (and the box and both gates) `cap_drop: [ALL]`, `no-new-privileges`, a read-only root, and pids/memory/CPU limits. front binds :443 through the per-container sysctl `net.ipv4.ip_unprivileged_port_start=0`, not a capability.
 - front's servers (`docker/front/servers.conf`) and certificate host list (`docker/front/hosts.txt`) are generated from `config.egressHosts` by `bun src/guard/egress.ts`. The tests fail if the committed files, or front's `sealed` aliases in compose.yaml, drift from the config. `oc_doctor` runs the same check (`egress` field).
@@ -46,6 +47,7 @@ GIT_SSL_CAINFO=/etc/ocd-front-ca/ca.pem
 REQUESTS_CA_BUNDLE=/etc/ocd-front-ca/ca.pem
 npm_config_registry=http://npm-cache:4873/
 BUN_CONFIG_REGISTRY=http://npm-cache:4873/
+pnpm_config_registry=http://npm-cache:4873/
 npm_config_audit=false
 npm_config_fund=false
 npm_config_update_notifier=false
@@ -54,9 +56,11 @@ PIP_TRUSTED_HOST=pypi-cache
 PIP_DISABLE_PIP_VERSION_CHECK=1
 UV_DEFAULT_INDEX=http://pypi-cache:5000/index/
 UV_INSECURE_HOST=pypi-cache
+COREPACK_NPM_REGISTRY=http://npm-cache:4873
+COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 ```
 
-No proxy variables and no `NO_PROXY`: the caches and the inbox are plain service names on `sealed`, and the allowed hosts resolve to front. The bridge refuses a box env list that names any of these, or any `*_PROXY` (compose-env.ts). npm, pip and bun were tested live through the caches (bun on 2026-10-01: `bun add is-number` resolved through `npm-cache`). The `UV_` lines were not tested: uv is not installed in the box image.
+No proxy variables and no `NO_PROXY`: the caches and the inbox are plain service names on `sealed`, and the allowed hosts resolve to front. The bridge refuses a box env list that names any of these, or any `*_PROXY` (compose-env.ts). npm, pip and bun were tested live through the caches (bun on 2026-10-01: `bun add is-number` resolved through `npm-cache`). The `UV_` lines were not tested: uv is not installed in the box image. pnpm is installed in the box image, pinned (#167). pnpm 11 does not read `npm_config_registry` from the environment (tested live: it went straight to `registry.npmjs.org` and failed with `EAI_AGAIN`), so it gets `pnpm_config_registry`; with it, `pnpm install` of vite, vitest, typescript, @types/node and jsdom worked through the cache (2026-10-12). corepack reads `COREPACK_NPM_REGISTRY`, so it also fetches package managers through `npm-cache` (tested: `corepack pnpm@9.15.9`, `corepack yarn@1.22.22`). Its shims are not enabled (read-only root), so call `corepack <tool>` directly. Yarn 2+ reads its own registry setting, which is not set: not covered.
 
 ## How the caches reach the internet — decision
 

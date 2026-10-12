@@ -17,7 +17,7 @@ describe("box env override: reserved names", () => {
   test("override refuses names the sandbox sets itself or that are bridge-only secrets (W2C-14)", () => {
     const reserved = [
       "INBOX_ADMIN_TOKEN", "OPENCODE_SERVER_PASSWORD", "OPENCODE_MCP_ALLOW", "OPENCODE_DISABLE_PROJECT_CONFIG", "OCD_INBOX_URL", "OCD_ANYTHING",
-      "HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy", "ALL_PROXY", "HOME", "PATH", "XDG_CONFIG_HOME", "npm_config_registry", "PIP_INDEX_URL",
+      "HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy", "ALL_PROXY", "HOME", "PATH", "XDG_CONFIG_HOME", "npm_config_registry", "PIP_INDEX_URL", "COREPACK_NPM_REGISTRY", "Corepack_Npm_Registry", "pnpm_config_registry", "PNPM_CONFIG_REGISTRY",
       "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO", "GIT_SSL_NO_VERIFY", "REQUESTS_CA_BUNDLE", "NODE_TLS_REJECT_UNAUTHORIZED",
     ]
     for (const name of reserved) {

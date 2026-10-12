@@ -52,6 +52,43 @@ describe("npm-cache (verdaccio)", () => {
   test("base image pinned by version and digest", () => {
     expect(read("npm", "Dockerfile")).toMatch(/^FROM verdaccio\/verdaccio:\d+\.\d+\.\d+@sha256:[0-9a-f]{64}$/m)
   })
+
+  // #167: at 512m Verdaccio ran out of heap on big packuments and restarted mid-install.
+  test("heap is set, and fits inside the container memory limit", () => {
+    const compose = Bun.YAML.parse(readFileSync(path.join(CACHES, "..", "compose.yaml"), "utf8")) as {
+      services: Record<string, { mem_limit?: string; environment?: Record<string, string> }>
+    }
+    const service = compose.services["npm-cache"]!
+    const heapMb = Number(/--max-old-space-size=(\d+)/.exec(service.environment?.NODE_OPTIONS ?? "")?.[1])
+    const limit = /^(\d+)([mg])$/.exec(service.mem_limit ?? "")
+    expect(limit).not.toBeNull()
+    const limitMb = Number(limit![1]) * (limit![2] === "g" ? 1024 : 1)
+    expect(heapMb).toBeGreaterThanOrEqual(1024)
+    expect(heapMb).toBeLessThan(limitMb)
+  })
+})
+
+describe("box package managers (#167)", () => {
+  const compose = Bun.YAML.parse(readFileSync(path.join(CACHES, "..", "compose.yaml"), "utf8")) as {
+    services: { box: { environment: Record<string, string> } }
+  }
+
+  test("pnpm is installed at build time with a pinned version", () => {
+    expect(readFileSync(path.join(CACHES, "..", "box", "Dockerfile"), "utf8")).toMatch(/npm install -g [^\n]*pnpm@\d+\.\d+\.\d+\b/)
+  })
+
+  test("every registry setting points at the cache, never a public registry", () => {
+    const env = compose.services.box.environment
+    expect(env.npm_config_registry).toBe("http://npm-cache:4873/")
+    expect(env.BUN_CONFIG_REGISTRY).toBe("http://npm-cache:4873/")
+    expect(env.COREPACK_NPM_REGISTRY).toBe("http://npm-cache:4873")
+    // pnpm 11 ignores npm_config_registry (seen live, #167).
+    expect(env.pnpm_config_registry).toBe("http://npm-cache:4873/")
+    // Any registry or index setting names one of the two caches, and nothing else.
+    const settings = Object.entries(env).filter(([name]) => /registry|index/i.test(name))
+    expect(settings.length).toBeGreaterThanOrEqual(6)
+    for (const [, value] of settings) expect(String(value)).toMatch(/^http:\/\/(npm-cache:4873|pypi-cache:5000)(\/|$)/)
+  })
 })
 
 describe("pypi-cache (nginx)", () => {
