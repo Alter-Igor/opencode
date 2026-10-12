@@ -195,8 +195,14 @@ export const SendMessageTool = Tool.define(
             catch: (err) => new Error(`Could not reach supervisor webhook: ${String(err)}`),
           })
 
+          if (!res.ok) {
+            return yield* Effect.fail(
+              new Error(`Supervisor webhook returned HTTP ${res.status}: ${res.text}`),
+            )
+          }
+
           return response(
-            `<message_delivery status="delivered" recipient="${recipient}" response="${res.text.slice(0, 200)}" />`,
+            `<message_delivery status="delivered" recipient="${recipient}" mode="webhook_posted" />`,
             { target: recipient, status: "dispatched" },
           )
         }
@@ -255,11 +261,16 @@ export const SendMessageTool = Tool.define(
           targetSessionID = child.id
           targetAgentName = targetAgent.name
         }
-      } else {
-        // Assume raw session ID or alias
+      } else if (recipient.startsWith("ses_")) {
         targetSessionID = SessionID.make(recipient)
         const targetSession = yield* sessions.get(targetSessionID)
         targetAgentName = targetSession.agent
+      } else {
+        return yield* Effect.fail(
+          new Error(
+            `Unsupported recipient format: "${recipient}". Supported formats: "parent", "session:<id>", "agent:<name>", "supervisor", or "https://...".`,
+          ),
+        )
       }
 
       const senderAddress = `session:${ctx.sessionID}`
@@ -287,6 +298,7 @@ export const SendMessageTool = Tool.define(
           // Fire into parent session and return acknowledgment so child can complete turn and let parent reply
           yield* ops
             .prompt({
+              messageID: MessageID.ascending(),
               sessionID: targetSessionID,
               agent: targetAgentName,
               parts,

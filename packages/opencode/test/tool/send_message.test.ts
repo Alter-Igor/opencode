@@ -274,6 +274,7 @@ describe("tool.send_message", () => {
         },
       })
 
+      const originalInbox = process.env.OCD_INBOX_URL
       process.env.OCD_INBOX_URL = `http://127.0.0.1:${server.port}`
 
       const ctx = {
@@ -305,7 +306,11 @@ describe("tool.send_message", () => {
 
         expect(res.output).toContain("mode=\"inbox_posted\"")
       } finally {
-        delete process.env.OCD_INBOX_URL
+        if (originalInbox !== undefined) {
+          process.env.OCD_INBOX_URL = originalInbox
+        } else {
+          delete process.env.OCD_INBOX_URL
+        }
         void server.stop(true)
       }
     }),

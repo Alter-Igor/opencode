@@ -11,7 +11,7 @@ Recipients supported:
 
 Delivery modes:
 - "fire_and_forget" (default): Sends the message and returns immediately.
-- "wait_reply": Sends the message and waits for the recipient agent or harness to reply.
+- "wait_reply": Sends the message and waits for the recipient agent or harness to reply. (Note: When recipient is "parent", wait_reply delivers to the parent session and returns delivery confirmation so you can complete your turn and allow the parent to reply without deadlocking).
 
 When to use:
 - To report progress, findings, or questions back to the parent session before completing a task.
