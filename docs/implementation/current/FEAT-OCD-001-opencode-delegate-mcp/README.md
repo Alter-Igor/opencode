@@ -1,7 +1,7 @@
 # FEAT-OCD-001: OpenCode delegate MCP bridge
 
 **Feature ID:** FEAT-OCD-001 · **Issue:** [#41 — local OpenCode MCP bridge for delegated sessions](https://github.com/Alter-Igor/opencode/issues/41)
-**Status:** Approved 2026-10-01 (D-A box, Q1 approve, Q2 Keystone + Synapse + npm + PyPI, Q3 patch). Execution: Wave 0.
+**Status:** In production use (0.5.1-dev). Approved 2026-10-01 (D-A box, Q1 approve, Q2 Keystone + Synapse + npm + PyPI, Q3 patch). Quality loop iter 0-14 (2026-10-11..12): learning + reporting + dashboard + self-cleanup - see `evidence/quality-loop-2026-10-12.md`.
 **Created:** 2026-09-30 · **Owner:** Igor Jericevich
 **Branch / worktree:** `opencode-mcp-bridge` · `C:\GitHub\opencode---opencode-mcp-bridge`
 

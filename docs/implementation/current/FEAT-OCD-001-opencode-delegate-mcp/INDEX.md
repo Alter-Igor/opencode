@@ -17,4 +17,5 @@
 | [evidence/adversarial-review.md](evidence/adversarial-review.md) | Review round 1 + dispositions |
 | [evidence/pr58-fresh-review.md](evidence/pr58-fresh-review.md) | Fresh review of PR #58, findings #59/#60 and validation |
 | [evidence/independent-token-recovery-review.md](evidence/independent-token-recovery-review.md) | Separate review of the token recovery fix |
+| [evidence/quality-loop-2026-10-12.md](evidence/quality-loop-2026-10-12.md) | Quality loop iter 0-14: learning/dashboard/self-cleanup summary, performance audit, open items |
 | [modules/](modules/) | Per-module docs |

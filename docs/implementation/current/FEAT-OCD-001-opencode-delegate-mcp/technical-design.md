@@ -1,8 +1,8 @@
-# FEAT-OCD-001 — Technical design (revision 6: confirmed front reloads and token recovery)
+# FEAT-OCD-001 — Technical design (revision 7: learning, reporting, dashboard, self-cleanup)
 
 No implementation code here — contracts, data shapes and behaviour only. Paths are relative to the repo root. Revision 2 changes are driven by `evidence/adversarial-review.md` (C1, C2, H1–H4, M1–M6).
 
-Revision 6, 2026-10-02: [PR #58 review](evidence/pr58-fresh-review.md), issues #59 and #60. Earlier revisions added chosen Keystone services (5), the front proxy (4), and Wave 0 corrections (3).
+Revision 6, 2026-10-02: [PR #58 review](evidence/pr58-fresh-review.md), issues #59 and #60. Earlier revisions added chosen Keystone services (5), the front proxy (4), and Wave 0 corrections (3). Revision 7, 2026-10-12: the quality loop (iter 0-14) added learning and reporting (Sec 11), the branded dashboard (Sec 12), self-cleanup (Sec 13) and a measured performance budget (Sec 14); evidence: evidence/quality-loop-2026-10-12.md.
 
 ### Synapse publication and loaded config
 
@@ -114,19 +114,27 @@ All tools: zod-validated input; short JSON + one-line summary; session text wrap
 |---|---|---|
 | `oc_doctor` | — | container state, image version/SHA, isolation level (S/U), the chosen Keystone set (saved or default) with each `ks-<id>` auth state, egress check (front config for that set, read-only mount), `frontMatches`, guard verdict |
 | `oc_login` | `server?` (default: every chosen `ks-<id>` that is `needs_auth`) | `needs_auth` → browser → `connected` / `failed` |
-| `oc_list_models` | `provider?` | `providerID/modelID` list, plus `keystone` (the box-wide set) |
+| `oc_list_models` | `provider?` | Synapse models the box offers (`synapse/<id>`, registered at box start, default `synapse/auto`), the `keystone` set, and - when Synapse publishes per-role fit (D4) - `roles`: the live top pick per role; pass `taskRole` to `oc_send`/`oc_start_session` and the bridge picks from it (§11) |
 | `oc_start_session` | `directory`, `title?`, `agent?`, `model?`, `profile?` (`standard`/`readonly`), `allowShared?`, `keystone?` (subset of the box-wide set; convenience only) | `sessionID`, `webUrl` (never contains the password, L6) |
-| `oc_send` | `sessionID`, `message`, `model?`, `agent?`, `correlationId?` | `accepted` \| `not_started` \| `refused(policy_*)` |
+| `oc_send` | `sessionID`, `message`, `model?`, `taskRole?`, `agent?`, `correlationId?`, `allowedPaths?`, `syncRef?` | `accepted` \| `not_started` \| `refused(policy_*)`; `taskPick` names the model chosen for the role (§11) |
 | `oc_status` | `sessionID?` | state (§6), since, todos, tokens, last error |
 | `oc_wait` | `sessionIDs[]`, `until[]`, `timeoutSec` ≤240, `cursor?` | events + cursor, or `still_running` |
 | `oc_events` | `cursor`, `sessionID?`, `limit` ≤200 | page of events |
 | `oc_result` | `sessionID`, `messages?` | last assistant text (untrusted), diff summary, todos |
+| `oc_collect` | `sessionID` | fetch the session's branch (`delegate/<key>`) into the owner's repo; merges nothing; warns on host-executable changes (hooks/scripts/CI) and out-of-`allowedPaths` edits (#148) |
 | `oc_pending` | `sessionID?` | pending permissions + questions with IDs |
 | `oc_answer` | `requestID`, `kind`, `reply` (`once`/`reject`+`message?`) or `answers[][]` | `ok` (`always` refused) |
 | `oc_abort` | `sessionID` | `ok` |
 | `oc_list_sessions` | `directory?`, `mine?` | sessions + supervisor + state; `prunedRecords` when it removed this box's host records of sessions proved gone (#53), so it is marked destructive |
 | `oc_post` / `oc_inbox` | `to`, `text`, `wake?` / `cursor?` | agent inbox (§7) |
 | `oc_server_restart` | `confirm`, `force?`, `keystone?` (new box-wide set, saved) | restarted, interrupted bridges, the set it runs with |
+| `oc_report` | `days?` | the §11 scorecard for every bridge sharing this home: counts, success rate, per-model rows |
+| `oc_dashboard` | - | local read-only owner page URL (§12); starts the server lazily, never the box |
+| `oc_close_session` | `sessionID`, `abort?`, `discardWork?`, `deleteBranch?` | deletes session + box copy + host record; refused while running, unreadable, or with uncollected work (data-loss guards #72/#77) |
+| `oc_cleanup` | - | closes sessions idle beyond `OPENCODE_DELEGATE_SESSION_TTL_DAYS` (default 14) under the same guards, never aborting or discarding |
+| `oc_sync` | `sessionID`, `ref` | fetch+merge a host ref into the session copy; refuses dirty or conflicting (aborts to keep the copy clean) |
+| `oc_verify` | `sessionID`, `command` | runs an allowlisted build/test/lint command on the host against the collected branch; exit code + trimmed output |
+| `oc_land` | `sessionID`, `title`, `body?`, verify commands | one-call finish: ff the collected branch, re-author with caller identity + Co-Authored-By, verify, push, open PR |
 
 Optional Claude channel push as in revision 1 (off by default).
 
@@ -167,10 +175,10 @@ As revision 1: stable error codes (`server_down`, `profile_invalid`, `profile_ch
 | Architecture | YES | Docker base image + proxy image assessed | ARCH-ASSESS-01 | assessment note in `evidence/` |
 | Documentation | YES | Pack + fork notes | DOC-MOD-01..04, DOC-HF-04 | review |
 | Work tracking | YES | #41 checkpoints | WT-PM-01..11 | issue history |
-| Realtime (browser) | NO | Not a browser surface | — | — |
-| Accessibility | NO | No UI of ours | — | — |
-| Analytics/privacy | NO | No analytics; Keystone audit + local log | — | — |
-| Performance | NO (no binding rule) | Targets in plan §9; bind-mount speed measured in T0.1 | — | timing |
+| Realtime (browser) | YES (§12 dashboard) | Local read-only page, 5 s poll of host records | OBS-RT-* | brand/rendered evidence in `evidence/quality-loop-2026-10-12.md` |
+| Accessibility | YES (§12 dashboard) | Contrast 4.5:1 both themes, keyboard tabs + focus ring, colour never the only signal, reduced-motion clamp | UX-AX-*, UX-BRAND-05 | used-font + contrast probes (`spike/font-evidence.ts`) |
+| Analytics/privacy | NO | No analytics; the dashboard shows host task metadata only (hashed repo/caller); no prompts leave the host | — | data.json shape test |
+| Performance | NO (no binding rule) | Measured budget in §14 | — | live probe (iter 15) |
 | Langfuse | NO (indirect) | Bridge makes no LLM calls | OBS-AI-02 | metadata test |
 
 ## 10. Edge cases
@@ -187,3 +195,34 @@ As revision 1: stable error codes (`server_down`, `profile_invalid`, `profile_ch
 10. Inbox ping-pong → hop + rate limits at the bridge.
 11. Docker Desktop not running → `sandbox_unavailable`; **no silent fallback to Level U**.
 12. Agent needs npm/pip/bun/uv packages → served by the read-only caches on the internal network; the box never reaches a public registry directly and cannot publish (Q2, review N3).
+
+## 11. Learning and reporting (revision 7)
+
+The bridge keeps a **host-only** learning loop about how well each Synapse model actually serves delegated work. Nothing leaves the host; the only outbound step is an offered outcome-ingest contract to Synapse (#1926).
+
+- **Task records** (`src/reporting/`): one JSON file per settled task under `<home>/workspaces/reports/` - metadata only (model ids, outcome, durations, token counts, hashed repo/caller names); never a prompt or answer text. Written by the hooks every tool already triggers (start/send/states/result/served/collect/close); `collected`/`disposition` carry the human-acceptance signal a benchmark call cannot yield. Store caps: 90 days by `startedAt` and 2,000 finished records, swept every 10 minutes on write (open tasks are never counted toward the cap).
+- **Scorecard** (`reporting/scorecard.ts`): pure per-model rollup, share-weighted (a task's credit splits by served-call counts). `served` rows stay separate from `requested-only` rows (the re-routed/404 ghost class), so a ghost never inflates a real server's rate. Surfaced by `opencode-delegate scorecard` (with the since-last-run delta) and on the dashboard.
+- **Serving history feeding role picks** (D4, owner decision 2026-10-10): `oc_send`/`oc_start_session {taskRole}` pick from Synapse's live `capabilities.suitability` (Synapse #1918/#1919), with exactly the client-side guards the gateway cannot have: the **box-offer constraint** and the **dead firewall** (ids that errored tasks while never serving a call - the unroutable catalogue-row class, e.g. ghost `claude-opus-5`). A hint never blocks a send; unreadable data falls back to the plain order and says so.
+- **Outcome export** (`opencode-delegate outcomes`): redacted JSONL - the proposed `synapse-internal` benchmark input; the row contract is offered on Synapse #1926, consumer-side conform promised, no parallel scorer built.
+- **`role-quality`** - the anti-duplication guard (owner directive 2026-10-11: work *with* Synapse's learning). It compares the LIVE published table against measured outcomes per role: a role is `baked` when its published top pick is offered, alive, and within tolerance of the best measured rate; `allBaked` also refuses while any dead row is still published. **The standing deal:** when `allBaked` flips true, the client-side tie-break term is deleted and the gateway table becomes the sole quality signal; the bridge keeps only the dead firewall and the box-offer constraint. Checked per loop iteration - machine state, not memory.
+- Knowledge loop closed: **AILES-180** (Alterspective-Intelligence #1484, merged 2026-10-12) records the "deferred a solved-class requirement without prior-art search" mistake; the KB now answers that query class directly.
+
+## 12. Dashboard (revision 7)
+
+`oc_dashboard` (#129, rebranded iter 8-9): a **local, read-only** owner page. `127.0.0.1` on a random port; every route behind a random 32-hex path token (constant-time compare); Host must equal `127.0.0.1:<port>` (DNS-rebinding guard); GET-only; `no-store`/`nosniff`/`no-referrer`; strict CSP (`default-src 'none'`, script/style/img/font/connect `'self'`). The single data channel is `data.json` (the same host task records as `oc_report`); the HTML/CSS/JS are constant strings and every data element is `createElement`+`textContent` - a repo, model or caller name can only ever be text (test-enforced, including a markup payload). Four views behind an accessible tablist (Overview / Tasks / Models / About), keyboard arrows, one 5-second poll interval, a system/light/dark theme cycle with localStorage memory - a small app, not one long page. Brand chrome per WEBSTA-001-UX-QUALITY: the page's own `:root` carries the brand tokens (the only hex source, test-enforced), first-party self-hosted woff2 `@font-face` of the licensed cuts (UX-BRAND-07a; proof script `spike/font-evidence.ts` - used-font probe + negative control, AIRUN-025), outlined hand-drawn brand vectors applied by CSS mask so they take the theme's colour, reversed logo on dark. `opencode-delegate dashboard [--no-open]` serves it standalone (a ref'd keep-alive interval pumps the loop; the MCP path stays unref'd so a tab never keeps a bridge alive); the first bridge run per home opens the browser once (`<home>/dashboard-opened` marker; the token URL is never written to disk). It never starts or touches the sandbox.
+
+## 13. Self-cleanup (revision 7)
+
+What the bridge writes deletes itself: task records (the §11 cap rule), session host states proved gone (#53: direct 404 **and** absent clone, by name, best-effort, tracked-in-memory never touched), hand-off leftovers (>30 min swept on start/reuse), and **bridge logs**: iter 12 added a daily sweep - at the first log line of a new day, `bridge-<YYYY-MM-DD>.log` files whose name-date is older than `LOG_RETENTION_DAYS` (30) are deleted. The date is parsed from the name, never mtime (a copied file keeps its day); foreign names in the folder are never touched; every failure is swallowed and retried at the next rollover (logging must never throw or block). The machine-local watcher supervisor (iter 10/14) self-re-arms forever and publishes `ocd-watch.status.json` (`watching`/`sleeping` + PIDs + `sleepUntil`) so a check-in can tell a 60-second re-arm pause from death; exact-PID stops only. Test isolation learned the hard way (iter 13): every fixture gets a throw-away bridge home - suite runs must never write into the operator's real `~/.local/share/opencode-delegate`.
+
+## 14. Performance budget (measured live 2026-10-12)
+
+| Path | Cost | Note |
+|---|---|---|
+| Dashboard poll (store re-read + rollup, 481 records) | ~27 ms | per open tab every 5 s; scales with the 2,000 cap (~100 ms worst); zero when no tab |
+| Role-pick serving history | 0.3 ms read, memoised 60 s per home | |
+| Live `/v1/models` fetch (per named/picked send) | ~7 ms median (4 s cap, fails open) | |
+| Synapse gateway per chat call | ~20 ms shell | no-model `/v1/models` probe 5-25 ms vs ~240 ms warm 1-token chat (rest is model time); connection reuse moves the 30-40 ms handshake out of the steady state |
+| Log sweep / prune | one folder read + deletes, once per day / per 10 min | off hot paths |
+
+No binding performance standard applies (the §9 matrix row is unchanged); this table is the reference budget, re-measurable with the throwaway probe pattern of iter 15.
