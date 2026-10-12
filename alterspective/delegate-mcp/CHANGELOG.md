@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.2 — 2026-10-12
+
+**Package installs work in the box again (#167).** Agents said "the sandbox has no network, so I cannot install packages". The box does install through the read-only caches; three gaps made it fail.
+
+- `npm-cache` no longer runs out of memory. At 512 MB Verdaccio hit its heap limit on big packuments (`vite`, `typescript`, `@types/node`) and restarted in the middle of installs (10 restarts in one day). It now has 2 GB and a 1536 MB Node heap.
+- The box image has `pnpm` (pinned, 11.28.2). It reads through `npm-cache` via `pnpm_config_registry`: pnpm 11 ignores `npm_config_registry`, so `npx pnpm` went straight to `registry.npmjs.org` and failed with `EAI_AGAIN` (the "no network" error). A repo that pins another pnpm version gets it through the same cache.
+- corepack now fetches through `npm-cache` (`COREPACK_NPM_REGISTRY`); before, it tried `registry.npmjs.org`, which the box cannot reach. `COREPACK_*` and `PNPM_CONFIG_*` names are reserved, so a host box-env list cannot override them.
+- No new egress host. The box still never reaches a public registry (review N3). The box and npm-cache images rebuild once.
+
 ## 0.5.1 — 2026-10-05
 
 **Which session delegated (#132).** The dashboard and `oc_report` can now tell sessions apart even when every session starts its bridge with the same `OPENCODE_DELEGATE_NAME`.
