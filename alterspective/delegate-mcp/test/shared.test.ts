@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { rmSync, writeFileSync } from "node:fs"
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { createLogger, redact, safeLog, scrub } from "../src/shared/log.ts"
@@ -105,6 +105,39 @@ describe("log", () => {
     const lines: string[] = []
     createLogger({ minLevel: "warn", write: (l) => lines.push(l) }).log("info", "t", "x")
     expect(lines).toHaveLength(0)
+  })
+
+  test("a new day sweeps bridge logs older than retentionDays by name and keeps the rest", () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "ocd-logret-"))
+    try {
+      for (const day of ["2026-08-01", "2026-09-15", "2026-09-16", "2026-09-30"]) writeFileSync(path.join(dir, `bridge-${day}.log`), "old\n")
+      writeFileSync(path.join(dir, "bridge-2026-09-15.txt"), "foreign name\n")
+      writeFileSync(path.join(dir, "notes.log"), "other file\n")
+      const logger = createLogger({ dir, write: () => {}, retentionDays: 15, now: () => Date.parse("2026-10-01T05:00:00.000Z") })
+      logger.log("info", "t", "hello")
+      expect(readdirSync(dir).sort()).toEqual(["bridge-2026-09-15.txt", "bridge-2026-09-16.log", "bridge-2026-09-30.log", "bridge-2026-10-01.log", "notes.log"])
+      expect(readFileSync(path.join(dir, "bridge-2026-10-01.log"), "utf8")).toContain("hello")
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("retention runs once per day (no re-sweep on every line) and the default window is 30 days", () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "ocd-logret2-"))
+    try {
+      const logger = createLogger({ dir, write: () => {}, now: () => Date.parse("2026-10-01T05:00:00.000Z") })
+      logger.log("info", "t", "a")
+      logger.log("info", "t", "b") // same day: no second sweep; and with no old files there is nothing to remove anyway
+      expect(readdirSync(dir).filter((n) => n === "bridge-2026-10-01.log")).toHaveLength(1)
+      // default 30 days from 2026-10-01: cutoff day 2026-09-01 - 08-31 goes, 09-01 keeps (>= cutoff)
+      writeFileSync(path.join(dir, "bridge-2026-08-31.log"), "out\n")
+      writeFileSync(path.join(dir, "bridge-2026-09-01.log"), "keep\n")
+      createLogger({ dir, write: () => {}, now: () => Date.parse("2026-10-01T06:00:00.000Z") }).log("info", "t", "c")
+      expect(readdirSync(dir)).not.toContain("bridge-2026-08-31.log")
+      expect(readdirSync(dir)).toContain("bridge-2026-09-01.log")
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })
 
@@ -293,3 +326,4 @@ describe("config", () => {
     expect(re.test("/mcp/c/../x")).toBe(false)
   })
 })
+

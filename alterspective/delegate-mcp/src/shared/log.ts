@@ -1,7 +1,10 @@
 // Structured JSON logs to stderr and a daily file (LOGGING-STANDARDS required fields).
 // stdout carries the MCP protocol, so nothing here may write to it (deviation D-1 from OBS-SNK-01).
 // Logging never throws (review A-11): a failing sink loses the line, never the call.
-import { appendFileSync, mkdirSync } from "node:fs"
+// Daily files are self-cleaning: at the first log of a new day, bridge-<date>.log files older than
+// retentionDays (default 30) are deleted. The date comes from the name, not mtime (a restored or
+// copied file keeps its day). Foreign names in the folder are never touched.
+import { appendFileSync, mkdirSync, readdirSync, unlinkSync } from "node:fs"
 import path from "node:path"
 
 export type Level = "debug" | "info" | "warn" | "error"
@@ -69,10 +72,37 @@ export function redact(fields: Fields): Fields {
   return out
 }
 
-export function createLogger(options: { dir?: string; minLevel?: Level; write?: (line: string) => void } = {}): Logger {
+export const LOG_RETENTION_DAYS = 30
+const DAY_MS = 24 * 60 * 60 * 1000
+const BRIDGE_LOG_RE = /^bridge-(\d{4}-\d{2}-\d{2})\.log$/
+
+/** Delete bridge-<date>.log files whose day is before (now - retentionDays), by NAME, keeping everything else. */
+function sweepOldLogs(dir: string, now: number, retentionDays: number): void {
+  const cutoff = new Date(now - retentionDays * DAY_MS).toISOString().slice(0, 10)
+  let names: string[]
+  try {
+    names = readdirSync(dir)
+  } catch {
+    return // an unreadable folder is retried at the next day rollover
+  }
+  for (const name of names) {
+    const day = BRIDGE_LOG_RE.exec(name)?.[1]
+    if (day === undefined || day >= cutoff) continue
+    try {
+      unlinkSync(path.join(dir, name))
+    } catch {
+      // a locked or vanished file is tried again tomorrow; retention is best effort
+    }
+  }
+}
+
+export function createLogger(options: { dir?: string; minLevel?: Level; write?: (line: string) => void; retentionDays?: number; now?: () => number } = {}): Logger {
   const order: Level[] = ["debug", "info", "warn", "error"]
   const min = order.indexOf(options.minLevel ?? "info")
   const write = options.write ?? ((line: string) => process.stderr.write(line + "\n"))
+  const retentionDays = Number.isInteger(options.retentionDays) && (options.retentionDays ?? 0) > 0 ? (options.retentionDays as number) : LOG_RETENTION_DAYS
+  const now = options.now ?? (() => Date.now())
+  let lastSweptDay: string | undefined
   let fileOk = options.dir !== undefined
   if (options.dir) {
     try {
@@ -86,11 +116,16 @@ export function createLogger(options: { dir?: string; minLevel?: Level; write?: 
       if (order.indexOf(level) < min) return
       let line: string
       try {
-        const ts = new Date().toISOString()
+        const ts = new Date(now()).toISOString()
         line = JSON.stringify({ ts, level, service: "opencode-delegate", component, msg: scrub(msg), ...redact(fields) })
         if (fileOk && options.dir) {
+          const day = ts.slice(0, 10)
+          if (day !== lastSweptDay) {
+            lastSweptDay = day
+            sweepOldLogs(options.dir, now(), retentionDays)
+          }
           try {
-            appendFileSync(path.join(options.dir, `bridge-${ts.slice(0, 10)}.log`), line + "\n")
+            appendFileSync(path.join(options.dir, `bridge-${day}.log`), line + "\n")
           } catch {
             // disk full, folder removed, file locked: keep going on stderr
           }
