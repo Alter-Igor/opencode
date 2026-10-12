@@ -84,9 +84,10 @@ describe("box package managers (#167)", () => {
     expect(env.COREPACK_NPM_REGISTRY).toBe("http://npm-cache:4873")
     // pnpm 11 ignores npm_config_registry (seen live, #167).
     expect(env.pnpm_config_registry).toBe("http://npm-cache:4873/")
-    for (const [name, value] of Object.entries(env)) {
-      if (/registry|index/i.test(name)) expect(String(value)).not.toMatch(/npmjs|pypi\.org|pythonhosted/)
-    }
+    // Any registry or index setting names one of the two caches, and nothing else.
+    const settings = Object.entries(env).filter(([name]) => /registry|index/i.test(name))
+    expect(settings.length).toBeGreaterThanOrEqual(6)
+    for (const [, value] of settings) expect(String(value)).toMatch(/^http:\/\/(npm-cache:4873|pypi-cache:5000)(\/|$)/)
   })
 })
 
