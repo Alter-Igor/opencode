@@ -74,7 +74,7 @@ describe("box package managers (#167)", () => {
   }
 
   test("pnpm is installed at build time with a pinned version", () => {
-    expect(readFileSync(path.join(CACHES, "..", "box", "Dockerfile"), "utf8")).toMatch(/npm install -g [^\n]*pnpm@\d+\.\d+\.\d+ /)
+    expect(readFileSync(path.join(CACHES, "..", "box", "Dockerfile"), "utf8")).toMatch(/npm install -g [^\n]*pnpm@\d+\.\d+\.\d+\b/)
   })
 
   test("every registry setting points at the cache, never a public registry", () => {
