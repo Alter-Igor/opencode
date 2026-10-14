@@ -1,7 +1,7 @@
 // #171: a committed image or profile starts a second compose project beside the one that is
 // already running. The project name is the base project plus the 12-hex content hash from the
 // image tag (identity.ts). A dirty tag (`-dirty-`) never starts a stack. At most two projects run.
-import { readFile, writeFile } from "node:fs/promises"
+import { readFile, rename, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { PROJECT_RE } from "../shared/config.ts"
 
@@ -62,5 +62,8 @@ export async function rememberGeneration(home: string, project: string): Promise
   if (!PROJECT_RE.test(project)) return
   const names = new Set(await readGenerations(home))
   names.add(project)
-  await writeFile(path.join(home, REGISTRY), JSON.stringify({ projects: [...names].sort() }) + "\n")
+  const file = path.join(home, REGISTRY)
+  const tmp = `${file}.${process.pid}.tmp`
+  await writeFile(tmp, JSON.stringify({ projects: [...names].sort() }) + "\n")
+  await rename(tmp, file)
 }

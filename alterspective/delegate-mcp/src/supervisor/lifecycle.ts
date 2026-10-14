@@ -392,6 +392,14 @@ async function finishGeneration(run: Run): Promise<void> {
   await sweepOthers(run, known)
 }
 
+/** Drop this bridge's lease file only. Do not stop the box: other sessions may still be on it. */
+async function releaseOwnLease(run: Run): Promise<void> {
+  if (!run.state.leased) return
+  await run.stopHeartbeat()
+  await run.leases.release(run.deps.bridgeId)
+  run.state.leased = false
+}
+
 async function beside(run: Run, made: Plan, next: string): Promise<ApiTarget> {
   const known = [...new Set([run.root.baseProject, ...(await readGenerations(run.deps.config.home))])]
   const ours = await inspectBox(run.deps.exec, INSPECT_ENV, next)
@@ -401,6 +409,7 @@ async function beside(run: Run, made: Plan, next: string): Promise<ApiTarget> {
     const problem = await profileProblem(run, ours, made, next)
     if (problem) throw await withHolders(run, problem)
   }
+  if (run.deps.config.project !== next) await releaseOwnLease(run)
   place(run, next)
   await rememberGeneration(run.deps.config.home, next)
   if (ours?.running) {

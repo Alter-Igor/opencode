@@ -234,6 +234,27 @@ describe("supervisor generations (#171)", () => {
     expect(calls.some((call) => call.argv.includes("up"))).toBe(false)
   })
 
+  test("a failed open removes the copied clone and keeps the caller record", async () => {
+    await writeOwner()
+    record()
+    const calls: Call[] = []
+    const failedOpen = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes("/session/status")) return Response.json({})
+      if (url.includes("/permission") || url.includes("/question")) return Response.json([])
+      if ((init?.method ?? "GET") === "POST" && url.includes("/session")) return new Response("no", { status: 500 })
+      return new Response("", { status: 200 })
+    }) as typeof fetch
+    await supervisor(deps(fakeDocker(oldBox(), calls), { image: IMAGE, fetch: failedOpen })).ensure()
+    expect(calls.some((call) => call.argv[1] === "cp")).toBe(true)
+    expect(calls.some((call) => call.argv[1] === "exec" && call.argv.includes("rm") && call.argv.includes(`/sessions/idle-key`))).toBe(true)
+    const state = readHostState(path.join(home, "workspaces"), "idle-key")
+    expect(state?.sessionID).toBe(CALLER)
+    expect(state?.boxSessionID).toBeUndefined()
+    expect(state?.boxProject).toBe("opencode-delegate")
+    expect(downOf(calls, "opencode-delegate")).toHaveLength(0)
+  })
+
   test("a session older than the newest 200 keeps its sandbox up", async () => {
     await writeOwner()
     const dir = path.join(home, "workspaces")
