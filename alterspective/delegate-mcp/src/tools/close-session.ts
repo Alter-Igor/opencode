@@ -327,7 +327,7 @@ export const cleanupTool = defineTool({
         await sweepOne(run, state)
       } catch (error) {
         out.skipped.unknown++
-        ctx.log.log("warn", "tools", "session sweep skipped a session", { sessionKey: state.sessionKey, correlationId, code: error instanceof DelegateError ? error.code : "unexpected" })
+        ctx.log.log("warn", "tools", "session sweep skipped a session", { sessionKey: state.sessionKey, correlationId, code: error instanceof DelegateError ? error.code : "unexpected", ...(error instanceof DelegateError ? { reason: error.message, detail: error.detail } : {}) })
       }
     }
     const summary = sweepSummary(out, dryRun, days, candidates.states.length, candidates.otherBridge)

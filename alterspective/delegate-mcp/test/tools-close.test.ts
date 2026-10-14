@@ -4,6 +4,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } fr
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs"
 import path from "node:path"
 import type { SessionState, SessionView } from "../src/shared/contracts.ts"
+import { DelegateError } from "../src/shared/errors.ts"
 import type { Call } from "../src/shared/opencode-api.ts"
 import { writeHostState, type HostSessionState } from "../src/supervisor/workspaces-state.ts"
 import { cleanupTool, closeSessionTool } from "../src/tools/close-session.ts"
@@ -330,6 +331,44 @@ describe("oc_cleanup", () => {
     },
     T * 2,
   )
+
+  test(
+    "#174: an old record whose session is gone from the box is swept, not skipped as unknown",
+    async () => {
+      const f = context()
+      const gone = await start(f, { ageDays: 30, track: false })
+      f.api.on(`GET /session/${gone.sessionID}`, { status: 404, data: { name: "NotFoundError" } })
+      const dry = await invoke(cleanupTool, {}, f.ctx)
+      // earlier tests leave records in the shared state dir, so check this key, not the whole list
+      expect(data(dry).wouldClose as string[]).toContain(gone.key)
+      expect(data(dry)).toMatchObject({ skipped: { unknown: 0 } })
+      expect(existsSync(recordFile(gone.key))).toBe(true)
+
+      const real = await invoke(cleanupTool, { dryRun: false }, f.ctx)
+      expect(data(real).closed as string[]).toContain(gone.key)
+      expect(data(real)).toMatchObject({ skipped: { unknown: 0 } })
+      expect(existsSync(recordFile(gone.key))).toBe(false)
+      expect(fx.leftovers(gone.key)).toEqual([])
+    },
+    T * 2,
+  )
+
+  test("#174: a skipped record logs the reason and detail, not just the code", async () => {
+    const f = context()
+    await start(f, { ageDays: 30, track: false })
+    const lines: Array<{ msg: string; fields?: Record<string, unknown> }> = []
+    f.ctx.log = { log: (_level, _component, msg, fields) => void lines.push({ msg, fields }) }
+    f.ctx.workspaces = {
+      ...f.ctx.workspaces,
+      inspectClose: async () => {
+        throw new DelegateError("not_found", "no such record", "look elsewhere", "close refused: probe")
+      },
+    }
+    const dry = await invoke(cleanupTool, {}, f.ctx)
+    expect(Number((data(dry).skipped as { unknown: number }).unknown)).toBeGreaterThanOrEqual(1)
+    const skipped = lines.find((l) => l.msg === "session sweep skipped a session")
+    expect(skipped?.fields).toMatchObject({ code: "not_found", reason: "no such record", detail: "close refused: probe" })
+  })
 
   test("a TTL of 0 disables the sweep", async () => {
     process.env[TTL_ENV] = "0"

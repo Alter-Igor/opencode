@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `oc_cleanup` now logs the error `reason` and `detail`, not only the code, when it skips a session (#174).
+
 ## 0.5.4 — 2026-10-14
 
 **Both boxes get the renewed tokens (#178).** With two box generations running (#171), a session on one of them failed with `errorCode: auth` ("Missing or invalid API key") while `oc_doctor` said Synapse was fine.
