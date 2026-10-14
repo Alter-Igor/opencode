@@ -32,29 +32,32 @@ async function liveLeases(run: Run, project: string): Promise<number> {
   return (await leases.active()).length
 }
 
-async function copyClone(exec: Exec, from: string, to: string, key: string, hostDir: string): Promise<boolean> {
+async function copyClone(exec: Exec, from: string, to: string, key: string, hostDir: string): Promise<"copied" | "not-copied" | "left-behind"> {
   const landed = path.join(hostDir, key)
   await rm(landed, { recursive: true, force: true })
   const out = await exec(["docker", "cp", `${from}:${SESSIONS}/${key}`, hostDir], { timeoutMs: 120_000 })
-  if (out.code !== 0) return false
+  if (out.code !== 0) return "not-copied"
   const into = await exec(["docker", "cp", landed, `${to}:${SESSIONS}/${key}`], { timeoutMs: 120_000 })
   await rm(landed, { recursive: true, force: true })
-  if (into.code !== 0) await removeClone(exec, to, key)
-  return into.code === 0
+  if (into.code !== 0) return (await removeClone(exec, to, key)) ? "not-copied" : "left-behind"
+  return "copied"
 }
 
-async function removeClone(exec: Exec, container: string, key: string): Promise<void> {
-  if (!SESSION_KEY.test(key)) return
-  await exec(["docker", "exec", container, "rm", "-rf", "--", `${SESSIONS}/${key}`], { timeoutMs: 30_000 }).catch(() => undefined)
+async function removeClone(exec: Exec, container: string, key: string): Promise<boolean> {
+  if (!SESSION_KEY.test(key)) return false
+  const result = await exec(["docker", "exec", container, "rm", "-rf", "--", `${SESSIONS}/${key}`], { timeoutMs: 30_000 }).catch(() => undefined)
+  return result?.code === 0
 }
 
-async function undoOpen(run: Run, key: string, sessionID: string): Promise<void> {
+/** Delete the new session first. The clone stays when that delete does not succeed. */
+async function undoOpen(run: Run, key: string, sessionID: string): Promise<boolean> {
   const box = await inspectBox(run.deps.exec, [PASSWORD_ENV], run.container).catch(() => undefined)
-  if (box?.running) {
-    const api = createApi(targetOf(box, run.deps.config.project), run.deps.fetch)
-    await api.call({ method: "DELETE", path: `/session/${sessionID}`, directory: `${SESSIONS}/${key}` }).catch(() => undefined)
-  }
-  await removeClone(run.deps.exec, run.container, key)
+  if (!box?.running) return false
+  const deleted = await createApi(targetOf(box, run.deps.config.project), run.deps.fetch)
+    .call({ method: "DELETE", path: `/session/${sessionID}`, directory: `${SESSIONS}/${key}` })
+    .catch(() => undefined)
+  if (!deleted || deleted.status < 200 || deleted.status >= 300) return false
+  return removeClone(run.deps.exec, run.container, key)
 }
 
 async function idleOn(run: Run, project: string, sessionID: string, directory: string): Promise<boolean> {
@@ -103,16 +106,17 @@ async function moveOne(run: Run, state: HostSessionState & { sessionID: string }
   const directory = `${SESSIONS}/${state.sessionKey}`
   if (!(await idleOn(run, state.boxProject!, state.sessionID, directory))) return false
   const copied = await copyClone(run.deps.exec, state.boxProject!, run.container, state.sessionKey, hostDir)
-  if (!copied) return false
+  if (copied === "left-behind") run.note("warn", "copied clone was not removed", { sessionKey: state.sessionKey })
+  if (copied !== "copied") return false
   const boxSessionID = await openOnNew(run, state, directory)
   if (!boxSessionID) {
-    await removeClone(run.deps.exec, run.container, state.sessionKey)
+    if (!(await removeClone(run.deps.exec, run.container, state.sessionKey))) run.note("warn", "copied clone was not removed", { sessionKey: state.sessionKey })
     return false
   }
   try {
     updateHostState(path.join(run.deps.config.home, "workspaces"), state.sessionKey, { boxProject: run.deps.config.project, boxSessionID })
   } catch (error) {
-    await undoOpen(run, state.sessionKey, boxSessionID)
+    if (!(await undoOpen(run, state.sessionKey, boxSessionID))) run.note("warn", "new session was not rolled back", { sessionKey: state.sessionKey })
     throw error
   }
   run.note("info", "moved idle session onto this sandbox", { sessionKey: state.sessionKey, from: state.boxProject })

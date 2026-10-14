@@ -5,7 +5,7 @@ import path from "node:path"
 import { mcpAllowPolicy } from "../src/shared/config.ts"
 import { planFor } from "../src/supervisor/plan.ts"
 import { readHostState, writeHostState } from "../src/supervisor/workspaces-state.ts"
-import { L, deps, fail, fakeDocker, home, leaseDir, supervisor, writeOwner, type Box, type Call, useSupervisorFixture } from "./supervisor-lifecycle-fixture.ts"
+import { L, deps, fail, fakeDocker, home, leaseDir, recorder, supervisor, writeOwner, type Box, type Call, useSupervisorFixture } from "./supervisor-lifecycle-fixture.ts"
 
 useSupervisorFixture()
 
@@ -253,6 +253,64 @@ describe("supervisor generations (#171)", () => {
     expect(state?.boxSessionID).toBeUndefined()
     expect(state?.boxProject).toBe("opencode-delegate")
     expect(downOf(calls, "opencode-delegate")).toHaveLength(0)
+  })
+
+  test("a failed session delete leaves the copied clone in place", async () => {
+    await writeOwner()
+    record()
+    await mkdir(path.join(home, "workspaces", `idle-key.json.${process.pid}.tmp`), { recursive: true })
+    const calls: Call[] = []
+    const failedDelete = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      const method = init?.method ?? "GET"
+      if (url.includes("/session/status")) return Response.json({})
+      if (url.includes("/permission") || url.includes("/question")) return Response.json([])
+      if (method === "POST" && url.includes("/session")) return Response.json({ id: MOVED })
+      if (method === "DELETE") return new Response("no", { status: 500 })
+      return new Response("", { status: 200 })
+    }) as typeof fetch
+    await supervisor(deps(fakeDocker(oldBox(), calls), { image: IMAGE, fetch: failedDelete })).ensure()
+    expect(calls.some((call) => call.argv[1] === "cp")).toBe(true)
+    expect(calls.some((call) => call.argv[1] === "exec" && call.argv.includes("rm"))).toBe(false)
+    const state = readHostState(path.join(home, "workspaces"), "idle-key")
+    expect(state?.sessionID).toBe(CALLER)
+    expect(state?.boxSessionID).toBeUndefined()
+    expect(state?.boxProject).toBe("opencode-delegate")
+  })
+
+  test("a failed clone removal is reported and the caller record stays", async () => {
+    await writeOwner()
+    record()
+    const calls: Call[] = []
+    const log = recorder()
+    const failedOpen = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes("/session/status")) return Response.json({})
+      if (url.includes("/permission") || url.includes("/question")) return Response.json([])
+      if ((init?.method ?? "GET") === "POST" && url.includes("/session")) return new Response("no", { status: 500 })
+      return new Response("", { status: 200 })
+    }) as typeof fetch
+    await supervisor(
+      deps(
+        fakeDocker(oldBox(), calls, {
+          exec: (argv) =>
+            argv.includes("rm")
+              ? { code: 1, stdout: "", stderr: "busy" }
+              : { code: 0, stdout: JSON.stringify({ names: [], removed: [] }), stderr: "" },
+        }),
+        {
+          image: IMAGE,
+          fetch: failedOpen,
+          log,
+        },
+      ),
+    ).ensure()
+    expect(calls.some((call) => call.argv[1] === "exec" && call.argv.includes("rm") && call.argv.includes("/sessions/idle-key"))).toBe(true)
+    expect(log.lines.some((line) => line.level === "warn" && line.msg === "copied clone was not removed")).toBe(true)
+    const state = readHostState(path.join(home, "workspaces"), "idle-key")
+    expect(state?.sessionID).toBe(CALLER)
+    expect(state?.boxSessionID).toBeUndefined()
+    expect(state?.boxProject).toBe("opencode-delegate")
   })
 
   test("a session older than the newest 200 keeps its sandbox up", async () => {

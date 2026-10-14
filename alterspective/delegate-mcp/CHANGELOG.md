@@ -10,6 +10,7 @@
 - The old project stops when it has no sessions and no live leases. A third generation waits.
 - A dirty checkout does not start a second stack. `oc_server_restart` still stops the box you mean to stop. Do not call it while a task is running.
 - Each generation has its own front folder, so two projects do not write the same `servers.conf`.
+- A copied clone is removed only after the new session is deleted. A failed delete or a failed remove is logged, and the caller record stays on the old project.
 
 Checked with `bun run typecheck` and the generation tests (fake docker). Not run against a live Docker host.
 
