@@ -2,7 +2,7 @@
 // the bridge's memory and in this child env (and so the container). It is never written to a
 // file or logged. Box env vars are listed in the override file by NAME only.
 import path from "node:path"
-import { DYNAMIC_PROFILE_ENV, frontDir, mcpAllowPolicy, type BridgeConfig } from "../shared/config.ts"
+import { DYNAMIC_PROFILE_ENV, frontDir, generationRoot, mcpAllowPolicy, type BridgeConfig } from "../shared/config.ts"
 import { parseProfile } from "../../mcp-gate/src/policy.ts"
 import { DelegateError } from "../shared/errors.ts"
 import { synapseLockFile } from "../synapse/lock.ts"
@@ -38,16 +38,19 @@ export type GateStart = { port: number; token: string; profile: string }
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
 
 export function paths(config: BridgeConfig) {
+  // A generation keeps its own profile, front, hand-off and leases. The start lock and the Synapse
+  // lock stay in the home so two projects cannot start or rewrite front at the same time (#171).
+  const root = generationRoot(config.home, config.project) ?? config.home
   return {
-    profile: path.join(config.home, "profile"),
-    handoff: path.join(config.home, "handoff"),
-    leases: path.join(config.home, "leases"),
+    profile: path.join(root, "profile"),
+    handoff: path.join(root, "handoff"),
+    leases: path.join(root, "leases"),
     startLock: path.join(config.home, "start.lock"),
     /** Review N1: the Synapse refresh lock; taken after the start lock to write front's generated files. */
     synapseLock: synapseLockFile(config.home),
-    boxEnvOverride: path.join(config.home, "compose.box-env.yaml"),
+    boxEnvOverride: path.join(root, "compose.box-env.yaml"),
     /** Generated front config, mounted read-only into front (never into the box). */
-    front: frontDir(config),
+    front: frontDir({ home: config.home, project: config.project }),
   }
 }
 

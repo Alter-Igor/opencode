@@ -3,7 +3,8 @@
 // before any health wait, so another bridge's release can never stop a box this bridge is
 // about to use (A-02). Every public call is logged with the bridge id and a correlation id.
 // A running set is reused only when the box AND its front/cache siblings match (N-9).
-// replace() (oc_server_restart) is the way out of profile_changed: down + start under the lock.
+// A committed image (12 hex, not -dirty-) starts a second project beside the running one (#171).
+// replace() (oc_server_restart) still downs only the project this process is bound to.
 // It can also change the box-wide Keystone set (review R4-01), saved in the bridge home.
 import { mkdir, writeFile } from "node:fs/promises"
 import path from "node:path"
@@ -19,17 +20,20 @@ import { emptyUnchosenKsAuthConf, ensureAuthConf, ensureKsAuthConf } from "../sy
 import { KEYSTONE_HOST_AUTH_ENV, keystoneHostAuth } from "../guard/egress-identity.ts"
 import { SYNAPSE_LOCK_WAIT_MS } from "../synapse/lock.ts"
 import type { RegisteredModels } from "../synapse/models.ts"
-import { INSPECT_ENV, MCP_ALLOW_ENV, approvedValues, boxEnvOverride, composeDownEnv, composeEnv, dynamicProfileFor, siblingContainers } from "./compose-env.ts"
+import { INSPECT_ENV, MCP_ALLOW_ENV, approvedValues, boxEnvOverride, composeDownEnv, composeEnv, containerName, dynamicProfileFor, paths, siblingContainers } from "./compose-env.ts"
+import { GENERATION_CAP, generationProject, readGenerations, rememberGeneration } from "./generations.ts"
 import { LABEL, dockerArgs, imageExists, inspectBox, redactAll, requireDocker, type BoxInspect, type Exec, type ExecResult } from "./docker.ts"
 import { waitHealthy } from "./health.ts"
 import { pruneSignIns, verifyLive } from "./live.ts"
-import type { LeaseFs } from "./leases.ts"
+import { createLeases, type LeaseFs } from "./leases.ts"
+import { relocateIdle } from "./relocate.ts"
 import type { ProcessProbe } from "./process.ts"
 import { planFor, withSynapseModels, type Plan } from "./plan.ts"
 import { fsFailure, writeProfile, type PermissionRule, type ProfileFs } from "./profile.ts"
 import { createContext, lockOptions, traced, withLease, type Run } from "./run.ts"
 import { withStartLock, type Every } from "./start-lock.ts"
 import { statusOf, targetOf, type DelegateSupervisor, type ReplaceOptions, type ReplaceResult } from "./status.ts"
+import { listHostStates } from "./workspaces-state.ts"
 
 export { PASSWORD_ENV, boxEnvOverride, composeDownEnv, composeEnv, paths, siblingContainers } from "./compose-env.ts"
 export { defaultSupervisorDeps } from "./deps.ts"
@@ -70,6 +74,10 @@ export type SupervisorDeps = {
   lockWaitMs?: number
   login?: Supervisor["login"]
   log?: Logger
+  /** #171: rules for a session copied onto this box. Absent: `permission`. */
+  sessionPermission?: (profile: "standard" | "readonly", keystone: string[] | undefined) => PermissionRule[]
+  /** #171: this process changed compose project. Synapse front and the inbox cache follow it. */
+  onBound?: (project: string) => void
 }
 
 /** What to do about a sandbox that does not fit this bridge: oc_server_restart replaces it (force when others hold it). */
@@ -129,9 +137,10 @@ function checkFrontConfig(service: string, sibling: BoxInspect | undefined, plan
  * must be running (W2C-12): reusing a box whose inbox or proxy has stopped would give a sandbox
  * that half works. front must also carry this plan's generated config.
  */
-export async function checkSiblings(run: Run, plan: Pick<Plan, "front">): Promise<void> {
+export async function checkSiblings(run: Run, plan: Pick<Plan, "front">, project = run.deps.config.project): Promise<void> {
   const { deps } = run
-  for (const { service, container } of siblingContainers(deps.config)) {
+  const config = project === deps.config.project ? deps.config : { ...deps.config, project }
+  for (const { service, container } of siblingContainers(config)) {
     const sibling = await inspectBox(deps.exec, [], container)
     const label = sibling?.labels[LABEL.image]
     if (label !== deps.image)
@@ -242,7 +251,7 @@ async function start(run: Run, planned: Plan): Promise<ApiTarget> {
     const gate = { port: gatePort, token: deps.randomPassword(), profile }
     const build = !(await imageExists(deps.exec, deps.image))
     run.note("info", "starting sandbox", { image: deps.image, build, port, inboxPort: inbox.port, profileHash: plan.built.hash.slice(0, 12), keystone: plan.config.keystoneConnections.join(",") })
-    const env = composeEnv({ ...deps, config: plan.config }, { built: plan.built, port, password, inbox, gate, front: plan.front })
+    const env = composeEnv({ ...deps, config: { ...plan.config, project: deps.config.project } }, { built: plan.built, port, password, inbox, gate, front: plan.front })
     const result = await deps.exec(dockerArgs.up(run.compose, build), { env, timeoutMs: 20 * 60_000 })
     if (result.code !== 0) throw upFailure(result, [password, inbox.token, gate.token, ...Object.values(approvedValues(deps))])
     const target = { baseUrl: `http://127.0.0.1:${port}`, password }
@@ -274,12 +283,172 @@ async function plan(run: Run, keystone?: readonly string[]): Promise<Plan> {
   return made
 }
 
+/** Point this process at `project` (its own profile, front, hand-off and leases). The configured name stays in baseProject. */
+function place(run: Run, project: string): void {
+  const ctx = run.root
+  if (ctx.deps.config.project === project && ctx.container === project && ctx.compose.project === project) {
+    run.dirs = ctx.dirs
+    run.compose = ctx.compose
+    run.container = ctx.container
+    run.leases = ctx.leases
+    return
+  }
+  ctx.deps.config.project = project
+  ctx.dirs = paths(ctx.deps.config)
+  ctx.compose = { project, files: [ctx.deps.composeFile, ctx.dirs.boxEnvOverride] }
+  ctx.container = containerName(ctx.deps.config)
+  ctx.leases = createLeases(ctx.deps.leaseFs, ctx.dirs.leases, { probe: ctx.deps.probe, now: ctx.deps.now })
+  run.dirs = ctx.dirs
+  run.compose = ctx.compose
+  run.container = ctx.container
+  run.leases = ctx.leases
+  ctx.deps.onBound?.(project)
+}
+
+async function profileProblem(run: Run, box: BoxInspect, made: Plan, project = run.deps.config.project): Promise<DelegateError | undefined> {
+  try {
+    checkReusable(run.deps, box, made)
+    await checkSiblings(run, made, project)
+    return undefined
+  } catch (error) {
+    if (!isDelegateError(error)) throw error
+    if (error.code === "profile_changed" || error.code === "sandbox_unavailable") return error
+    throw error
+  }
+}
+
+function waiting(running: readonly string[]): DelegateError {
+  return new DelegateError(
+    "profile_changed",
+    "Two sandboxes are already running, so this update is waiting.",
+    "Wait until an older sandbox has no running task, then retry. Do not call oc_server_restart while a task is running.",
+    `running ${running.join(",")}`,
+  )
+}
+
+async function runningProjects(run: Run, names: readonly string[]): Promise<string[]> {
+  const running: string[] = []
+  for (const project of names) {
+    const box = await inspectBox(run.deps.exec, [], project)
+    if (box?.running) running.push(project)
+  }
+  return running
+}
+
+/** Live leases in that project's own lease folder. A read failure counts as held, so the box stays up. */
+async function heldLeases(run: Run, project: string): Promise<number> {
+  try {
+    const dir = paths({ ...run.deps.config, project }).leases
+    const leases = createLeases(run.deps.leaseFs, dir, { probe: run.deps.probe, now: run.deps.now })
+    return (await leases.active()).length
+  } catch {
+    return 1
+  }
+}
+
+/**
+ * Stop `project` without dropping this process's lease folder or its startedHere flag.
+ * compose down never uses -v. The project this process holds is not passed here.
+ */
+async function downProject(run: Run, project: string): Promise<void> {
+  const config = { ...run.deps.config, project }
+  const override = paths(config).boxEnvOverride
+  await mkdir(path.dirname(override), { recursive: true })
+  await writeFile(override, boxEnvOverride(config.boxEnv), "utf8")
+  const result = await run.deps.exec(dockerArgs.down({ project, files: [run.deps.composeFile, override] }), {
+    env: composeDownEnv({ ...run.deps, config }),
+    cwd: run.deps.config.home,
+    timeoutMs: 120_000,
+  })
+  if (result.code !== 0) {
+    const detail = `exit ${result.code}: ${result.stderr.trim().slice(-400)}`
+    run.note("error", "stop failed", { code: result.code, detail })
+    throw new DelegateError("sandbox_unavailable", "The sandbox did not stop.", `Run \`docker compose -p ${project} down\`, or oc_doctor.`, detail)
+  }
+}
+
+async function sweepOthers(run: Run, projects: readonly string[]): Promise<void> {
+  const here = run.deps.config.project
+  // Every record, not the newest-200 display list: an older session must keep its box up.
+  const states = listHostStates(path.join(run.deps.config.home, "workspaces"), Number.POSITIVE_INFINITY)
+  for (const project of projects) {
+    if (project === here) continue
+    const box = await inspectBox(run.deps.exec, [], project).catch(() => undefined)
+    if (!box?.running) continue
+    if ((await heldLeases(run, project)) > 0) continue
+    if (states.some((state) => state.boxProject === project)) continue
+    await downProject(run, project).catch((error: unknown) => {
+      run.note("warn", "empty sandbox was not stopped", { project, detail: error instanceof Error ? error.message.slice(0, 200) : "unknown" })
+    })
+  }
+}
+
+/** Move idle work onto this project, then stop an older project that has no lease and no session. */
+async function finishGeneration(run: Run): Promise<void> {
+  const known = [...new Set([run.root.baseProject, ...(await readGenerations(run.deps.config.home))])]
+  await relocateIdle(run, known).catch((error: unknown) => {
+    run.note("warn", "idle sessions were not moved", { detail: error instanceof Error ? error.message.slice(0, 200) : "unknown" })
+  })
+  await sweepOthers(run, known)
+}
+
+/** Drop this bridge's lease file only. Do not stop the box: other sessions may still be on it. */
+async function releaseOwnLease(run: Run): Promise<void> {
+  if (!run.state.leased) return
+  await run.stopHeartbeat()
+  await run.leases.release(run.deps.bridgeId)
+  run.state.leased = false
+}
+
+async function beside(run: Run, made: Plan, next: string): Promise<ApiTarget> {
+  const known = [...new Set([run.root.baseProject, ...(await readGenerations(run.deps.config.home))])]
+  const ours = await inspectBox(run.deps.exec, INSPECT_ENV, next)
+  const running = await runningProjects(run, known.filter((project) => project !== next))
+  if (!ours?.running && running.length >= GENERATION_CAP) throw waiting(running)
+  if (ours?.running) {
+    const problem = await profileProblem(run, ours, made, next)
+    if (problem) throw await withHolders(run, problem)
+  }
+  if (run.deps.config.project !== next) await releaseOwnLease(run)
+  place(run, next)
+  await rememberGeneration(run.deps.config.home, next)
+  if (ours?.running) {
+    const target = await reuse(run, ours, made)
+    await finishGeneration(run)
+    return target
+  }
+  const target = await start(run, made)
+  await finishGeneration(run)
+  return target
+}
+
 async function ensure(run: Run): Promise<ApiTarget> {
   await prepareHost(run)
   const made = await plan(run)
   return withStartLock(run.deps.leaseFs, run.dirs.startLock, async () => {
     const box = await inspectBox(run.deps.exec, INSPECT_ENV, run.container)
-    return box?.running ? reuse(run, box, made) : start(run, made)
+    if (!box?.running) {
+      const next = generationProject(run.root.baseProject, run.deps.image)
+      if (next && next !== run.deps.config.project) {
+        const known = [...new Set([run.root.baseProject, ...(await readGenerations(run.deps.config.home))])]
+        const ours = await inspectBox(run.deps.exec, INSPECT_ENV, next)
+        const running = await runningProjects(run, known.filter((project) => project !== next))
+        if (ours?.running || running.length >= GENERATION_CAP) return beside(run, made, next)
+      }
+      const target = await start(run, made)
+      await finishGeneration(run)
+      return target
+    }
+    const problem = await profileProblem(run, box, made)
+    if (!problem) {
+      const target = await reuse(run, box, made)
+      await finishGeneration(run)
+      return target
+    }
+    if (problem.code !== "profile_changed") throw await withHolders(run, problem)
+    const next = generationProject(run.root.baseProject, run.deps.image)
+    if (!next || next === run.deps.config.project) throw await withHolders(run, problem)
+    return beside(run, made, next)
   }, await lockOptions(run))
 }
 

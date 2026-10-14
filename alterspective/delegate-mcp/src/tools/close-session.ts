@@ -37,7 +37,7 @@ export function ttlDays(raw: string | undefined): number {
   return Number(raw.trim())
 }
 
-type Located = { sessionKey: string; remote?: RemoteSession }
+type Located = { sessionKey: string; remote?: RemoteSession; live: string }
 
 const notOurs = (sessionID: string) =>
   new DelegateError("not_found", `Session ${sessionID} is not one of this bridge's sessions.`, "Use oc_list_sessions to see this bridge's sessions.")
@@ -46,16 +46,19 @@ const notOurs = (sessionID: string) =>
 async function locate(ctx: ToolContext, box: Box, sessionID: string, correlationId: string): Promise<Located> {
   checkSessionId(sessionID)
   const known = ctx.sessions.get(sessionID)
-  const res = await box.api.call<RemoteSession>({ path: `/session/${sessionID}`, directory: known?.boxPath, correlationId })
-  if (res.status === 200 && res.data?.id === sessionID) {
-    const key = known?.sessionKey ?? (typeof res.data.metadata?.sessionKey === "string" ? res.data.metadata.sessionKey : "")
-    if (!known && res.data.directory !== boxPathOf(key)) throw notOurs(sessionID)
-    return { sessionKey: key, remote: res.data }
+  const owned = known ? undefined : (await ownedStates(ctx)).find((state) => state.sessionID === sessionID)
+  const live = known?.boxSessionID ?? owned?.boxSessionID ?? sessionID
+  const directory = known?.boxPath ?? (owned ? boxPathOf(owned.sessionKey) : undefined)
+  const res = await box.api.call<RemoteSession>({ path: `/session/${live}`, directory, correlationId })
+  if (res.status === 200 && res.data?.id === live) {
+    const key = known?.sessionKey ?? owned?.sessionKey ?? (typeof res.data.metadata?.sessionKey === "string" ? res.data.metadata.sessionKey : "")
+    if (!known && !owned && res.data.directory !== boxPathOf(key)) throw notOurs(sessionID)
+    return { sessionKey: key, remote: res.data, live }
   }
   if (res.status !== 404) throw new DelegateError("upstream_error", "The delegate server failed to read the session.", "Retry; if it repeats, run oc_doctor.", `HTTP ${res.status}`)
-  const key = known?.sessionKey ?? (await ownedStates(ctx)).find((s) => s.sessionID === sessionID)?.sessionKey
+  const key = known?.sessionKey ?? owned?.sessionKey
   if (!key) throw notOurs(sessionID)
-  return { sessionKey: key }
+  return { sessionKey: key, live }
 }
 
 /** DELETE /session/:id; 404 means the sandbox no longer has it. Anything else throws (nothing else is removed). */
@@ -123,15 +126,15 @@ const closeSeen = (view: SessionView | undefined) => (view ? { state: view.state
 /** The stop hook: nothing to do for a session the sandbox lost; an active one is refused, or aborted and awaited. */
 async function stopSession(ctx: ToolContext, box: Box, located: Located, sessionID: string, abort: boolean, correlationId: string): Promise<Stopped> {
   if (!located.remote) return { aborted: false }
-  const view = await viewOf(box, sessionID)
+  const view = await viewOf(box, located.live)
   let state = view.state
   if (!ACTIVE.has(state)) return { aborted: false, view }
   if (!abort) throw active(sessionID, state, false)
-  const res = await box.api.call<unknown>({ method: "POST", path: `/session/${sessionID}/abort`, directory: boxPathOf(located.sessionKey), correlationId })
+  const res = await box.api.call<unknown>({ method: "POST", path: `/session/${located.live}/abort`, directory: boxPathOf(located.sessionKey), correlationId })
   ctx.log.log("info", "tools", "abort sent before closing a session", { sessionID, correlationId, status: res.status })
   if (res.status < 200 || res.status >= 300) throw new DelegateError("upstream_error", `The sandbox did not accept the abort of session ${sessionID}, so nothing was deleted.`, "Retry; check oc_status.", `HTTP ${res.status}`)
   for (let poll = 0; poll < STOP_POLLS; poll++) {
-    state = await stateOf(box, sessionID)
+    state = await stateOf(box, located.live)
     if (!ACTIVE.has(state)) return { aborted: true }
     await new Promise((resolve) => setTimeout(resolve, STOP_POLL_MS))
   }
@@ -171,13 +174,13 @@ async function closeOne(ctx: ToolContext, box: Box, located: Located, args: Clos
       aborted = stopped.aborted
       seen = stopped.view
     },
-    deleteSession: sessionDeleter(box, args.sessionID, located.sessionKey, correlationId),
+    deleteSession: sessionDeleter(box, located.live, located.sessionKey, correlationId),
   })
   const canCollect = located.remote !== undefined || ctx.sessions.has(args.sessionID)
   if (outcome.refused && outcome.session === "kept") {
     // Refused before stopping: a running session is the more useful answer (its work is not done yet).
     if (!aborted && located.remote && args.abort !== true) {
-      const state = await stateOf(box, args.sessionID)
+      const state = await stateOf(box, located.live)
       if (ACTIVE.has(state)) throw active(args.sessionID, state, false)
     }
     throw refusalError(args.sessionID, outcome, canCollect)
@@ -224,15 +227,18 @@ export const closeSessionTool = defineTool({
 
 type Row = { sessionKey: string; reason: string; uncollectedCommits: number; uncommittedPaths: number; ignoredPaths: number; discardedCommits: number }
 type Sweep = { closed: string[]; wouldClose: string[]; kept: Row[]; partial: string[]; skipped: { recent: number; active: number; unknown: number } }
-type Candidate = { sessionID: string; sessionKey: string; createdAt: string }
+type Candidate = { sessionID: string; sessionKey: string; createdAt: string; boxSessionID?: string }
+
+const liveOf = (state: { sessionID: string; boxSessionID?: string }) => state.boxSessionID ?? state.sessionID
 type SweepRun = { ctx: ToolContext; box: Box; cutoff: number; dryRun: boolean; deleteBranch: boolean; correlationId: string; out: Sweep }
 
 /** Last activity: the server's update time when it still has the session, else the record's creation. */
 async function lastActive(run: SweepRun, state: Candidate): Promise<{ at: number; present: boolean } | undefined> {
-  const res = await run.box.api.call<RemoteSession>({ path: `/session/${state.sessionID}`, directory: boxPathOf(state.sessionKey), correlationId: run.correlationId }).catch(() => undefined)
+  const live = liveOf(state)
+  const res = await run.box.api.call<RemoteSession>({ path: `/session/${live}`, directory: boxPathOf(state.sessionKey), correlationId: run.correlationId }).catch(() => undefined)
   const created = Date.parse(state.createdAt)
   if (res?.status === 404) return { at: created, present: false }
-  if (res?.status !== 200 || res.data?.id !== state.sessionID) return undefined
+  if (res?.status !== 200 || res.data?.id !== live) return undefined
   const updated = res.data.time?.updated
   return { at: typeof updated === "number" && Number.isFinite(updated) ? Math.max(created, updated) : created, present: true }
 }
@@ -243,7 +249,7 @@ async function staleness(run: SweepRun, state: Candidate): Promise<{ skip: keyof
   if (!last) return { skip: "unknown" }
   if (last.at >= run.cutoff) return { skip: "recent" }
   if (!last.present) return { present: false }
-  const now = (await run.box.hub.view(state.sessionID)).state
+  const now = (await run.box.hub.view(liveOf(state))).state
   return UNVERIFIED.has(now) ? { skip: "unknown" } : ACTIVE.has(now) ? { skip: "active" } : { present: true }
 }
 
@@ -266,14 +272,14 @@ async function sweepOne(run: SweepRun, state: Candidate): Promise<void> {
     else keep(out, state.sessionKey, plan.reason ?? "check_failed", plan)
     return
   }
-  const located: Located = { sessionKey: state.sessionKey, ...(stale.present ? { remote: { id: state.sessionID } } : {}) }
+  const located: Located = { sessionKey: state.sessionKey, live: liveOf(state), ...(stale.present ? { remote: { id: liveOf(state) } } : {}) }
   let seen: SessionView | undefined
   const o = await whileClosing(ctx, state.sessionID, () =>
     ctx.workspaces.closeSession(state.sessionKey, owner, { discardWork: false, deleteBranch: run.deleteBranch }, {
       stop: async () => {
         seen = (await stopSession(ctx, run.box, located, state.sessionID, false, run.correlationId)).view
       },
-      deleteSession: sessionDeleter(run.box, state.sessionID, state.sessionKey, run.correlationId),
+      deleteSession: sessionDeleter(run.box, located.live, state.sessionKey, run.correlationId),
     }),
   )
   if (o.closed) {

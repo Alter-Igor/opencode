@@ -31,6 +31,8 @@ export type Overrides = {
   inspect?: ExecResult
   /** Inspect result for a named container (the box's egress/cache siblings, N-9). */
   containers?: Record<string, ExecResult>
+  /** Other compose projects already running. The `state` argument stays the default project. */
+  projects?: Record<string, Box>
   /** `docker exec` into the box (R5-01 sign-in store). Default: an empty store, nothing removed. */
   exec?: (argv: string[]) => ExecResult
 }
@@ -54,7 +56,15 @@ export const owner = JSON.stringify({
   provider: { synapse: { npm: "@ai-sdk/openai-compatible", options: { baseURL: "https://synapse2-api.alterspective.com.au/v1" } } },
 })
 
+const SIBLING_SUFFIX = /-(?:front|npm-cache|pypi-cache|inbox|mcp-gate)$/
+
 export function fakeDocker(state: Box, calls: Call[], over: Overrides = {}): Exec {
+  const boxes = new Map<string, Box>([["opencode-delegate", state], ...Object.entries(over.projects ?? {})])
+  const projectOf = (name: string) => name.replace(SIBLING_SUFFIX, "")
+  const projectArg = (argv: string[]) => {
+    const index = argv.indexOf("-p")
+    return index >= 0 ? argv[index + 1] : undefined
+  }
   return async (argv: string[], options?: ExecOptions) => {
     calls.push({ argv, env: options?.env, cwd: options?.cwd })
     if (argv[1] === "exec") return over.exec?.(argv) ?? { code: 0, stdout: JSON.stringify({ names: [], removed: [] }), stderr: "" }
@@ -62,23 +72,29 @@ export function fakeDocker(state: Box, calls: Call[], over: Overrides = {}): Exe
     if (sub === "version") return { code: 0, stdout: "29.8.0\n", stderr: "" }
     if (sub === "image") return over.imageMissing ? { code: 1, stdout: "", stderr: "No such image" } : { code: 0, stdout: "sha256:x", stderr: "" }
     if (sub === "inspect") {
-      const named = over.containers?.[argv.at(-1) ?? ""]
+      const name = argv.at(-1) ?? ""
+      const named = over.containers?.[name]
       if (named) return named
       if (over.inspect) return over.inspect
-      if (!state.running) return { code: 1, stdout: "", stderr: "Error: No such container: opencode-delegate" }
-      return { code: 0, stdout: JSON.stringify({ state: { Running: true, Health: { Status: "healthy" } }, labels: state.labels, env: state.env, image: IMAGE }), stderr: "" }
+      const box = boxes.get(projectOf(name))
+      if (!box?.running) return { code: 1, stdout: "", stderr: `Error: No such container: ${name}` }
+      return { code: 0, stdout: JSON.stringify({ state: { Running: true, Health: { Status: "healthy" } }, labels: box.labels, env: box.env, image: IMAGE }), stderr: "" }
     }
     if (argv.includes("up")) {
       const env = options?.env ?? {}
       const failed = over.up?.(env)
       if (failed) return failed
-      state.running = true
-      state.labels = { [L.hash]: env.OCD_PROFILE_HASH!, [L.port]: env.OCD_PORT!, [L.image]: env.OCD_IMAGE!, [L.front]: env.OCD_FRONT_HASH! }
-      state.env = [`OPENCODE_SERVER_PASSWORD=${env.OPENCODE_SERVER_PASSWORD}`, `OPENCODE_MCP_ALLOW=${env.OPENCODE_MCP_ALLOW}`]
+      const project = projectArg(argv) ?? "opencode-delegate"
+      const box = boxes.get(project) ?? { running: false, labels: {}, env: [] }
+      boxes.set(project, box)
+      box.running = true
+      box.labels = { [L.hash]: env.OCD_PROFILE_HASH!, [L.port]: env.OCD_PORT!, [L.image]: env.OCD_IMAGE!, [L.front]: env.OCD_FRONT_HASH! }
+      box.env = [`OPENCODE_SERVER_PASSWORD=${env.OPENCODE_SERVER_PASSWORD}`, `OPENCODE_MCP_ALLOW=${env.OPENCODE_MCP_ALLOW}`]
     }
     if (argv.includes("down")) {
       if (over.down) return over.down
-      state.running = false
+      const box = boxes.get(projectArg(argv) ?? "opencode-delegate")
+      if (box) box.running = false
     }
     return { code: 0, stdout: "", stderr: "" }
   }

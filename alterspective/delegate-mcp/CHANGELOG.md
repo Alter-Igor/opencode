@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.5.3 — 2026-10-14
+
+**A new image starts beside the running box (#171).** A new agent can use a new image while an old turn keeps running.
+
+- A committed image tag starts a second compose project, `opencode-delegate-<12 hex>`. The old project stays up. Ports stay on `127.0.0.1`. A bridge whose own box is already stopped joins that generation when it is running, instead of starting the old name again. A generation that does not match is refused before this bridge rebinds.
+- A new session from the new bridge uses the new project. An old session stays on the project stored in its host record.
+- An idle session moves only when that project's lease folder has no live lease. The copy is the git work. The caller session id stays. The chat in the old box stays there.
+- The old project stops when it has no sessions and no live leases. A third generation waits.
+- A dirty checkout does not start a second stack. `oc_server_restart` still stops the box you mean to stop. Do not call it while a task is running.
+- Each generation has its own front folder, so two projects do not write the same `servers.conf`.
+- A copied clone is removed only after the new session is deleted. A failed delete or a failed remove is logged, and the caller record stays on the old project.
+
+Checked with `bun run typecheck` and the generation tests (fake docker). Not run against a live Docker host.
+
 ## 0.5.2 — 2026-10-12
 
 **Package installs work in the box again (#167).** Agents said "the sandbox has no network, so I cannot install packages". The box does install through the read-only caches; three gaps made it fail.

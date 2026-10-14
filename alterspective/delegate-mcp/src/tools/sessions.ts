@@ -171,7 +171,7 @@ export const abortTool = defineTool({
         `owned by ${record.caller}`,
       )
     }
-    const res = await box.api.call<unknown>({ method: "POST", path: `/session/${record.sessionID}/abort`, directory: record.boxPath, correlationId })
+    const res = await box.api.call<unknown>({ method: "POST", path: `/session/${record.boxSessionID ?? record.sessionID}/abort`, directory: record.boxPath, correlationId })
     if (res.status === 404) throw new DelegateError("not_found", `Session ${record.sessionID} is gone: the sandbox no longer has it.`, "Start a new session with oc_start_session.", "HTTP 404")
     if (res.status < 200 || res.status >= 300) throw new DelegateError("upstream_error", "The delegate server failed to abort the session.", "Retry; check oc_status.", `HTTP ${res.status}`)
     const accepted = res.data === true

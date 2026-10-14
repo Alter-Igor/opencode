@@ -5,7 +5,7 @@ import { z } from "zod"
 import { recordStates, type ObservedState } from "../reporting/hooks.ts"
 import type { HubEvent, SessionView, WaitUntil } from "../shared/contracts.ts"
 import type { Box, ToolContext } from "./context.ts"
-import { cursorSchema, formatCursor, ownSession, parseCursor, sessionIdSchema } from "./core-session.ts"
+import { cursorSchema, formatCursor, liveSessionID, ownSession, parseCursor, sessionIdSchema } from "./core-session.ts"
 import { defineTool } from "./define.ts"
 import { ok, untrusted } from "./shape.ts"
 
@@ -42,17 +42,30 @@ function capEvents(events: HubEvent[], next: string, max: number) {
 
 async function checkOwned(ctx: ToolContext, ids: string[], correlationId: string) {
   const box = await ctx.box()
-  for (const id of ids) await ownSession(ctx, box, id, correlationId)
-  return box
+  const back = new Map<string, string>()
+  const live: string[] = []
+  for (const id of ids) {
+    const { record } = await ownSession(ctx, box, id, correlationId)
+    const boxID = liveSessionID(record)
+    back.set(boxID, record.sessionID)
+    live.push(boxID)
+  }
+  return { box, back, live }
 }
 
-type WaitArgs = { sessionIDs: string[]; until?: WaitUntil[]; timeoutSec?: number; cursor?: string }
+type WaitArgs = { sessionIDs: string[]; until?: WaitUntil[]; timeoutSec?: number; cursor?: string; back?: Map<string, string> }
+
+function asCaller<T extends { sessionID?: string }>(item: T, back?: Map<string, string>): T {
+  const caller = item.sessionID ? back?.get(item.sessionID) : undefined
+  if (!caller || caller === item.sessionID) return item
+  return { ...item, sessionID: caller }
+}
 
 /** W3A-03: the hub this wait ran on was stopped or replaced (restart, reconnect, shutdown). */
 async function hubChanged(ctx: ToolContext, args: WaitArgs) {
   const fresh = ctx.peekBox() ?? (await ctx.box().catch(() => undefined))
   const next = fresh ? formatCursor(fresh.hub.cursor()) : undefined
-  const views = fresh ? await Promise.all(args.sessionIDs.map((id) => fresh.hub.view(id))) : []
+  const views = fresh ? (await Promise.all(args.sessionIDs.map((id) => fresh.hub.view(id)))).map((view) => asCaller(view, args.back)) : []
   const summary = "The sandbox connection was replaced or stopped during the wait (restart or reconnect), so events may have been missed. Check oc_status, then call oc_wait again with the new cursor."
   return ok(summary, { still_running: false, hub_changed: true, ...(next ? { next } : {}), views })
 }
@@ -86,14 +99,15 @@ async function waitOn(ctx: ToolContext, box: Box, args: WaitArgs) {
   const timeoutSec = args.timeoutSec ?? DEFAULT_WAIT_SEC
   const result = await box.hub.wait({ sessionIDs: args.sessionIDs, until: args.until ?? DEFAULT_UNTIL, timeoutMs: timeoutSec * 1000, cursor: parseCursor(args.cursor) })
   if (ctx.peekBox() !== box) return hubChanged(ctx, args)
-  const page = capEvents(result.events, formatCursor(result.next), 100)
+  const events = result.events.map((event) => asCaller(event, args.back))
+  const page = capEvents(events, formatCursor(result.next), 100)
   if (result.timedOut) {
-    const states = await Promise.all(args.sessionIDs.map((id) => box.hub.view(id)))
-    recordStates(ctx, observed(result.events, states))
+    const states = (await Promise.all(args.sessionIDs.map((id) => box.hub.view(id)))).map((view) => asCaller(view, args.back))
+    recordStates(ctx, observed(events, states))
     return timedOut(timeoutSec, page.next, page.events, states)
   }
-  const views = result.views ?? []
-  recordStates(ctx, observed(result.events, views))
+  const views = (result.views ?? []).map((view) => asCaller(view, args.back))
+  recordStates(ctx, observed(events, views))
   const now = Date.now()
   const matched = [
     ...page.events.filter((e) => e.state).map((e) => `${e.sessionID ?? "?"} ${e.state}${e.code ? ` (${e.code})` : ""}`),
@@ -116,8 +130,8 @@ export const waitTool = defineTool({
   },
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   async run(args, ctx, correlationId) {
-    const box = await checkOwned(ctx, args.sessionIDs, correlationId)
-    return waitOn(ctx, box, args)
+    const owned = await checkOwned(ctx, args.sessionIDs, correlationId)
+    return waitOn(ctx, owned.box, { ...args, sessionIDs: owned.live, back: owned.back })
   },
 })
 
@@ -135,10 +149,13 @@ export const eventsTool = defineTool({
     const held = ctx.peekBox()
     // W3A-10: never starts the sandbox. Without a held box there is no event buffer to page.
     if (!held) return ok("No events: this bridge holds no sandbox connection yet.", { expired: false, events: [] })
-    const box = args.sessionID ? await checkOwned(ctx, [args.sessionID], correlationId) : held
-    const page = box.hub.events(parseCursor(args.cursor), args.sessionID ? { sessionID: args.sessionID } : undefined, args.limit ?? 50)
+    const owned = args.sessionID ? await checkOwned(ctx, [args.sessionID], correlationId) : undefined
+    const box = owned?.box ?? held
+    const live = owned?.live[0]
+    const page = box.hub.events(parseCursor(args.cursor), live ? { sessionID: live } : undefined, args.limit ?? 50)
     if (page.expired)
       return ok("That cursor has expired (the sandbox restarted or the buffer moved on). Call oc_status, then page again without a cursor.", { expired: true, events: [], next: formatCursor(page.next) })
-    return ok(`${page.events.length} event${page.events.length === 1 ? "" : "s"}.`, { expired: false, events: page.events.map(shapeEvent), next: formatCursor(page.next) })
+    const events = page.events.map((event) => shapeEvent(asCaller(event, owned?.back)))
+    return ok(`${page.events.length} event${page.events.length === 1 ? "" : "s"}.`, { expired: false, events, next: formatCursor(page.next) })
   },
 })

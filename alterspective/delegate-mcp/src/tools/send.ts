@@ -10,7 +10,7 @@ import { DelegateError } from "../shared/errors.ts"
 import type { Box, SessionRecord, ToolContext } from "./context.ts"
 import { readInstructions, type Instructions } from "./core-box.ts"
 import { closingError, isClosing } from "./closing.ts"
-import { CORRELATION_RE, agentSchema, formatCursor, modelSchema, ownSession, parseModel, requireSynapseModel, sameRules, sessionGone, sessionIdSchema } from "./core-session.ts"
+import { CORRELATION_RE, agentSchema, formatCursor, liveSessionID, modelSchema, ownSession, parseModel, requireSynapseModel, sameRules, sessionGone, sessionIdSchema } from "./core-session.ts"
 import { DEFAULT_MODEL, SYNAPSE_PROVIDER } from "../supervisor/profile.ts"
 import { defineTool } from "./define.ts"
 import { boxDefault, fetchModels, pickRoleModel, requireModel } from "./models.ts"
@@ -76,10 +76,11 @@ export async function sendPrompt(ctx: ToolContext, box: Box, record: SessionReco
   const cursor = box.hub.cursor()
   // #73: the run's start for the task record, taken before the POST (a fast run can settle during it).
   const sendStartedAt = new Date().toISOString()
-  const res = await box.api.call({ method: "POST", path: `/session/${encodeURIComponent(record.sessionID)}/prompt_async`, directory: record.boxPath, body, correlationId: prompt.correlationId })
+  const live = liveSessionID(record)
+  const res = await box.api.call({ method: "POST", path: `/session/${encodeURIComponent(live)}/prompt_async`, directory: record.boxPath, body, correlationId: prompt.correlationId })
   if (res.status === 404) throw sessionGone(record.sessionID)
   if (res.status < 200 || res.status >= 300) throw new DelegateError("upstream_error", "The delegate server did not accept the message.", "Check oc_status, then retry.", `HTTP ${res.status}`)
-  box.hub.markSent(record.sessionID)
+  box.hub.markSent(live)
   // #73: metadata only (the model and agent sent); the prompt text never reaches the record.
   recordSend(ctx, record, { model, agent, at: sendStartedAt })
   ctx.log.log("info", "tools", "prompt sent", { sessionID: record.sessionID, correlationId: prompt.correlationId, instructions: instructions.files.join(","), instructionsTruncated: instructions.truncated, instructionsFailed: (instructions.failed ?? []).join(","), savedModelFallback: saved.fallback !== undefined })

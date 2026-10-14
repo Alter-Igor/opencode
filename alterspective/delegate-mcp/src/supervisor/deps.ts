@@ -23,6 +23,8 @@ export type DefaultDepsOptions = {
   /** Tests only: the command runner used for git (docker calls always use it too). */
   exec?: Exec
   ownerConfigDir?: string
+  sessionPermission?: SupervisorDeps["sessionPermission"]
+  onBound?: SupervisorDeps["onBound"]
 }
 
 export async function defaultSupervisorDeps(config: BridgeConfig, options: DefaultDepsOptions): Promise<SupervisorDeps> {
@@ -55,5 +57,7 @@ export async function defaultSupervisorDeps(config: BridgeConfig, options: Defau
     now: Date.now,
     log: options.log,
     login: options.login,
+    sessionPermission: options.sessionPermission,
+    onBound: options.onBound,
   }
 }

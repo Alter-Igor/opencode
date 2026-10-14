@@ -95,8 +95,21 @@ export function effectiveConfig<C extends KeystoneConfig>(config: C): C {
   return { ...config, keystoneConnections: currentKeystone(config).connections }
 }
 
+/**
+ * Folder for one generation project (`<base>-<12 hex>`), or undefined for the base project.
+ * The base project keeps `home/front`, `home/profile` and `home/handoff` so a second project
+ * never rewrites files the running box has already mounted (#171).
+ */
+export function generationRoot(home: string, project: string | undefined): string | undefined {
+  if (!project || !PROJECT_RE.test(project) || !/-[0-9a-f]{12}$/.test(project)) return undefined
+  return path.join(home, "generations", project)
+}
+
 /** Where the bridge writes front's generated server config (mounted read-only into `front`). */
-export const frontDir = (config: Pick<BridgeConfig, "home">) => path.join(config.home, "front")
+export const frontDir = (config: Pick<BridgeConfig, "home"> & { project?: string }) => {
+  const root = generationRoot(config.home, config.project)
+  return path.join(root ?? config.home, "front")
+}
 
 /**
  * The OPENCODE_MCP_ALLOW policy the box runs with (enforced by the fork patch, §3.4): Keystone's

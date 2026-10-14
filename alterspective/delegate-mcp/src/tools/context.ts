@@ -15,6 +15,8 @@ import type { KeystoneAuth } from "../keystone-auth/index.ts"
 /** A session this bridge started: where it lives on the host and in the box. */
 export type SessionRecord = {
   sessionID: string
+  /** #171: id on the current box when an idle move minted a new one. Tool replies keep `sessionID`. */
+  boxSessionID?: string
   sessionKey: string
   hostRepo: string
   boxPath: string

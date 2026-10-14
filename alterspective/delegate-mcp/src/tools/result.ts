@@ -8,7 +8,7 @@ import { sessionErrorCode, sessionErrorDetail } from "../shared/session-error.ts
 import { stripUnsafe } from "../shared/text.ts"
 import type { Box, SessionRecord } from "./context.ts"
 import { diffSummary } from "./core-box.ts"
-import { ownSession, sessionIdSchema } from "./core-session.ts"
+import { liveSessionID, ownSession, sessionIdSchema } from "./core-session.ts"
 import { defineTool } from "./define.ts"
 import { headTail, ok, untrusted, windowText } from "./shape.ts"
 
@@ -60,7 +60,7 @@ function errorFields(error: unknown) {
 }
 
 async function lastAssistant(box: Box, record: SessionRecord, count: number, correlationId: string) {
-  const res = await box.api.call<Message[]>({ path: `/session/${record.sessionID}/message?limit=${Math.min(200, count * 8)}`, directory: record.boxPath, correlationId })
+  const res = await box.api.call<Message[]>({ path: `/session/${liveSessionID(record)}/message?limit=${Math.min(200, count * 8)}`, directory: record.boxPath, correlationId })
   if (res.status !== 200 || !Array.isArray(res.data)) throw new DelegateError("upstream_error", "The delegate server failed to return the session's messages.", "Retry; if it repeats, run oc_doctor.", `HTTP ${res.status}`)
   const replies = res.data.filter((m) => m.info?.role === "assistant").slice(-count)
   // #73: the fetched messages go to the task record hook, which keeps only model ids and token counts.
@@ -75,7 +75,7 @@ function pickReply(messages: Message[], messageID: string): Message {
 }
 
 async function todos(box: Box, record: SessionRecord, correlationId: string) {
-  const res = await box.api.call<Todo[]>({ path: `/session/${record.sessionID}/todo`, directory: record.boxPath, correlationId })
+  const res = await box.api.call<Todo[]>({ path: `/session/${liveSessionID(record)}/todo`, directory: record.boxPath, correlationId })
   if (res.status !== 200 || !Array.isArray(res.data)) return undefined
   return res.data.slice(0, MAX_TODOS).map((t) => ({
     status: typeof t.status === "string" && /^[a-z_]{1,20}$/.test(t.status) ? t.status : "unknown",
@@ -99,7 +99,7 @@ export const resultTool = defineTool({
     const box = await ctx.box()
     const { record } = await ownSession(ctx, box, args.sessionID, correlationId)
     if (args.messageID !== undefined) {
-      const res = await box.api.call<Message[]>({ path: `/session/${record.sessionID}/message?limit=200`, directory: record.boxPath, correlationId })
+      const res = await box.api.call<Message[]>({ path: `/session/${liveSessionID(record)}/message?limit=200`, directory: record.boxPath, correlationId })
       if (res.status !== 200 || !Array.isArray(res.data)) throw new DelegateError("upstream_error", "The delegate server failed to return the session's messages.", "Retry; if it repeats, run oc_doctor.", `HTTP ${res.status}`)
       const clean = cleanText(pickReply(res.data, args.messageID))
       const page = windowText(clean, args.textOffset ?? 0, REPLY_BUDGET)
@@ -115,7 +115,7 @@ export const resultTool = defineTool({
       lastAssistant(box, record, args.messages ?? 1, correlationId),
       diffSummary(ctx, record),
       todos(box, record, correlationId),
-      box.hub.view(record.sessionID),
+      box.hub.view(liveSessionID(record)),
     ])
     recordResult(ctx, record, { state: view.state, at: view.since }, messages, diff.outOfScope?.length)
     recordServed(ctx, record.sessionKey, record.sessionID)

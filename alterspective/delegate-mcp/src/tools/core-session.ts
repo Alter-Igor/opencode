@@ -8,7 +8,7 @@
 import { randomBytes } from "node:crypto"
 import { z } from "zod"
 import type { Cursor } from "../shared/contracts.ts"
-import { DelegateError } from "../shared/errors.ts"
+import { DelegateError, isDelegateError } from "../shared/errors.ts"
 import type { ApiTarget } from "../shared/opencode-api.ts"
 import { AGENT_RE, MODEL_RE, SESSION_ID_RE, SESSION_KEY, type HostSessionState, type SessionProfile } from "../supervisor/workspaces-state.ts"
 import type { Box, SessionRecord, ToolContext } from "./context.ts"
@@ -79,6 +79,11 @@ export function webUrl(target: ApiTarget, directory: string, sessionID: string):
   return `${base.protocol}//${base.host}/${base64Url(directory)}/session/${sessionID}`
 }
 
+/** The id the current box knows. After an idle move this is `boxSessionID`; replies still use `sessionID`. */
+export function liveSessionID(record: { sessionID: string; boxSessionID?: string }): string {
+  return record.boxSessionID ?? record.sessionID
+}
+
 export function checkSessionId(sessionID: string): void {
   if (!SESSION_ID_RE.test(sessionID)) throw new DelegateError("invalid_input", "That is not a session id.", "Pass a sessionID returned by oc_start_session or oc_list_sessions.")
 }
@@ -139,15 +144,17 @@ export async function recordFromState(ctx: ToolContext, state: HostSessionState 
     ...(state.keystone ? { keystone: state.keystone } : {}),
     ...(state.caller ? { caller: state.caller } : {}),
     ...(state.allowedPaths ? { allowedPaths: state.allowedPaths } : {}),
+    ...(state.boxSessionID ? { boxSessionID: state.boxSessionID } : {}),
   }
 }
 
-/** Adopt a session the box has: only when the host record for its key names this id and this bridge. */
-async function adopt(ctx: ToolContext, remote: RemoteSession): Promise<SessionRecord> {
+/** Adopt a session the box has: the host record's caller id is `callerID`; the box id may be `boxSessionID`. */
+async function adopt(ctx: ToolContext, remote: RemoteSession, callerID: string): Promise<SessionRecord> {
   const key = typeof remote.metadata?.sessionKey === "string" ? remote.metadata.sessionKey : ""
   const state = await hostState(ctx, key)
-  if (!state || state.sessionID !== remote.id || state.supervisor !== ctx.supervisor) throw notOurs(remote.id, "no host record of this bridge names it", remote.parentID)
-  if (remote.directory !== boxPathOf(state.sessionKey)) throw notOurs(remote.id, "directory does not match its host record")
+  const live = state?.boxSessionID ?? state?.sessionID
+  if (!state || state.sessionID !== callerID || live !== remote.id || state.supervisor !== ctx.supervisor) throw notOurs(callerID, "no host record of this bridge names it", remote.parentID)
+  if (remote.directory !== boxPathOf(state.sessionKey)) throw notOurs(callerID, "directory does not match its host record")
   return recordFromState(ctx, { ...state, sessionID: state.sessionID })
 }
 
@@ -163,11 +170,21 @@ export async function ownSession(ctx: ToolContext, box: Box, sessionID: string, 
   if (isClosing(ctx, sessionID)) throw closingError(sessionID)
   const known = ctx.sessions.get(sessionID)
   if (known && !read) return { record: known }
-  const remote = await readSession(ctx, box, sessionID, correlationId, known?.boxPath, known !== undefined)
+  const state = known ? undefined : (await ownedStates(ctx)).find((item) => item.sessionID === sessionID)
+  const live = known?.boxSessionID ?? state?.boxSessionID ?? sessionID
+  const directory = known?.boxPath ?? (state ? boxPathOf(state.sessionKey) : undefined)
+  const ours = known !== undefined || state !== undefined
+  let remote: RemoteSession
+  try {
+    remote = await readSession(ctx, box, live, correlationId, directory, ours)
+  } catch (error) {
+    if (live !== sessionID && isDelegateError(error) && error.code === "not_found") throw ours ? sessionGone(sessionID) : notOurs(sessionID, "HTTP 404")
+    throw error
+  }
   if (known) return { record: known, remote }
-  const record = await adopt(ctx, remote)
+  const record = await adopt(ctx, remote, sessionID)
   ctx.sessions.set(sessionID, record)
-  box.hub.track(sessionID, record.boxPath)
+  box.hub.track(live, record.boxPath)
   ctx.log.log("info", "tools", "adopted session from its host record", { sessionID, sessionKey: record.sessionKey, correlationId })
   return { record, remote }
 }
