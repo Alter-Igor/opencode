@@ -8,16 +8,19 @@
 //   (POST /mcp/<entry>/connect) when it is not connected. That call runs after publish returns
 //   its promise, outside the manager's work, and a failure is logged, never thrown into it.
 // Never logged or returned here: the token. Only the connection id, the credential kind and states.
+import { stat } from "node:fs/promises"
 import { DelegateError } from "../shared/errors.ts"
 import { entryName, idOfEntry } from "../shared/keystone.ts"
 import { safeLog, type Logger } from "../shared/log.ts"
 import type { McpStatus, OpencodeApi } from "../shared/opencode-api.ts"
-import { writeKsAuthConf } from "../synapse/auth-conf.ts"
+import { ksAuthConfPath, writeKsAuthConf } from "../synapse/auth-conf.ts"
 import type { Reload } from "../synapse/token-manager.ts"
 import type { Publish } from "./manager.ts"
 import type { KsStatus } from "./report.ts"
 
 const COMPONENT = "keystone-auth"
+/** #178: whether a box's front folder already holds this connection's include. */
+const hasInclude = (dir: string, id: string) => stat(ksAuthConfPath(dir, id)).then((s) => s.isFile(), () => false)
 /** The instance directory the bridge's box calls use. */
 const DIRECTORY = "/sessions"
 
@@ -62,13 +65,15 @@ export function createKsPublisher(deps: KsPublisherDeps): Publish {
     }
   }
   return async (connectionId, bearer) => {
-    // Lock hold time: this runs under the shared lock. The write is local; reloadFront is bounded by
-    // its docker exec (30 s) plus, on failure, one docker inspect (20 s), about 50 s in all, well
-    // inside the 2-minute lock wait (SYNAPSE_LOCK_WAIT_MS) other bridges allow. Inherited from step 1.
+    // Lock hold time: this runs under the shared lock. The writes are local; each front's reload is
+    // bounded by its docker exec (30 s) plus, on failure, one docker inspect (20 s): about 50 s per
+    // box (#178: reloadFronts reloads every box), inside the 2-minute lock wait (SYNAPSE_LOCK_WAIT_MS).
     await write(deps.frontDir, connectionId, bearer)
-    // #178: another box's write failing is logged, never thrown: it must not undo this one.
+    // #178: another box's write failing is logged, never thrown: it must not undo this one. Only a
+    // box that already has this connection's include gets it (its own chosen set made the file), so
+    // an unchosen connection keeps no bearer on disk there (#67 review L4).
     for (const dir of deps.otherFrontDirs ? await deps.otherFrontDirs().catch(() => []) : []) {
-      if (dir === deps.frontDir) continue
+      if (dir === deps.frontDir || !(await hasInclude(dir, connectionId))) continue
       await write(dir, connectionId, bearer).catch(() => safeLog(deps.log, "warn", COMPONENT, "could not write another box's Keystone include", { connection: connectionId }))
     }
     const reload = await deps.reload()

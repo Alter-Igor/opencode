@@ -7,7 +7,7 @@ import { isDelegateError } from "../shared/errors.ts"
 import { safeLog } from "../shared/log.ts"
 import { authConfHasToken, authConfPath } from "./auth-conf.ts"
 import { refreshSynapse, rotatedRefreshToken } from "./keystone-token.ts"
-import { TICK_MS, adopt, currentPending, failClosed, isDue, keepRotated, pendingElsewhere, publishAuthConf, readState, reloadFront, reloadFronts, savePending, writeState, type Refreshed, type SynapseDeps, type TokenState } from "./token-manager.ts"
+import { TICK_MS, adopt, currentPending, failClosed, isDue, keepRotated, pendingElsewhere, publishAuthConf, readState, reloadFronts, savePending, writeState, type Refreshed, type SynapseDeps, type TokenState } from "./token-manager.ts"
 
 export const RETRY_BASE_MS = 30_000
 export const RETRY_MAX_MS = 10 * 60_000
@@ -18,6 +18,14 @@ export const RELOAD_RETRY_MAX_MS = 5 * 60_000
 export const reloadBackoffMs = (failures: number) => Math.min(RELOAD_RETRY_MAX_MS, TICK_MS * 2 ** Math.max(0, failures - 1))
 
 const includeHasToken = async (deps: SynapseDeps) => authConfHasToken(await readFile(authConfPath(deps.frontDir), "utf8").catch(() => ""))
+/** #178: any box's include still carries a token (expiry must empty them all, not only this box's). */
+async function anyIncludeHasToken(deps: SynapseDeps): Promise<boolean> {
+  const others = deps.targets ? await deps.targets().catch(() => []) : []
+  for (const dir of [deps.frontDir, ...others.map((t) => t.frontDir)]) {
+    if (authConfHasToken(await readFile(authConfPath(dir), "utf8").catch(() => ""))) return true
+  }
+  return false
+}
 const pastExpiry = (state: TokenState | undefined, now: number) => state !== undefined && now >= state.expiresAt
 /** Only a transient failure (it carries `failures`) is retried on the timer, once its backoff ends. */
 const reloadRetryDue = (state: TokenState | undefined, now: number) => {
@@ -50,7 +58,8 @@ async function refreshLocked(deps: SynapseDeps, force: boolean): Promise<Refresh
     // backoff, without rotating again or waiting until the newly issued token's next renewal point.
     // front_not_running and config_changed do not clear by themselves: front loads the current
     // files when it starts, and a changed servers.conf needs a sandbox restart.
-    return { ...expired, reload: await reloadFront(deps) }
+    // #178: every box, so another box's front also gets the include again.
+    return { ...expired, reload: await reloadFronts(deps) }
   }
   // N1: another bridge holds the rotated refresh token in memory; the stored one is stale. Wait for it.
   if (!force && pendingElsewhere(deps, state)) return { ...(await expireIfPast(deps, state)), error: "another bridge holds an unsaved refresh token" }
@@ -95,7 +104,7 @@ async function retryLater(deps: SynapseDeps, state: TokenState | undefined, reas
 
 /** Past expiry: take the token out of front (no credential leaves front). Not a sign-out. */
 async function expireIfPast(deps: SynapseDeps, state: TokenState | undefined): Promise<Refreshed> {
-  if (!pastExpiry(state, deps.now()) || !(await includeHasToken(deps))) return { outcome: "fresh" }
+  if (!pastExpiry(state, deps.now()) || !(await anyIncludeHasToken(deps))) return { outcome: "fresh" }
   await publishAuthConf(deps, undefined)
   if (state) await writeState(deps.home, { ...state, includeAt: deps.now() })
   safeLog(deps.log, "warn", "synapse", "synapse token expired; removed from front, renewal keeps retrying", {})

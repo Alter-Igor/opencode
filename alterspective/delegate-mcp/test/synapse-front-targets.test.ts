@@ -10,7 +10,8 @@ import { frontDir } from "../src/shared/config.ts"
 import { silentLogger } from "../src/shared/log.ts"
 import type { Exec } from "../src/supervisor/docker.ts"
 import { rememberGeneration } from "../src/supervisor/generations.ts"
-import { authConfHasToken, authConfPath, ksAuthConfPath } from "../src/synapse/auth-conf.ts"
+import { authConf, authConfHasToken, authConfPath, ksAuthConfPath } from "../src/synapse/auth-conf.ts"
+import { refreshIfDue } from "../src/synapse/refresh.ts"
 import { frontTargets, type FrontTarget } from "../src/synapse/front-targets.ts"
 import { memoryStore } from "../src/synapse/secret-store.ts"
 import { FRONT_RELOAD, adopt, failClosed, readState, type SynapseDeps } from "../src/synapse/token-manager.ts"
@@ -31,9 +32,13 @@ async function twoBoxes() {
   return { home, base, gen }
 }
 
-function deps(home: string, own: FrontTarget, reloaded: string[]): SynapseDeps {
+function deps(home: string, own: FrontTarget, reloaded: string[], failing?: string): SynapseDeps {
   const exec: Exec = async (argv) => {
-    if (argv.includes(FRONT_RELOAD)) reloaded.push(argv[2] ?? "")
+    if (argv.includes(FRONT_RELOAD)) {
+      reloaded.push(argv[2] ?? "")
+      // front-reload exit 4 (nginx -t refused) for one container only.
+      if (argv[2] === failing) return { code: 4, stdout: "", stderr: "front-reload: refused" }
+    }
     return { code: 0, stdout: "true\n", stderr: "" }
   }
   return {
@@ -86,6 +91,29 @@ describe("a Synapse renewal reaches every box", () => {
     expect((await readState(home))?.lastReload?.result).toBe("reloaded")
   })
 
+  test("another box's failed reload neither changes nor records this bridge's result", async () => {
+    const { home, base, gen } = await twoBoxes()
+    const reloaded: string[] = []
+    expect(await adopt(deps(home, base, reloaded, gen.frontContainer), { accessToken: ACCESS, expiresInSec: 1000 })).toBe("reloaded")
+    expect(reloaded).toEqual([base.frontContainer, gen.frontContainer])
+    const last = (await readState(home))?.lastReload
+    expect(last?.result).toBe("reloaded")
+    expect(last?.failures).toBeUndefined()
+  })
+
+  test("past expiry, another box's include is emptied even when this box's is already empty", async () => {
+    const { home, base, gen } = await twoBoxes()
+    const reloaded: string[] = []
+    let clock = 1_000_000
+    // Keystone is down (the fake answers 500): a passing failure, so past expiry the token is removed.
+    const d: SynapseDeps = { ...deps(home, base, reloaded), now: () => clock }
+    await adopt(d, { accessToken: ACCESS, expiresInSec: 1000 })
+    writeFileSync(authConfPath(base.frontDir), authConf(undefined))
+    clock += 2_000_000
+    expect((await refreshIfDue(d)).outcome).toBe("expired")
+    expect(hasToken(gen.frontDir)).toBe(false)
+  })
+
   test("failing closed empties every box's include", async () => {
     const { home, base, gen } = await twoBoxes()
     const reloaded: string[] = []
@@ -108,10 +136,18 @@ describe("a Synapse renewal reaches every box", () => {
 })
 
 describe("a Keystone publish reaches every box", () => {
-  test("the include goes to the bound box and every other; another box's write failure is not thrown", async () => {
+  test("the include goes to the bound box and every other box that has it; another box's write failure is not thrown", async () => {
     const { base, gen } = await twoBoxes()
-    const publish = createKsPublisher({ frontDir: gen.frontDir, otherFrontDirs: async () => [gen.frontDir, base.frontDir, path.join(base.frontDir, "missing", "\0bad")], reload: async () => "reloaded", connect: async () => {}, log: silentLogger })
+    // The base box chose rag-read (its empty include exists); a third folder did not.
+    writeFileSync(ksAuthConfPath(base.frontDir, "rag-read"), "")
+    const unchosen = mkdtempSync(path.join(os.tmpdir(), "ocd-unchosen-"))
+    // A file that cannot be replaced (a non-empty folder in its place): the write fails.
+    const failing = mkdtempSync(path.join(os.tmpdir(), "ocd-failing-"))
+    mkdirSync(path.join(ksAuthConfPath(failing, "rag-read"), "x"), { recursive: true })
+    const publish = createKsPublisher({ frontDir: gen.frontDir, otherFrontDirs: async () => [gen.frontDir, base.frontDir, unchosen, failing], reload: async () => "reloaded", connect: async () => {}, log: silentLogger })
     await publish("rag-read", ACCESS)
     for (const dir of [gen.frontDir, base.frontDir]) expect(readFileSync(ksAuthConfPath(dir, "rag-read"), "utf8")).toContain(`"Bearer ${ACCESS}"`)
+    // #67 L4: no bearer on disk for a connection that box did not choose.
+    expect(() => readFileSync(ksAuthConfPath(unchosen, "rag-read"))).toThrow()
   })
 })

@@ -172,7 +172,8 @@ export async function publishAuthConf(deps: Pick<SynapseDeps, "targets" | "front
 
 /**
  * #178: reload this bridge's front (recorded and returned, as reloadFront), then every other box's
- * front (logged only). Lock hold time: one more bounded reload per extra box (GENERATION_CAP is 2).
+ * front (logged only). Lock hold time: one more bounded reload (about 50 s worst case) per other
+ * box folder this home remembers, not only running ones.
  */
 export async function reloadFronts(deps: Pick<SynapseDeps, "targets" | "frontDir" | "exec" | "frontContainer" | "home" | "now" | "log">, options: { record?: boolean; component?: string } = {}): Promise<Reload> {
   const own = await reloadFront(deps, options)
