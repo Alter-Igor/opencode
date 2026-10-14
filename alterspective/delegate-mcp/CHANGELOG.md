@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.4 — 2026-10-14
+
+**Both boxes get the renewed tokens (#178).** With two box generations running (#171), a session on one of them failed with `errorCode: auth` ("Missing or invalid API key") while `oc_doctor` said Synapse was fine.
+
+- The token state is one per bridge home, but each box has its own front folder. The bridge that renewed wrote only its own box's include, so the other box kept an expired Synapse bearer and empty Keystone bearers.
+- A renewal, an expiry and a failed-closed sign-in now write the include into every box's front folder (the base project and each remembered generation whose folder exists) and reload each front. This bridge's own box is written and reloaded first; another box's failure is logged, never thrown.
+- Keystone includes now go to the box this bridge is bound to (they always went to the base box's folder, while the reload went to the bound box) and to every other box that already has that connection's include. A box that did not choose a connection keeps no bearer for it on disk.
+- Past expiry, the token is removed from every box, even when this bridge's own include is already empty. A retried reload also reloads every box.
+- Still open (follow-up): `oc_doctor` checks only the bound box; another box's failed reload is not retried on its own; a new box starts with empty Keystone includes until the next Keystone renewal; reloads also run against stopped generations.
+
+Checked with `bun run typecheck` and the full delegate-mcp suite (new `test/synapse-front-targets.test.ts`). Live: before the fix the generation box's include had expired at 11:15Z and a `pong` task failed with `auth`; after copying the base include across and reloading that front by hand, the same task answered `pong`. The fixed bridge itself is not yet run live.
+
 ## 0.5.3 — 2026-10-14
 
 **A new image starts beside the running box (#171).** A new agent can use a new image while an old turn keeps running.
