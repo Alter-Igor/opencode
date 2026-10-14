@@ -272,14 +272,20 @@ export const {
 
         case "session.deleted": {
           const result = search(store.session, event.properties.info.id, (s) => s.id)
-          if (result.found) {
-            setStore(
-              "session",
-              produce((draft) => {
-                draft.splice(result.index, 1)
-              }),
-            )
-          }
+          const id = event.properties.info.id
+          setStore(
+            produce((draft) => {
+              if (result.found) draft.session.splice(result.index, 1)
+              for (const message of draft.message[id] ?? []) delete draft.part[message.id]
+              delete draft.message[id]
+              delete draft.todo[id]
+              delete draft.session_diff[id]
+              delete draft.session_status[id]
+              delete draft.permission[id]
+              delete draft.question[id]
+            }),
+          )
+          fullSyncedSessions.delete(id)
           break
         }
         case "session.updated": {
@@ -361,7 +367,7 @@ export const {
         case "message.removed": {
           touchMessage(event.properties.sessionID, event.properties.messageID)
           const messages = store.message[event.properties.sessionID]
-          const index = messages.findIndex((message) => message.id === event.properties.messageID)
+          const index = (messages ?? []).findIndex((message) => message.id === event.properties.messageID)
           if (index !== -1) {
             setStore(
               "message",
@@ -417,7 +423,7 @@ export const {
         case "message.part.removed": {
           touchPart(event.properties.sessionID, event.properties.partID)
           const parts = store.part[event.properties.messageID]
-          const result = search(parts, event.properties.partID, (part) => part.id)
+          const result = search(parts ?? [], event.properties.partID, (part) => part.id)
           if (result.found) {
             setStore(
               "part",
