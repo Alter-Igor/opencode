@@ -370,6 +370,24 @@ describe("oc_cleanup", () => {
     expect(skipped?.fields).toMatchObject({ code: "not_found", reason: "no such record", detail: "close refused: probe" })
   })
 
+  test("#174: a refused ownership check names which check failed, with no record data", async () => {
+    const f = context()
+    const other = await start(f, { supervisor: "supervisor:other-bridge" })
+    const boxed = await start(f, { track: false })
+    const { boxProject: _dropped, ...rest } = boxed.state
+    writeHostState(stateDir(), { ...rest, boxProject: "some-other-box" })
+    const refusal = async (s: Started, owner: { supervisor: string; sessionID: string }) => {
+      const error = await f.ctx.workspaces.inspectClose(s.key, owner, { deleteBranch: false }).then(
+        () => undefined,
+        (e: unknown) => e as DelegateError,
+      )
+      return error?.detail
+    }
+    expect(await refusal(other, { supervisor: f.ctx.supervisor, sessionID: other.sessionID })).toBe(`close refused: ${other.key} (other bridge)`)
+    expect(await refusal(boxed, { supervisor: f.ctx.supervisor, sessionID: boxed.sessionID })).toBe(`close refused: ${boxed.key} (other box)`)
+    expect(await refusal(boxed, { supervisor: f.ctx.supervisor, sessionID: "ses_wrong" })).toBe(`close refused: ${boxed.key} (session id differs)`)
+  })
+
   test("a TTL of 0 disables the sweep", async () => {
     process.env[TTL_ENV] = "0"
     const f = context()

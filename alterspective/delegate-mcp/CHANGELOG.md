@@ -3,6 +3,7 @@
 ## Unreleased
 
 - `oc_cleanup` now logs the error `reason` and `detail`, not only the code, when it skips a session (#174).
+- A refused close or sweep ownership check now names which check failed (other bridge, other box, session id differs, record unreadable) in the error detail (#174).
 
 ## 0.5.4 — 2026-10-14
 
