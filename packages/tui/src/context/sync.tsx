@@ -272,14 +272,20 @@ export const {
 
         case "session.deleted": {
           const result = search(store.session, event.properties.info.id, (s) => s.id)
-          if (result.found) {
-            setStore(
-              "session",
-              produce((draft) => {
-                draft.splice(result.index, 1)
-              }),
-            )
-          }
+          const id = event.properties.info.id
+          setStore(
+            produce((draft) => {
+              if (result.found) draft.session.splice(result.index, 1)
+              for (const message of draft.message[id] ?? []) delete draft.part[message.id]
+              delete draft.message[id]
+              delete draft.todo[id]
+              delete draft.session_diff[id]
+              delete draft.session_status[id]
+              delete draft.permission[id]
+              delete draft.question[id]
+            }),
+          )
+          fullSyncedSessions.delete(id)
           break
         }
         case "session.updated": {
