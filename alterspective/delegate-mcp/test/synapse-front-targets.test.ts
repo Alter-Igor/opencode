@@ -10,7 +10,7 @@ import { frontDir } from "../src/shared/config.ts"
 import { silentLogger } from "../src/shared/log.ts"
 import type { Exec } from "../src/supervisor/docker.ts"
 import { rememberGeneration } from "../src/supervisor/generations.ts"
-import { authConf, authConfHasToken, authConfPath, ksAuthConfPath } from "../src/synapse/auth-conf.ts"
+import { authConf, authConfHasToken, authConfPath, ksAuthConfPath, writeKsAuthConf } from "../src/synapse/auth-conf.ts"
 import { refreshIfDue } from "../src/synapse/refresh.ts"
 import { frontTargets, type FrontTarget } from "../src/synapse/front-targets.ts"
 import { memoryStore } from "../src/synapse/secret-store.ts"
@@ -141,11 +141,18 @@ describe("a Keystone publish reaches every box", () => {
     // The base box chose rag-read (its empty include exists); a third folder did not.
     writeFileSync(ksAuthConfPath(base.frontDir, "rag-read"), "")
     const unchosen = mkdtempSync(path.join(os.tmpdir(), "ocd-unchosen-"))
-    // A file that cannot be replaced (a non-empty folder in its place): the write fails.
+    // A box that chose rag-read but whose write fails: logged, never thrown.
     const failing = mkdtempSync(path.join(os.tmpdir(), "ocd-failing-"))
-    mkdirSync(path.join(ksAuthConfPath(failing, "rag-read"), "x"), { recursive: true })
-    const publish = createKsPublisher({ frontDir: gen.frontDir, otherFrontDirs: async () => [gen.frontDir, base.frontDir, unchosen, failing], reload: async () => "reloaded", connect: async () => {}, log: silentLogger })
+    writeFileSync(ksAuthConfPath(failing, "rag-read"), "")
+    const tried: string[] = []
+    const write = async (dir: string, id: string, token: string | undefined) => {
+      tried.push(dir)
+      if (dir === failing) throw new Error("disk full")
+      await writeKsAuthConf(dir, id, token)
+    }
+    const publish = createKsPublisher({ frontDir: gen.frontDir, otherFrontDirs: async () => [gen.frontDir, base.frontDir, unchosen, failing], reload: async () => "reloaded", connect: async () => {}, log: silentLogger, write })
     await publish("rag-read", ACCESS)
+    expect(tried).toEqual([gen.frontDir, base.frontDir, failing])
     for (const dir of [gen.frontDir, base.frontDir]) expect(readFileSync(ksAuthConfPath(dir, "rag-read"), "utf8")).toContain(`"Bearer ${ACCESS}"`)
     // #67 L4: no bearer on disk for a connection that box did not choose.
     expect(() => readFileSync(ksAuthConfPath(unchosen, "rag-read"))).toThrow()
