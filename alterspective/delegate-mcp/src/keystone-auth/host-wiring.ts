@@ -25,9 +25,14 @@ const DIRECTORY = "/sessions"
 const PUBLISHED: ReadonlySet<Reload> = new Set<Reload>(["reloaded", "front_not_running"])
 
 export type KsPublisherDeps = {
-  /** The bridge home's front folder (shared/config.ts frontDir). */
+  /** The front folder of the box this bridge is bound to (shared/config.ts frontDir). */
   frontDir: string
-  /** Reload front (synapse/token-manager.ts reloadFront). MUST NOT take the shared lock. */
+  /**
+   * #178: the other boxes' front folders this bridge home runs. Each gets the same include, so a
+   * second box generation does not keep an empty or expired Keystone bearer. Unset: none.
+   */
+  otherFrontDirs?: () => Promise<string[]>
+  /** Reload every front (synapse/token-manager.ts reloadFronts). MUST NOT take the shared lock. */
   reload: () => Promise<Reload>
   /** Connect one box entry after a bearer is published (ensureEntryConnected on the held box). */
   connect: (entry: string) => Promise<unknown>
@@ -61,6 +66,11 @@ export function createKsPublisher(deps: KsPublisherDeps): Publish {
     // its docker exec (30 s) plus, on failure, one docker inspect (20 s), about 50 s in all, well
     // inside the 2-minute lock wait (SYNAPSE_LOCK_WAIT_MS) other bridges allow. Inherited from step 1.
     await write(deps.frontDir, connectionId, bearer)
+    // #178: another box's write failing is logged, never thrown: it must not undo this one.
+    for (const dir of deps.otherFrontDirs ? await deps.otherFrontDirs().catch(() => []) : []) {
+      if (dir === deps.frontDir) continue
+      await write(dir, connectionId, bearer).catch(() => safeLog(deps.log, "warn", COMPONENT, "could not write another box's Keystone include", { connection: connectionId }))
+    }
     const reload = await deps.reload()
     const credential = bearer === undefined ? "empty" : "published"
     safeLog(deps.log, PUBLISHED.has(reload) ? "info" : "warn", COMPONENT, "keystone credential published", { connection: connectionId, credential, reload })

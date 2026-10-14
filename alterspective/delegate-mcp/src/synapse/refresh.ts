@@ -5,9 +5,9 @@
 import { readFile } from "node:fs/promises"
 import { isDelegateError } from "../shared/errors.ts"
 import { safeLog } from "../shared/log.ts"
-import { authConfHasToken, authConfPath, writeAuthConf } from "./auth-conf.ts"
+import { authConfHasToken, authConfPath } from "./auth-conf.ts"
 import { refreshSynapse, rotatedRefreshToken } from "./keystone-token.ts"
-import { TICK_MS, adopt, currentPending, failClosed, isDue, keepRotated, pendingElsewhere, readState, reloadFront, savePending, writeState, type Refreshed, type SynapseDeps, type TokenState } from "./token-manager.ts"
+import { TICK_MS, adopt, currentPending, failClosed, isDue, keepRotated, pendingElsewhere, publishAuthConf, readState, reloadFront, reloadFronts, savePending, writeState, type Refreshed, type SynapseDeps, type TokenState } from "./token-manager.ts"
 
 export const RETRY_BASE_MS = 30_000
 export const RETRY_MAX_MS = 10 * 60_000
@@ -96,10 +96,10 @@ async function retryLater(deps: SynapseDeps, state: TokenState | undefined, reas
 /** Past expiry: take the token out of front (no credential leaves front). Not a sign-out. */
 async function expireIfPast(deps: SynapseDeps, state: TokenState | undefined): Promise<Refreshed> {
   if (!pastExpiry(state, deps.now()) || !(await includeHasToken(deps))) return { outcome: "fresh" }
-  await writeAuthConf(deps.frontDir, undefined)
+  await publishAuthConf(deps, undefined)
   if (state) await writeState(deps.home, { ...state, includeAt: deps.now() })
   safeLog(deps.log, "warn", "synapse", "synapse token expired; removed from front, renewal keeps retrying", {})
-  return { outcome: "expired", reload: await reloadFront(deps) }
+  return { outcome: "expired", reload: await reloadFronts(deps) }
 }
 
 /** The renewal loop of one bridge. Returns a stop function. Errors are logged by code, never thrown. */

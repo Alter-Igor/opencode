@@ -7,6 +7,7 @@ import { nodeLeaseFs } from "../supervisor/leases.ts"
 import { defaultOpener } from "../supervisor/login.ts"
 import { nodeProcessProbe, ownStartTime } from "../supervisor/process.ts"
 import { withStartLock } from "../supervisor/start-lock.ts"
+import { frontTargets } from "./front-targets.ts"
 import { SYNAPSE_LOCK_WAIT_MS, synapseLockFile } from "./lock.ts"
 import { refreshIfDue, startRefreshLoop } from "./refresh.ts"
 import { loadAppSecrets, type AppSecrets } from "./secrets.ts"
@@ -45,6 +46,8 @@ export function createSynapseAuth(config: Pick<BridgeConfig, "home" | "keystoneO
     frontDir: frontDir(config),
     origin: config.keystoneOrigin,
     frontContainer: `${config.project}-front`,
+    // #178: every box this home runs gets each renewed include, the bound one first.
+    targets: () => frontTargets(config.home, config.project, { frontDir: deps.frontDir, frontContainer: deps.frontContainer }),
     store: dpapiStore(refreshStoreFile(config.home)),
     memory: { id: `${process.pid}-${randomUUID()}` },
     secrets: loadSecrets,

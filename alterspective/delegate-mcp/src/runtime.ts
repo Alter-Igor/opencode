@@ -22,7 +22,7 @@ import { createSupervisor, defaultSupervisorDeps, type DelegateSupervisor, type 
 import { login } from "./supervisor/login.ts"
 import { createWorkspaces } from "./supervisor/workspaces.ts"
 import { createSynapseAuth, type SynapseAuth } from "./synapse/index.ts"
-import { reloadFront } from "./synapse/token-manager.ts"
+import { reloadFronts } from "./synapse/token-manager.ts"
 import { keystoneHostAuth } from "./guard/egress-identity.ts"
 import { createKeystoneAuth, type KeystoneAuth } from "./keystone-auth/index.ts"
 import { connectSignedIn, createKsPublisher, ensureEntryConnected, startReconnectLoop } from "./keystone-auth/host-wiring.ts"
@@ -321,10 +321,12 @@ function startHostKeystone(keystone: KeystoneAuth, config: BridgeConfig, log: Lo
  */
 export function hostKeystone(config: BridgeConfig, env: NodeJS.ProcessEnv, log: Logger, synapse: Pick<SynapseAuth, "deps">, heldBox: () => Box | undefined): KeystoneAuth {
   const publish = createKsPublisher({
+    // #178: the bound box's folder, the same one `reload` reloads first (was always the base box's).
     get frontDir() {
-      return frontDir(config)
+      return synapse.deps.frontDir
     },
-    reload: () => reloadFront(synapse.deps, { record: false, component: "keystone-auth" }),
+    otherFrontDirs: async () => (synapse.deps.targets ? await synapse.deps.targets() : []).map((t) => t.frontDir),
+    reload: () => reloadFronts(synapse.deps, { record: false, component: "keystone-auth" }),
     connect: async (entry) => {
       const box = heldBox()
       return box ? ensureEntryConnected(box.api, entry, log) : "not_running"
