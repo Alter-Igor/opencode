@@ -17,6 +17,7 @@ import type { BridgeConfig } from "../shared/config.ts"
 import type { Workspace, Workspaces } from "../shared/contracts.ts"
 import { DelegateError, isDelegateError } from "../shared/errors.ts"
 import { safeLog, silentLogger, type Logger } from "../shared/log.ts"
+import { containerName, paths } from "./compose-env.ts"
 import { flagChanges, parseRawDiff } from "./workspaces-detect.ts"
 import { boxFailure, canonicalPath, invalidFolder, isUnder, runCommand, samePath, systemSubst, type Exec } from "./workspaces-exec.ts"
 import { copyOutBundle, dockerTarSource, type TarSource } from "./workspaces-copyout.ts"
@@ -415,9 +416,11 @@ export function createWorkspaces(options: WorkspacesOptions): DelegateWorkspaces
   const ctx: Ctx = {
     roots: options.config.roots,
     host: options.hostExec ?? ((argv, o) => runCommand(argv, undefined, o?.timeoutMs)),
-    box: options.boxExec ?? ((argv, o) => runCommand(["docker", "exec", options.container, ...argv], undefined, o?.timeoutMs)),
-    tar: options.boxTar ?? dockerTarSource(options.container),
-    handoffDir: options.handoffDir ?? path.join(options.config.home, "handoff"),
+    box: options.boxExec ?? ((argv, o) => runCommand(["docker", "exec", containerName(options.config), ...argv], undefined, o?.timeoutMs)),
+    tar: options.boxTar ?? ((boxPath, timeoutMs) => dockerTarSource(containerName(options.config))(boxPath, timeoutMs)),
+    get handoffDir() {
+      return options.handoffDir ?? paths(options.config).handoff
+    },
     stateDir: options.stateDir ?? path.join(options.config.home, "workspaces"),
     boxHandoff: options.boxHandoff ?? "/handoff",
     boxSessions: options.boxSessions ?? "/sessions",
@@ -428,9 +431,21 @@ export function createWorkspaces(options: WorkspacesOptions): DelegateWorkspaces
   }
   const logger = options.logger ?? silentLogger
   // #53: the host records folder is shared by every project under one home; the record names its box.
-  const boxProject = options.config.project
-  const pruneSessionStates = createSessionPruner({ stateDir: ctx.stateDir, boxSessions: ctx.boxSessions, box: ctx.box, boxProject, timeoutMs: ctx.timeouts.short })
-  const closeDeps: CloseDeps = { stateDir: ctx.stateDir, boxSessions: ctx.boxSessions, boxProject, host: ctx.host, box: ctx.box, timeoutMs: ctx.timeouts.short, excludes: WORKSPACE_EXCLUDES, resolveRepo: (hostRepo) => resolveRepo(ctx, hostRepo) }
+  // boxProject is read when a record is pruned or closed, so a generation rebind is visible (#171).
+  const bound = {
+    stateDir: ctx.stateDir,
+    boxSessions: ctx.boxSessions,
+    box: ctx.box,
+    host: ctx.host,
+    timeoutMs: ctx.timeouts.short,
+    excludes: WORKSPACE_EXCLUDES,
+    resolveRepo: (hostRepo: string) => resolveRepo(ctx, hostRepo),
+    get boxProject() {
+      return options.config.project
+    },
+  }
+  const pruneSessionStates = createSessionPruner(bound)
+  const closeDeps: CloseDeps = bound
   // Session keys are logged (they are the owner's own labels); repo paths go only to failure detail.
   return {
     open: (hostRepo: string, sessionKey: string, call?: CallOptions) =>
@@ -440,7 +455,7 @@ export function createWorkspaces(options: WorkspacesOptions): DelegateWorkspaces
     sync: (ws: Workspace, ref: string, call?: CallOptions) =>
       traced(logger, "sync", call, { sessionKey: ws.sessionKey, ref }, () => sync(ctx, ws, ref), (r) => ({ synced: r.synced, head: r.synced ? r.head : "" })),
     resolveRepo: (hostRepo: string, call?: CallOptions) => traced(logger, "resolveRepo", call, {}, () => resolveRepo(ctx, hostRepo)),
-    bindSession: async (key, binding) => bindHostState(ctx.stateDir, key, { ...binding, boxProject }),
+    bindSession: async (key, binding) => bindHostState(ctx.stateDir, key, { ...binding, boxProject: options.config.project }),
     updateSessionState: async (key, patch) => updateHostState(ctx.stateDir, key, patch),
     sessionState: async (key) => readHostState(ctx.stateDir, key),
     listSessionStates: async () => listHostStates(ctx.stateDir),

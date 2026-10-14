@@ -48,6 +48,11 @@ export type HostSessionState = {
    * clone, stamped at bind time. Absent on records from older bridges; those are never pruned.
    */
   boxProject?: string
+  /**
+   * #171: the OpenCode session id on the box named by boxProject, after an idle move.
+   * `sessionID` stays the id the caller was given. Absent means they are the same id.
+   */
+  boxSessionID?: string
 }
 
 /** Written by oc_start_session right after POST /session; the workspaces layer adds `boxProject`. */
@@ -93,9 +98,10 @@ export function parseHostState(raw: string, key: string): HostSessionState | und
   const keystone = keystoneList(p.keystone)
   // A box name that does not parse is dropped: the record then counts as legacy and is never pruned.
   const boxProject = optional(p.boxProject, PROJECT_RE)
+  const boxSessionID = optional(p.boxSessionID, SESSION_ID_RE)
   const caller = str(p.caller)?.slice(0, 128)
   const allowedPaths = Array.isArray(p.allowedPaths) ? p.allowedPaths.filter((s): s is string => typeof s === "string") : undefined
-  return { ...state, ...(model ? { model } : {}), ...(agent ? { agent } : {}), ...(keystone ? { keystone } : {}), ...(boxProject ? { boxProject } : {}), ...(caller ? { caller } : {}), ...(allowedPaths ? { allowedPaths } : {}) }
+  return { ...state, ...(model ? { model } : {}), ...(agent ? { agent } : {}), ...(keystone ? { keystone } : {}), ...(boxProject ? { boxProject } : {}), ...(boxSessionID ? { boxSessionID } : {}), ...(caller ? { caller } : {}), ...(allowedPaths ? { allowedPaths } : {}) }
 }
 
 function checkState(state: HostSessionState): void {
@@ -108,6 +114,7 @@ function checkState(state: HostSessionState): void {
     (state.agent !== undefined && !AGENT_RE.test(state.agent)) ||
     (state.keystone !== undefined && keystoneList(state.keystone) === undefined) ||
     (state.boxProject !== undefined && !PROJECT_RE.test(state.boxProject)) ||
+    (state.boxSessionID !== undefined && !SESSION_ID_RE.test(state.boxSessionID)) ||
     (state.caller !== undefined && typeof state.caller !== "string") ||
     (state.allowedPaths !== undefined && (!Array.isArray(state.allowedPaths) || !state.allowedPaths.every((s) => typeof s === "string")))
   if (bad) throw new DelegateError("upstream_error", "The session's host record would not be valid, so it was not saved.", "Start the session again with oc_start_session.", "invalid host state")
@@ -149,8 +156,8 @@ export function readHostState(dir: string, key: string): HostSessionState | unde
   )
 }
 
-/** Every readable record (damaged ones are skipped), newest first, at most MAX_LISTED_STATES. */
-export function listHostStates(dir: string): HostSessionState[] {
+/** Every readable record (damaged ones are skipped), newest first. The default cap is the display list. */
+export function listHostStates(dir: string, limit = MAX_LISTED_STATES): HostSessionState[] {
   let names: string[]
   try {
     names = readdirSync(dir).filter((n) => n.endsWith(".json"))
@@ -167,7 +174,7 @@ export function listHostStates(dir: string): HostSessionState[] {
       // damaged or unreadable: not listed (readHostState reports it when the key is asked for)
     }
   }
-  return states.sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, MAX_LISTED_STATES)
+  return states.sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, limit)
 }
 
 /** Record the OpenCode session a workspace became. Refused when the record already names another session. */

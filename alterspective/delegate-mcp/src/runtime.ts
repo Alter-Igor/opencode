@@ -165,7 +165,7 @@ class Manager implements BoxManager {
     const { deps } = this
     const api = (deps.api ?? ((t: ApiTarget) => createApi(t)))(target)
     const hub = (deps.hub ?? ((t: ApiTarget, a: OpencodeApi) => createHub({ target: t, api: a, log: deps.log })))(target, api)
-    for (const s of deps.sessions.values()) hub.track(s.sessionID, s.boxPath)
+    for (const s of deps.sessions.values()) hub.track(s.boxSessionID ?? s.sessionID, s.boxPath)
     try {
       await hub.start()
     } catch (error) {
@@ -218,7 +218,7 @@ function logger(config: BridgeConfig, env: NodeJS.ProcessEnv): Logger {
   return createLogger({ dir: path.join(config.home, "logs"), minLevel })
 }
 
-function supervisorFor(config: BridgeConfig, bridgeId: string, log: Logger, box: () => Promise<Box>): DelegateSupervisor {
+function supervisorFor(config: BridgeConfig, bridgeId: string, log: Logger, box: () => Promise<Box>, onBound: (project: string) => void): DelegateSupervisor {
   const guard = createGuard(config)
   return lazySupervisor(async () =>
     createSupervisor(
@@ -228,6 +228,8 @@ function supervisorFor(config: BridgeConfig, bridgeId: string, log: Logger, box:
         repoRoot: REPO_ROOT,
         log,
         login: async (entry, opener) => login((await box()).api, entry, { authOrigin: config.keystoneOrigin, logger: log, opener }),
+        sessionPermission: (profile, keystone) => guard.permissionBaseline(profile, keystone),
+        onBound,
       }),
     ),
   )
@@ -241,12 +243,18 @@ export async function createRuntime(options: RuntimeOptions = {}): Promise<Runti
   const log = options.log ?? logger(config, env)
   const versionInfo = options.version ?? (await readVersion(hostRunner, env))
   const sessions = new Map<string, SessionRecord>()
-  const supervisorService = supervisorFor(config, bridgeId, log, () => manager.box())
+  let onBound: (project: string) => void = () => {}
+  const supervisorService = supervisorFor(config, bridgeId, log, () => manager.box(), (project) => onBound(project))
   const manager = createBoxManager({ supervisor: supervisorService, sessions, log })
   const inboxTarget = cachedTarget(() => inboxTargetFromDocker(bunExec, config))
   const gateTarget = cachedTarget(() => gateTargetFromDocker(bunExec, config))
-  const container = containerName(config)
   const synapse = createSynapseAuth(config, env, log)
+  onBound = (project) => {
+    synapse.deps.frontDir = frontDir({ home: config.home, project })
+    synapse.deps.frontContainer = `${project}-front`
+    inboxTarget.invalidate()
+    gateTarget.invalidate()
+  }
   // The same source as the profile, guard, front generator and supervisor (process.env).
   const keystone = keystoneHostAuth() ? hostKeystone(config, env, log, synapse, () => manager.peek()) : undefined
   // A renewal while this bridge held no box connected nothing: connect signed-in entries on each new box.
@@ -260,7 +268,7 @@ export async function createRuntime(options: RuntimeOptions = {}): Promise<Runti
     log,
     guard: createGuard(config),
     supervisorService,
-    workspaces: createWorkspaces({ config, container, logger: log }),
+    workspaces: createWorkspaces({ config, container: containerName(config), logger: log }),
     inbox: createInbox({ supervisor: `supervisor:${name}`, target: inboxTarget.target, invalidate: inboxTarget.invalidate }),
     gate: createGateApprovals({ target: gateTarget.target, invalidate: gateTarget.invalidate }),
     servedModels: (sessionID, sinceIso) => servedModelsFromFront(bunExec, config, sessionID, sinceIso),
@@ -273,7 +281,7 @@ export async function createRuntime(options: RuntimeOptions = {}): Promise<Runti
       return manager.restart(options)
     },
     onBox: (listener) => manager.onBox(listener),
-    boxExec: (argv, timeoutMs, cwd) => runCommand(["docker", "exec", ...(cwd ? ["-w", cwd] : []), container, ...argv], cleanEnv(), timeoutMs ?? 60_000),
+    boxExec: (argv, timeoutMs, cwd) => runCommand(["docker", "exec", ...(cwd ? ["-w", cwd] : []), containerName(config), ...argv], cleanEnv(), timeoutMs ?? 60_000),
     hostExec: (argv, timeoutMs, cwd) => hostRunner(argv, timeoutMs ?? 60_000, cwd),
     sessions,
     synapse,
@@ -313,7 +321,9 @@ function startHostKeystone(keystone: KeystoneAuth, config: BridgeConfig, log: Lo
  */
 export function hostKeystone(config: BridgeConfig, env: NodeJS.ProcessEnv, log: Logger, synapse: Pick<SynapseAuth, "deps">, heldBox: () => Box | undefined): KeystoneAuth {
   const publish = createKsPublisher({
-    frontDir: frontDir(config),
+    get frontDir() {
+      return frontDir(config)
+    },
     reload: () => reloadFront(synapse.deps, { record: false, component: "keystone-auth" }),
     connect: async (entry) => {
       const box = heldBox()

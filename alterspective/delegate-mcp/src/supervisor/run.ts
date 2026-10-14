@@ -21,12 +21,16 @@ type Heartbeat = { stopped: boolean; inFlight?: Promise<void>; stopTimer: () => 
 type State = { startedHere: boolean; leased: boolean; heartbeat?: Heartbeat; self?: ProcessRecord }
 
 export type Ctx = {
+  /** The context object itself, so a per-call Run can rebind the shared placement (#171). */
+  root: Ctx
   deps: SupervisorDeps
   log: Logger
   dirs: ReturnType<typeof paths>
   leases: Leases
   compose: ComposeFiles
   container: string
+  /** Compose project this process was configured with. Generations never rename it. */
+  baseProject: string
   state: State
 }
 
@@ -39,15 +43,18 @@ export type Run = Ctx & {
 
 export function createContext(deps: SupervisorDeps): Ctx {
   const dirs = paths(deps.config)
-  return {
+  const ctx = {
     deps,
     log: deps.log ?? silentLogger,
     dirs,
     leases: createLeases(deps.leaseFs, dirs.leases, { probe: deps.probe, now: deps.now }),
     compose: { project: deps.config.project, files: [deps.composeFile, dirs.boxEnvOverride] },
     container: containerName(deps.config),
+    baseProject: deps.config.project,
     state: { startedHere: false, leased: false },
-  }
+  } as Ctx
+  ctx.root = ctx
+  return ctx
 }
 
 export function toDelegateError(error: unknown, fallback: ErrorCode = "sandbox_unavailable"): DelegateError {

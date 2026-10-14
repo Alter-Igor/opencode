@@ -333,7 +333,7 @@ Each result is at most 32,000 characters. When a result is too big, whole list i
 | `oc_list_sessions` | This bridge's sessions. `all: true` lists every session in the box, with the bridge that owns it. |
 | `oc_post` | Posts to the agent inbox as this bridge. `wake: true` also delivers it to one of this bridge's sessions. |
 | `oc_inbox` | Reads this bridge's inbox. Text is untrusted; `truncated: true` means old unread messages were dropped. |
-| `oc_server_restart` | `{confirm: true, force?, keystone?}`. Restarts the box with the current profile (after `profile_changed`). `keystone` changes the box-wide set of Keystone services and saves it. Running sessions are stopped. `force: true` restarts it even while other bridges use it. |
+| `oc_server_restart` | `{confirm: true, force?, keystone?}`. Restarts the box this bridge is bound to. A committed image starts a second box beside the running one instead, and an idle task moves when its bridge is gone. Use this tool for a dirty checkout, or when you mean to stop that box. A third box waits. Running sessions on the box you restart are stopped. `keystone` changes the box-wide set of Keystone services and saves it. `force: true` restarts it even while other bridges use it. Do not call it while a task is running. |
 
 Deleted sessions: after a successful `oc_list_sessions`, the bridge checks a small page of host records. It removes a record only when the server returns 404 for that session and the box confirms its clone folder is absent. A surviving clone or link keeps the record so a session still known to this bridge can be collected. Errors keep records for a later pass. A saved cursor reaches old records over repeated list calls; one call need not clean every record. The display still shows at most the newest 200 host records.
 
@@ -407,7 +407,7 @@ The bridge keeps one small record per task on your PC, at `<home>/workspaces/rep
 | Error code | What it means | What to do |
 |---|---|---|
 | `sandbox_unavailable` | Docker Desktop is not running, or Docker cannot be reached. There is no fallback to your own account. | Start Docker Desktop, then run `oc_doctor`. |
-| `profile_changed` | The running box was started with a different profile, image, policy or Keystone set than this bridge expects. | Run `oc_server_restart`. Your sign-in is kept. |
+| `profile_changed` | The running box was started with a different profile, image, policy or Keystone set than this bridge expects. | A committed image starts a second box beside the one that is running. An idle task moves onto it when no bridge still holds the old box. A dirty checkout does not start a second box. A third box waits. Run `oc_server_restart` only when you mean to stop the running box. Do not call it while a task is running. Your sign-in is kept. |
 | `needs_auth` | The Keystone sign-in is missing or expired. | Run `oc_login`. |
 | `port_busy` | Port 19876 (the sign-in callback), or 1459 for `{server: "synapse"}`, is in use, often by an OpenCode sign-in in another window. | Finish or close the other sign-in, then retry `oc_login`. |
 | `policy_violation` | Something broke the rules: a non-Keystone MCP entry, changed permission rules, a wake for a session that is not yours, or an `always` answer. Nothing was sent. | Read the message. Run `oc_doctor`. Answer with `once` or `reject`. |

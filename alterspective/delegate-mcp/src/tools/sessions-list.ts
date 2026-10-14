@@ -6,7 +6,7 @@ import { z } from "zod"
 import { BOX_DIRECTORY_RE, type SessionView } from "../shared/contracts.ts"
 import { DelegateError } from "../shared/errors.ts"
 import type { Box, ToolContext } from "./context.ts"
-import { SESSION_ID_RE, ownSession, ownedStates, sessionIdSchema, type RemoteSession } from "./core-session.ts"
+import { SESSION_ID_RE, liveSessionID, ownSession, ownedStates, sessionIdSchema, type RemoteSession } from "./core-session.ts"
 import { defineTool } from "./define.ts"
 import { ok, untrusted } from "./shape.ts"
 
@@ -21,31 +21,36 @@ async function listRemote(box: Box, correlationId: string): Promise<RemoteSessio
   return res.data.filter((s) => typeof s?.id === "string" && SESSION_ID_RE.test(s.id))
 }
 
-type OwnedInfo = { caller?: string; mine: boolean }
+type OwnedInfo = { caller?: string; mine: boolean; display: string; live: string }
+
+function remember(map: Map<string, OwnedInfo>, info: OwnedInfo, callerID: string, live: string): void {
+  if (!map.has(callerID)) map.set(callerID, info)
+  if (live !== callerID && !map.has(live)) map.set(live, info)
+}
 
 /** Session ids this bridge owns, stamped with caller and whether it belongs to the current caller. */
 async function ownedMap(ctx: ToolContext): Promise<Map<string, OwnedInfo>> {
   const map = new Map<string, OwnedInfo>()
   for (const [id, rec] of ctx.sessions.entries()) {
     const mine = !rec.caller || !ctx.caller || rec.caller === ctx.caller
-    map.set(id, { caller: rec.caller, mine })
+    const live = liveSessionID(rec)
+    remember(map, { caller: rec.caller, mine, display: id, live }, id, live)
   }
   for (const state of await ownedStates(ctx)) {
-    if (!map.has(state.sessionID)) {
-      const mine = !state.caller || !ctx.caller || state.caller === ctx.caller
-      map.set(state.sessionID, { caller: state.caller, mine })
-    }
+    const mine = !state.caller || !ctx.caller || state.caller === ctx.caller
+    const live = state.boxSessionID ?? state.sessionID
+    remember(map, { caller: state.caller, mine, display: state.sessionID, live }, state.sessionID, live)
   }
   return map
 }
 
 /** Box data: only validated shapes outside `untrusted` (W3A-06 / W3C-03). */
-function listed(s: RemoteSession, mine: boolean, caller?: string) {
+function listed(s: RemoteSession, mine: boolean, caller: string | undefined, sessionID = s.id) {
   const directory = typeof s.directory === "string" && BOX_DIRECTORY_RE.test(s.directory) ? { directory: s.directory } : { untrustedDirectory: untrusted(typeof s.directory === "string" ? s.directory : "", 200) }
   const claimed = s.metadata?.supervisor
   const updated = s.time?.updated
   return {
-    sessionID: s.id,
+    sessionID,
     ...directory,
     /** What the box's metadata claims (box data); `mine` comes from the host records. */
     metadataSupervisor: typeof claimed === "string" && SUPERVISOR_RE.test(claimed) ? claimed : undefined,
@@ -62,7 +67,7 @@ type Row = ReturnType<typeof listed> & { state?: string; branch?: string; note?:
 async function withState(ctx: ToolContext, box: Box, row: Row, correlationId: string): Promise<Row> {
   try {
     const { record } = await ownSession(ctx, box, row.sessionID, correlationId)
-    return { ...row, state: (await box.hub.view(record.sessionID)).state, branch: record.branch }
+    return { ...row, state: (await box.hub.view(liveSessionID(record))).state, branch: record.branch }
   } catch (error) {
     const why = error instanceof DelegateError ? error.code : "unexpected error"
     return { ...row, state: "not_tracked", note: `Owned per the host record but not tracked (${why}); oc_status ${row.sessionID} retries.` }
@@ -105,7 +110,10 @@ export const listSessionsTool = defineTool({
     const pruned = await ctx.workspaces
       .pruneSessionStates(
         ctx.supervisor,
-        async (state, timeoutMs) => !remote.some((session) => session.id === state.sessionID) && (await readPresence(state.sessionID, `/sessions/${state.sessionKey}`, timeoutMs)) === 404,
+        async (state, timeoutMs) => {
+          const live = state.boxSessionID ?? state.sessionID
+          return !remote.some((session) => session.id === live) && (await readPresence(live, `/sessions/${state.sessionKey}`, timeoutMs)) === 404
+        },
         (sessionID) => ctx.sessions.has(sessionID),
       )
       .catch((): string[] => {
@@ -115,11 +123,12 @@ export const listSessionsTool = defineTool({
     for (const sessionKey of pruned) ctx.log.log("info", "tools", "removed the host record of a session gone from the sandbox with its clone", { correlationId, sessionKey })
     const rows: Row[] = remote.map((s) => {
       const info = owned.get(s.id)
-      return listed(s, info ? info.mine : false, info?.caller)
+      return listed(s, info ? info.mine : false, info?.caller, info?.display)
     })
     const shown = args.all ? rows : rows.filter((r) => r.mine)
     const sessions = await Promise.all(shown.map((row) => (row.mine ? withState(ctx, box, row, correlationId) : row)))
-    const absent = [...owned.entries()].filter(([id, info]) => info.mine && !remote.some((s) => s.id === id)).map(([id]) => id)
+    const remoteIds = new Set(remote.map((session) => session.id))
+    const absent = [...owned.values()].filter((info, index, all) => info.mine && all.findIndex((item) => item.display === info.display) === index && !remoteIds.has(info.live)).map((info) => info.display)
     const gaps = absent.length ? await missing(absent, readPresence) : undefined
     const summary = `${sessions.length} session${sessions.length === 1 ? "" : "s"}${args.all ? " in the sandbox" : " of this caller"}.`
     return ok(summary, { supervisor: ctx.supervisor, ...(ctx.caller ? { caller: ctx.caller } : {}), sessions, ...(gaps?.missingFromServer.length ? { missingFromServer: gaps.missingFromServer } : {}), ...(gaps?.unknown.length ? { presenceUnknown: gaps.unknown } : {}), ...(pruned.length ? { prunedRecords: pruned } : {}) })
@@ -137,7 +146,8 @@ async function statusViews(ctx: ToolContext, box: Box, ids: string[], correlatio
     ids.map(async (id) => {
       try {
         const { record } = await ownSession(ctx, box, id, correlationId)
-        return await box.hub.view(record.sessionID)
+        const view = await box.hub.view(liveSessionID(record))
+        return view.sessionID === record.sessionID ? view : { ...view, sessionID: record.sessionID }
       } catch (error) {
         return untrackedView(id, error)
       }
@@ -154,13 +164,14 @@ export const statusTool = defineTool({
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   async run(args, ctx, correlationId) {
     const map = await ownedMap(ctx)
-    const ids = args.sessionID ? [args.sessionID] : [...map.keys()]
+    const ids = args.sessionID ? [args.sessionID] : [...new Set([...map.values()].map((info) => info.display))]
     if (ids.length === 0) return ok("This bridge has no sessions yet.", { sessions: [] })
     const box = await ctx.box()
     if (args.sessionID) {
       const { record } = await ownSession(ctx, box, args.sessionID, correlationId)
-      const view = await box.hub.view(record.sessionID)
-      return ok(`${view.sessionID} ${view.state}`, { sessions: [view] })
+      const view = await box.hub.view(liveSessionID(record))
+      const shown = view.sessionID === record.sessionID ? view : { ...view, sessionID: record.sessionID }
+      return ok(`${shown.sessionID} ${shown.state}`, { sessions: [shown] })
     }
     const views = await statusViews(ctx, box, ids, correlationId)
     return ok(views.map((v) => `${v.sessionID} ${v.state}`).join("; "), { sessions: views })

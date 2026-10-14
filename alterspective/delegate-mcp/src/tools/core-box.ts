@@ -162,7 +162,7 @@ export async function refuseBusy(ctx: ToolContext, hostRepo: string, same: (a: s
   if (!box) return
   for (const record of ctx.sessions.values()) {
     if (!same(record.hostRepo, hostRepo)) continue
-    const view = await box.hub.view(record.sessionID)
+    const view = await box.hub.view(record.boxSessionID ?? record.sessionID)
     if (!BUSY.has(view.state)) continue
     throw new DelegateError(
       "directory_busy",
