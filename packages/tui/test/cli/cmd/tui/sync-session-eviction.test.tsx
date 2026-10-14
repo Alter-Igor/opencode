@@ -101,3 +101,25 @@ test("deleting a session releases its messages, parts and per-session state", as
     app.renderer.destroy()
   }
 })
+
+test("late remove events for a deleted session do not throw or bring entries back", async () => {
+  await using tmp = await tmpdir()
+  await Bun.write(`${tmp.path}/kv.json`, "{}")
+  const { app, emit, sync } = await mount(undefined, tmp.path)
+  const sessionID = "ses_evict_late"
+
+  try {
+    emit(global({ id: "evt_s", type: "session.updated", properties: { sessionID, info: { ...info(1), id: sessionID } } }))
+    emit(global({ id: "evt_d", type: "session.deleted", properties: { sessionID, info: { ...info(1), id: sessionID } } }))
+    emit(global({ id: "evt_rm", type: "message.removed", properties: { sessionID, messageID: "msg_gone" } }))
+    emit(global({ id: "evt_rp", type: "message.part.removed", properties: { sessionID, messageID: "msg_gone", partID: "prt_gone" } }))
+    // a later, unrelated event proves the handlers above did not break event delivery
+    emit(global({ id: "evt_u", type: "session.updated", properties: { sessionID: "ses_after", info: { ...info(2), id: "ses_after" } } }))
+    await wait(() => sync.data.session.some((s) => s.id === "ses_after"))
+
+    expect(sync.data.message[sessionID]).toBeUndefined()
+    expect(sync.data.part["msg_gone"]).toBeUndefined()
+  } finally {
+    app.renderer.destroy()
+  }
+})
