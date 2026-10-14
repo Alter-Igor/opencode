@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `oc_cleanup` now logs the error `reason` and `detail`, not only the code, when it skips a session (#174).
+
 ## 0.5.3 — 2026-10-14
 
 **A new image starts beside the running box (#171).** A new agent can use a new image while an old turn keeps running.
