@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `oc_cleanup` resolves the box before it reads its candidate records. Before, the first call after a bridge start picked records for the old box project, then moved to the newer generation and refused every one as "other box", so nothing was swept (#174).
 - `oc_cleanup` now logs the error `reason` and `detail`, not only the code, when it skips a session (#174).
 - A refused close or sweep ownership check now names which check failed (other bridge, other box, session id differs, record unreadable) in the error detail (#174).
 
