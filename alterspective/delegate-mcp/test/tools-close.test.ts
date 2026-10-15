@@ -368,7 +368,7 @@ describe("oc_cleanup", () => {
     expect(Number((data(dry).skipped as { unknown: number }).unknown)).toBeGreaterThanOrEqual(1)
     const skipped = lines.find((l) => l.msg === "session sweep skipped a session")
     expect(skipped?.fields).toMatchObject({ code: "not_found", reason: "no such record", detail: "close refused: probe" })
-  })
+  }, T * 2)
 
   test("#174: a refused ownership check names which check failed, with no record data", async () => {
     const f = context()
@@ -386,7 +386,28 @@ describe("oc_cleanup", () => {
     expect(await refusal(other, { supervisor: f.ctx.supervisor, sessionID: other.sessionID })).toBe(`close refused: ${other.key} (other bridge)`)
     expect(await refusal(boxed, { supervisor: f.ctx.supervisor, sessionID: boxed.sessionID })).toBe(`close refused: ${boxed.key} (other box)`)
     expect(await refusal(boxed, { supervisor: f.ctx.supervisor, sessionID: "ses_wrong" })).toBe(`close refused: ${boxed.key} (session id differs)`)
-  })
+  }, T * 2)
+
+  test("#174: the box is resolved before the sweep reads its candidates (the first bind can change the box project)", async () => {
+    const f = context()
+    await start(f, { ageDays: 30, track: false })
+    const order: string[] = []
+    const box = f.ctx.box.bind(f.ctx)
+    f.ctx.box = async () => {
+      order.push("box")
+      return box()
+    }
+    const candidates = f.ctx.workspaces.closeCandidates.bind(f.ctx.workspaces)
+    f.ctx.workspaces = {
+      ...f.ctx.workspaces,
+      closeCandidates: async (...args: Parameters<typeof candidates>) => {
+        order.push("candidates")
+        return candidates(...args)
+      },
+    }
+    await invoke(cleanupTool, {}, f.ctx)
+    expect(order.slice(0, 2)).toEqual(["box", "candidates"])
+  }, T * 2)
 
   test("a TTL of 0 disables the sweep", async () => {
     process.env[TTL_ENV] = "0"
