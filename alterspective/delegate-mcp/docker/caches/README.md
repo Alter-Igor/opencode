@@ -58,9 +58,22 @@ UV_DEFAULT_INDEX=http://pypi-cache:5000/index/
 UV_INSECURE_HOST=pypi-cache
 COREPACK_NPM_REGISTRY=http://npm-cache:4873
 COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+YARN_NPM_REGISTRY_SERVER=http://npm-cache:4873
+YARN_UNSAFE_HTTP_WHITELIST=npm-cache
+YARN_ENABLE_TELEMETRY=0
 ```
 
-No proxy variables and no `NO_PROXY`: the caches and the inbox are plain service names on `sealed`, and the allowed hosts resolve to front. The bridge refuses a box env list that names any of these, or any `*_PROXY` (compose-env.ts). npm, pip and bun were tested live through the caches (bun on 2026-10-01: `bun add is-number` resolved through `npm-cache`). The `UV_` lines were not tested: uv is not installed in the box image. pnpm is installed in the box image, pinned (#167). pnpm 11 does not read `npm_config_registry` from the environment (tested live: it went straight to `registry.npmjs.org` and failed with `EAI_AGAIN`), so it gets `pnpm_config_registry`; with it, `pnpm install` of vite, vitest, typescript, @types/node and jsdom worked through the cache (2026-10-12). corepack reads `COREPACK_NPM_REGISTRY`, so it also fetches package managers through `npm-cache` (tested: `corepack pnpm@9.15.9`, `corepack yarn@1.22.22`). Its shims are not enabled (read-only root), so call `corepack <tool>` directly. Yarn 2+ reads its own registry setting, which is not set: not covered.
+No proxy variables and no `NO_PROXY`: the caches and the inbox are plain service names on `sealed`, and the allowed hosts resolve to front. The bridge refuses a box env list that names any of these, or any `*_PROXY` (compose-env.ts). npm, pip and bun were tested live through the caches (bun on 2026-10-01: `bun add is-number` resolved through `npm-cache`). The `UV_` lines were not tested: uv is not installed in the box image. pnpm is installed in the box image, pinned (#167). pnpm 11 does not read `npm_config_registry` from the environment (tested live: it went straight to `registry.npmjs.org` and failed with `EAI_AGAIN`), so it gets `pnpm_config_registry`; with it, `pnpm install` of vite, vitest, typescript, @types/node and jsdom worked through the cache (2026-10-12). corepack reads `COREPACK_NPM_REGISTRY`, so it also fetches package managers through `npm-cache` (tested: `corepack pnpm@9.15.9`, `corepack yarn@1.22.22`). Its shims are not enabled (read-only root), so call `corepack <tool>` directly. Yarn 2+ reads only its own settings, so it gets `YARN_NPM_REGISTRY_SERVER`, and it refuses a plain-http registry unless the host is whitelisted (`YN0081`), so it also gets `YARN_UNSAFE_HTTP_WHITELIST` (#169). Tested live on 2026-10-17: without them `corepack yarn add is-number` (yarn 4.9.2) failed on DNS; with them it worked through the cache.
+
+### Lockfiles leave the box with public URLs (#162)
+
+npm and Yarn 1 write the address they fetched from into the lockfile, so a lockfile written in the box held `http://npm-cache:4873/...`, and `npm ci` or an image build outside the box failed. The box image now sets git clean filters in `/etc/gitattributes` (git's system attributes file) for `package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml` and `bun.lock` (to `https://registry.npmjs.org/`) and `yarn.lock` (to `https://registry.yarnpkg.com/`). The filter runs at `git add`: the commit gets the public URL, the working copy keeps the cache address, and `git status` stays clean.
+
+- Tested live on 2026-10-17: in the box, `npm ci` from a lockfile with public URLs installs through the cache (npm swaps `registry.npmjs.org` for the configured registry). The filter was proved on the box's base image as the agent user (uid 10001), including a lockfile in a subfolder.
+- pnpm (default registry), bun and Yarn 2+ lockfiles name no registry host, so they need no rewrite. The filter covers them anyway.
+- Not covered: Yarn 1 does not swap a public host for the configured registry, so `yarn install` of a Yarn 1 lockfile with public URLs fails in the box. That was already true for any Yarn 1 repository before this change. Python lockfiles (`uv.lock`) are not rewritten.
+- A repository's own `.gitattributes` can set another filter for these files and win.
+- Safety net: `oc_collect` lists every changed file whose new version still names `npm-cache:4873` or `pypi-cache:5000` (`mirrorAddressFiles`) and warns in its summary.
 
 ## How the caches reach the internet — decision
 

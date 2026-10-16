@@ -288,6 +288,26 @@ async function executableChanges(ctx: Ctx, repo: string, base: string, branch: s
   })
 }
 
+/** The caches' addresses inside the sealed network (compose.yaml); a build outside the box cannot reach them. */
+export const MIRROR_ADDRESSES = ["npm-cache:4873", "pypi-cache:5000"] as const
+
+/**
+ * #162: changed files whose branch version still holds a cache address, i.e. a file the box's git
+ * clean filter does not cover (uv.lock, a lockfile under another name, a hand-written config).
+ * -G narrows to files whose diff touches an address; git grep keeps those whose new version has one.
+ */
+async function mirrorAddressChanges(ctx: Ctx, repo: string, base: string, branch: string): Promise<string[]> {
+  const pattern = `-G(${MIRROR_ADDRESSES.join("|")})`
+  const listed = await hostGit(ctx, ["-C", repo, "diff", "--name-only", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", pattern, base, branch, "--"], "look for the cache address in changed files")
+  const touched = listed.split("\0").filter(Boolean)
+  if (touched.length === 0) return []
+  const grep = await ctx.host(["git", "-C", repo, "grep", "-l", "-z", "-F", ...MIRROR_ADDRESSES.flatMap((a) => ["-e", a]), branch, "--", ...touched.slice(0, 500)], { timeoutMs: ctx.timeouts.short })
+  // Exit 1 is "no match". Any other failure reports the -G list: a loud false positive beats silence.
+  if (grep.code === 1) return []
+  if (grep.code !== 0) return touched
+  return grep.stdout.split("\0").filter(Boolean).map((hit) => hit.slice(branch.length + 1))
+}
+
 async function collect(ctx: Ctx, ws: Workspace) {
   checkKey(ws.sessionKey)
   const state = readState(ctx, ws.sessionKey)
@@ -304,7 +324,8 @@ async function collect(ctx: Ctx, ws: Workspace) {
   }
   const count = await hostGit(ctx, ["-C", state.hostRepo, "rev-list", "--count", `${state.base}..${branch}`], "count commits")
   const hostExecutableChanges = await executableChanges(ctx, state.hostRepo, state.base, branch)
-  return { branch, commits: Number(count.trim()), hostExecutableChanges }
+  const mirrorAddressFiles = await mirrorAddressChanges(ctx, state.hostRepo, state.base, branch)
+  return { branch, commits: Number(count.trim()), hostExecutableChanges, mirrorAddressFiles }
 }
 
 export type SyncResult =
@@ -451,7 +472,7 @@ export function createWorkspaces(options: WorkspacesOptions): DelegateWorkspaces
     open: (hostRepo: string, sessionKey: string, call?: CallOptions) =>
       traced(logger, "open", call, { sessionKey }, () => open(ctx, hostRepo, sessionKey), (ws) => ({ branch: ws.branch })),
     collect: (ws: Workspace, call?: CallOptions) =>
-      traced(logger, "collect", call, { sessionKey: ws.sessionKey }, () => collect(ctx, ws), (r) => ({ branch: r.branch, commits: r.commits, hostExecutableChanges: r.hostExecutableChanges.length })),
+      traced(logger, "collect", call, { sessionKey: ws.sessionKey }, () => collect(ctx, ws), (r) => ({ branch: r.branch, commits: r.commits, hostExecutableChanges: r.hostExecutableChanges.length, mirrorAddressFiles: r.mirrorAddressFiles.length })),
     sync: (ws: Workspace, ref: string, call?: CallOptions) =>
       traced(logger, "sync", call, { sessionKey: ws.sessionKey, ref }, () => sync(ctx, ws, ref), (r) => ({ synced: r.synced, head: r.synced ? r.head : "" })),
     resolveRepo: (hostRepo: string, call?: CallOptions) => traced(logger, "resolveRepo", call, {}, () => resolveRepo(ctx, hostRepo)),

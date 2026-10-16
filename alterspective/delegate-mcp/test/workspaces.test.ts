@@ -38,7 +38,7 @@ describe("workspaces: collect never runs hooks planted in the box clone (red tes
       const tip = await fx.boxGit("hook-test", ["rev-parse", "delegate/hook-test"])
       const result = await fx.workspaces().collect(ws)
       expect(existsSync(fx.marker)).toBe(false)
-      expect(result).toEqual({ branch: "delegate/hook-test", commits: 1, hostExecutableChanges: [] })
+      expect(result).toEqual({ branch: "delegate/hook-test", commits: 1, hostExecutableChanges: [], mirrorAddressFiles: [] })
       expect(await git(fx.hostRepo, ["rev-parse", "delegate/hook-test"])).toBe(tip)
       expect(await git(fx.hostRepo, ["branch", "--show-current"])).toBe("main")
       expect(fx.handoffFiles()).toEqual([])
@@ -122,6 +122,41 @@ describe("workspaces: host-executable changes are reported", () => {
           "CLAUDE.md", "Makefile", "docs/link", "package.json", "pyproject.toml", "tools/build", "tools/go.cmd", "tools/go.sh", "tools/run.PS1", "vendor/sub",
         ].sort(),
       )
+    },
+    T,
+  )
+})
+
+describe("workspaces: collect names files that still hold a cache address (#162)", () => {
+  test(
+    "only files whose branch version has the address are listed",
+    async () => {
+      const workspaces = fx.workspaces()
+      const ws = await workspaces.open(fx.hostRepo, "mirror-test")
+      await fx.boxCommit(
+        "mirror-test",
+        {
+          "package-lock.json": '{"resolved": "http://npm-cache:4873/a/-/a-1.0.0.tgz"}\n',
+          "py/uv.lock": 'source = { registry = "http://pypi-cache:5000/index/" }\n',
+          "fixed.json": '{"url": "http://npm-cache:4873/b"}\n',
+          "notes.md": "no address here\n",
+        },
+        "lockfiles",
+      )
+      await fx.boxCommit("mirror-test", { "fixed.json": '{"url": "https://registry.npmjs.org/b"}\n' }, "fix one")
+      const result = await workspaces.collect(ws)
+      expect([...result.mirrorAddressFiles].sort()).toEqual(["package-lock.json", "py/uv.lock"])
+    },
+    T,
+  )
+
+  test(
+    "a branch without the address lists nothing",
+    async () => {
+      const workspaces = fx.workspaces()
+      const ws = await workspaces.open(fx.hostRepo, "mirror-clean")
+      await fx.boxCommit("mirror-clean", { "package-lock.json": '{"resolved": "https://registry.npmjs.org/a/-/a-1.0.0.tgz"}\n' }, "clean")
+      expect((await workspaces.collect(ws)).mirrorAddressFiles).toEqual([])
     },
     T,
   )

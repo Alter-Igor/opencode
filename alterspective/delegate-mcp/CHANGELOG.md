@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Lockfiles written in the box leave it with public registry URLs (#162). npm and Yarn 1 wrote `http://npm-cache:4873/...` into `package-lock.json` and `yarn.lock`, so `npm ci` and image builds outside the box failed. The box image now sets git clean filters (`/etc/gitattributes`) that swap the cache address for `https://registry.npmjs.org/` (`yarn.lock`: `https://registry.yarnpkg.com/`) when a lockfile is committed. The working copy keeps the cache address, so installs in the box still work. `oc_collect` also returns `mirrorAddressFiles` and warns when a changed file still names `npm-cache:4873` or `pypi-cache:5000` (for example `uv.lock`, which is not rewritten).
+- Yarn 2+ installs through the cache (#169): the box sets `YARN_NPM_REGISTRY_SERVER`, `YARN_UNSAFE_HTTP_WHITELIST` and `YARN_ENABLE_TELEMETRY=0`, and `YARN_` is now a reserved box env prefix.
+- Checked live on 2026-10-17: npm, Yarn 1 and Yarn 4.9.2 in the running box; the git filter on the box's base image (`node:22-slim`, same digest) as uid 10001. The full new box image was not built; it builds on the next bridge start.
+
 - `oc_cleanup` resolves the box before it reads its candidate records. Before, the first call after a bridge start picked records for the old box project, then moved to the newer generation and refused every one as "other box", so nothing was swept (#174).
 - `oc_cleanup` now logs the error `reason` and `detail`, not only the code, when it skips a session (#174).
 - A refused close or sweep ownership check now names which check failed (other bridge, other box, session id differs, record unreadable) in the error detail (#174).

@@ -80,7 +80,7 @@ export function siblingContainers(config: Pick<BridgeConfig, "project">): Array<
 /** TLS trust settings: the box trusts front's internal CA only, and nothing may turn checks off (R3-01). */
 const TLS_TRUST_ENV = ["NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO", "GIT_SSL_NO_VERIFY", "REQUESTS_CA_BUNDLE", "NODE_TLS_REJECT_UNAUTHORIZED"]
 const RESERVED_EXACT = new Set(["INBOX_ADMIN_TOKEN", "GATE_ADMIN_TOKEN", "GATE_PROFILE", "HOME", "PATH", "BUN_CONFIG_REGISTRY", ...TLS_TRUST_ENV])
-const RESERVED_PREFIX = ["OCD_", "OPENCODE_", "INBOX_", "XDG_", "NPM_CONFIG_", "PIP_", "UV_", "COREPACK_", "PNPM_CONFIG_"]
+const RESERVED_PREFIX = ["OCD_", "OPENCODE_", "INBOX_", "XDG_", "NPM_CONFIG_", "PIP_", "UV_", "COREPACK_", "PNPM_CONFIG_", "YARN_"]
 const RESERVED_SUFFIX = ["_PROXY"]
 
 export function isReservedBoxEnv(name: string): boolean {
