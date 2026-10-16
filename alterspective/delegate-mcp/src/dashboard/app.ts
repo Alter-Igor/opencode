@@ -256,9 +256,8 @@ function boot() {
   }
 
   function show(data, now) {
-    var root = render(data, now);
-    VIEWS.forEach(function (v, i) {
-      if (bodies[v.id]) bodies[v.id].replaceChildren(root.children[i]);
+    VIEWS.forEach(function (v) {
+      if (bodies[v.id]) bodies[v.id].replaceChildren(renderView(v.id, data, now));
       if (panels[v.id]) panels[v.id].hidden = v.id !== active;
     });
     asOf.textContent = "As of " + formatTime(data.asOf) + ". Updates every 5 seconds.";
