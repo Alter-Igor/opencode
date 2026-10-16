@@ -145,7 +145,35 @@ describe("workspaces: collect names files that still hold a cache address (#162)
       )
       await fx.boxCommit("mirror-test", { "fixed.json": '{"url": "https://registry.npmjs.org/b"}\n' }, "fix one")
       const result = await workspaces.collect(ws)
-      expect([...result.mirrorAddressFiles].sort()).toEqual(["package-lock.json", "py/uv.lock"])
+      expect([...(result.mirrorAddressFiles ?? [])].sort()).toEqual(["package-lock.json", "py/uv.lock"])
+    },
+    T,
+  )
+
+  test(
+    "a repo that marks lockfiles -diff or binary does not hide them; a glob-like name is a plain name",
+    async () => {
+      // Host-side git reads attributes from the owner's checkout, so they go in the host repo.
+      const attributes = path.join(fx.hostRepo, ".git", "info", "attributes")
+      mkdirSync(path.dirname(attributes), { recursive: true })
+      writeFileSync(attributes, "*.lock -diff\n*.bin binary\n")
+      try {
+        const workspaces = fx.workspaces()
+        const ws = await workspaces.open(fx.hostRepo, "mirror-binary")
+        await fx.boxCommit(
+          "mirror-binary",
+          {
+            "uv.lock": 'source = { registry = "http://pypi-cache:5000/index/" }\n',
+            "deps.bin": "http://npm-cache:4873/a\n",
+            "[i]": "http://npm-cache:4873/b\n",
+          },
+          "lockfiles",
+        )
+        const result = await workspaces.collect(ws)
+        expect([...(result.mirrorAddressFiles ?? [])].sort()).toEqual(["[i]", "deps.bin", "uv.lock"])
+      } finally {
+        rmSync(attributes, { force: true })
+      }
     },
     T,
   )

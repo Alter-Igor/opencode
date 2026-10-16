@@ -117,6 +117,15 @@ describe("oc_collect", () => {
     expect(data(result).mirrorAddressFiles).toMatchObject({ count: 1, paths: { text: "uv.lock", truncated: false } })
   })
 
+  test("a failed cache address check is a warning, not an error; the branch result stands", async () => {
+    const f = fakeContext()
+    f.ctx.sessions.set(SID, record())
+    f.ctx.workspaces.collect = async (ws) => ({ branch: ws.branch, commits: 2, hostExecutableChanges: [], mirrorAddressFiles: null })
+    const result = await invoke(collectTool, { sessionID: SID }, f.ctx)
+    expect(text(result).split("\n")[0]).toContain("could not run")
+    expect(data(result)).toMatchObject({ commits: 2, mirrorAddressFiles: { checked: false } })
+  })
+
   test("a clean collect reports no cache address files and no warning", async () => {
     const f = fakeContext()
     f.ctx.sessions.set(SID, record())

@@ -30,7 +30,7 @@ export interface Workspaces {
   /** Bundle the owner's repo, clone it in the box, create branch `delegate/<key>`. */
   open(hostRepo: string, sessionKey: string): Promise<Workspace>
   /** Bundle the session branch in the box and fetch it into the owner's repo. Returns the branch name. */
-  collect(workspace: Workspace): Promise<{ branch: string; commits: number; hostExecutableChanges: string[]; mirrorAddressFiles: string[] }>
+  collect(workspace: Workspace): Promise<{ branch: string; commits: number; hostExecutableChanges: string[]; mirrorAddressFiles: string[] | null }>
 }
 
 /** MOD-02: policy verdicts. Every check fails closed. */

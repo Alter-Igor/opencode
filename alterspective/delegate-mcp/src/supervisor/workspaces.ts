@@ -295,17 +295,24 @@ export const MIRROR_ADDRESSES = ["npm-cache:4873", "pypi-cache:5000"] as const
  * #162: changed files whose branch version still holds a cache address, i.e. a file the box's git
  * clean filter does not cover (uv.lock, a lockfile under another name, a hand-written config).
  * -G narrows to files whose diff touches an address; git grep keeps those whose new version has one.
+ * --text on both: a repo that marks lockfiles `-diff` or `binary` must not hide them (QA on #185).
+ * git grep takes no pathspecs (no command-line cap, no glob matching) and is intersected instead.
+ * null: the check itself failed. The branch is already fetched, so that is a warning, never an error.
  */
-async function mirrorAddressChanges(ctx: Ctx, repo: string, base: string, branch: string): Promise<string[]> {
+async function mirrorAddressChanges(ctx: Ctx, repo: string, base: string, branch: string): Promise<string[] | null> {
   const pattern = `-G(${MIRROR_ADDRESSES.join("|")})`
-  const listed = await hostGit(ctx, ["-C", repo, "diff", "--name-only", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", pattern, base, branch, "--"], "look for the cache address in changed files")
-  const touched = listed.split("\0").filter(Boolean)
-  if (touched.length === 0) return []
-  const grep = await ctx.host(["git", "-C", repo, "grep", "-l", "-z", "-F", ...MIRROR_ADDRESSES.flatMap((a) => ["-e", a]), branch, "--", ...touched.slice(0, 500)], { timeoutMs: ctx.timeouts.short })
-  // Exit 1 is "no match". Any other failure reports the -G list: a loud false positive beats silence.
-  if (grep.code === 1) return []
-  if (grep.code !== 0) return touched
-  return grep.stdout.split("\0").filter(Boolean).map((hit) => hit.slice(branch.length + 1))
+  try {
+    const listed = await hostGit(ctx, ["-C", repo, "diff", "--name-only", "-z", "--text", "--no-renames", "--no-ext-diff", "--no-textconv", pattern, base, branch, "--"], "look for the cache address in changed files")
+    const touched = new Set(listed.split("\0").filter(Boolean))
+    if (touched.size === 0) return []
+    const grep = await ctx.host(["git", "-C", repo, "grep", "-l", "-z", "--text", "-F", ...MIRROR_ADDRESSES.flatMap((a) => ["-e", a]), branch], { timeoutMs: ctx.timeouts.short })
+    // Exit 1 is "no match". Any other failure reports the -G list: a loud false positive beats silence.
+    if (grep.code === 1) return []
+    if (grep.code !== 0) return [...touched]
+    return grep.stdout.split("\0").filter(Boolean).map((hit) => hit.slice(branch.length + 1)).filter((file) => touched.has(file))
+  } catch {
+    return null
+  }
 }
 
 async function collect(ctx: Ctx, ws: Workspace) {
@@ -472,7 +479,7 @@ export function createWorkspaces(options: WorkspacesOptions): DelegateWorkspaces
     open: (hostRepo: string, sessionKey: string, call?: CallOptions) =>
       traced(logger, "open", call, { sessionKey }, () => open(ctx, hostRepo, sessionKey), (ws) => ({ branch: ws.branch })),
     collect: (ws: Workspace, call?: CallOptions) =>
-      traced(logger, "collect", call, { sessionKey: ws.sessionKey }, () => collect(ctx, ws), (r) => ({ branch: r.branch, commits: r.commits, hostExecutableChanges: r.hostExecutableChanges.length, mirrorAddressFiles: r.mirrorAddressFiles.length })),
+      traced(logger, "collect", call, { sessionKey: ws.sessionKey }, () => collect(ctx, ws), (r) => ({ branch: r.branch, commits: r.commits, hostExecutableChanges: r.hostExecutableChanges.length, mirrorAddressFiles: r.mirrorAddressFiles?.length ?? "check failed" })),
     sync: (ws: Workspace, ref: string, call?: CallOptions) =>
       traced(logger, "sync", call, { sessionKey: ws.sessionKey, ref }, () => sync(ctx, ws, ref), (r) => ({ synced: r.synced, head: r.synced ? r.head : "" })),
     resolveRepo: (hostRepo: string, call?: CallOptions) => traced(logger, "resolveRepo", call, {}, () => resolveRepo(ctx, hostRepo)),
