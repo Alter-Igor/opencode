@@ -514,6 +514,11 @@ describe("dashboard page", () => {
     expect(bySelector.get("#view-models")!.hidden).toBe(false)
     expect(bySelector.get("#view-overview")!.hidden).toBe(true)
     expect((bySelector.get("[data-role=body-models]") as E).children[0]!.children.length).toBeGreaterThan(0)
+    // each view body has its distinct section content
+    expect(flat(bySelector.get("[data-role=body-overview]")!)).toContain("Who is delegating")
+    expect(flat(bySelector.get("[data-role=body-tasks]")!)).toContain("Running now")
+    expect(flat(bySelector.get("[data-role=body-models]")!)).toContain("Model scorecard")
+    expect(flat(bySelector.get("[data-role=body-about]")!)).toContain("About this page")
     // arrow from the active tab wraps to the next
     tabs.children[2]!.fire("keydown", { key: "ArrowRight" })
     expect(bySelector.get("#view-about")!.hidden).toBe(false)
