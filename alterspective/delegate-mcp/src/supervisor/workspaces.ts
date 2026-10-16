@@ -294,22 +294,22 @@ export const MIRROR_ADDRESSES = ["npm-cache:4873", "pypi-cache:5000"] as const
 /**
  * #162: changed files whose branch version still holds a cache address, i.e. a file the box's git
  * clean filter does not cover (uv.lock, a lockfile under another name, a hand-written config).
- * -G narrows to files whose diff touches an address; git grep keeps those whose new version has one.
- * --text on both: a repo that marks lockfiles `-diff` or `binary` must not hide them (QA on #185).
- * git grep takes no pathspecs (no command-line cap, no glob matching) and is intersected instead.
+ * Every changed file counts, not only diffs that touch an address: an unchanged address line in a
+ * changed file breaks the build just the same (CodeRabbit on #185). git grep --text searches the
+ * branch tree, so a repo's `-diff` / `binary` attributes cannot hide a file (QA on #185); it takes
+ * no pathspecs (no command-line cap, no glob matching) and is intersected with the changed files.
  * null: the check itself failed. The branch is already fetched, so that is a warning, never an error.
  */
 async function mirrorAddressChanges(ctx: Ctx, repo: string, base: string, branch: string): Promise<string[] | null> {
-  const pattern = `-G(${MIRROR_ADDRESSES.join("|")})`
   try {
-    const listed = await hostGit(ctx, ["-C", repo, "diff", "--name-only", "-z", "--text", "--no-renames", "--no-ext-diff", "--no-textconv", pattern, base, branch, "--"], "look for the cache address in changed files")
-    const touched = new Set(listed.split("\0").filter(Boolean))
-    if (touched.size === 0) return []
-    const grep = await ctx.host(["git", "-C", repo, "grep", "-l", "-z", "--text", "-F", ...MIRROR_ADDRESSES.flatMap((a) => ["-e", a]), branch], { timeoutMs: ctx.timeouts.short })
-    // Exit 1 is "no match". Any other failure reports the -G list: a loud false positive beats silence.
-    if (grep.code === 1) return []
-    if (grep.code !== 0) return [...touched]
-    return grep.stdout.split("\0").filter(Boolean).map((hit) => hit.slice(branch.length + 1)).filter((file) => touched.has(file))
+    const listed = await hostGit(ctx, ["-C", repo, "diff", "--name-only", "-z", "--no-renames", base, branch, "--"], "list changed files")
+    const changed = new Set(listed.split("\0").filter(Boolean))
+    if (changed.size === 0) return []
+    // `--` after the revision: a host path named like the branch must not make git read it as a file.
+    const grep = await ctx.host(["git", "-C", repo, "grep", "-l", "-z", "--text", "-F", ...MIRROR_ADDRESSES.flatMap((a) => ["-e", a]), branch, "--"], { timeoutMs: ctx.timeouts.short })
+    if (grep.code === 1) return [] // no match anywhere on the branch
+    if (grep.code !== 0) return null
+    return grep.stdout.split("\0").filter(Boolean).map((hit) => hit.slice(branch.length + 1)).filter((file) => changed.has(file))
   } catch {
     return null
   }

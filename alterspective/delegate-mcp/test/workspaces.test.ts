@@ -179,6 +179,31 @@ describe("workspaces: collect names files that still hold a cache address (#162)
   )
 
   test(
+    "a changed file is listed when its address line is old and untouched; a host path named like the branch does not confuse git",
+    async () => {
+      const file = path.join(fx.hostRepo, "registry.conf")
+      writeFileSync(file, "registry=http://npm-cache:4873/\nretries=1\n")
+      await git(fx.hostRepo, ["add", "registry.conf"])
+      await git(fx.hostRepo, ["commit", "-q", "-m", "old address"])
+      const lookalike = path.join(fx.hostRepo, "delegate", "mirror-old")
+      try {
+        const workspaces = fx.workspaces()
+        const ws = await workspaces.open(fx.hostRepo, "mirror-old")
+        mkdirSync(path.dirname(lookalike), { recursive: true })
+        writeFileSync(lookalike, "untracked file named like the branch\n")
+        await fx.boxCommit("mirror-old", { "registry.conf": "registry=http://npm-cache:4873/\nretries=2\n" }, "other line")
+        const result = await workspaces.collect(ws)
+        expect(result.mirrorAddressFiles).toEqual(["registry.conf"])
+      } finally {
+        rmSync(path.join(fx.hostRepo, "delegate"), { recursive: true, force: true })
+        await git(fx.hostRepo, ["rm", "-q", "registry.conf"])
+        await git(fx.hostRepo, ["commit", "-q", "-m", "drop old address"])
+      }
+    },
+    T,
+  )
+
+  test(
     "a branch without the address lists nothing",
     async () => {
       const workspaces = fx.workspaces()
