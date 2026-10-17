@@ -24,6 +24,7 @@ import { SynapseAuthPlugin } from "./synapse"
 import { CerebrasPlugin } from "./cerebras"
 import { GoalLoopPlugin } from "./goal-loop"
 import { OpencodealtDocsPlugin } from "./opencodealt-docs"
+import { SmallModelDelegationPlugin } from "./small-model-delegation"
 import { SnowflakeCortexAuthPlugin } from "./snowflake-cortex"
 import { Effect, Layer, Context } from "effect"
 import { EffectBridge } from "@/effect/bridge"
@@ -97,6 +98,8 @@ export function forkPlugins(): PluginInstance[] {
     GoalLoopPlugin,
     // Fork-only (#90): /docs and the "our docs, not upstream's" system line.
     OpencodealtDocsPlugin,
+    // Fork-only: small model context preservation via subagent delegation.
+    SmallModelDelegationPlugin,
   ]
 }
 

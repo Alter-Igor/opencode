@@ -145,6 +145,8 @@ services:
       # By name only: values come from the `docker compose` process env, never a file.
       OPENCODE_MCP_ALLOW:
       OPENCODE_SERVER_PASSWORD:
+      OPENCODE_SMALL_MODEL_THRESHOLD:
+      OPENCODE_SMALL_MODEL_DELEGATION:
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS -o /dev/null -u \"opencode:$$OPENCODE_SERVER_PASSWORD\" 'http://127.0.0.1:4096/path?directory=/sessions'"]
       interval: 10s

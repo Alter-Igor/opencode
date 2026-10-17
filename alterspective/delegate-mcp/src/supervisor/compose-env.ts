@@ -14,8 +14,10 @@ export type FrontFiles = { servers: string; hash: string }
 
 export const PASSWORD_ENV = "OPENCODE_SERVER_PASSWORD"
 export const MCP_ALLOW_ENV = "OPENCODE_MCP_ALLOW"
+export const SMALL_MODEL_THRESHOLD_ENV = "OPENCODE_SMALL_MODEL_THRESHOLD"
+export const SMALL_MODEL_DELEGATION_ENV = "OPENCODE_SMALL_MODEL_DELEGATION"
 /** Container env the supervisor reads back from `docker inspect`; everything else is discarded unread. */
-export const INSPECT_ENV = [PASSWORD_ENV, MCP_ALLOW_ENV]
+export const INSPECT_ENV = [PASSWORD_ENV, MCP_ALLOW_ENV, SMALL_MODEL_THRESHOLD_ENV, SMALL_MODEL_DELEGATION_ENV]
 /**
  * MOD-05 inbox sidecar admin token: generated per box start like the password, given to the
  * `docker compose up` child and so to the INBOX container only (never the box), and read back by
@@ -174,6 +176,8 @@ export function composeEnv(inputs: ComposeInputs, start: StartValues): Record<st
     ...frontEnv(inputs.hostEnv),
     [MCP_ALLOW_ENV]: mcpAllowPolicy(inputs.config),
     [PASSWORD_ENV]: start.password,
+    ...(inputs.hostEnv[SMALL_MODEL_THRESHOLD_ENV] !== undefined ? { [SMALL_MODEL_THRESHOLD_ENV]: inputs.hostEnv[SMALL_MODEL_THRESHOLD_ENV]! } : {}),
+    ...(inputs.hostEnv[SMALL_MODEL_DELEGATION_ENV] !== undefined ? { [SMALL_MODEL_DELEGATION_ENV]: inputs.hostEnv[SMALL_MODEL_DELEGATION_ENV]! } : {}),
     ...inboxEnv,
     ...gateEnv,
   })
