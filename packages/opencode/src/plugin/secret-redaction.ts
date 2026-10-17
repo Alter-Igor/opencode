@@ -28,10 +28,13 @@ export function redactSecrets(text: string): string {
 
 /**
  * Redact a tool result in place, as the `tool.execute.after` hook receives it: the output text,
- * the title, and any string the tool keeps in `metadata` (bash keeps its streamed output there).
+ * the title, any string the tool keeps in `metadata` (bash keeps its streamed output there), and
+ * for MCP tools the text of `content` items.
  * Returns how many fields changed, so the caller can log that something was hidden.
  */
-export function redactToolResult(result: { title?: unknown; output?: unknown; metadata?: unknown } | undefined): number {
+export function redactToolResult(
+  result: { title?: unknown; output?: unknown; metadata?: unknown; content?: unknown } | undefined,
+): number {
   if (!result) return 0
   let changed = 0
   const scrub = (value: unknown): unknown => {
@@ -51,5 +54,18 @@ export function redactToolResult(result: { title?: unknown; output?: unknown; me
   if (typeof result.output === "string") result.output = scrub(result.output)
   if (typeof result.title === "string") result.title = scrub(result.title)
   if (result.metadata && typeof result.metadata === "object") scrub(result.metadata)
+  // An MCP tool's hook payload is the raw MCP result: core builds the stored text from its text
+  // items and embedded resource text after the hook (architect on #26). Image and blob data are
+  // left alone, so a binary payload is never altered.
+  if (Array.isArray(result.content)) {
+    for (const item of result.content) {
+      if (!item || typeof item !== "object" || Object.isFrozen(item)) continue
+      const entry = item as { type?: unknown; text?: unknown; resource?: { text?: unknown } }
+      if (entry.type === "text" && typeof entry.text === "string") entry.text = scrub(entry.text)
+      const resource = entry.resource
+      if (entry.type === "resource" && resource && typeof resource.text === "string" && !Object.isFrozen(resource))
+        resource.text = scrub(resource.text)
+    }
+  }
   return changed
 }

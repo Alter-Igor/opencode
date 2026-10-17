@@ -58,6 +58,21 @@ describe("redactToolResult (#26)", () => {
     expect(result.metadata.nested.lines[1]).toBe("fine")
   })
 
+  test("an MCP result: text and embedded resource text are redacted, image data is untouched", () => {
+    const data = "iVBORw0KGgo" + KEYS.aws // base64-looking image data, even if it happens to contain a key shape
+    const result = {
+      content: [
+        { type: "text", text: `token ${KEYS.github}` },
+        { type: "resource", resource: { uri: "file:///x", text: KEYS.synapse } },
+        { type: "image", mimeType: "image/png", data },
+      ],
+    }
+    expect(redactToolResult(result)).toBe(2)
+    expect(result.content[0]).toEqual({ type: "text", text: "token [REDACTED:github]" })
+    expect((result.content[1] as { resource: { text: string } }).resource.text).toBe("[REDACTED:synapse]")
+    expect((result.content[2] as { data: string }).data).toBe(data)
+  })
+
   test("a missing result, a clean result and a frozen object are left alone", () => {
     expect(redactToolResult(undefined)).toBe(0)
     const clean = { title: "ls", output: "a.txt\nb.txt", metadata: {} }
