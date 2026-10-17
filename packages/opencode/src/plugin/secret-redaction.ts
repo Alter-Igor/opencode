@@ -33,9 +33,12 @@ const RULES: ReadonlyArray<Rule> = [
   key("openrouter", ["sk-or-v1-"], "sk-or-v1-", "[A-Za-z0-9]{32,}"),
   key("anthropic", ["sk-ant-"], "sk-ant-", "[A-Za-z0-9_-]{32,}"),
   key("stripe", ["_live_", "_test_"], "[sr]k_(?:live|test)_", "[A-Za-z0-9]{20,}"),
-  // A real OpenAI key mixes digits, upper and lower case; a name like sk-project-management-v2 does not.
+  // A real OpenAI key is random: about one character in six is a digit. A name like
+  // sk-project-management-v2 or sk-ReactComponentLibraryVersion2BuildOutput has one or none, and
+  // the old mixed-case check missed a key with no upper case (#207). So: a lower-case letter and at
+  // least three digits after the prefix.
   key("openai", ["sk-"], "sk-", "(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{32,}", (match) =>
-    /\d/.test(match) && /[A-Z]/.test(match) && /[a-z]/.test(match) ? "[REDACTED:openai]" : match,
+    /[a-z]/.test(match.slice(3)) && (match.slice(3).match(/\d/g)?.length ?? 0) >= 3 ? "[REDACTED:openai]" : match,
   ),
   key("github", ["ghp_", "gho_", "ghu_", "ghs_", "ghr_"], "gh[pousr]_", "[A-Za-z0-9]{36,}"),
   key("github", ["github_pat_"], "github_pat_", "[A-Za-z0-9_]{60,}"),
@@ -44,8 +47,10 @@ const RULES: ReadonlyArray<Rule> = [
   key("huggingface", ["hf_"], "hf_", "[A-Za-z0-9]{30,}"),
   key("aws", ["AKIA", "ASIA"], "A[KS]IA", "[0-9A-Z]{16}(?![0-9A-Z])"),
   {
+    // aws_secret_access_key = …, and the JSON and SDK spelling "SecretAccessKey": "…" (#207).
     name: "aws",
-    pattern: /(aws_secret_access_key\s*[=:]\s*["']?)[A-Za-z0-9/+=]{40}/gi,
+    hints: ["ecret", "ECRET"],
+    pattern: /((?:aws_)?secret_?access_?key["']?\s*[=:]\s*["']?)[A-Za-z0-9/+=]{40}/gi,
     replace: (_match, name) => `${name}[REDACTED:aws]`,
   },
   {
@@ -61,10 +66,13 @@ const RULES: ReadonlyArray<Rule> = [
   // A JWT: three base64url parts, the first two starting with "eyJ" (a JSON object).
   key("jwt", ["eyJ"], "eyJ", "[A-Za-z0-9_-]{10,}\\.eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}"),
   {
+    // Any case (`authorization: bearer …`, #207). A placeholder (`Bearer YOUR_API_TOKEN_GOES_HERE`)
+    // or a file path (`Bearer src/plugin/x.ts`) is left alone.
     name: "bearer",
-    hints: ["Bearer"],
-    pattern: /(Bearer\s+)[A-Za-z0-9._~+/-]{20,}=*/g,
-    replace: (match, prefix) => (match.includes("[REDACTED") ? match : `${prefix}[REDACTED:bearer]`),
+    hints: ["Bearer", "bearer", "BEARER"],
+    pattern: /(Bearer\s+)([A-Za-z0-9._~+/-]{20,}=*)/gi,
+    replace: (match, prefix, token) =>
+      match.includes("[REDACTED") || isPlaceholder(token) || isPath(token) ? match : `${prefix}[REDACTED:bearer]`,
   },
   {
     // user:password@ in a URL; the user name stays, the password goes. Anchored on "://" after a
@@ -73,15 +81,30 @@ const RULES: ReadonlyArray<Rule> = [
     // a "/", a space or a quote, so one with a raw "@", "#" or "?" in it is hidden whole
     // (CodeRabbit and QA on #26: pasted connection strings often hold these unencoded). Failing
     // that, it runs to the first "@", so a password holding a quote is still hidden.
+    // The user name may be empty (`redis://:pw@host`, #207). A "password" of only digits and colons
+    // (`http://x:12:34@y`) is a port or a time, not a secret, and is left alone. A password with a
+    // raw "/" is not found: it cannot be told apart from a path.
     name: "url-credentials",
     hints: ["://"],
-    pattern: /:\/\/(?<=[a-z0-9+.-]:\/\/)([^\s:/@]+:)(?:[^\s/"'<>`]{3,}|[^\s@/]{3,})@/gi,
-    replace: (_match, user) => `://${user}[REDACTED:url-credentials]@`,
+    pattern: /:\/\/(?<=[a-z0-9+.-]:\/\/)([^\s:/@]*:)((?:[^\s/"'<>`]{3,}|[^\s@/]{3,}))@/gi,
+    replace: (match, user, password) =>
+      password.includes(":") && /^[\d:]+$/.test(password) ? match : `://${user}[REDACTED:url-credentials]@`,
   },
 ]
 
-const PEM_BEGIN = /-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----/g
-const PEM_END = /-----END [A-Z0-9 ]{0,40}PRIVATE KEY-----/g
+/** A template value, not a token: all capitals and underscores, or a "your"/"example" word. */
+function isPlaceholder(token: string): boolean {
+  return /^[A-Z_]+$/.test(token) || /your|example|placeholder|insert/i.test(token)
+}
+
+/** A file path (`src/plugin/x.ts`, `./a/b.json`), not a token. */
+function isPath(token: string): boolean {
+  return /^\.{0,2}\//.test(token) || (token.includes("/") && /\.[a-z][a-z0-9]{0,4}$/i.test(token))
+}
+
+// `PRIVATE KEY BLOCK` is the PGP armour (#207).
+const PEM_BEGIN = /-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----/g
+const PEM_END = /-----END [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----/g
 
 /**
  * A PEM private key block, found by scanning (linear time, QA on #26: a lazy `[\s\S]*?` rule took
@@ -89,7 +112,7 @@ const PEM_END = /-----END [A-Z0-9 ]{0,40}PRIVATE KEY-----/g
  * cut off by truncation is hidden too.
  */
 function redactPem(text: string): string {
-  if (!text.includes("PRIVATE KEY-----")) return text
+  if (!text.includes("PRIVATE KEY")) return text
   let out = ""
   let from = 0
   PEM_BEGIN.lastIndex = 0

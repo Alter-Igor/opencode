@@ -103,6 +103,44 @@ describe("redactSecrets (#26)", () => {
   })
 })
 
+describe("redactSecrets pattern follow-ups (#207)", () => {
+  test("finds the shapes the #26 QA rounds missed", () => {
+    const cases: Array<[string, string]> = [
+      [`redis://:${"pw" + "Secret9"}@cache:6379`, "redis://:[REDACTED:url-credentials]@cache:6379"],
+      [`authorization: bearer ${fake("", "aB3._~", 32)}`, "authorization: bearer [REDACTED:bearer]"],
+      [`AUTHORIZATION: BEARER ${fake("", "Zq8x", 28)}`, "AUTHORIZATION: BEARER [REDACTED:bearer]"],
+      [`{"SecretAccessKey": "${fake("", "aB3/+", 40)}"}`, '{"SecretAccessKey": "[REDACTED:aws]"}'],
+      [`AWS_SECRET_ACCESS_KEY=${fake("", "Qw9+", 40)}`, "AWS_SECRET_ACCESS_KEY=[REDACTED:aws]"],
+      [`${"sk-"}${fake("", "q7x2zr", 48)}`, "[REDACTED:openai]"],
+    ]
+    for (const [input, output] of cases) expect(redactSecrets(input)).toBe(output)
+  })
+
+  test("hides a PGP private key block, with or without its END line", () => {
+    const begin = "-----BEGIN " + "PGP PRIVATE KEY BLOCK-----"
+    const end = "-----END " + "PGP PRIVATE KEY BLOCK-----"
+    expect(redactSecrets(`a\n${begin}\nlQOYBF\n${end}\nb`)).toBe("a\n[REDACTED:private-key]\nb")
+    expect(redactSecrets(`a\n${begin}\nlQOYBF cut off`)).toBe("a\n[REDACTED:private-key]")
+  })
+
+  test("leaves the #26 false positives alone", () => {
+    const text = [
+      "Authorization: Bearer YOUR_API_TOKEN_GOES_HERE",
+      "Bearer src/plugin/observer/module.ts",
+      "Bearer ./scripts/release/publish-all.sh",
+      "http://x:12:34@y",
+      "sk-ReactComponentLibraryVersion2BuildOutput",
+      "a bearer of bad news",
+    ].join("\n")
+    expect(redactSecrets(text)).toBe(text)
+  })
+
+  test("still hides a digits-only URL password and a bearer token that holds a slash", () => {
+    expect(redactSecrets(`http://admin:${"123" + "456"}@host/x`)).toBe("http://admin:[REDACTED:url-credentials]@host/x")
+    expect(redactSecrets(`Bearer ${fake("", "aB3/", 32)}`)).toBe("Bearer [REDACTED:bearer]")
+  })
+})
+
 describe("redactedCopy (#26, QA: doom-loop guard)", () => {
   test("returns a redacted deep copy and leaves the value alone", () => {
     const input = { command: `curl -H "x-api-key: ${KEYS.synapse}"`, n: 1 }
