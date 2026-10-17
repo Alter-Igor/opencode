@@ -54,6 +54,8 @@ export type StoreOptions = {
   maxSegments?: number
   /** Retention budget of the supervisor-inbox series. Defaults to the values above. */
   supervisor?: { segmentBytes?: number; maxSegments?: number }
+  /** Test seam (#190): the rename used by the state.json save. Default `renameSync`. */
+  renameFile?: (from: string, to: string) => void
 }
 
 type Series = "session" | "supervisor"
@@ -83,6 +85,7 @@ export function seriesOf(address: string): Series {
 
 export class InboxStore {
   readonly #dir: string
+  readonly #renameFile: ((from: string, to: string) => void) | undefined
   readonly #logs: Record<Series, SegmentLog>
   readonly #index: Record<Series, Map<string, StoredMessage[]>> = { session: new Map(), supervisor: new Map() }
   readonly #threads = new Map<string, ThreadState>()
@@ -95,6 +98,7 @@ export class InboxStore {
 
   private constructor(options: StoreOptions) {
     this.#dir = options.dir
+    this.#renameFile = options.renameFile
     const bytes = options.segmentBytes ?? DEFAULT_SEGMENT_BYTES
     const max = options.maxSegments ?? DEFAULT_MAX_SEGMENTS
     const sup = { segmentBytes: options.supervisor?.segmentBytes ?? bytes, maxSegments: options.supervisor?.maxSegments ?? max }
@@ -148,7 +152,7 @@ export class InboxStore {
     } finally {
       closeSync(fd)
     }
-    renameWithRetry(temp, file)
+    renameWithRetry(temp, file, { rename: this.#renameFile })
   }
 
   #loadLine(line: string, series: Series): number | undefined {

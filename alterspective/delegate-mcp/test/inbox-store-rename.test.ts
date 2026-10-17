@@ -52,6 +52,30 @@ describe("inbox store: renameWithRetry (#190)", () => {
     expect(waits).toEqual([...RENAME_RETRY_DELAYS_MS])
   })
 
+  test("the store's state save goes through the retry: a refused first rename still writes state.json", async () => {
+    const { mkdtempSync, readFileSync, renameSync, rmSync } = await import("node:fs")
+    const os = await import("node:os")
+    const path = await import("node:path")
+    const { InboxStore } = await import("../inbox-sidecar/src/store.ts")
+    const dir = mkdtempSync(path.join(os.tmpdir(), "ocd-rename-store-"))
+    try {
+      let calls = 0
+      // A new data folder starts a new epoch, which saves state.json once while opening.
+      InboxStore.open({
+        dir,
+        renameFile: (from, to) => {
+          calls++
+          if (calls === 1) throw fsError("EPERM")
+          renameSync(from, to)
+        },
+      })
+      expect(calls).toBe(2)
+      expect(JSON.parse(readFileSync(path.join(dir, "state.json"), "utf8")).epoch).toMatch(/^[0-9a-f]{16}$/)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   test("a plain rename on disk works with the default rename and sleep", async () => {
     const { mkdtempSync, writeFileSync, readFileSync, rmSync } = await import("node:fs")
     const os = await import("node:os")
