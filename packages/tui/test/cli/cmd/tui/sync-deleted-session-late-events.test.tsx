@@ -128,6 +128,47 @@ describe("deleted sessions (#176)", () => {
     }
   })
 
+  test("a session list fetched before the delete does not bring the session back (CodeRabbit on #176)", async () => {
+    await using tmp = await tmpdir()
+    await Bun.write(`${tmp.path}/kv.json`, "{}")
+    const sessionID = "ses_late_list"
+    let hold: Promise<void> | undefined
+    let release!: () => void
+    let listed = false
+    const { app, emit, sync } = await mount((url) => {
+      if (url.pathname !== "/session" || !hold) return undefined
+      listed = true
+      return hold.then(() => json([info(sessionID), info("ses_kept")]))
+    }, tmp.path)
+
+    try {
+      hold = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      emit(global({ id: "evt_s", type: "session.updated", properties: { sessionID, info: info(sessionID) } }))
+      await wait(() => sync.data.session.some((s) => s.id === sessionID))
+      const refresh = sync.session.refresh()
+      await wait(() => listed)
+      emit(global({ id: "evt_d", type: "session.deleted", properties: { sessionID, info: info(sessionID) } }))
+      await wait(() => !sync.data.session.some((s) => s.id === sessionID))
+      release()
+      await refresh
+
+      expect(sync.data.session.map((s) => s.id)).toContain("ses_kept")
+      expect(sync.data.session.some((s) => s.id === sessionID)).toBe(false)
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
+  test("filter and omit drop only deleted sessions", () => {
+    const deleted = createDeletedSessions()
+    expect(deleted.filter([{ id: "a" }])).toEqual([{ id: "a" }])
+    deleted.add("a")
+    expect(deleted.filter([{ id: "a" }, { id: "b" }])).toEqual([{ id: "b" }])
+    expect(deleted.omit({ a: 1, b: 2 })).toEqual({ b: 2 })
+  })
+
   test("eventSessionID reads the session from each event shape", () => {
     expect(eventSessionID({ type: "session.status", properties: { sessionID: "a" } })).toBe("a")
     expect(eventSessionID({ type: "message.updated", properties: { info: { id: "msg", sessionID: "b" } } })).toBe("b")

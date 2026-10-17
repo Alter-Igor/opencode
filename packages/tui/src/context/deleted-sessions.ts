@@ -38,6 +38,15 @@ export function createDeletedSessions(limit = LIMIT) {
     has(id: string) {
       return ids.has(id)
     },
+    /** A fetched session list without deleted sessions (a list fetched before the delete). */
+    filter<T extends { id: string }>(list: T[]): T[] {
+      return ids.size === 0 ? list : list.filter((item) => !ids.has(item.id))
+    },
+    /** A fetched per-session map without deleted sessions' keys. */
+    omit<T>(map: Record<string, T>): Record<string, T> {
+      if (ids.size === 0) return map
+      return Object.fromEntries(Object.entries(map).filter(([id]) => !ids.has(id)))
+    },
     /** True when the event belongs to a deleted session and must not write to the store. */
     ignores(event: SessionEvent) {
       if (ids.size === 0 || event.type === "session.deleted") return false

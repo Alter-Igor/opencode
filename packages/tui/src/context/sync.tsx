@@ -541,7 +541,7 @@ export const {
 
       setStore("status", store.status !== "complete" ? "partial" : "complete")
       void Promise.all([
-        timed(sessionListPromise, "session-list").catch(() => null).then((sessions) => sessions && setStore("session", reconcile(sessions))),
+        timed(sessionListPromise, "session-list").catch(() => null).then((sessions) => sessions && setStore("session", reconcile(deletedSessions.filter(sessions)))),
         consoleStatePromise.then((consoleState) => setStore("console_state", reconcile(consoleState))).catch(() => setStore("console_state", reconcile(emptyConsoleState))),
         sdk.client.config.providers({ workspace }).then((res) => {
           if (res.data?.providers && res.data.providers.length > 0) {
@@ -580,7 +580,7 @@ export const {
           .catch(() => {}),
         sdk.client.formatter.status({ workspace }).then((x) => setStore("formatter", reconcile(x.data ?? []))).catch(() => {}),
         sdk.client.session.status({ workspace }).then((x) => {
-          setStore("session_status", reconcile(x.data ?? {}))
+          setStore("session_status", reconcile(deletedSessions.omit(x.data ?? {})))
         }).catch(() => {}),
         sdk.client.provider.auth({ workspace }).then((x) => setStore("provider_auth", reconcile(x.data ?? {}))).catch(() => {}),
         sdk.client.vcs.get({ workspace }).then((x) => setStore("vcs", reconcile(x.data))).catch(() => {}),
@@ -620,7 +620,7 @@ export const {
         },
         async refresh() {
           const list = await listSessions()
-          setStore("session", reconcile(list))
+          setStore("session", reconcile(deletedSessions.filter(list)))
         },
         status(sessionID: string) {
           const session = result.session.get(sessionID)
