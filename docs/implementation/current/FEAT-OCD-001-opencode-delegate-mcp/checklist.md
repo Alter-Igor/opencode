@@ -57,4 +57,5 @@ Each task is 50–200 LOC, under 2 hours, and ends in something that can be chec
 - [x] Items 2–8 coded, tested and documented (branch `delegate-mirror-check-followups`)
 - [x] Fresh QA PASS (round 3) and architect ALIGNED on `e8fc2f60d6`
 - [ ] Full suite on the final head (last run stopped for low memory)
-- [ ] Re-gate for the docs-only handover commit, PR, pr-loop, integrate, merge
+- [x] Architect re-gate on the docs-only handover head `444577ec8e13` (ARCH-GATE-02: ALIGNED, `synapse/moonshotai/kimi-k3`)
+- [ ] PR, pr-loop, integrate, merge

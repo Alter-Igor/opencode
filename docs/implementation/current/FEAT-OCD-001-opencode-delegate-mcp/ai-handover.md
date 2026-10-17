@@ -32,7 +32,7 @@ Branch `delegate-mirror-check-followups` (worktree `C:\GitHub\opencode---delegat
 ## Next, in order
 
 1. Run the full suite in `alterspective/delegate-mcp` with nothing else running: `bun test`. Earlier mixed runs failed only in `defaultSupervisorDeps: image identity` (each ~5 s, the default per-test timeout) and some 60 s close/cleanup timeouts, while other runs were going. If those fail again, run that file alone on this branch and on `dev` to see whether they are pre-existing.
-2. The head moved after the gates: this handover commit is docs only. Post a short re-gate for QA and the architect naming the new head, or ask them to confirm.
+2. ~~The head moved after the gates~~ Done: the architect re-gated `444577ec8e13` (docs-only handover commit) and confirmed ALIGNED — ARCH-GATE-02.
 3. Open the PR: body draft at the session scratchpad `pr186.md` (rewrite if missing). Title `fix(delegate-mcp): cache-address check follow-ups (#186)`. Then pr-loop → integrate → merge with `--match-head-commit`. The owner approved this merge on 2026-10-17.
 4. After merge: `aio repo-worktree close --repo C:\GitHub\opencode---delegate-mirror-check-followups`, then delete the remote branch.
 
