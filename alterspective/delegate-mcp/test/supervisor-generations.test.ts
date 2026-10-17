@@ -321,12 +321,22 @@ describe("supervisor generations (#171)", () => {
     })
     const calls: Call[] = []
     // Accepts the connection and never answers, like Docker Desktop holding a published port open.
-    const hung: Box = { running: true, labels: { [L.port]: "4802" }, env: ["OPENCODE_SERVER_PASSWORD=kept"] }
+    const hung: Box = { running: true, labels: { [L.port]: "4899" }, env: ["OPENCODE_SERVER_PASSWORD=kept"] }
+    // Only the liveness probe hangs: this test proves its 3 s cap. Other calls to that box (relocation
+    // checks with their own timeouts) get a quick 503, so they do not slow the test.
     const hangs = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      if (String(input).includes(":4802/"))
-        return new Promise<Response>((_, reject) =>
-          init?.signal?.addEventListener("abort", () => reject(new DOMException("timed out", "TimeoutError"))),
-        )
+      const url = String(input)
+      if (url.includes(":4899/path"))
+        return new Promise<Response>((_, reject) => {
+          // A real hung socket keeps the process alive; Bun's AbortSignal.timeout timer does not, so
+          // hold a timer open the way the socket would, until the probe's own abort fires.
+          const socket = setTimeout(() => {}, 15_000)
+          init?.signal?.addEventListener("abort", () => {
+            clearTimeout(socket)
+            reject(new DOMException("timed out", "TimeoutError"))
+          })
+        })
+      if (url.includes(":4899/")) return new Response("", { status: 503 })
       return new Response("", { status: 200 })
     }) as typeof fetch
     const started = Date.now()
