@@ -44,8 +44,11 @@ describe("redactSecrets (#26)", () => {
       [`DefaultEndpointsProtocol=https;AccountKey=${fake("", "aB3+/", 44)};`, "DefaultEndpointsProtocol=https;AccountKey=[REDACTED:azure];"],
       [`Authorization: Bearer ${fake("", "aB3._~", 32)}`, "Authorization: Bearer [REDACTED:bearer]"],
       [`git clone https://deploy:${"s3cr3t" + "Passw0rd"}@git.example.com/x`, "git clone https://deploy:[REDACTED:url-credentials]@git.example.com/x"],
-      // CodeRabbit on #26: a raw "@" in the password; the query after the host is left alone.
+      // CodeRabbit and QA on #26: a raw "@", "#" or "?" in the password; the query after the path is left alone.
       [`https://u:${"p@ss" + "w0rd"}@db.example.com/x?next=a@b`, "https://u:[REDACTED:url-credentials]@db.example.com/x?next=a@b"],
+      [`postgres://app:${"Xk9#" + "mP2q"}@db:5432/x`, "postgres://app:[REDACTED:url-credentials]@db:5432/x"],
+      [`DATABASE_URL=mysql://root:${"Tr0ub4dor" + "?3"}@localhost/app`, "DATABASE_URL=mysql://root:[REDACTED:url-credentials]@localhost/app"],
+      [`"https://u:${"pw" + "99"}@h","b":"c@d"`, `"https://u:[REDACTED:url-credentials]@h","b":"c@d"`],
       [slackApp, "[REDACTED:slack]"],
     ]
     for (const [input, expected] of cases) expect(redactSecrets(input)).toBe(expected)

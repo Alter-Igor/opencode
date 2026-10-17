@@ -70,10 +70,12 @@ const RULES: ReadonlyArray<Rule> = [
     // user:password@ in a URL; the user name stays, the password goes. Anchored on "://" after a
     // scheme character: a rule that started at the scheme was quadratic on long `a.b.c...` runs
     // (architect on #26) and slow on text with many URLs. The password runs to the last "@" before
-    // the path, query or fragment, so one with a raw "@" in it is hidden whole (CodeRabbit on #26).
+    // a "/", a space or a quote, so one with a raw "@", "#" or "?" in it is hidden whole
+    // (CodeRabbit and QA on #26: pasted connection strings often hold these unencoded). Failing
+    // that, it runs to the first "@", so a password holding a quote is still hidden.
     name: "url-credentials",
     hints: ["://"],
-    pattern: /:\/\/(?<=[a-z0-9+.-]:\/\/)([^\s:/@]+:)[^\s/?#]{3,}@/gi,
+    pattern: /:\/\/(?<=[a-z0-9+.-]:\/\/)([^\s:/@]+:)(?:[^\s/"'<>`]{3,}|[^\s@/]{3,})@/gi,
     replace: (_match, user) => `://${user}[REDACTED:url-credentials]@`,
   },
 ]
