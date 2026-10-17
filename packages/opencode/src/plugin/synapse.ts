@@ -9,6 +9,7 @@ import { Global } from "@opencode-ai/core/global"
 import { Flock } from "@opencode-ai/core/util/flock"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { INJECTED_LEARNINGS_LIMIT, learningStorePaths, sessionObserver, sanitizeJsonSchemaForOpenAI } from "./observer"
+import { redactToolResult } from "./secret-redaction"
 import { EscalationTracker, declaredTier, classifyFailure, malformedToolCallFromEvent } from "./synapse-escalation"
 import {
   PinnedFallbackMemory,
@@ -1879,6 +1880,10 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
       }
     },
     "tool.execute.after": async (toolInput, output) => {
+      // #26: hide credentials before the session store keeps the result and the model sees it
+      // again (a shell command once echoed a live API key into the transcript). In place: core
+      // returns this same object as the tool result.
+      redactToolResult(output)
       // #95: core calls this hook with no output when a tool fails (a failed subtask, for one).
       // Reading output.output then threw inside the failure path and lost the error metadata.
       sessionObserver.onToolAfter(toolInput.sessionID, toolInput.callID, toolInput.tool, output?.output)
