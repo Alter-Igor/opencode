@@ -84,8 +84,11 @@ export async function resolveVisionImage(
   const real = await fs.realpath(target)
   const type = IMAGE_TYPES[path.extname(real).toLowerCase()]
   if (!type) throw new Error(`Not a supported image file: ${real}. Use .png, .jpg, .jpeg, .gif, .webp or .bmp.`)
-  const approved = await fs.stat(real)
-  if (approved.size > SYNAPSE_VISION_MAX_BYTES) {
+  // lstat: a link put at this path after realpath is refused before the ask, not followed.
+  // bigint: NTFS file ids can exceed Number.MAX_SAFE_INTEGER.
+  const approved = await fs.lstat(real, { bigint: true })
+  if (!approved.isFile()) throw new Error(`Image file not found: ${real}`)
+  if (approved.size > BigInt(SYNAPSE_VISION_MAX_BYTES)) {
     throw new Error(`Image is too large (${approved.size} bytes). The limit is ${SYNAPSE_VISION_MAX_BYTES} bytes.`)
   }
   await beforeRead?.(real)
@@ -93,11 +96,11 @@ export async function resolveVisionImage(
   // it) and check the handle is the same file, so swapping it after the ask reads nothing else.
   const handle = await fs.open(real, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0))
   try {
-    const opened = await handle.stat()
+    const opened = await handle.stat({ bigint: true })
     if (!opened.isFile() || opened.dev !== approved.dev || opened.ino !== approved.ino) {
       throw new Error(`Image file changed after it was approved: ${real}`)
     }
-    if (opened.size > SYNAPSE_VISION_MAX_BYTES) {
+    if (opened.size > BigInt(SYNAPSE_VISION_MAX_BYTES)) {
       throw new Error(`Image is too large (${opened.size} bytes). The limit is ${SYNAPSE_VISION_MAX_BYTES} bytes.`)
     }
     const bytes = await handle.readFile()

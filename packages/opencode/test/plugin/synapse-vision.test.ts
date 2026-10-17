@@ -100,9 +100,12 @@ describe("synapse_vision (#193)", () => {
     await fs.writeFile(file, Buffer.from(PNG_BASE64, "base64"))
     await expect(
       resolveVisionImage("shot.png", dir, async (approved) => {
-        // Replace the approved file with a different one before the read.
+        // Replace the approved file with a different one before the read. The replacement is
+        // made while the original still exists, so it cannot reuse the original's inode.
+        const replacement = `${approved}.new`
+        await fs.writeFile(replacement, Buffer.from(PNG_BASE64, "base64"))
         await fs.rm(approved)
-        await fs.writeFile(approved, Buffer.from(PNG_BASE64, "base64"))
+        await fs.rename(replacement, approved)
       }),
     ).rejects.toThrow("changed after it was approved")
   })
