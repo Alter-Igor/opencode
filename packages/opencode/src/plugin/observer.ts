@@ -384,9 +384,12 @@ class SessionObserverManager {
   /**
    * Store a rule. With a `workspaceDir` it is written to BOTH stores, by design (#38): the global
    * copy is what makes `synapse_record_learning` keep its promise that the rule guides "all
-   * future sessions", in any project; the project copy (`.system_generated/logs`) keeps it with
-   * the repository. So a rule recorded in a project is live machine-wide, and `forgetLearning`
-   * removes both copies. Without a `workspaceDir` only the global store is written.
+   * future sessions", in any project; the project copy (`.system_generated/logs`, not committed)
+   * keeps it with that workspace. So a rule recorded in a project is live machine-wide, and a
+   * `forgetLearning` from the same workspace removes both copies. Without a `workspaceDir` only
+   * the global store is written. Automatic rules (buddy review findings) are mirrored too, which
+   * can carry one project's text into every project's prompt: an owner decision, #211. A store
+   * that cannot be read is left alone, never overwritten.
    */
   public async recordLearning(
     learning: Omit<SessionLearning, "id" | "timestamp">,
@@ -406,11 +409,11 @@ class SessionObserverManager {
         const scope: "global" | "project" = file === paths.project ? "project" : "global"
         try {
           await fs.mkdir(path.dirname(file), { recursive: true })
-          let existing: SessionLearning[] = []
-          try {
-            const parsed = JSON.parse(await fs.readFile(file, "utf8"))
-            if (Array.isArray(parsed)) existing = parsed
-          } catch {}
+          // #38: a store we cannot read is left alone. Writing one row over it would drop its
+          // other rules and the tombstones that keep forgotten rules forgotten.
+          const read = await readRuleStore(file)
+          if (read === "unreadable") continue
+          const existing: SessionLearning[] = read ?? []
           const found = existing.find((e) => e.lesson.trim().toLowerCase() === normalizedText)
           if (found) {
             // Re-recording refreshes recency AND moves the rule to the front, so it
@@ -513,7 +516,8 @@ class SessionObserverManager {
    * Forget rules whose text matches (case-insensitive substring): mark them deleted
    * (tombstone) in both persisted stores. Returns the number of distinct rules newly
    * forgotten; a rule present in both stores is counted once. A rule recorded in a project
-   * lives in both stores (see `recordLearning`), so one forget removes both copies. If any
+   * lives in both stores (see `recordLearning`), so one forget from that workspace removes both
+   * copies; from another workspace only the global copy is reached. If any
    * store cannot be read, nothing is changed and 0 is returned (#38).
    */
   public async forgetLearning(lessonText: string, workspaceDir?: string): Promise<number> {

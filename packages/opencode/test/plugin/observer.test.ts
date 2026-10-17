@@ -390,6 +390,26 @@ describe("rule visibility", () => {
     }
   })
 
+  test("recording a rule never overwrites a store it cannot read (#38)", async () => {
+    await using home = await tmpdir()
+    await using ws = await tmpdir()
+    const prev = process.env.OPENCODE_TEST_HOME
+    process.env.OPENCODE_TEST_HOME = home.path
+    try {
+      const project = learningStorePaths(ws.path).project!
+      await fs.mkdir(path.dirname(project), { recursive: true })
+      await fs.writeFile(project, "{ half-written", "utf8")
+
+      await sessionObserver.recordLearning({ lesson: "new rule", source: "user_feedback" }, ws.path)
+
+      expect(await fs.readFile(project, "utf8")).toBe("{ half-written")
+      const global = JSON.parse(await fs.readFile(learningStorePaths().global!, "utf8")) as Array<{ lesson: string }>
+      expect(global.map((l) => l.lesson)).toContain("new rule")
+    } finally {
+      restoreTestHome(prev)
+    }
+  })
+
   test("a rule recorded in a project is mirrored to the global store by design (#38)", async () => {
     await using home = await tmpdir()
     await using ws = await tmpdir()
