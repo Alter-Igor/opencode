@@ -29,6 +29,8 @@ function isMcpResult(value: unknown): value is { content: unknown[]; isError?: u
  */
 const NOT_A_FAILURE = [
   "Tool execution aborted",
+  // The MCP SDK's text when the call's abort signal fires (the user stopped the reply; #209 item 9).
+  "This operation was aborted",
   "The user rejected permission to use this specific tool call",
   "The user has specified a rule which prevents you from using this specific tool call",
   "The user dismissed this question",

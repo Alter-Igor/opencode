@@ -631,6 +631,7 @@ describe("MCP tool failures with real remote tool names (#18)", () => {
       "The user rejected permission to use this specific tool call with the following feedback: not now",
       'The user has specified a rule which prevents you from using this specific tool call. Here are some of the relevant rules []',
       "The user dismissed this question",
+      "This operation was aborted",
     ]
     errors.forEach((error, i) => {
       sessionObserver.onToolBefore(sessionId, `c${i}`, "alterspective-rag_rag_search", {})
