@@ -3,6 +3,7 @@ import { existsSync } from "node:fs"
 import { mkdir, readFile, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { mcpAllowPolicy } from "../src/shared/config.ts"
+import { SILENT_BOX_WAIT_MS, SILENT_GAP_MS } from "../src/supervisor/lifecycle.ts"
 import { planFor } from "../src/supervisor/plan.ts"
 import { readHostState, writeHostState } from "../src/supervisor/workspaces-state.ts"
 import { L, deps, fail, fakeDocker, home, leaseDir, recorder, supervisor, writeOwner, type Box, type Call, useSupervisorFixture } from "./supervisor-lifecycle-fixture.ts"
@@ -212,6 +213,210 @@ describe("supervisor generations (#171)", () => {
     expect(error.message).toContain("waiting")
     expect(calls.some((call) => call.argv.includes("up"))).toBe(false)
     expect(calls.some((call) => call.argv.includes("down"))).toBe(false)
+  })
+
+  test("a silent old box stays up the first time, then stops after the wait", async () => {
+    await writeOwner()
+    const quiet = "opencode-delegate-bbbbbbbbbbbb"
+    const loud = "opencode-delegate-cccccccccccc"
+    await writeFile(path.join(home, "generations.json"), JSON.stringify({ projects: [quiet, loud] }) + "\n")
+    await mkdir(path.join(home, "silent"), { recursive: true })
+    await writeFile(path.join(home, "silent", loud), "0\n")
+    const pin = (sessionKey: string, sessionID: string, boxProject: string) =>
+      writeHostState(path.join(home, "workspaces"), {
+        sessionKey,
+        hostRepo: "C:\\GitHub\\demo",
+        base: BASE,
+        createdAt: new Date(0).toISOString(),
+        sessionID,
+        supervisor: "supervisor:test",
+        profile: "standard",
+        boxProject,
+      })
+    pin("quiet-key", CALLER, quiet)
+    pin("loud-key", "ses_loudsession1", loud)
+    const calls: Call[] = []
+    const quietBox: Box = { running: true, labels: {}, env: [] }
+    const loudBox: Box = { running: true, labels: { [L.port]: "4801" }, env: ["OPENCODE_SERVER_PASSWORD=kept"] }
+    let now = 1_000
+    const fetchOk = (async (input: RequestInfo | URL) => {
+      if (String(input).includes("/session/status")) return Response.json({ ses_loudsession1: { type: "busy" } })
+      return new Response("", { status: 200 })
+    }) as typeof fetch
+    const sup = supervisor(
+      deps(fakeDocker({ running: false, labels: {}, env: [] }, calls, { projects: { [quiet]: quietBox, [loud]: loudBox } }), {
+        image: IMAGE,
+        now: () => now,
+        fetch: fetchOk,
+      }),
+    )
+    const first = await fail(sup.ensure())
+    expect(first.code).toBe("profile_changed")
+    expect(downOf(calls, quiet)).toHaveLength(0)
+    expect(downOf(calls, loud)).toHaveLength(0)
+    expect(existsSync(path.join(home, "silent", quiet))).toBe(true)
+    expect(existsSync(path.join(home, "silent", loud))).toBe(false)
+    // Checks every 30 s revalidate: the silence must last the whole wait, with no long gap.
+    for (let waited = 0; waited < SILENT_BOX_WAIT_MS; waited += 30_000) {
+      expect(downOf(calls, quiet)).toHaveLength(0)
+      now += 30_000
+      await sup.ensure().catch(() => undefined)
+    }
+    const down = downOf(calls, quiet)
+    expect(down).toHaveLength(1)
+    expect(down[0]?.argv.includes("-v")).toBe(false)
+    expect(downOf(calls, loud)).toHaveLength(0)
+    expect(readHostState(path.join(home, "workspaces"), "quiet-key")?.sessionID).toBe(CALLER)
+    expect(readHostState(path.join(home, "workspaces"), "loud-key")?.boxProject).toBe(loud)
+  })
+
+  test("a live lease keeps a silent box up", async () => {
+    await writeOwner()
+    const quiet = "opencode-delegate-bbbbbbbbbbbb"
+    await writeFile(path.join(home, "generations.json"), JSON.stringify({ projects: [quiet, "opencode-delegate-cccccccccccc"] }) + "\n")
+    writeHostState(path.join(home, "workspaces"), {
+      sessionKey: "quiet-key",
+      hostRepo: "C:\\GitHub\\demo",
+      base: BASE,
+      createdAt: new Date(0).toISOString(),
+      sessionID: CALLER,
+      supervisor: "supervisor:test",
+      profile: "standard",
+      boxProject: quiet,
+    })
+    const lease = path.join(home, "generations", quiet, "leases")
+    await mkdir(lease, { recursive: true })
+    await writeFile(path.join(lease, "bridge-old"), JSON.stringify({ pid: process.pid, startedAt: 1 }) + "\n")
+    await mkdir(path.join(home, "silent"), { recursive: true })
+    await writeFile(path.join(home, "silent", quiet), "0\n")
+    const calls: Call[] = []
+    const other: Box = { running: true, labels: {}, env: [] }
+    const error = await fail(
+      supervisor(
+        deps(
+          fakeDocker({ running: false, labels: {}, env: [] }, calls, {
+            projects: { [quiet]: other, "opencode-delegate-cccccccccccc": { ...other } },
+          }),
+          { image: IMAGE, now: () => SILENT_BOX_WAIT_MS + 5_000 },
+        ),
+      ).ensure(),
+    )
+    expect(error.code).toBe("profile_changed")
+    expect(downOf(calls, quiet)).toHaveLength(0)
+  })
+
+  test("a box that hangs counts as silent within the 3 s probe cap (architect on #234)", async () => {
+    await writeOwner()
+    const quiet = "opencode-delegate-dddddddddddd"
+    await writeFile(path.join(home, "generations.json"), JSON.stringify({ projects: [quiet, "opencode-delegate-cccccccccccc"] }) + "\n")
+    writeHostState(path.join(home, "workspaces"), {
+      sessionKey: "hang-key",
+      hostRepo: "C:\\GitHub\\demo",
+      base: BASE,
+      createdAt: new Date(0).toISOString(),
+      sessionID: CALLER,
+      supervisor: "supervisor:test",
+      profile: "standard",
+      boxProject: quiet,
+    })
+    const calls: Call[] = []
+    // Accepts the connection and never answers, like Docker Desktop holding a published port open.
+    const hung: Box = { running: true, labels: { [L.port]: "4899" }, env: ["OPENCODE_SERVER_PASSWORD=kept"] }
+    // Only the liveness probe hangs: this test proves its 3 s cap. Other calls to that box (relocation
+    // checks with their own timeouts) get a quick 503, so they do not slow the test.
+    const hangs = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes(":4899/path"))
+        return new Promise<Response>((_, reject) => {
+          // A real hung socket keeps the process alive; Bun's AbortSignal.timeout timer does not, so
+          // hold a timer open the way the socket would, until the probe's own abort fires.
+          const socket = setTimeout(() => {}, 15_000)
+          init?.signal?.addEventListener("abort", () => {
+            clearTimeout(socket)
+            reject(new DOMException("timed out", "TimeoutError"))
+          })
+        })
+      if (url.includes(":4899/")) return new Response("", { status: 503 })
+      return new Response("", { status: 200 })
+    }) as typeof fetch
+    const started = Date.now()
+    const error = await fail(
+      supervisor(
+        deps(fakeDocker({ running: false, labels: {}, env: [] }, calls, { projects: { [quiet]: hung, "opencode-delegate-cccccccccccc": { running: true, labels: {}, env: [] } } }), {
+          image: IMAGE,
+          fetch: hangs,
+          now: () => 1_000,
+        }),
+      ).ensure(),
+    )
+    expect(error.code).toBe("profile_changed")
+    expect(Date.now() - started).toBeLessThan(10_000)
+    expect(existsSync(path.join(home, "silent", quiet))).toBe(true)
+    expect(downOf(calls, quiet)).toHaveLength(0)
+  }, 20_000)
+
+  test("a gap longer than SILENT_GAP_MS between checks starts the wait again (#234 QA)", async () => {
+    await writeOwner()
+    const quiet = "opencode-delegate-ffffffffffff"
+    await writeFile(path.join(home, "generations.json"), JSON.stringify({ projects: [quiet, "opencode-delegate-cccccccccccc"] }) + "\n")
+    writeHostState(path.join(home, "workspaces"), {
+      sessionKey: "gap-key",
+      hostRepo: "C:\\GitHub\\demo",
+      base: BASE,
+      createdAt: new Date(0).toISOString(),
+      sessionID: CALLER,
+      supervisor: "supervisor:test",
+      profile: "standard",
+      boxProject: quiet,
+    })
+    // Silent since 0, last seen silent at 0: then nothing checked for the whole wait (PC asleep).
+    await mkdir(path.join(home, "silent"), { recursive: true })
+    await writeFile(path.join(home, "silent", quiet), "0 0\n")
+    const calls: Call[] = []
+    const error = await fail(
+      supervisor(
+        deps(fakeDocker({ running: false, labels: {}, env: [] }, calls, { projects: { [quiet]: { running: true, labels: {}, env: [] }, "opencode-delegate-cccccccccccc": { running: true, labels: {}, env: [] } } }), {
+          image: IMAGE,
+          now: () => SILENT_BOX_WAIT_MS + SILENT_GAP_MS + 5_000,
+        }),
+      ).ensure(),
+    )
+    expect(error.code).toBe("profile_changed")
+    expect(downOf(calls, quiet)).toHaveLength(0)
+    const stamp = (await readFile(path.join(home, "silent", quiet), "utf8")).trim()
+    expect(stamp).toBe(`${SILENT_BOX_WAIT_MS + SILENT_GAP_MS + 5_000} ${SILENT_BOX_WAIT_MS + SILENT_GAP_MS + 5_000}`)
+  })
+
+  test("a box that is still starting resets its silent wait (architect on #234)", async () => {
+    await writeOwner()
+    const quiet = "opencode-delegate-eeeeeeeeeeee"
+    await writeFile(path.join(home, "generations.json"), JSON.stringify({ projects: [quiet, "opencode-delegate-cccccccccccc"] }) + "\n")
+    writeHostState(path.join(home, "workspaces"), {
+      sessionKey: "fresh-key",
+      hostRepo: "C:\\GitHub\\demo",
+      base: BASE,
+      createdAt: new Date(0).toISOString(),
+      sessionID: CALLER,
+      supervisor: "supervisor:test",
+      profile: "standard",
+      boxProject: quiet,
+    })
+    // An old stamp from the box this one replaced.
+    await mkdir(path.join(home, "silent"), { recursive: true })
+    await writeFile(path.join(home, "silent", quiet), "0\n")
+    const calls: Call[] = []
+    const fresh: Box = { running: true, labels: {}, env: [], health: "starting" }
+    const error = await fail(
+      supervisor(
+        deps(fakeDocker({ running: false, labels: {}, env: [] }, calls, { projects: { [quiet]: fresh, "opencode-delegate-cccccccccccc": { running: true, labels: {}, env: [] } } }), {
+          image: IMAGE,
+          now: () => SILENT_BOX_WAIT_MS + 5_000,
+        }),
+      ).ensure(),
+    )
+    expect(error.code).toBe("profile_changed")
+    expect(downOf(calls, quiet)).toHaveLength(0)
+    expect(existsSync(path.join(home, "silent", quiet))).toBe(false)
   })
 
   test("a generation that does not match is refused before this bridge rebinds", async () => {

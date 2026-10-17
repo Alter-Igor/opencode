@@ -24,6 +24,14 @@ async function probeOnce(deps: HealthDeps, target: ApiTarget): Promise<Probe> {
   }
 }
 
+/**
+ * One probe of a box, with the same 3 s cap (#177): true when its OpenCode server answers. Used to
+ * tell a silent old box from a busy one without holding the start lock for long.
+ */
+export async function boxAnswers(fetchFn: typeof fetch, target: ApiTarget): Promise<boolean> {
+  return (await probeOnce({ fetch: fetchFn, now: Date.now, sleep: async () => {} }, target)).ok
+}
+
 export async function waitHealthy(deps: HealthDeps, target: ApiTarget, container: string): Promise<void> {
   const deadline = deps.now() + (deps.healthTimeoutMs ?? 120_000)
   let last = "no probe ran"
