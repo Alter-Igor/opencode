@@ -22,6 +22,7 @@ import { InstanceState } from "@/effect/instance-state"
 import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { HttpApiBuilder, HttpApiError, HttpApiSchema } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
+import { cancelSessionTree } from "@/session/cancel-tree"
 import {
   CommandPayload,
   DiffQuery,
@@ -176,6 +177,8 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     })
 
     const remove = Effect.fn("SessionHttpApi.remove")(function* (ctx: { params: { sessionID: SessionID } }) {
+      // Fork (#214): stop a running reply (and its sub-sessions') before the session is removed.
+      yield* cancelSessionTree({ cancel: promptSvc.cancel, children: session.children }, ctx.params.sessionID)
       yield* SessionError.mapStorageNotFound(session.remove(ctx.params.sessionID))
       return true
     })
