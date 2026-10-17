@@ -186,6 +186,8 @@ describe("synapse_vision (#193)", () => {
     // No Synapse in this config, or the tool is not offered to this agent: no note.
     expect(await proxyUnsupportedImages(msgs, textOnly, undefined, undefined, { provider: {} }, tools)).toBe(msgs)
     expect(await proxyUnsupportedImages(msgs, textOnly, undefined, undefined, cfg, ["read"])).toBe(msgs)
+    const disabled = { ...cfg, disabled_providers: ["synapse"] }
+    expect(await proxyUnsupportedImages(msgs, textOnly, undefined, undefined, disabled, tools)).toBe(msgs)
   })
 })
 

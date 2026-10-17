@@ -1,6 +1,7 @@
 ﻿import type { ModelMessage } from "ai"
 import type * as Provider from "./provider"
 import { SYNAPSE_VISION_TOOL, saveImageForVision, visionNote } from "@/plugin/synapse-vision"
+import { synapseAllowed } from "@/plugin/synapse-models"
 
 export interface VisionProxyConfig {
   model: string
@@ -175,7 +176,10 @@ export async function proxyUnsupportedImages(
   // #193: with no vision_proxy configured, a Synapse user gets the image as a saved file and a
   // note to ask the synapse_vision tool about it, instead of an error the model cannot act on.
   const synapseEyes =
-    !proxyConfig && Boolean(globalConfig?.provider?.synapse) && new Set(toolNames ?? []).has(SYNAPSE_VISION_TOOL)
+    !proxyConfig &&
+    Boolean(globalConfig?.provider?.synapse) &&
+    synapseAllowed(globalConfig as Parameters<typeof synapseAllowed>[0]) &&
+    new Set(toolNames ?? []).has(SYNAPSE_VISION_TOOL)
   if (!proxyConfig && !synapseEyes) return msgs
 
   // If the proxy config doesn't include its own apiKey, try the provider's

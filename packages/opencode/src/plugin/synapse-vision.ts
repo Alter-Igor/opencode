@@ -214,6 +214,8 @@ export async function saveImageForVision(
   await fs.mkdir(dir, { recursive: true, mode: 0o700 })
   if (!swept.has(dir)) {
     swept.add(dir)
+    // mkdir's mode does not tighten a folder that already exists.
+    await fs.chmod(dir, 0o700).catch(() => undefined)
     await sweepOldImages(dir, keepMs)
   }
   const file = path.join(dir, createHash("sha256").update(decoded.bytes).digest("hex").slice(0, 32) + ext)

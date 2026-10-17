@@ -228,7 +228,8 @@ function errorText(error: unknown, token: string | undefined): string {
   return token ? text.split(token).join("[REDACTED]") : text
 }
 
-function synapseAllowed(cfg: Config): boolean {
+/** False when `disabled_providers` / `enabled_providers` turn the Synapse provider off. */
+export function synapseAllowed(cfg: Config): boolean {
   if (cfg.disabled_providers?.includes(SYNAPSE_PROVIDER_ID)) return false
   if (cfg.enabled_providers && !cfg.enabled_providers.includes(SYNAPSE_PROVIDER_ID)) return false
   return true
