@@ -52,9 +52,11 @@ describe("session retrospective profile", () => {
       expect(await fs.readdir(ws.path)).not.toContain(".system_generated")
       expect(sessionObserver.getLatestRetrospectives().some((retro) => retro.sessionId === sessionId)).toBe(false)
       expect(telemetry).not.toHaveBeenCalled()
-      // Turning it back on must not replay records held while the profile was disabled.
+      // Turning it back on must not replay records held while the profile was disabled: there are
+      // none left, so nothing is written or sent (#209: no empty retrospectives).
       delete process.env.OPENCODE_DISABLE_SESSION_RETROSPECTIVES
-      expect((await sessionObserver.finalizeSessionRetrospective(sessionId))?.totalToolCalls).toBe(0)
+      expect(await sessionObserver.finalizeSessionRetrospective(sessionId)).toBeNull()
+      expect(telemetry).not.toHaveBeenCalled()
     } finally {
       if (previous === undefined) delete process.env.OPENCODE_DISABLE_SESSION_RETROSPECTIVES
       if (previous !== undefined) process.env.OPENCODE_DISABLE_SESSION_RETROSPECTIVES = previous
@@ -779,6 +781,8 @@ describe("MCP tool failures with real remote tool names (#18)", () => {
       "The user dismissed this question",
       "MCP error -32001: AbortError: The operation was aborted.",
       "MCP error -32001: AbortError: This operation was aborted",
+      "The operation was aborted.",
+      "Error: This operation was aborted",
     ]
     errors.forEach((error, i) => {
       sessionObserver.onToolBefore(sessionId, `c${i}`, "alterspective-rag_rag_search", {})
@@ -787,6 +791,33 @@ describe("MCP tool failures with real remote tool names (#18)", () => {
     const retro = await sessionObserver.finalizeSessionRetrospective(sessionId)
     expect(retro?.totalToolCalls).toBe(errors.length)
     expect(retro?.anomalies.filter((a) => a.type === "MCP_TOOL_FAILURE")).toEqual([])
+  })
+
+  test("an MCP server's own error that mentions an aborted operation still counts (#209)", async () => {
+    sessionObserver.markNativeTool("read")
+    const sessionId = "obs-209-server-abort-text"
+    sessionObserver.onToolBefore(sessionId, "c1", "alterspective-rag_rag_search", {})
+    sessionObserver.onToolFailed(
+      sessionId,
+      "c1",
+      "alterspective-rag_rag_search",
+      "MCP error -32603: query failed: the operation was aborted by the database",
+    )
+    const retro = await sessionObserver.finalizeSessionRetrospective(sessionId)
+    expect(retro?.anomalies.filter((a) => a.type === "MCP_TOOL_FAILURE")).toHaveLength(1)
+  })
+
+  test("a turn with no tool calls writes and sends no retrospective (#209)", async () => {
+    await using ws = await tmpdir()
+    const sessionId = "obs-209-empty"
+    expect(await sessionObserver.finalizeSessionRetrospective(sessionId, ws.path)).toBeNull()
+    // A session.deleted right after an idle: the idle took the records, the delete finds none.
+    sessionObserver.onToolBefore(sessionId, "c1", "read", {})
+    sessionObserver.onToolAfter(sessionId, "c1", "read", "ok")
+    expect((await sessionObserver.finalizeSessionRetrospective(sessionId, ws.path))?.totalToolCalls).toBe(1)
+    expect(await sessionObserver.finalizeSessionRetrospective(sessionId, ws.path)).toBeNull()
+    expect(await fs.readdir(path.join(ws.path, ".system_generated", "retrospectives"))).toHaveLength(1)
+    expect(telemetry).toHaveBeenCalledTimes(1)
   })
 
   test("a real MCP timeout still counts as a failure (#209)", async () => {
@@ -837,9 +868,8 @@ describe("MCP tool failures with real remote tool names (#18)", () => {
   test("a failure for a call the observer never saw start is ignored (a fork or compaction replays old parts)", async () => {
     const sessionId = "obs-18-replay"
     sessionObserver.onToolFailed(sessionId, "old-call", "alterspective-rag_rag_search", "Error: old failure")
-    const retro = await sessionObserver.finalizeSessionRetrospective(sessionId)
-    expect(retro?.totalToolCalls).toBe(0)
-    expect(retro?.anomalies.filter((a) => a.type === "MCP_TOOL_FAILURE")).toEqual([])
+    // No record was made, so there is nothing to report at all (#209: no empty retrospectives).
+    expect(await sessionObserver.finalizeSessionRetrospective(sessionId)).toBeNull()
   })
 
   test("failedToolFromEvent reads only failed tool parts", () => {
