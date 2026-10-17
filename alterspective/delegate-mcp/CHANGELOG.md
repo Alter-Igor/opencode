@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.4 — 2026-10-14
+
+**A silent old box stops after 15 minutes (#177).** Two running boxes block the next update. A box that will not answer, and that no bridge holds, is stopped once that has lasted 15 minutes. The first check only remembers the time. A box we can still read stays up, so a running task is not cut. The stop does not delete the box disk. The session records stay.
+
+Checked with `bun run typecheck` and the generation tests (fake docker). Not run against a live Docker host.
+
 ## 0.5.3 — 2026-10-14
 
 **A new image starts beside the running box (#171).** A new agent can use a new image while an old turn keeps running.
