@@ -1,9 +1,10 @@
-// #26: credentials in tool output are hidden before the session store keeps them.
+// #26: credentials in tool results are hidden before the session store keeps them.
 // Fixtures are assembled at run time so this file never holds a string that looks like a real
 // key to a secret scanner (GitHub push protection, gitleaks).
 import { describe, expect, test } from "bun:test"
-import { redactSecrets, redactToolResult } from "../../src/plugin/secret-redaction"
+import { redactSecrets, redactToolPart, redactToolResult } from "../../src/plugin/secret-redaction"
 import { redactSensitiveData } from "../../src/plugin/observer"
+import { SynapseAuthPlugin } from "../../src/plugin/synapse"
 
 const fake = (prefix: string, body: string, length: number) => prefix + body.repeat(Math.ceil(length / body.length)).slice(0, length)
 
@@ -11,7 +12,11 @@ const KEYS: Record<string, string> = {
   openrouter: fake("sk-" + "or-v1-", "5a5f0c", 64),
   anthropic: fake("sk-" + "ant-api03-", "Ab9_", 90),
   openai: fake("sk-" + "proj-", "Q7xZ", 48),
+  stripe: fake("sk" + "_live_", "aB3", 24),
   github: fake("gh" + "p_", "aB3dE", 36),
+  gitlab: fake("gl" + "pat-", "aB3_x", 20),
+  npm: fake("np" + "m_", "aB3dE", 36),
+  huggingface: fake("h" + "f_", "aB3", 34),
   aws: fake("AK" + "IA", "QWERTY23", 16),
   google: fake("AI" + "za", "Sy0_x-", 35),
   slack: fake("xo" + "xb-", "1234-abcd", 24),
@@ -28,20 +33,51 @@ describe("redactSecrets (#26)", () => {
     }
   })
 
-  test("leaves ordinary output unchanged", () => {
+  test("a key glued to an underscore still counts (QA on #26)", () => {
+    expect(redactSecrets(`X_${KEYS.openrouter}`)).toBe("X_[REDACTED:openrouter]")
+  })
+
+  test("named secrets keep their name and lose the value", () => {
+    const slackApp = fake("xa" + "pp-1-", "A1b2C3", 16)
+    const cases: Array<[string, string]> = [
+      [`aws_secret_access_key = ${fake("", "aB3/+", 40)}`, "aws_secret_access_key = [REDACTED:aws]"],
+      [`DefaultEndpointsProtocol=https;AccountKey=${fake("", "aB3+/", 44)};`, "DefaultEndpointsProtocol=https;AccountKey=[REDACTED:azure];"],
+      [`Authorization: Bearer ${fake("", "aB3._~", 32)}`, "Authorization: Bearer [REDACTED:bearer]"],
+      [`git clone https://deploy:${"s3cr3t" + "Passw0rd"}@git.example.com/x`, "git clone https://deploy:[REDACTED:url-credentials]@git.example.com/x"],
+      [slackApp, "[REDACTED:slack]"],
+    ]
+    for (const [input, expected] of cases) expect(redactSecrets(input)).toBe(expected)
+  })
+
+  test("leaves ordinary output unchanged, including sk- names that are not keys (QA on #26)", () => {
     const text = [
       "src/index.ts:12  const sk = 'task-runner'",
       "commit 43274025e9b7828756953381e21052b2fc8082e4",
       "sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4",
       "uuid 3f2c9a7e-1d4b-4c8e-9a2f-6b7d8e9f0a1b, base64 aGVsbG8gd29ybGQ=",
       "AKIA is a prefix; sk-short is too short",
+      "sk-project-management-dashboard-component-v2",
+      "node_modules/sk-learn-wrapper-for-python-bindings/index.js",
+      "origin/sk-add-the-retry-when-windows-refuses-rename",
+      "git@github.com:Alter-Igor/opencode.git",
     ].join("\n")
     expect(redactSecrets(text)).toBe(text)
   })
 
-  test("a private key block is hidden whole", () => {
-    const block = ["-----BEGIN " + "RSA PRIVATE KEY-----", "MIIEowIBAAKCAQEA", "-----END " + "RSA PRIVATE KEY-----"].join("\n")
-    expect(redactSecrets(`before\n${block}\nafter`)).toBe("before\n[REDACTED:private-key]\nafter")
+  test("a private key block is hidden whole; one cut off before END is hidden to the end", () => {
+    const begin = "-----BEGIN " + "RSA PRIVATE KEY-----"
+    const end = "-----END " + "RSA PRIVATE KEY-----"
+    expect(redactSecrets(`before\n${begin}\nMIIEowIBAAKCAQEA\n${end}\nafter`)).toBe("before\n[REDACTED:private-key]\nafter")
+    expect(redactSecrets(`before\n${begin}\nMIIEowIBAAKC (truncated)`)).toBe("before\n[REDACTED:private-key]")
+  })
+
+  test("large output with many unterminated BEGIN lines stays fast (QA on #26: linear scan)", () => {
+    const line = "-----BEGIN " + "EC PRIVATE KEY-----\n" + "x".repeat(1000) + "\n"
+    const text = "start\n" + line.repeat(5000)
+    const began = performance.now()
+    const out = redactSecrets(text)
+    expect(performance.now() - began).toBeLessThan(1000)
+    expect(out).toBe("start\n[REDACTED:private-key]")
   })
 })
 
@@ -80,6 +116,48 @@ describe("redactToolResult (#26)", () => {
     expect(clean.output).toBe("a.txt\nb.txt")
     const frozen = { title: "x", output: "ok", metadata: Object.freeze({ output: KEYS.github }) }
     expect(() => redactToolResult(frozen)).not.toThrow()
+  })
+})
+
+describe("redactToolPart: every stored copy of a tool part (#26, QA)", () => {
+  test("a running part: streamed shell output in metadata is redacted", () => {
+    const part = { type: "tool", state: { status: "running", input: { command: "echo $KEY" }, metadata: { output: `${KEYS.openrouter}\n` } } }
+    expect(redactToolPart(part)).toBe(1)
+    expect(part.state.metadata.output).toBe("[REDACTED:openrouter]\n")
+  })
+
+  test("a failed part: error text and input arguments are redacted", () => {
+    const part = { type: "tool", state: { status: "error", input: { command: `curl -H "x-api-key: ${KEYS.synapse}"` }, error: `401 for ${KEYS.synapse}` } }
+    expect(redactToolPart(part)).toBe(2)
+    expect(JSON.stringify(part)).not.toContain(KEYS.synapse)
+  })
+
+  test("attachments and other part types are left alone", () => {
+    const attachment = { type: "file", url: "data:image/png;base64,iVBORw0KGgo" + KEYS.aws }
+    const tool = { type: "tool", state: { status: "completed", output: "ok", attachments: [attachment] } }
+    expect(redactToolPart(tool)).toBe(0)
+    expect(tool.state.attachments[0]).toBe(attachment)
+    const text = { type: "text", text: KEYS.github }
+    expect(redactToolPart(text)).toBe(0)
+    expect(text.text).toBe(KEYS.github)
+  })
+})
+
+describe("wiring (#26, QA)", () => {
+  test("the Synapse plugin's tool.execute.after hook redacts the result it is given", async () => {
+    const hooks = await SynapseAuthPlugin({
+      client: {} as never,
+      project: {} as never,
+      directory: "/test/dir",
+      worktree: "",
+      experimental_workspace: { register() {} },
+      serverUrl: new URL("https://example.com"),
+      $: {} as never,
+    } as never)
+    const output = { title: "bash", output: `KEY=${KEYS.openrouter}`, metadata: { output: KEYS.openrouter } }
+    await hooks["tool.execute.after"]?.({ tool: "bash", sessionID: "ses_test", callID: "call_1", args: {} }, output)
+    expect(output.output).toBe("KEY=[REDACTED:openrouter]")
+    expect(output.metadata.output).toBe("[REDACTED:openrouter]")
   })
 })
 
