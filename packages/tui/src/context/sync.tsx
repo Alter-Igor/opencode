@@ -387,7 +387,11 @@ export const {
           break
         }
         case "message.part.updated": {
-          if (outsideWindow(store.message[event.properties.part.sessionID], event.properties.part.messageID)) break
+          if (
+            !hydratingSessions.has(event.properties.part.sessionID) &&
+            outsideWindow(store.message[event.properties.part.sessionID], event.properties.part.messageID)
+          )
+            break
           touchPart(event.properties.part.sessionID, event.properties.part.id)
           const parts = store.part[event.properties.part.messageID]
           if (!parts) {
