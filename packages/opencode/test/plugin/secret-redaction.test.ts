@@ -2,7 +2,7 @@
 // Fixtures are assembled at run time so this file never holds a string that looks like a real
 // key to a secret scanner (GitHub push protection, gitleaks).
 import { describe, expect, test } from "bun:test"
-import { redactedCopy, redactSecrets, redactToolPart, redactToolResult } from "../../src/plugin/secret-redaction"
+import { redactedCopy, redactedToolPart, redactSecrets, redactToolPart, redactToolResult } from "../../src/plugin/secret-redaction"
 import { redactSensitiveData } from "../../src/plugin/observer"
 import { SynapseAuthPlugin } from "../../src/plugin/synapse"
 
@@ -213,6 +213,21 @@ describe("redactToolResult (#26)", () => {
     expect(clean.output).toBe("a.txt\nb.txt")
     const frozen = { title: "x", output: "ok", metadata: Object.freeze({ output: KEYS.github }) }
     expect(() => redactToolResult(frozen)).not.toThrow()
+  })
+})
+
+describe("redactedToolPart: the projector's stored copy (#207)", () => {
+  test("a tool part comes back as a redacted copy; the original is not changed", () => {
+    const part = { type: "tool", state: { status: "completed", output: `${KEYS.openrouter}\n` } }
+    const stored = redactedToolPart(part)
+    expect(stored).not.toBe(part)
+    expect(JSON.stringify(stored)).toContain("[REDACTED:openrouter]")
+    expect(part.state.output).toContain(KEYS.openrouter)
+  })
+
+  test("any other part is returned as it is", () => {
+    const text = { type: "text", text: KEYS.openrouter }
+    expect(redactedToolPart(text)).toBe(text)
   })
 })
 
