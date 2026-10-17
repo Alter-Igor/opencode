@@ -323,16 +323,20 @@ async function mirrorAddressChanges(ctx: Ctx, repo: string, base: string, branch
 /** Command-line budget for the changed-file names passed to git grep; past it, the whole tree is read (Windows caps a command line near 32k characters). */
 export const MAX_PATHSPEC_CHARS = 16_000
 
+/** One path part git passes back unchanged on every host: plain characters, and not `.` or `..`. */
+const PLAIN_PART = /^(?!\.\.?$)[A-Za-z0-9._@+-]+$/
+
 /**
- * The pathspecs for git grep, or [] for the whole tree. A narrowed read must never miss a file, so
- * it is only used when every name is safe to pass back to git (QA on #186):
- * - a `\` in a name (legal in the Linux tree the box writes) is a folder break to Git for Windows,
- *   even with --literal-pathspecs, so that file would never be read;
- * - U+FFFD means the name was not UTF-8 and was decoded lossily; passed back, it matches nothing.
- * Each name counts twice plus 3: Windows argument quoting can turn `"` into `\"` and adds quotes.
+ * The pathspecs for git grep, or [] for the whole tree. A narrowed read must never miss a file, and
+ * git rewrites some names it is handed back even with --literal-pathspecs (QA on #186: each of
+ * these read as clean): `\` is a folder break to Git for Windows; `C:/<repo>/x` becomes `x`;
+ * `a/../x` and `a/./x` are tidied; a name that was not UTF-8 decodes to U+FFFD and matches
+ * nothing. So it narrows only when every part of every name is plain (an allowlist, not a list of
+ * known traps); any other name reads the whole tree, which is always right, only slower.
+ * Each name counts twice plus 3 for Windows argument quoting.
  */
 export function grepPathspecs(names: readonly string[]): string[] {
-  if (names.some((name) => name.includes("\\") || name.includes("�"))) return []
+  if (!names.every((name) => name.split("/").every((part) => PLAIN_PART.test(part)))) return []
   return names.reduce((n, name) => n + name.length * 2 + 3, 0) <= MAX_PATHSPEC_CHARS ? [...names] : []
 }
 
