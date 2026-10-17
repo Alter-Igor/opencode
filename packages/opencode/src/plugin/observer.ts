@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises"
 import * as path from "node:path"
 import { truthy } from "@opencode-ai/core/flag/flag"
 import { getLatestSynapseServing } from "./synapse"
+import { redactSecrets } from "./secret-redaction"
 
 export interface ToolExecutionRecord {
   callId: string
@@ -53,9 +54,12 @@ export interface DiagnosticLogEntry {
 
 export function redactSensitiveData(data: any): any {
   if (typeof data === "string") {
-    return data
+    const masked = data
       .replace(/Bearer\s+eyJ[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.?[A-Za-z0-9-_.+/=]*/gi, "Bearer [REDACTED_JWT]")
-      .replace(/(?:key|token|secret|password|authorization)\s*[:=]\s*["']?[A-Za-z0-9-_]{8,}["']?/gi, "$1: [REDACTED]")
+      // #26: capture the name, so the result reads `token: [REDACTED]` (the group was
+      // non-capturing, so this wrote a literal "$1").
+      .replace(/(key|token|secret|password|authorization)\s*[:=]\s*["']?[A-Za-z0-9-_]{8,}["']?/gi, "$1: [REDACTED]")
+    return redactSecrets(masked)
   }
   if (!data || typeof data !== "object") return data
   if (Array.isArray(data)) return data.map(redactSensitiveData)
