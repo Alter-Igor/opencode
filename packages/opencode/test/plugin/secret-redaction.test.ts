@@ -134,6 +134,7 @@ describe("redactSecrets pattern follow-ups (#207)", () => {
     const word = "secretAccessKey: awsCredentialsSecretAccessKeyValueFromVaultX"
     expect(redactSecrets(word)).toBe(word)
     expect(redactSecrets(`Bearer ${"aB3dE5fG7hJ9/kLmN0pQ" + "rStUv.abc1"}`)).toBe("Bearer [REDACTED:bearer]")
+    expect(redactSecrets(`Bearer ${"aB3dE5fG7hJ9/kLmN0pQ" + ".abc"}`)).toBe("Bearer [REDACTED:bearer]")
   })
 
   test("hides a PGP private key block, with or without its END line", () => {

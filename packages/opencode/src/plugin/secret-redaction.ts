@@ -117,13 +117,16 @@ function isPlaceholder(token: string): boolean {
 
 /**
  * A file path (`src/plugin/x.ts`, `./a/b.json`), not a token: it starts with `./` or `../`, or
- * holds a `/` and ends in an extension of lower-case letters only. A base64 token can start with
- * `/` and can hold `/`, but not `.`; an opaque token ending in `.abc1` is not a path either (QA on
- * #228).
+ * holds a `/` and ends in a common file extension. A base64 token can start with `/` and can hold
+ * `/`, but not `.`; an opaque token ending in `.abc` or `.abc1` is not a path (QA and CodeRabbit
+ * on #228), so only listed extensions count.
  */
 function isPath(token: string): boolean {
-  return /^\.\.?\//.test(token) || (token.includes("/") && /\.[a-z]{1,5}$/.test(token))
+  return /^\.\.?\//.test(token) || (token.includes("/") && FILE_EXTENSION.test(token))
 }
+
+const FILE_EXTENSION =
+  /\.(?:[cm]?[jt]sx?|json|jsonc|md|mdx|txt|log|ya?ml|toml|ini|env|sh|bash|ps1|py|go|rs|java|kt|rb|php|cs|c|h|cpp|hpp|swift|sql|html?|css|scss|xml|svg|lock|zip|tar|gz|png|jpe?g|gif|pdf)$/
 
 /** Plain lower-case words (`authentication-mechanism-documentation`): a random token has a digit or a capital. */
 function isWords(token: string): boolean {
