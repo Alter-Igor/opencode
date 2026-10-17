@@ -389,12 +389,13 @@ class SessionObserverManager {
    * `forgetLearning` from the same workspace removes both copies. Without a `workspaceDir` only
    * the global store is written. Automatic rules (buddy review findings) are mirrored too, which
    * can carry one project's text into every project's prompt: an owner decision, #211. A store
-   * that cannot be read is left alone, never overwritten.
+   * that cannot be read is left alone, never overwritten. `savedTo` names the stores actually
+   * written, so a caller never reports a rule as saved when it was not.
    */
   public async recordLearning(
     learning: Omit<SessionLearning, "id" | "timestamp">,
     workspaceDir?: string,
-  ): Promise<SessionLearning> {
+  ): Promise<SessionLearning & { savedTo: Array<"global" | "project"> }> {
     const normalizedText = learning.lesson.trim().toLowerCase()
     const paths = learningStorePaths(workspaceDir)
     const files = [paths.global, paths.project].filter((file): file is string => Boolean(file))
@@ -404,6 +405,7 @@ class SessionObserverManager {
       ...learning,
     }
     let stored = entry
+    const savedTo: Array<"global" | "project"> = []
     await this.mutate(async () => {
       for (const file of files) {
         const scope: "global" | "project" = file === paths.project ? "project" : "global"
@@ -425,14 +427,16 @@ class SessionObserverManager {
             found.deletedBy = undefined
             stored = found
             await writeJsonAtomic(file, trimRules([found, ...existing.filter((e) => e !== found)]))
+            savedTo.push(scope)
             continue
           }
           await writeJsonAtomic(file, trimRules([{ ...entry, scope }, ...existing]))
           stored = { ...entry, scope }
+          savedTo.push(scope)
         } catch {}
       }
     })
-    return stored
+    return { ...stored, savedTo }
   }
 
   /**
@@ -616,8 +620,14 @@ async function readRuleStore(file: string): Promise<SessionLearning[] | undefine
     return code === "ENOENT" ? undefined : "unreadable"
   }
   try {
-    const parsed = JSON.parse(raw)
-    return Array.isArray(parsed) ? (parsed as SessionLearning[]) : "unreadable"
+    const parsed: unknown = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return "unreadable"
+    // A hand-edited or cut-off store can hold `[null]` or `[42]`; such a row would throw half
+    // way through a forget, after another store was already written (CodeRabbit on #38).
+    const valid = parsed.every(
+      (row) => !!row && typeof row === "object" && typeof (row as { lesson?: unknown }).lesson === "string",
+    )
+    return valid ? (parsed as SessionLearning[]) : "unreadable"
   } catch {
     return "unreadable"
   }

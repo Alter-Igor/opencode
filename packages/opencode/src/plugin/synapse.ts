@@ -1980,7 +1980,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
           if (!args.lesson || !args.lesson.trim()) {
             return "Please provide a valid lesson description."
           }
-          await sessionObserver.recordLearning(
+          const recorded = await sessionObserver.recordLearning(
             {
               lesson: args.lesson.trim(),
               context: args.context,
@@ -1988,6 +1988,11 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
             },
             input.directory,
           )
+          // #38: say what was really saved; a rule store that cannot be read is skipped.
+          if (recorded.savedTo.length === 0)
+            return `Could not record the rule "${args.lesson}": no rule store could be read and written. Nothing was saved.`
+          if (!recorded.savedTo.includes("global"))
+            return `Recorded the rule "${args.lesson}" for this project only: the machine-wide rule store could not be read, so other projects will not use it.`
           return `✅ Successfully recorded rule: "${args.lesson}". This knowledge is stored and will automatically guide future sessions.`
         },
       }),
