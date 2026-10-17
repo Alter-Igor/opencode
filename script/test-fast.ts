@@ -48,12 +48,24 @@ function changedFiles(): string[] {
 const CODE = /\.(ts|tsx|js|mjs|cjs)$/
 const TEST = /\.test\.(ts|tsx)$/
 
-/** The nearest folder above `file` holding package.json and a test/ folder. */
+/**
+ * A package's test folder: bunfig.toml `[test] root` when set (packages/app keeps its tests next
+ * to the code, `root = "./src"`), else test/ (#224: the fast tier skipped packages/app entirely).
+ */
+function testRootOf(abs: string): string {
+  const bunfig = path.join(abs, "bunfig.toml")
+  if (!existsSync(bunfig)) return "test"
+  const section = readFileSync(bunfig, "utf8").split(/^\[test\]\s*$/m)[1]?.split(/^\[/m)[0] ?? ""
+  const match = section.match(/^\s*root\s*=\s*"\.?\/?([^"]+)"/m)
+  return match ? match[1]!.replace(/\/$/, "") : "test"
+}
+
+/** The nearest folder above `file` holding package.json and its test folder. */
 function packageOf(file: string): string | undefined {
   let dir = path.dirname(file)
   while (dir && dir !== ".") {
     const abs = path.join(root, dir)
-    if (existsSync(path.join(abs, "package.json")) && existsSync(path.join(abs, "test"))) return dir
+    if (existsSync(path.join(abs, "package.json")) && existsSync(path.join(abs, testRootOf(abs)))) return dir
     const parent = path.dirname(dir)
     if (parent === dir) break
     dir = parent
@@ -77,7 +89,9 @@ const testsByPackage = new Map<string, string[]>()
 function testsOf(pkg: string): string[] {
   let tests = testsByPackage.get(pkg)
   if (!tests) {
-    tests = walk(path.join(root, pkg, "test")).map((abs) => path.relative(path.join(root, pkg), abs).split(path.sep).join("/"))
+    tests = walk(path.join(root, pkg, testRootOf(path.join(root, pkg)))).map((abs) =>
+      path.relative(path.join(root, pkg), abs).split(path.sep).join("/"),
+    )
     testsByPackage.set(pkg, tests)
   }
   return tests
@@ -114,6 +128,22 @@ const imports = (source: string, target: string) =>
 const importsModule = (source: string, module: string, inner = module) =>
   imports(source, `src/${module}`) || (inner !== module && imports(source, `src/${inner}`))
 
+const SPECIFIER = /(?:from\s+|import\s*\(\s*|import\s+)["']([^"']+)["']/g
+
+/** #224: true when a test under src/ imports src/<module> by a relative path or the `@/` alias (packages/app). */
+const importsByPath = (source: string, test: string, module: string, inner: string) => {
+  const targets = new Set([`src/${module}`, `src/${inner}`])
+  for (const [, spec] of source.matchAll(SPECIFIER)) {
+    const resolved = spec.startsWith("@/")
+      ? `src/${spec.slice(2)}`
+      : spec.startsWith(".")
+        ? path.posix.join(path.posix.dirname(test), spec)
+        : undefined
+    if (resolved && targets.has(resolved.replace(CODE, ""))) return true
+  }
+  return false
+}
+
 /** True when `source` imports the helper file `abs` by its name, or by its folder for an index file. */
 const importsHelper = (source: string, abs: string) => {
   const name = path.basename(abs).replace(CODE, "")
@@ -132,6 +162,12 @@ function mapToTests(pkg: string, rel: string): string[] {
   const module = inner.endsWith("/index") ? inner.slice(0, -"/index".length) : inner
   const helpers = helpersOf(pkg).filter((abs) => importsModule(readFileSync(abs, "utf8"), module, inner))
   return testsOf(pkg).filter((test) => {
+    // #224: a test kept next to the code (src/<dir>/<name>.test.ts) maps from its own folder.
+    if (test.startsWith("src/")) {
+      if (path.posix.dirname(test) === path.posix.dirname(rel) && path.posix.basename(test).startsWith(name)) return true
+      const source = readFileSync(path.join(root, pkg, test), "utf8")
+      return importsModule(source, module, inner) || importsByPath(source, test, module, inner)
+    }
     const testDir = path.posix.dirname(test.slice("test/".length))
     const testName = path.posix.basename(test)
     if (testDir === dir && testName.startsWith(name)) return true
@@ -182,11 +218,21 @@ if (linting) {
   if (lint.exitCode !== 0) failed = true
 }
 for (const [pkg, tests] of plan) {
-  const run = Bun.spawnSync(["bun", "test", "--timeout", "30000", ...[...tests].sort().map((test) => `./${test}`)], {
-    cwd: path.join(root, pkg),
-    stdout: "inherit",
-    stderr: "inherit",
-  })
-  if (run.exitCode !== 0) failed = true
+  // #224: a package whose test:unit script sets --conditions (packages/app: solid) needs it here too.
+  const script = String(JSON.parse(readFileSync(path.join(root, pkg, "package.json"), "utf8")).scripts?.["test:unit"] ?? "")
+  const conditions = script.match(/--conditions=\S+/g) ?? []
+  const files = [...tests].sort().map((test) => `./${test}`)
+  // #224: a `mock.module` lasts for the whole bun process, so one file's mock (packages/app's
+  // child-store.test.ts replaces @tanstack/solid-query) broke the next file's imports. When any
+  // mapped file mocks a module, each file runs in its own process.
+  const isolate = files.some((file) => readFileSync(path.join(root, pkg, file), "utf8").includes("mock.module("))
+  for (const batch of isolate ? files.map((file) => [file]) : [files]) {
+    const run = Bun.spawnSync(["bun", "test", "--timeout", "30000", ...conditions, ...batch], {
+      cwd: path.join(root, pkg),
+      stdout: "inherit",
+      stderr: "inherit",
+    })
+    if (run.exitCode !== 0) failed = true
+  }
 }
 process.exit(failed ? 1 : 0)

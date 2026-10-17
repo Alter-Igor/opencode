@@ -14,6 +14,7 @@ import type { FileDiffInfo } from "@opencode-ai/client/promise"
 import type { State, VcsCache } from "./types"
 import { trimSessions } from "./session-trim"
 import { dropSessionCaches } from "./session-cache"
+import { isDeletedSessionEvent, markSessionDeleted } from "./deleted-sessions"
 import { diffs as list, message as clean } from "@/utils/diffs"
 import { messageKey } from "@/utils/session-message"
 
@@ -122,6 +123,8 @@ export function applyDirectoryEvent(input: {
 }) {
   const event = input.event
   if (input.sessionContent === false && SESSION_CONTENT_EVENTS.has(event.type)) return
+  // Fork (#214): late events of a deleted session must not re-create its entries.
+  if (isDeletedSessionEvent(input.store, event)) return
   const limit = Math.max(input.store.limit, input.retainedLimit ?? 0)
   switch (event.type) {
     case "server.instance.disposed": {
@@ -175,6 +178,7 @@ export function applyDirectoryEvent(input: {
       const properties = event.properties as { sessionID?: string; info?: Session }
       const sessionID = properties.info?.id ?? properties.sessionID
       if (!sessionID) break
+      markSessionDeleted(input.store, sessionID)
       const result = Binary.search(input.store.session, sessionID, (s) => s.id)
       const info = properties.info ?? (result.found ? input.store.session[result.index] : undefined)
       if (result.found) {
