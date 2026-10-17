@@ -8,7 +8,7 @@ export type CancelTreeDeps<ID> = {
   /** Cancel one session's run and wait for it to stop. */
   readonly cancel: (sessionID: ID) => Effect.Effect<void>
   /**
-   * True when the session runs nothing. Such a session is not cancelled: cancel would publish
+   * True when the session runs nothing (status idle and no busy runner). Such a session is not cancelled: cancel would publish
    * `session.status` / `session.idle` for it, and an idle event on a session being deleted wakes
    * idle listeners (the observer's retrospective, the goal loop) for nothing (architect on #214).
    */

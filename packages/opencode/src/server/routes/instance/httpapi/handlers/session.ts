@@ -182,7 +182,19 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
         {
           cancel: promptSvc.cancel,
           children: session.children,
-          isIdle: (id) => statusSvc.get(id).pipe(Effect.map((status) => status.type === "idle")),
+          // Idle only when neither the status nor the runner says busy: a reply that just started
+          // has a busy runner before it sets its status (QA on #214).
+          isIdle: (id) =>
+            statusSvc.get(id).pipe(
+              Effect.flatMap((status) =>
+                status.type !== "idle"
+                  ? Effect.succeed(false)
+                  : runState.assertNotBusy(id).pipe(
+                      Effect.as(true),
+                      Effect.catchCause(() => Effect.succeed(false)),
+                    ),
+              ),
+            ),
         },
         ctx.params.sessionID,
       )
