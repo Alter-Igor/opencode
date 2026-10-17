@@ -249,12 +249,17 @@ const live: Layer.Layer<
       // Runtime seam: native is an opt-in adapter over @opencode-ai/llm. It
       // either returns a ready LLMEvent stream or a concrete fallback reason.
       if (flags.experimentalNativeLlm) {
+        // #235: the native runtime skips the AI SDK middleware below, so give it the same image
+        // swap for text-only models (a no-op when the model can see images).
+        const nativeMessages = yield* Effect.promise(() =>
+          proxyUnsupportedImages(prepared.messages, input.model, item.options, item, cfg, Object.keys(prepared.tools)),
+        )
         const native = LLMNativeRuntime.stream({
           model: input.model,
           provider: item,
           auth: info,
           llmClient,
-          messages: prepared.messages,
+          messages: nativeMessages,
           tools: prepared.tools,
           toolChoice: input.toolChoice,
           temperature: prepared.params.temperature,

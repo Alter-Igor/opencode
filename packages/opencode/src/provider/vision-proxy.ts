@@ -187,9 +187,42 @@ export async function proxyUnsupportedImages(
     proxyConfig.apiKey = providerInfo.options.apiKey
   }
 
+  /** The text that stands in for one image the model cannot see. */
+  async function imageText(imageData: string, mediaType?: string, filename?: string): Promise<string> {
+    if (!proxyConfig) {
+      const location = await saveImageForVision(imageData, mediaType).catch(() => undefined)
+      return location
+        ? visionNote(location, filename)
+        : "[An image was provided but could not be prepared for the synapse_vision tool (empty, an unsupported type such as SVG, or larger than 20 MB). Tell the user; do not guess what it shows.]"
+    }
+    const description = await describeImage(toDataUrl(imageData, mediaType) ?? imageData, proxyConfig)
+    return description
+      ? `[Image description from vision proxy (${proxyConfig.model})]:\n${description}`
+      : "[Image was provided but vision proxy could not describe it.]"
+  }
+
   const result: ModelMessage[] = []
   for (const msg of msgs) {
-    if (msg.role !== "user" || typeof msg.content === "string" || !Array.isArray(msg.content)) {
+    if (typeof msg.content === "string" || !Array.isArray(msg.content)) {
+      result.push(msg)
+      continue
+    }
+
+    // #235: some SDKs keep a tool's screenshot inside the tool result (message-v2.ts
+    // supportsMediaInToolResult), so it never becomes a user part. Swap it here too.
+    if (msg.role === "tool") {
+      let changed = false
+      const content: unknown[] = []
+      for (const part of msg.content as unknown[]) {
+        const swapped = await swapToolResultImages(part, imageText)
+        if (swapped !== part) changed = true
+        content.push(swapped)
+      }
+      result.push(changed ? ({ ...msg, content } as ModelMessage) : msg)
+      continue
+    }
+
+    if (msg.role !== "user") {
       result.push(msg)
       continue
     }
@@ -201,28 +234,7 @@ export async function proxyUnsupportedImages(
       const imageData = extractImageData(imageLike)
       if (imageData) {
         hadImages = true
-        if (!proxyConfig) {
-          const location = await saveImageForVision(imageData, imageLike.mediaType).catch(() => undefined)
-          newContent.push({
-            type: "text",
-            text: location
-              ? visionNote(location, imageLike.filename)
-              : "[An image was provided but could not be prepared for the synapse_vision tool (empty, an unsupported type such as SVG, or larger than 20 MB). Tell the user; do not guess what it shows.]",
-          })
-          continue
-        }
-        const description = await describeImage(imageData, proxyConfig)
-        if (description) {
-          newContent.push({
-            type: "text",
-            text: `[Image description from vision proxy (${proxyConfig.model})]:\n${description}`,
-          })
-        } else {
-          newContent.push({
-            type: "text",
-            text: "[Image was provided but vision proxy could not describe it.]",
-          })
-        }
+        newContent.push({ type: "text", text: await imageText(imageData, imageLike.mediaType, imageLike.filename) })
       } else {
         newContent.push(part)
       }
@@ -236,4 +248,35 @@ export async function proxyUnsupportedImages(
   }
 
   return result
+}
+
+/**
+ * Replace image items inside one tool-result part's `content` output with text. Handles the
+ * ModelMessage shape (`media`, as message-v2.ts builds it) and the provider prompt shapes the
+ * middleware sees (`image-data`, `file-data` with an image media type). Returns the part itself
+ * when nothing changed.
+ */
+async function swapToolResultImages(
+  part: unknown,
+  imageText: (data: string, mediaType?: string, filename?: string) => Promise<string>,
+): Promise<unknown> {
+  const tool = part as { type?: string; output?: { type?: string; value?: unknown } }
+  if (tool?.type !== "tool-result" || tool.output?.type !== "content" || !Array.isArray(tool.output.value)) return part
+  let changed = false
+  const value: unknown[] = []
+  for (const item of tool.output.value as Array<Record<string, unknown>>) {
+    const kind = item?.type
+    const mediaType = typeof item?.mediaType === "string" ? item.mediaType : undefined
+    const isImage =
+      (kind === "image-data" || ((kind === "media" || kind === "file-data") && mediaType?.startsWith("image/"))) &&
+      typeof item.data === "string"
+    if (!isImage) {
+      value.push(item)
+      continue
+    }
+    changed = true
+    const filename = typeof item.filename === "string" ? item.filename : undefined
+    value.push({ type: "text", text: await imageText(item.data as string, mediaType ?? "image/png", filename) })
+  }
+  return changed ? { ...tool, output: { ...tool.output, value } } : part
 }
