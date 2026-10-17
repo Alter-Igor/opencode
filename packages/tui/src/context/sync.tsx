@@ -23,6 +23,7 @@ import type {
 import { createStore, produce, reconcile } from "solid-js/store"
 import { useProject } from "./project"
 import { useEvent } from "./event"
+import { createDeletedSessions } from "./deleted-sessions"
 import { useSDK } from "./sdk"
 import { useTuiStartup } from "./runtime"
 import { createSimpleContext } from "./helper"
@@ -148,6 +149,8 @@ export const {
     const sdk = useSDK()
 
     const fullSyncedSessions = new Set<string>()
+    // Fork (#176): late events and in-flight syncs of a deleted session must not bring it back.
+    const deletedSessions = createDeletedSessions()
     const syncingSessions = new Map<string, Promise<void>>()
     const hydratingSessions = new Map<string, { messages: Set<string>; parts: Set<string> }>()
     const touchMessage = (sessionID: string, messageID: string) => {
@@ -174,6 +177,7 @@ export const {
     }
 
     event.subscribe((event, { directory, workspace }) => {
+      if (deletedSessions.ignores(event)) return
       switch (event.type) {
         case "server.instance.disposed":
           void bootstrap()
@@ -286,6 +290,7 @@ export const {
             }),
           )
           fullSyncedSessions.delete(id)
+          deletedSessions.add(id)
           break
         }
         case "session.updated": {
@@ -640,6 +645,7 @@ export const {
               sdk.client.session.todo({ sessionID }),
               sdk.client.session.diff({ sessionID }),
             ])
+            if (deletedSessions.has(sessionID)) return
             setStore(
               produce((draft) => {
                 const match = search(draft.session, sessionID, (s) => s.id)

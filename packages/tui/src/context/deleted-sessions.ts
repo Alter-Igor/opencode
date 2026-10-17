@@ -1,0 +1,46 @@
+// Fork (#176): the server deletes a session without stopping a reply that is still running, and
+// it publishes message and part events before it writes them. Late events for a deleted session
+// would re-create its store entries in sync.tsx after `session.deleted` freed them (#173), and a
+// `sync()` still fetching would write the session back. Session IDs are never reused, so a small
+// set of deleted IDs is enough to ignore them.
+
+/** How many deleted session IDs are remembered; the oldest is forgotten first. */
+const LIMIT = 200
+
+type SessionEvent = { type: string; properties?: unknown }
+
+/** The session an event writes to, for the event types sync.tsx keys by session. */
+export function eventSessionID(event: SessionEvent): string | undefined {
+  const properties = event.properties as
+    | { sessionID?: unknown; info?: { id?: unknown; sessionID?: unknown }; part?: { sessionID?: unknown } }
+    | undefined
+  if (!properties || typeof properties !== "object") return undefined
+  if (typeof properties.sessionID === "string") return properties.sessionID
+  // message.updated carries the message in `info`; session.updated carries the session itself.
+  if (typeof properties.info?.sessionID === "string") return properties.info.sessionID
+  if (event.type.startsWith("session.") && typeof properties.info?.id === "string") return properties.info.id
+  if (typeof properties.part?.sessionID === "string") return properties.part.sessionID
+  return undefined
+}
+
+export function createDeletedSessions(limit = LIMIT) {
+  const ids = new Set<string>()
+  return {
+    add(id: string) {
+      ids.delete(id)
+      ids.add(id)
+      if (ids.size <= limit) return
+      const oldest = ids.values().next().value
+      if (oldest !== undefined) ids.delete(oldest)
+    },
+    has(id: string) {
+      return ids.has(id)
+    },
+    /** True when the event belongs to a deleted session and must not write to the store. */
+    ignores(event: SessionEvent) {
+      if (ids.size === 0 || event.type === "session.deleted") return false
+      const id = eventSessionID(event)
+      return id !== undefined && ids.has(id)
+    },
+  }
+}
