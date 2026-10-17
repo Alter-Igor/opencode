@@ -13,6 +13,8 @@ describe("provider error classification", () => {
       "Prompt has 5,958,968 tokens, but the configured context size is 256,000 tokens",
       "Too many tokens",
       "Token limit exceeded",
+      "Request estimated at 283070 tokens exceeds the largest feasible context window (272000).",
+      '{"error":{"code":"context_overflow","message":"Request estimated at 272551 tokens exceeds the largest feasible context window (272000 tokens) across eligible instances","reason":"context_overflow"}}',
     ]
 
     expect(messages.every(isContextOverflow)).toBe(true)

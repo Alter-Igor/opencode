@@ -1510,6 +1510,26 @@ describe("session.message-v2.fromError", () => {
     expect(SessionV1.ContextOverflowError.isInstance(result)).toBe(true)
   })
 
+  test("detects context overflow from Synapse context_overflow code and message", () => {
+    const error = new APICallError({
+      message: "Request estimated at 283070 tokens exceeds the largest feasible context window (272000).",
+      url: "https://synapse2-api.alterspective.com.au/v1/chat/completions",
+      requestBodyValues: {},
+      statusCode: 400,
+      responseHeaders: { "content-type": "application/json" },
+      responseBody: JSON.stringify({
+        error: {
+          code: "context_overflow",
+          message: "Request estimated at 283070 tokens exceeds the largest feasible context window (272000).",
+          reason: "context_overflow",
+        },
+      }),
+      isRetryable: false,
+    })
+    const result = MessageV2.fromError(error, { providerID })
+    expect(SessionV1.ContextOverflowError.isInstance(result)).toBe(true)
+  })
+
   test("does not classify 429 no body as context overflow", () => {
     const result = MessageV2.fromError(
       new APICallError({
