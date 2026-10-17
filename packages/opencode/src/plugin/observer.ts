@@ -29,12 +29,18 @@ function isMcpResult(value: unknown): value is { content: unknown[]; isError?: u
  */
 const NOT_A_FAILURE = [
   "Tool execution aborted",
-  // The MCP SDK's text when the call's abort signal fires (the user stopped the reply; #209 item 9).
-  "This operation was aborted",
   "The user rejected permission to use this specific tool call",
   "The user has specified a rule which prevents you from using this specific tool call",
   "The user dismissed this question",
 ]
+
+/**
+ * #209: an MCP call stopped by its abort signal (the user stopped the reply) fails with the SDK's
+ * wrapped text, e.g. `MCP error -32001: AbortError: The operation was aborted.` (Bun) or
+ * "... This operation was aborted" (Node), so it is matched anywhere in the text, not as a prefix.
+ * A real timeout reads `MCP error -32001: Request timed out` and still counts.
+ */
+const ABORTED = /operation was aborted/i
 
 /** #18: a `message.part.updated` event for a tool part that failed, as the observer needs it. */
 export function failedToolFromEvent(event: {
@@ -239,7 +245,7 @@ class SessionObserverManager {
     if (!record) return
     record.endTime ??= Date.now()
     record.durationMs = record.endTime - record.startTime
-    if (NOT_A_FAILURE.some((prefix) => error.startsWith(prefix))) return
+    if (NOT_A_FAILURE.some((prefix) => error.startsWith(prefix)) || ABORTED.test(error)) return
     record.isError = true
     record.errorMessage = error.slice(0, 200)
   }
