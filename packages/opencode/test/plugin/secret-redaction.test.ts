@@ -103,6 +103,71 @@ describe("redactSecrets (#26)", () => {
   })
 })
 
+describe("redactSecrets pattern follow-ups (#207)", () => {
+  test("finds the shapes the #26 QA rounds missed", () => {
+    const cases: Array<[string, string]> = [
+      [`redis://:${"pw" + "Secret9"}@cache:6379`, "redis://:[REDACTED:url-credentials]@cache:6379"],
+      [`authorization: bearer ${fake("", "aB3._~", 32)}`, "authorization: bearer [REDACTED:bearer]"],
+      [`AUTHORIZATION: BEARER ${fake("", "Zq8x", 28)}`, "AUTHORIZATION: BEARER [REDACTED:bearer]"],
+      [`{"SecretAccessKey": "${fake("", "aB3/+", 40)}"}`, '{"SecretAccessKey": "[REDACTED:aws]"}'],
+      [`AWS_SECRET_ACCESS_KEY=${fake("", "Qw9+", 40)}`, "AWS_SECRET_ACCESS_KEY=[REDACTED:aws]"],
+      [`${"sk-"}${fake("", "q7x2zr", 48)}`, "[REDACTED:openai]"],
+    ]
+    for (const [input, output] of cases) expect(redactSecrets(input)).toBe(output)
+  })
+
+  test("QA on #228: legacy OpenAI keys, CLI and mixed-case AWS forms, the whole AWS value", () => {
+    // A legacy key: the T3BlbkFJ marker holds one digit, and the rest may hold one more or none.
+    const legacy = "sk-" + "abcdefghijklmnopqrst" + "T3Blbk" + "FJ" + "uvwxyzABCDEFGHIJKLMN"
+    expect(redactSecrets(legacy)).toBe("[REDACTED:openai]")
+    expect(redactSecrets(`sk-${fake("", "qxzrwvbnmlkj", 46)}a1b2`)).toBe("[REDACTED:openai]")
+    const value = fake("", "aB3/+", 40)
+    const cases: Array<[string, string]> = [
+      [`aws configure set aws_secret_access_key ${value}`, "aws configure set aws_secret_access_key [REDACTED:aws]"],
+      [`--secret-access-key=${value}`, "--secret-access-key=[REDACTED:aws]"],
+      [`SeCrEtAcCeSsKeY=${value}`, "SeCrEtAcCeSsKeY=[REDACTED:aws]"],
+      [`aws_secret_access_key=${value}aB3/+`, "aws_secret_access_key=[REDACTED:aws]"],
+      [`BeArEr ${fake("", "aB3._~", 32)}`, "BeArEr [REDACTED:bearer]"],
+    ]
+    for (const [input, output] of cases) expect(redactSecrets(input)).toBe(output)
+    // A word-like value is not a key; an opaque token ending in .abc1 is not a path.
+    const word = "secretAccessKey: awsCredentialsSecretAccessKeyValueFromVaultX"
+    expect(redactSecrets(word)).toBe(word)
+    expect(redactSecrets(`Bearer ${"aB3dE5fG7hJ9/kLmN0pQ" + "rStUv.abc1"}`)).toBe("Bearer [REDACTED:bearer]")
+    expect(redactSecrets(`Bearer ${"aB3dE5fG7hJ9/kLmN0pQ" + ".abc"}`)).toBe("Bearer [REDACTED:bearer]")
+  })
+
+  test("hides a PGP private key block, with or without its END line", () => {
+    const begin = "-----BEGIN " + "PGP PRIVATE KEY BLOCK-----"
+    const end = "-----END " + "PGP PRIVATE KEY BLOCK-----"
+    expect(redactSecrets(`a\n${begin}\nlQOYBF\n${end}\nb`)).toBe("a\n[REDACTED:private-key]\nb")
+    expect(redactSecrets(`a\n${begin}\nlQOYBF cut off`)).toBe("a\n[REDACTED:private-key]")
+  })
+
+  test("leaves the #26 false positives alone", () => {
+    const text = [
+      "Authorization: Bearer YOUR_API_TOKEN_GOES_HERE",
+      "Bearer src/plugin/observer/module.ts",
+      "Bearer ./scripts/release/publish-all.sh",
+      "http://x:12:34@y",
+      "sk-ReactComponentLibraryVersion2BuildOutput",
+      "a bearer of bad news",
+      "the bearer authentication-mechanism-documentation",
+      "token_type: bearer\nrefresh_token_expiration_time: 3600",
+      "Bearer your_token_value_goes_here",
+    ].join("\n")
+    expect(redactSecrets(text)).toBe(text)
+  })
+
+  test("still hides a digits-only URL password and a bearer token that holds a slash", () => {
+    expect(redactSecrets(`http://admin:${"123" + "456"}@host/x`)).toBe("http://admin:[REDACTED:url-credentials]@host/x")
+    expect(redactSecrets(`Bearer ${fake("", "aB3/", 32)}`)).toBe("Bearer [REDACTED:bearer]")
+    // A base64 token may start with "/" or hold a random "your"; neither makes it a path or a placeholder.
+    expect(redactSecrets(`Bearer /${fake("", "aB3/", 31)}`)).toBe("Bearer [REDACTED:bearer]")
+    expect(redactSecrets(`Bearer eyYour${fake("", "Zq8x", 28)}`)).toBe("Bearer [REDACTED:bearer]")
+  })
+})
+
 describe("redactedCopy (#26, QA: doom-loop guard)", () => {
   test("returns a redacted deep copy and leaves the value alone", () => {
     const input = { command: `curl -H "x-api-key: ${KEYS.synapse}"`, n: 1 }
