@@ -15,6 +15,7 @@ import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { Session as SessionNs } from "@/session/session"
 import { SessionID } from "@/session/schema"
+import { SessionStatus } from "@/session/status"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { EventSequenceTable } from "@opencode-ai/core/event/sql"
@@ -46,6 +47,7 @@ const workspaceLayer = (experimentalWorkspaces: boolean) =>
     LayerNode.group([
       Workspace.node,
       SessionNs.node,
+      SessionStatus.node,
       SessionProjector.node,
       Database.node,
       InstanceStore.node,
@@ -813,6 +815,48 @@ describe("workspace CRUD", () => {
         ).toEqual([])
       })
     },
+    { git: true },
+  )
+
+  it.instance(
+    "remove stops a busy session's run first, and leaves an idle one alone (#214)",
+    () =>
+      Effect.gen(function* () {
+        const { directory: dir } = yield* TestInstance
+        const instance = yield* requireInstance
+        const workspace = yield* Workspace.Service
+        const sessionSvc = yield* SessionNs.Service
+        const status = yield* SessionStatus.Service
+        const store = yield* InstanceStore.Service
+        const type = unique("remove-busy")
+        const folder = path.join(dir, "remove-busy")
+        const recorded = localAdapter(folder)
+        registerAdapter(instance.project.id, type, recorded.adapter)
+        const info = yield* workspace.create({ type, branch: null, projectID: instance.project.id, extra: null })
+        const busy = yield* sessionSvc.create({})
+        const quiet = yield* sessionSvc.create({})
+        yield* attachSessionToWorkspace(busy.id, info.id)
+        yield* attachSessionToWorkspace(quiet.id, info.id)
+        // A workspace session's prompts run in the workspace folder's instance (QA on #229), so its
+        // busy status lives there, not in the instance that calls remove.
+        const inFolder = <A, E, R>(effect: Effect.Effect<A, E, R>) => store.provide({ directory: folder }, effect)
+        yield* inFolder(status.set(busy.id, { type: "busy" }))
+        expect((yield* status.get(busy.id)).type).toBe("idle")
+        const captured = captureGlobalEvents()
+        const idled = (id: SessionID) =>
+          captured.events.some((event) => event.payload?.type === "session.idle" && event.payload.properties?.sessionID === id)
+        try {
+          yield* workspace.remove(info.id)
+          // The busy session was cancelled in its folder's instance: with no runner, cancel sets it
+          // idle, which publishes session.idle.
+          expect((yield* inFolder(status.get(busy.id))).type).toBe("idle")
+          yield* eventuallyEffect(Effect.sync(() => expect(idled(busy.id)).toBe(true)))
+          // The idle one was not cancelled, so no idle event woke listeners for it.
+          expect(idled(quiet.id)).toBe(false)
+        } finally {
+          captured.dispose()
+        }
+      }),
     { git: true },
   )
 
