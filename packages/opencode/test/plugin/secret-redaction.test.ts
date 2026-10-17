@@ -131,6 +131,9 @@ describe("redactSecrets pattern follow-ups (#207)", () => {
       "http://x:12:34@y",
       "sk-ReactComponentLibraryVersion2BuildOutput",
       "a bearer of bad news",
+      "the bearer authentication-mechanism-documentation",
+      "token_type: bearer\nrefresh_token_expiration_time: 3600",
+      "Bearer your_token_value_goes_here",
     ].join("\n")
     expect(redactSecrets(text)).toBe(text)
   })
@@ -138,6 +141,9 @@ describe("redactSecrets pattern follow-ups (#207)", () => {
   test("still hides a digits-only URL password and a bearer token that holds a slash", () => {
     expect(redactSecrets(`http://admin:${"123" + "456"}@host/x`)).toBe("http://admin:[REDACTED:url-credentials]@host/x")
     expect(redactSecrets(`Bearer ${fake("", "aB3/", 32)}`)).toBe("Bearer [REDACTED:bearer]")
+    // A base64 token may start with "/" or hold a random "your"; neither makes it a path or a placeholder.
+    expect(redactSecrets(`Bearer /${fake("", "aB3/", 31)}`)).toBe("Bearer [REDACTED:bearer]")
+    expect(redactSecrets(`Bearer eyYour${fake("", "Zq8x", 28)}`)).toBe("Bearer [REDACTED:bearer]")
   })
 })
 

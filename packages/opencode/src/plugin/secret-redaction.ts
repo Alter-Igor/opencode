@@ -2,8 +2,9 @@
 // A model once ran a shell command that echoed a live API key; the observer redacted its own
 // diagnostics log, but the tool output itself was saved in plain text and fed back to the model.
 // Only high-confidence key shapes are matched, so ordinary output is not changed.
-// Two callers: the Synapse plugin's `tool.execute.after` hook (the result object the model gets
-// back) and `Session.updatePart` (every stored copy of a tool part: running, completed, failed).
+// Three callers: the Synapse plugin's `tool.execute.after` hook (the result object the model gets
+// back), `Session.updatePart` (every stored copy of a tool part: running, completed, failed) and
+// `opencode import` (`cli/cmd/import.ts`, which inserts parts directly).
 // The doom-loop guard in `session/processor.ts` uses `redactedCopy` to compare with stored inputs.
 
 /**
@@ -66,13 +67,17 @@ const RULES: ReadonlyArray<Rule> = [
   // A JWT: three base64url parts, the first two starting with "eyJ" (a JSON object).
   key("jwt", ["eyJ"], "eyJ", "[A-Za-z0-9_-]{10,}\\.eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}"),
   {
-    // Any case (`authorization: bearer …`, #207). A placeholder (`Bearer YOUR_API_TOKEN_GOES_HERE`)
-    // or a file path (`Bearer src/plugin/x.ts`) is left alone.
+    // Any case (`authorization: bearer …`, #207), with spaces or tabs only between the word and
+    // the token: a newline would let `token_type: bearer` take the next line's key (architect on
+    // #228). A placeholder (`Bearer YOUR_API_TOKEN_GOES_HERE`), a file path (`Bearer src/plugin/x.ts`)
+    // or plain lower-case words (`the bearer authentication-mechanism`) are left alone.
     name: "bearer",
     hints: ["Bearer", "bearer", "BEARER"],
-    pattern: /(Bearer\s+)([A-Za-z0-9._~+/-]{20,}=*)/gi,
+    pattern: /(Bearer[ \t]+)([A-Za-z0-9._~+/-]{20,}=*)/gi,
     replace: (match, prefix, token) =>
-      match.includes("[REDACTED") || isPlaceholder(token) || isPath(token) ? match : `${prefix}[REDACTED:bearer]`,
+      match.includes("[REDACTED") || isPlaceholder(token) || isPath(token) || isWords(token)
+        ? match
+        : `${prefix}[REDACTED:bearer]`,
   },
   {
     // user:password@ in a URL; the user name stays, the password goes. Anchored on "://" after a
@@ -92,14 +97,26 @@ const RULES: ReadonlyArray<Rule> = [
   },
 ]
 
-/** A template value, not a token: all capitals and underscores, or a "your"/"example" word. */
+/**
+ * A template value, not a token: all capitals and underscores, starting with a "your"/"example"
+ * word, or ending in `_HERE`. Matched at the ends only, so a random token holding "your" counts.
+ */
 function isPlaceholder(token: string): boolean {
-  return /^[A-Z_]+$/.test(token) || /your|example|placeholder|insert/i.test(token)
+  return /^[A-Z_]+$/.test(token) || /^(?:your|my|example|placeholder|insert)[_-]/i.test(token) || /_here$/i.test(token)
 }
 
-/** A file path (`src/plugin/x.ts`, `./a/b.json`), not a token. */
+/**
+ * A file path (`src/plugin/x.ts`, `./a/b.json`), not a token: it starts with `./` or `../`, or
+ * holds a `/` and ends in a lower-case extension. A base64 token can start with `/` and can hold
+ * `/`, but has no `.`, so it is not taken for a path.
+ */
 function isPath(token: string): boolean {
-  return /^\.{0,2}\//.test(token) || (token.includes("/") && /\.[a-z][a-z0-9]{0,4}$/i.test(token))
+  return /^\.\.?\//.test(token) || (token.includes("/") && /\.[a-z][a-z0-9]{0,4}$/.test(token))
+}
+
+/** Plain lower-case words (`authentication-mechanism-documentation`): a random token has a digit or a capital. */
+function isWords(token: string): boolean {
+  return /^[a-z._~+/-]+$/.test(token)
 }
 
 // `PRIVATE KEY BLOCK` is the PGP armour (#207).
