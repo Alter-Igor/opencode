@@ -4,7 +4,7 @@ import type { Message, Part, Session } from "@opencode-ai/sdk/v2/client"
 import { createStore } from "solid-js/store"
 import type { State } from "./types"
 import { applyDirectoryEvent } from "./event-reducer"
-import { eventSessionID, isDeletedSessionEvent, markSessionDeleted } from "./deleted-sessions"
+import { dropDeletedSessionEvent, eventSessionID, isDeletedSessionEvent, markSessionDeleted } from "./deleted-sessions"
 
 const session = (id: string) => ({ id, time: { created: 1, updated: 1 } }) as Session
 
@@ -76,5 +76,36 @@ describe("deleted sessions in the web app (#214)", () => {
     expect(eventSessionID({ type: "message.updated", properties: { info: { id: "m", sessionID: "s" } } })).toBe("s")
     expect(eventSessionID({ type: "session.updated", properties: { info: { id: "s2" } } })).toBe("s2")
     expect(eventSessionID({ type: "message.part.updated", properties: { part: { sessionID: "s3" } } })).toBe("s3")
+    expect(eventSessionID({ type: "x", properties: {}, current: { type: "session.moved", data: { sessionID: "s4" } } })).toBe(
+      "s4",
+    )
+  })
+
+  test("a store forgets its oldest deleted ID after 200, and an event with no properties passes", () => {
+    const store = {}
+    for (let i = 0; i < 201; i++) markSessionDeleted(store, `ses_${i}`)
+    expect(isDeletedSessionEvent(store, { type: "session.status", properties: { sessionID: "ses_0" } })).toBe(false)
+    expect(isDeletedSessionEvent(store, { type: "session.status", properties: { sessionID: "ses_1" } })).toBe(true)
+    expect(isDeletedSessionEvent(store, { type: "session.status", properties: { sessionID: "ses_200" } })).toBe(true)
+    expect(isDeletedSessionEvent(store, { type: "session.status" })).toBe(false)
+  })
+
+  test("the server-wide guard marks a deleted session and drops its later events", () => {
+    const key = {}
+    expect(dropDeletedSessionEvent(key, { type: "session.deleted", properties: { info: { id: "ses_d" } } })).toBe(false)
+    expect(dropDeletedSessionEvent(key, { type: "message.updated", properties: { info: { id: "m", sessionID: "ses_d" } } })).toBe(
+      true,
+    )
+    expect(dropDeletedSessionEvent(key, { type: "session.updated", properties: { info: { id: "ses_d" } } })).toBe(true)
+    expect(dropDeletedSessionEvent(key, { type: "session.status", properties: { sessionID: "ses_other" } })).toBe(false)
+    expect(dropDeletedSessionEvent(key, { type: "server.connected", properties: {} })).toBe(false)
+  })
+
+  test("server-sync drops a deleted session's events before the session cache, home list and reducer see them", async () => {
+    const source = await Bun.file(new URL("../server-sync.tsx", import.meta.url)).text()
+    const guard = source.indexOf("if (dropDeletedSessionEvent(session, event)) return")
+    expect(guard).toBeGreaterThan(-1)
+    for (const call of ["session.applyV2(event.current)", "session.apply(event)", "homeSessions.apply(event)"])
+      expect(source.indexOf(call)).toBeGreaterThan(guard)
   })
 })

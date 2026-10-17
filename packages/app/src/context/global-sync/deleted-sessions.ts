@@ -9,7 +9,7 @@ const LIMIT = 200
 
 const deletedByStore = new WeakMap<object, Set<string>>()
 
-type SessionEvent = { type: string; properties?: unknown }
+type SessionEvent = { type: string; properties?: unknown; current?: unknown }
 
 /** The session an event writes to, for the event types the reducer keys by session. */
 export function eventSessionID(event: SessionEvent): string | undefined {
@@ -21,6 +21,8 @@ export function eventSessionID(event: SessionEvent): string | undefined {
   if (typeof properties.info?.sessionID === "string") return properties.info.sessionID
   if (event.type.startsWith("session.") && typeof properties.info?.id === "string") return properties.info.id
   if (typeof properties.part?.sessionID === "string") return properties.part.sessionID
+  const current = event.current as { data?: { sessionID?: unknown } } | undefined
+  if (typeof current?.data?.sessionID === "string") return current.data.sessionID
   return undefined
 }
 
@@ -49,4 +51,19 @@ export function isDeletedSessionEvent(store: object, event: SessionEvent): boole
     return false
   }
   return id !== undefined && ids.has(id)
+}
+
+/**
+ * The server-wide guard in server-sync.tsx. It runs before the session cache
+ * (server-session.ts), the home list and the directory reducer see the event, because the live
+ * app calls the reducer with `sessionContent: false` and the session cache re-creates a session
+ * from any of its events. Returns true when the event must be dropped.
+ */
+export function dropDeletedSessionEvent(key: object, event: SessionEvent): boolean {
+  if (event.type === "session.deleted") {
+    const id = eventSessionID(event)
+    if (id !== undefined) markSessionDeleted(key, id)
+    return false
+  }
+  return isDeletedSessionEvent(key, event)
 }

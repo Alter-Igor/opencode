@@ -128,6 +128,22 @@ const imports = (source: string, target: string) =>
 const importsModule = (source: string, module: string, inner = module) =>
   imports(source, `src/${module}`) || (inner !== module && imports(source, `src/${inner}`))
 
+const SPECIFIER = /(?:from\s+|import\s*\(\s*|import\s+)["']([^"']+)["']/g
+
+/** #224: true when a test under src/ imports src/<module> by a relative path or the `@/` alias (packages/app). */
+const importsByPath = (source: string, test: string, module: string, inner: string) => {
+  const targets = new Set([`src/${module}`, `src/${inner}`])
+  for (const [, spec] of source.matchAll(SPECIFIER)) {
+    const resolved = spec.startsWith("@/")
+      ? `src/${spec.slice(2)}`
+      : spec.startsWith(".")
+        ? path.posix.join(path.posix.dirname(test), spec)
+        : undefined
+    if (resolved && targets.has(resolved.replace(CODE, ""))) return true
+  }
+  return false
+}
+
 /** True when `source` imports the helper file `abs` by its name, or by its folder for an index file. */
 const importsHelper = (source: string, abs: string) => {
   const name = path.basename(abs).replace(CODE, "")
@@ -147,11 +163,11 @@ function mapToTests(pkg: string, rel: string): string[] {
   const helpers = helpersOf(pkg).filter((abs) => importsModule(readFileSync(abs, "utf8"), module, inner))
   return testsOf(pkg).filter((test) => {
     // #224: a test kept next to the code (src/<dir>/<name>.test.ts) maps from its own folder.
-    if (test.startsWith("src/"))
-      return (
-        (path.posix.dirname(test) === path.posix.dirname(rel) && path.posix.basename(test).startsWith(name)) ||
-        importsModule(readFileSync(path.join(root, pkg, test), "utf8"), module, inner)
-      )
+    if (test.startsWith("src/")) {
+      if (path.posix.dirname(test) === path.posix.dirname(rel) && path.posix.basename(test).startsWith(name)) return true
+      const source = readFileSync(path.join(root, pkg, test), "utf8")
+      return importsModule(source, module, inner) || importsByPath(source, test, module, inner)
+    }
     const testDir = path.posix.dirname(test.slice("test/".length))
     const testName = path.posix.basename(test)
     if (testDir === dir && testName.startsWith(name)) return true
