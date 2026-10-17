@@ -381,10 +381,21 @@ class SessionObserverManager {
     } catch {}
   }
 
+  /**
+   * Store a rule. With a `workspaceDir` it is written to BOTH stores, by design (#38): the global
+   * copy is what makes `synapse_record_learning` keep its promise that the rule guides "all
+   * future sessions", in any project; the project copy (`.system_generated/logs`, not committed)
+   * keeps it with that workspace. So a rule recorded in a project is live machine-wide, and a
+   * `forgetLearning` from the same workspace removes both copies. Without a `workspaceDir` only
+   * the global store is written. Automatic rules (buddy review findings) are mirrored too, which
+   * can carry one project's text into every project's prompt: an owner decision, #211. A store
+   * that cannot be read is left alone, never overwritten. `savedTo` names the stores actually
+   * written, so a caller never reports a rule as saved when it was not.
+   */
   public async recordLearning(
     learning: Omit<SessionLearning, "id" | "timestamp">,
     workspaceDir?: string,
-  ): Promise<SessionLearning> {
+  ): Promise<SessionLearning & { savedTo: Array<"global" | "project"> }> {
     const normalizedText = learning.lesson.trim().toLowerCase()
     const paths = learningStorePaths(workspaceDir)
     const files = [paths.global, paths.project].filter((file): file is string => Boolean(file))
@@ -394,16 +405,17 @@ class SessionObserverManager {
       ...learning,
     }
     let stored = entry
+    const savedTo: Array<"global" | "project"> = []
     await this.mutate(async () => {
       for (const file of files) {
         const scope: "global" | "project" = file === paths.project ? "project" : "global"
         try {
           await fs.mkdir(path.dirname(file), { recursive: true })
-          let existing: SessionLearning[] = []
-          try {
-            const parsed = JSON.parse(await fs.readFile(file, "utf8"))
-            if (Array.isArray(parsed)) existing = parsed
-          } catch {}
+          // #38: a store we cannot read is left alone. Writing one row over it would drop its
+          // other rules and the tombstones that keep forgotten rules forgotten.
+          const read = await readRuleStore(file)
+          if (read === "unreadable") continue
+          const existing: SessionLearning[] = read ?? []
           const found = existing.find((e) => e.lesson.trim().toLowerCase() === normalizedText)
           if (found) {
             // Re-recording refreshes recency AND moves the rule to the front, so it
@@ -415,14 +427,16 @@ class SessionObserverManager {
             found.deletedBy = undefined
             stored = found
             await writeJsonAtomic(file, trimRules([found, ...existing.filter((e) => e !== found)]))
+            savedTo.push(scope)
             continue
           }
           await writeJsonAtomic(file, trimRules([{ ...entry, scope }, ...existing]))
           stored = { ...entry, scope }
+          savedTo.push(scope)
         } catch {}
       }
     })
-    return stored
+    return { ...stored, savedTo }
   }
 
   /**
@@ -505,7 +519,10 @@ class SessionObserverManager {
   /**
    * Forget rules whose text matches (case-insensitive substring): mark them deleted
    * (tombstone) in both persisted stores. Returns the number of distinct rules newly
-   * forgotten; a rule present in both stores is counted once.
+   * forgotten; a rule present in both stores is counted once. A rule recorded in a project
+   * lives in both stores (see `recordLearning`), so one forget from that workspace removes both
+   * copies; from another workspace only the global copy is reached. If any
+   * store cannot be read, nothing is changed and 0 is returned (#38).
    */
   public async forgetLearning(lessonText: string, workspaceDir?: string): Promise<number> {
     const needle = lessonText.trim().toLowerCase()
@@ -515,54 +532,29 @@ class SessionObserverManager {
     const files = [paths.global, paths.project].filter((file): file is string => Boolean(file))
     // One mutation for both stores, so a record cannot interleave between them.
     return this.mutate(async () => {
-      const results: Array<{ keys: Set<string>; ok: boolean }> = []
-      for (const file of files) results.push(await this.applyTombstones(file, matches))
-      // If a store could not be read or written, we cannot claim its copy is gone, so
-      // report nothing rather than a count that may be wrong.
-      if (results.some((r) => !r.ok)) return 0
+      // #38: read and check every store before writing any. If a store cannot be read, we
+      // cannot claim its copy is gone, so we report nothing AND change nothing: a refused
+      // forget used to tombstone the global copy before it found the project store unreadable.
+      const stores: Array<{ file: string; rows: SessionLearning[] }> = []
+      for (const file of files) {
+        const read = await readRuleStore(file)
+        if (read === "unreadable") return 0
+        if (read) stores.push({ file, rows: read })
+      }
       const forgotten = new Set<string>()
-      for (const result of results) for (const key of result.keys) forgotten.add(key)
+      for (const store of stores) {
+        const keys = markForgotten(store.rows, matches)
+        if (keys.size === 0) continue
+        try {
+          await writeJsonAtomic(store.file, trimRules(store.rows))
+        } catch {
+          // A failed write leaves that copy live; an earlier store may already be written.
+          return 0
+        }
+        for (const key of keys) forgotten.add(key)
+      }
       return forgotten.size
     })
-  }
-
-  /**
-   * Mark matching live rules as deleted in one store. The rows are kept as
-   * tombstones so a later merge or sync cannot resurrect them. Non-queuing: the
-   * caller must already hold the mutation lock. Returns the keys acted on and
-   * whether the read and write both succeeded; an absent store is not a failure.
-   */
-  private async applyTombstones(
-    file: string,
-    matches: (l: SessionLearning) => boolean,
-  ): Promise<{ keys: Set<string>; ok: boolean }> {
-    const keys = new Set<string>()
-    let raw: string
-    try {
-      raw = await fs.readFile(file, "utf8")
-    } catch (error) {
-      // Only a missing store is a successful absence; any other read error means we
-      // cannot know what the store holds.
-      const code = error && typeof error === "object" && "code" in error ? (error as { code?: unknown }).code : undefined
-      return { keys, ok: code === "ENOENT" }
-    }
-    try {
-      const parsed = JSON.parse(raw)
-      if (!Array.isArray(parsed)) return { keys, ok: false }
-      const rows = parsed as SessionLearning[]
-      let changed = false
-      for (const row of rows) {
-        if (!isLive(row) || !matches(row)) continue
-        row.deletedAt = new Date().toISOString()
-        row.deletedBy = process.env.USERNAME || process.env.USER || "local"
-        keys.add(learningKey(row))
-        changed = true
-      }
-      if (changed) await writeJsonAtomic(file, trimRules(rows))
-      return { keys, ok: true }
-    } catch {
-      return { keys, ok: false }
-    }
   }
 
   public getLatestRetrospectives(): SessionRetrospective[] {
@@ -613,6 +605,48 @@ const learningKey = (l: SessionLearning) => String(l.lesson ?? "").trim().toLowe
 
 /** A rule is live unless it carries a tombstone. */
 const isLive = (l: SessionLearning) => !l.deletedAt
+
+/**
+ * One rule store's rows. `undefined`: the store does not exist, which is a real absence.
+ * `"unreadable"`: any other read error, bad JSON, or JSON that is not an array; we cannot know
+ * what the store holds.
+ */
+async function readRuleStore(file: string): Promise<SessionLearning[] | undefined | "unreadable"> {
+  let raw: string
+  try {
+    raw = await fs.readFile(file, "utf8")
+  } catch (error) {
+    const code = error && typeof error === "object" && "code" in error ? (error as { code?: unknown }).code : undefined
+    return code === "ENOENT" ? undefined : "unreadable"
+  }
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return "unreadable"
+    // A hand-edited or cut-off store can hold `[null]` or `[42]`; such a row would throw half
+    // way through a forget, after another store was already written (CodeRabbit on #38).
+    const valid = parsed.every(
+      (row) => !!row && typeof row === "object" && typeof (row as { lesson?: unknown }).lesson === "string",
+    )
+    return valid ? (parsed as SessionLearning[]) : "unreadable"
+  } catch {
+    return "unreadable"
+  }
+}
+
+/**
+ * Tombstone the matching live rows in place and return their keys. The rows are kept so a later
+ * merge or sync cannot resurrect them.
+ */
+function markForgotten(rows: SessionLearning[], matches: (l: SessionLearning) => boolean): Set<string> {
+  const keys = new Set<string>()
+  for (const row of rows) {
+    if (!isLive(row) || !matches(row)) continue
+    row.deletedAt = new Date().toISOString()
+    row.deletedBy = process.env.USERNAME || process.env.USER || "local"
+    keys.add(learningKey(row))
+  }
+  return keys
+}
 
 const MAX_LIVE_RULES = 100
 const MAX_TOMBSTONES = 100
