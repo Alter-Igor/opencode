@@ -44,6 +44,8 @@ describe("redactSecrets (#26)", () => {
       [`DefaultEndpointsProtocol=https;AccountKey=${fake("", "aB3+/", 44)};`, "DefaultEndpointsProtocol=https;AccountKey=[REDACTED:azure];"],
       [`Authorization: Bearer ${fake("", "aB3._~", 32)}`, "Authorization: Bearer [REDACTED:bearer]"],
       [`git clone https://deploy:${"s3cr3t" + "Passw0rd"}@git.example.com/x`, "git clone https://deploy:[REDACTED:url-credentials]@git.example.com/x"],
+      // CodeRabbit on #26: a raw "@" in the password; the query after the host is left alone.
+      [`https://u:${"p@ss" + "w0rd"}@db.example.com/x?next=a@b`, "https://u:[REDACTED:url-credentials]@db.example.com/x?next=a@b"],
       [slackApp, "[REDACTED:slack]"],
     ]
     for (const [input, expected] of cases) expect(redactSecrets(input)).toBe(expected)
