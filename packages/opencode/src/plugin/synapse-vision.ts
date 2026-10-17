@@ -92,9 +92,11 @@ export async function resolveVisionImage(
     throw new Error(`Image is too large (${approved.size} bytes). The limit is ${SYNAPSE_VISION_MAX_BYTES} bytes.`)
   }
   await beforeRead?.(real)
-  // #199: read the file that was approved. Open without following a link (where the OS allows
+  // #198: read the file that was approved. Open without following a link (where the OS allows
   // it) and check the handle is the same file, so swapping it after the ask reads nothing else.
-  const handle = await fs.open(real, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0))
+  // O_NONBLOCK: a named pipe swapped in before the open must not hang it (POSIX only).
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0)
+  const handle = await fs.open(real, flags)
   try {
     const opened = await handle.stat({ bigint: true })
     if (!opened.isFile() || opened.dev !== approved.dev || opened.ino !== approved.ino) {
@@ -111,7 +113,8 @@ export async function resolveVisionImage(
       if (bytesRead === 0) break
       length += bytesRead
     }
-    if (length > Number(opened.size)) throw new Error(`Image file changed after it was approved: ${real}`)
+    // A file that grew or shrank after the check is not the file that was approved.
+    if (length !== Number(opened.size)) throw new Error(`Image file changed after it was approved: ${real}`)
     const bytes = buffer.subarray(0, length)
     return { url: `data:${type};base64,${bytes.toString("base64")}`, label: target }
   } finally {
@@ -288,7 +291,7 @@ export async function saveImageForVision(
         },
       )
     } finally {
-      // #199: never leave a partial file behind, whether the write or the rename failed.
+      // #198: never leave a partial file behind, whether the write or the rename failed.
       if (!renamed) await fs.rm(partial, { force: true }).catch(() => undefined)
     }
   }

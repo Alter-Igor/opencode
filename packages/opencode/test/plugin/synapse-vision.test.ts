@@ -14,6 +14,22 @@ import { proxyUnsupportedImages } from "@/provider/vision-proxy"
 import { SynapseAuthPlugin } from "@/plugin/synapse"
 import { Global } from "@opencode-ai/core/global"
 import { pathToFileURL } from "url"
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "fs"
+
+// Windows without the symlink privilege cannot make links; the link tests are then skipped,
+// visibly, instead of passing without checking anything.
+const canSymlink = (() => {
+  const probe = mkdtempSync(path.join(os.tmpdir(), "vision-symlink-probe-"))
+  try {
+    writeFileSync(path.join(probe, "target"), "x")
+    symlinkSync(path.join(probe, "target"), path.join(probe, "link"))
+    return true
+  } catch {
+    return false
+  } finally {
+    rmSync(probe, { recursive: true, force: true })
+  }
+})()
 
 // 1x1 transparent PNG.
 const PNG_BASE64 =
@@ -73,18 +89,13 @@ describe("synapse_vision (#193)", () => {
     expect(seen).toEqual([await fs.realpath(file)])
   })
 
-  test("a link is checked at its real target, not at the link (#198)", async () => {
+  test.skipIf(!canSymlink)("a link is checked at its real target, not at the link (#198)", async () => {
     const outside = await fs.mkdtemp(path.join(os.tmpdir(), "vision-link-"))
     try {
       const real = path.join(outside, "secret.png")
       await fs.writeFile(real, Buffer.from(PNG_BASE64, "base64"))
       const link = path.join(dir, "link.png")
-      const linked = await fs.symlink(real, link).then(
-        () => true,
-        () => false,
-      )
-      // Windows without the symlink privilege cannot make one; the check then has nothing to prove.
-      if (!linked) return
+      await fs.symlink(real, link)
       const seen: string[] = []
       await resolveVisionImage("link.png", dir, async (f) => {
         seen.push(f)
@@ -95,7 +106,7 @@ describe("synapse_vision (#193)", () => {
     }
   })
 
-  test("a file swapped after the ask is not read (#199)", async () => {
+  test("a file swapped after the ask is not read (#198)", async () => {
     const file = path.join(dir, "shot.png")
     await fs.writeFile(file, Buffer.from(PNG_BASE64, "base64"))
     await expect(
@@ -110,7 +121,7 @@ describe("synapse_vision (#193)", () => {
     ).rejects.toThrow("changed after it was approved")
   })
 
-  test("a failed write leaves no partial file (#199)", async () => {
+  test("a failed write leaves no partial file (#198)", async () => {
     const saveDir = path.join(dir, "readonly")
     await fs.mkdir(saveDir)
     // A folder where the final name should go makes the rename fail on every OS.
@@ -320,14 +331,9 @@ describe("synapse_vision tool permissions (#193)", () => {
     } as never
   }
 
-  test("a project opened through a link is still inside the project (#199)", async () => {
+  test.skipIf(!canSymlink)("a project opened through a link is still inside the project (#198)", async () => {
     const link = `${project}-link`
-    const linked = await fs.symlink(project, link, "dir").then(
-      () => true,
-      () => false,
-    )
-    // Windows without the symlink privilege cannot make one; the check then has nothing to prove.
-    if (!linked) return
+    await fs.symlink(project, link, "dir")
     try {
       const asked: unknown[] = []
       const tool = await visionTool()
@@ -336,7 +342,8 @@ describe("synapse_vision tool permissions (#193)", () => {
       expect(asked).toHaveLength(0)
       expect(out).toContain("a red banner")
     } finally {
-      await fs.rm(link, { force: true, recursive: false }).catch(() => fs.unlink(link))
+      // A folder link on Windows is removed with rmdir; elsewhere unlink removes it.
+      await fs.unlink(link).catch(() => fs.rmdir(link)).catch(() => undefined)
     }
   })
 

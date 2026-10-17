@@ -2181,7 +2181,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
               // Same rule and pattern as src/tool/external-directory.ts (a non-git worktree is "/").
               const win = process.platform === "win32"
               const full = win ? FSUtil.normalizePath(file) : file
-              // `file` is already a real path (#199), so compare it with real roots too: a project
+              // `file` is already a real path (#198), so compare it with real roots too: a project
               // behind a link, or macOS's /var -> /private/var temp folder, must not ask.
               const real = async (root: string) =>
                 win ? FSUtil.normalizePath(root) : await fs.realpath(root).catch(() => root)
