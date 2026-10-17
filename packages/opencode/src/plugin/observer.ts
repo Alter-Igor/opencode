@@ -235,13 +235,9 @@ class SessionObserverManager {
   public onToolFailed(sessionId: string, callId: string, tool: string, error: string) {
     const record = this.trajectories.get(sessionId)?.find((r) => r.callId === callId && r.tool === tool)
     if (!record) return
-    if (NOT_A_FAILURE.some((prefix) => error.startsWith(prefix))) {
-      record.endTime ??= Date.now()
-      record.durationMs = record.endTime - record.startTime
-      return
-    }
     record.endTime ??= Date.now()
     record.durationMs = record.endTime - record.startTime
+    if (NOT_A_FAILURE.some((prefix) => error.startsWith(prefix))) return
     record.isError = true
     record.errorMessage = error.slice(0, 200)
   }
@@ -288,6 +284,11 @@ class SessionObserverManager {
     const records = this.trajectories.get(sessionId) ?? []
     const startTime = this.sessionStartTimes.get(sessionId) ?? Date.now()
     const endTime = Date.now()
+    // #209: a retrospective covers the calls since the last one. The records used to stay, so every
+    // later idle reported the same failures again, and a long-running server kept every call's
+    // arguments in memory for the life of the process.
+    this.trajectories.delete(sessionId)
+    this.sessionStartTimes.delete(sessionId)
 
     const anomalies: SessionAnomaly[] = []
     const learnings: string[] = []
