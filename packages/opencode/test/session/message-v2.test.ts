@@ -1530,6 +1530,22 @@ describe("session.message-v2.fromError", () => {
     expect(SessionV1.ContextOverflowError.isInstance(result)).toBe(true)
   })
 
+  test("detects Synapse context overflow from the body code or reason alone (#196)", () => {
+    for (const body of [{ error: { code: "context_overflow" } }, { error: { reason: "context_overflow" } }]) {
+      const error = new APICallError({
+        message: "Bad Request",
+        url: "https://synapse2-api.alterspective.com.au/v1/chat/completions",
+        requestBodyValues: {},
+        statusCode: 400,
+        responseHeaders: { "content-type": "application/json" },
+        responseBody: JSON.stringify(body),
+        isRetryable: false,
+      })
+      const result = MessageV2.fromError(error, { providerID })
+      expect(SessionV1.ContextOverflowError.isInstance(result)).toBe(true)
+    }
+  })
+
   test("does not classify 429 no body as context overflow", () => {
     const result = MessageV2.fromError(
       new APICallError({

@@ -21,4 +21,13 @@ describe("provider stream errors", () => {
         responseBody: JSON.stringify({ type: "error", error: { message } }),
       })
   })
+
+  test("classifies the Synapse context_overflow code in a stream error (#196)", () => {
+    const body = { type: "error", error: { code: "context_overflow", message: "Request estimated at 283070 tokens exceeds the largest feasible context window (272000)." } }
+    expect(ProviderError.parseStreamError(body)).toEqual({
+      type: "context_overflow",
+      message: "Input exceeds context window of this model",
+      responseBody: JSON.stringify(body),
+    })
+  })
 })
