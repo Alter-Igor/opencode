@@ -31,7 +31,11 @@ describe("provider error classification", () => {
   })
 
   test("does not classify a longer name that contains context_overflow (#196)", () => {
-    const messages = ["Unknown parameter: context_overflow_policy", "prevent_context_overflow must be a boolean"]
+    const messages = [
+      "Unknown parameter: context_overflow_policy",
+      "prevent_context_overflow must be a boolean",
+      "Unknown parameter: context_overflow",
+    ]
 
     expect(messages.some(isContextOverflow)).toBe(false)
   })

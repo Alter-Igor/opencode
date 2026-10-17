@@ -20,7 +20,7 @@ const patterns = [
   /context window exceeds limit/i,
   /exceeded model token limit/i,
   /context[_ ]length[_ ]exceeded/i,
-  /\bcontext_overflow\b/i, // Synapse's code (#196); \b keeps names like context_overflow_policy out
+  /"(?:code|reason)"\s*:\s*"context_overflow"/i, // Synapse's code or reason as JSON (#196); plain text such as a parameter name does not match
   /request entity too large/i,
   /context length is only \d+ tokens/i,
   /input length.*exceeds.*context length/i,
