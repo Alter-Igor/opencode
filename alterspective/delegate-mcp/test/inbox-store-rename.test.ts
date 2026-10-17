@@ -1,7 +1,7 @@
 // #190: the inbox store's atomic state save retries a rename that Windows refuses for a moment
 // (antivirus or the indexer holding state.json open). Seen as EPERM in the full suite.
 import { describe, expect, test } from "bun:test"
-import { renameWithRetry, RENAME_RETRY_DELAYS_MS } from "../inbox-sidecar/src/store.ts"
+import { renameWithRetry } from "../inbox-sidecar/src/store.ts"
 
 const fsError = (code: string) => Object.assign(new Error(`${code}: rename`), { code })
 
@@ -18,7 +18,7 @@ describe("inbox store: renameWithRetry (#190)", () => {
         sleep: (ms) => waits.push(ms),
       })
       expect(calls).toBe(3)
-      expect(waits).toEqual(RENAME_RETRY_DELAYS_MS.slice(0, 2))
+      expect(waits).toEqual([10, 20]) // the documented waits, pinned (CodeRabbit on #194)
     }
   })
 
@@ -48,8 +48,8 @@ describe("inbox store: renameWithRetry (#190)", () => {
         sleep: (ms) => waits.push(ms),
       })
     expect(run).toThrow("EPERM")
-    expect(calls).toBe(RENAME_RETRY_DELAYS_MS.length + 1)
-    expect(waits).toEqual([...RENAME_RETRY_DELAYS_MS])
+    expect(calls).toBe(5)
+    expect(waits).toEqual([10, 20, 40, 80])
   })
 
   test("the store's state save goes through the retry: a refused first rename still writes state.json", async () => {
