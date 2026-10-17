@@ -698,8 +698,7 @@ function trimRules(rows: SessionLearning[]): SessionLearning[] {
   ]
 }
 
-/** Write JSON via a temp file + rename so a reader never sees a half-written file. */
-/** Write a rule store through a temp file and a rename. Exported for tests (#217). */
+/** Write a rule store through a temp file and a rename, so a reader never sees a half-written file. Exported for tests (#217). */
 export async function writeJsonAtomic(file: string, rows: SessionLearning[]): Promise<void> {
   const tmp = `${file}.${process.pid}.${Math.random().toString(36).slice(2, 7)}.tmp`
   try {
