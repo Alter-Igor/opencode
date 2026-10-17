@@ -639,6 +639,27 @@ describe("rule visibility", () => {
     }
   })
 
+  test("a write whose lock cannot be taken still saves where it can and logs lock_failed (#217)", async () => {
+    await using home = await tmpdir()
+    await using ws = await tmpdir()
+    const prev = process.env.OPENCODE_TEST_HOME
+    process.env.OPENCODE_TEST_HOME = home.path
+    try {
+      // A file where the global store's folder should be: the lock folder cannot be made there.
+      const folder = path.dirname(learningStorePaths(ws.path).global!)
+      await fs.mkdir(path.dirname(folder), { recursive: true })
+      await fs.writeFile(folder, "not a folder", "utf8")
+      const recorded = await sessionObserver.recordLearning({ lesson: "saved without the lock", source: "user_feedback" }, ws.path)
+      expect(recorded.savedTo).toEqual(["project"])
+      const failed = sessionObserver
+        .getDiagnosticLogs()
+        .filter((e) => e.type === "LEARNING_STORE" && e.details.event === "lock_failed" && e.details.file === learningStorePaths(ws.path).global)
+      expect(failed.length).toBeGreaterThan(0)
+    } finally {
+      restoreTestHome(prev)
+    }
+  })
+
   test(
     "two processes recording rules at once lose none of them (#217)",
     async () => {

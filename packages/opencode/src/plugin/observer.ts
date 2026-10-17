@@ -774,12 +774,30 @@ function trimRules(rows: SessionLearning[]): SessionLearning[] {
   ]
 }
 
+/**
+ * #217: on Windows a rename onto a file another handle has open (antivirus, the indexer, a
+ * reader in another process) fails with EPERM, EBUSY or EACCES for a moment; QA saw 3 of 6
+ * single-process runs of 120 writes lose a rule this way. Retry those briefly; anything else, or
+ * the last attempt, throws.
+ */
+async function renameWithRetry(from: string, to: string): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fs.rename(from, to)
+    } catch (error) {
+      const code = error && typeof error === "object" && "code" in error ? (error as { code?: unknown }).code : undefined
+      if (attempt >= 5 || (code !== "EPERM" && code !== "EBUSY" && code !== "EACCES")) throw error
+      await new Promise((resolve) => setTimeout(resolve, 20 * 2 ** attempt))
+    }
+  }
+}
+
 /** Write a rule store through a temp file and a rename, so a reader never sees a half-written file. Exported for tests (#217). */
 export async function writeJsonAtomic(file: string, rows: SessionLearning[]): Promise<void> {
   const tmp = `${file}.${process.pid}.${Math.random().toString(36).slice(2, 7)}.tmp`
   try {
     await fs.writeFile(tmp, JSON.stringify(rows, null, 2), "utf8")
-    await fs.rename(tmp, file)
+    await renameWithRetry(tmp, file)
   } catch (error) {
     // #217: a failed rename (Windows EPERM/EBUSY) used to leave learnings.json.*.tmp behind.
     await fs.rm(tmp, { force: true }).catch(() => {})
