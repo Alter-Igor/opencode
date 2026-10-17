@@ -454,6 +454,100 @@ describe("rule visibility", () => {
     }
   })
 
+  test("a refused forget says why: an unreadable store (#212)", async () => {
+    await using home = await tmpdir()
+    await using ws = await tmpdir()
+    const prev = process.env.OPENCODE_TEST_HOME
+    process.env.OPENCODE_TEST_HOME = home.path
+    try {
+      await sessionObserver.recordLearning({ lesson: "why refused", source: "user_feedback" }, ws.path)
+      await fs.writeFile(learningStorePaths(ws.path).project!, "[bad", "utf8")
+      expect(await sessionObserver.forgetLearningResult("why refused", ws.path)).toEqual({ forgotten: 0, refused: "unreadable" })
+      expect(await sessionObserver.forgetLearningResult("no such rule", ws.path)).toEqual({ forgotten: 0, refused: "unreadable" })
+    } finally {
+      restoreTestHome(prev)
+    }
+  })
+
+  // chmod does not stop writes on Windows.
+  test.skipIf(process.platform === "win32")(
+    "a forget whose second write fails puts the first store back (#212)",
+    async () => {
+      await using home = await tmpdir()
+      await using ws = await tmpdir()
+      const prev = process.env.OPENCODE_TEST_HOME
+      process.env.OPENCODE_TEST_HOME = home.path
+      const projectDir = path.dirname(learningStorePaths(ws.path).project!)
+      try {
+        await sessionObserver.recordLearning({ lesson: "roll me back", source: "user_feedback" }, ws.path)
+        await fs.chmod(projectDir, 0o555)
+        // Root ignores the mode; then this case cannot be set up here.
+        const probe = path.join(projectDir, "probe")
+        if (await fs.writeFile(probe, "x").then(() => true, () => false)) {
+          await fs.rm(probe)
+          return
+        }
+
+        expect(await sessionObserver.forgetLearningResult("roll me back", ws.path)).toEqual({
+          forgotten: 0,
+          refused: "write_failed",
+          restored: true,
+        })
+        const global = JSON.parse(await fs.readFile(learningStorePaths().global!, "utf8")) as Array<{
+          lesson: string
+          deletedAt?: string
+        }>
+        expect(global.find((l) => l.lesson === "roll me back")?.deletedAt).toBeUndefined()
+      } finally {
+        await fs.chmod(projectDir, 0o755).catch(() => {})
+        restoreTestHome(prev)
+      }
+    },
+  )
+
+  test("listing and injection skip a store with a malformed row instead of throwing (#212)", async () => {
+    await using home = await tmpdir()
+    await using ws = await tmpdir()
+    const prev = process.env.OPENCODE_TEST_HOME
+    process.env.OPENCODE_TEST_HOME = home.path
+    try {
+      await sessionObserver.recordLearning({ lesson: "global survives", source: "user_feedback" })
+      const project = learningStorePaths(ws.path).project!
+      await fs.mkdir(path.dirname(project), { recursive: true })
+      await fs.writeFile(project, JSON.stringify([null]), "utf8")
+
+      expect((await sessionObserver.listLearnings(ws.path)).map((l) => l.lesson)).toContain("global survives")
+      expect((await sessionObserver.getRecentLearnings(5, ws.path)).map((l) => l.lesson)).toContain("global survives")
+    } finally {
+      restoreTestHome(prev)
+    }
+  })
+
+  test("synapse_forget_rule does not say 'No rule matched' when a store is unreadable (#212)", async () => {
+    await using home = await tmpdir()
+    await using ws = await tmpdir()
+    const prev = process.env.OPENCODE_TEST_HOME
+    process.env.OPENCODE_TEST_HOME = home.path
+    try {
+      await sessionObserver.recordLearning({ lesson: "still here", source: "user_feedback" }, ws.path)
+      await fs.writeFile(learningStorePaths(ws.path).project!, "[bad", "utf8")
+      const hooks = await SynapseAuthPlugin({
+        client: {} as never,
+        project: {} as never,
+        directory: ws.path,
+        worktree: "",
+        experimental_workspace: { register() {} },
+        serverUrl: new URL("https://example.com"),
+        $: {} as never,
+      } as never)
+      const reply = String(await hooks.tool?.synapse_forget_rule?.execute({ lesson: "still here" }, {} as never))
+      expect(reply).toContain("could not be read")
+      expect(reply).not.toContain("No rule matched")
+    } finally {
+      restoreTestHome(prev)
+    }
+  })
+
   test("a rule recorded in a project is mirrored to the global store by design (#38)", async () => {
     await using home = await tmpdir()
     await using ws = await tmpdir()
