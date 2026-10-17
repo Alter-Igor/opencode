@@ -14,6 +14,38 @@ import path from "node:path"
 import { EPOCH, SUPERVISOR_ADDRESS, type StoredMessage } from "./rules.ts"
 import { SegmentLog } from "./segments.ts"
 
+/** Waits before each retry of a refused rename (150 ms in all). */
+export const RENAME_RETRY_DELAYS_MS = [10, 20, 40, 80] as const
+
+/** Codes Windows returns while another process (antivirus, the indexer) briefly holds the file. */
+const TRANSIENT_RENAME = new Set(["EPERM", "EBUSY", "EACCES"])
+
+/**
+ * #190: `renameSync`, retried on a transient Windows refusal. On Windows, replacing state.json fails
+ * with EPERM while something holds it open for a moment; it clears within milliseconds. The store's
+ * API is synchronous, so the wait is synchronous too. Any other error, or a lock that outlasts every
+ * retry, is thrown as before. On Linux (the box) the first rename succeeds and nothing changes.
+ */
+export function renameWithRetry(
+  from: string,
+  to: string,
+  io: { rename?: (from: string, to: string) => void; sleep?: (ms: number) => void } = {},
+): void {
+  const rename = io.rename ?? renameSync
+  const sleep = io.sleep ?? ((ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms))
+  for (let attempt = 0; ; attempt++) {
+    try {
+      rename(from, to)
+      return
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      const delay = RENAME_RETRY_DELAYS_MS[attempt]
+      if (delay === undefined || !code || !TRANSIENT_RENAME.has(code)) throw error
+      sleep(delay)
+    }
+  }
+}
+
 export type StoreOptions = {
   dir: string
   /** Start a new segment once the current one reaches this size. Default 10 MB. */
@@ -116,7 +148,7 @@ export class InboxStore {
     } finally {
       closeSync(fd)
     }
-    renameSync(temp, file)
+    renameWithRetry(temp, file)
   }
 
   #loadLine(line: string, series: Series): number | undefined {
