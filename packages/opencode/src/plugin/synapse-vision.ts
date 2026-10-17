@@ -1,6 +1,7 @@
 import * as fs from "fs/promises"
 import * as path from "path"
-import { createHash } from "crypto"
+import { createHash, randomUUID } from "crypto"
+import { fileURLToPath } from "url"
 import { Global } from "@opencode-ai/core/global"
 
 /**
@@ -63,18 +64,63 @@ export async function resolveVisionImage(
   if (value.startsWith("data:")) throw new Error("Only base64 image data URLs are supported (data:image/...;base64,...).")
   if (/^https?:\/\//i.test(value)) return { url: value, label: value }
 
-  const file = value.replace(/^file:\/\/\/?/i, "")
+  // #198: a file URL keeps its leading slash on POSIX (file:///etc/x.png is /etc/x.png).
+  let file = value
+  if (/^file:/i.test(value)) {
+    try {
+      file = fileURLToPath(value)
+    } catch {
+      throw new Error(`Not a valid file URL: ${value}`)
+    }
+  }
   const target = path.isAbsolute(file) ? file : path.join(directory || process.cwd(), file)
-  const type = IMAGE_TYPES[path.extname(target).toLowerCase()]
-  if (!type) throw new Error(`Not a supported image file: ${target}. Use .png, .jpg, .jpeg, .gif, .webp or .bmp.`)
+  if (!IMAGE_TYPES[path.extname(target).toLowerCase()]) {
+    throw new Error(`Not a supported image file: ${target}. Use .png, .jpg, .jpeg, .gif, .webp or .bmp.`)
+  }
   const stat = await fs.stat(target).catch(() => undefined)
   if (!stat?.isFile()) throw new Error(`Image file not found: ${target}`)
-  if (stat.size > SYNAPSE_VISION_MAX_BYTES) {
-    throw new Error(`Image is too large (${stat.size} bytes). The limit is ${SYNAPSE_VISION_MAX_BYTES} bytes.`)
+  // #198: check and read the real file, so a link inside the project cannot reach outside it
+  // without the permission ask.
+  const real = await fs.realpath(target)
+  const type = IMAGE_TYPES[path.extname(real).toLowerCase()]
+  if (!type) throw new Error(`Not a supported image file: ${real}. Use .png, .jpg, .jpeg, .gif, .webp or .bmp.`)
+  // lstat: a link put at this path after realpath is refused before the ask, not followed.
+  // bigint: NTFS file ids can exceed Number.MAX_SAFE_INTEGER.
+  const approved = await fs.lstat(real, { bigint: true })
+  if (!approved.isFile()) throw new Error(`Image file not found: ${real}`)
+  if (approved.size > BigInt(SYNAPSE_VISION_MAX_BYTES)) {
+    throw new Error(`Image is too large (${approved.size} bytes). The limit is ${SYNAPSE_VISION_MAX_BYTES} bytes.`)
   }
-  await beforeRead?.(target)
-  const bytes = await fs.readFile(target)
-  return { url: `data:${type};base64,${bytes.toString("base64")}`, label: target }
+  await beforeRead?.(real)
+  // #198: read the file that was approved. Open without following a link (where the OS allows
+  // it) and check the handle is the same file, so swapping it after the ask reads nothing else.
+  // O_NONBLOCK: a named pipe swapped in before the open must not hang it (POSIX only).
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0)
+  const handle = await fs.open(real, flags)
+  try {
+    const opened = await handle.stat({ bigint: true })
+    if (!opened.isFile() || opened.dev !== approved.dev || opened.ino !== approved.ino) {
+      throw new Error(`Image file changed after it was approved: ${real}`)
+    }
+    if (opened.size > BigInt(SYNAPSE_VISION_MAX_BYTES)) {
+      throw new Error(`Image is too large (${opened.size} bytes). The limit is ${SYNAPSE_VISION_MAX_BYTES} bytes.`)
+    }
+    // Read at most one byte over the limit, so a file that grew after the check is refused.
+    const buffer = Buffer.alloc(Number(opened.size) + 1)
+    let length = 0
+    while (length < buffer.length) {
+      const { bytesRead } = await handle.read(buffer, length, buffer.length - length, length)
+      if (bytesRead === 0) break
+      length += bytesRead
+    }
+    // A file that grew or shrank after the check is not the file that was approved.
+    if (length !== Number(opened.size)) throw new Error(`Image file changed after it was approved: ${real}`)
+    const bytes = buffer.subarray(0, length)
+    return { url: `data:${type};base64,${bytes.toString("base64")}`, label: target }
+  } finally {
+    // A failed close must not hide the real error.
+    await handle.close().catch(() => undefined)
+  }
 }
 
 /** Where images a text-only model cannot see are saved for the tool (see saveImageForVision). */
@@ -177,7 +223,8 @@ function imageBytes(value: string, mediaType: string): { bytes: Buffer; mediaTyp
   return { bytes, mediaType: match ? match[1] : mediaType }
 }
 
-const swept = new Set<string>()
+// One sweep per folder per process; every save in that folder waits for it (#198).
+const sweeps = new Map<string, Promise<void>>()
 
 /** Best effort: delete saved images older than `keepMs`. Errors are ignored. */
 async function sweepOldImages(dir: string, keepMs: number): Promise<void> {
@@ -212,25 +259,41 @@ export async function saveImageForVision(
   const ext = EXTENSIONS[decoded.mediaType.toLowerCase()]
   if (!ext) return undefined
   await fs.mkdir(dir, { recursive: true, mode: 0o700 })
-  if (!swept.has(dir)) {
-    swept.add(dir)
-    // mkdir's mode does not tighten a folder that already exists.
-    await fs.chmod(dir, 0o700).catch(() => undefined)
-    await sweepOldImages(dir, keepMs)
+  let sweep = sweeps.get(dir)
+  if (!sweep) {
+    sweep = (async () => {
+      // mkdir's mode does not tighten a folder that already exists.
+      await fs.chmod(dir, 0o700).catch(() => undefined)
+      await sweepOldImages(dir, keepMs)
+    })()
+    sweeps.set(dir, sweep)
   }
+  await sweep
   const file = path.join(dir, createHash("sha256").update(decoded.bytes).digest("hex").slice(0, 32) + ext)
   const exists = await fs.stat(file).then(
     (stat) => stat.size === decoded.bytes.length,
     () => false,
   )
   if (!exists) {
-    // Write then rename, so a concurrent step never reads a half-written file.
-    const partial = `${file}.${process.pid}.${Date.now()}.tmp`
-    await fs.writeFile(partial, decoded.bytes, { mode: 0o600 })
-    await fs.rename(partial, file).catch(async (error) => {
-      await fs.rm(partial, { force: true }).catch(() => undefined)
-      if (!(await fs.stat(file).catch(() => undefined))) throw error
-    })
+    // Write a file only this call owns, then rename, so a concurrent step never reads a
+    // half-written file (#198).
+    const partial = `${file}.${process.pid}.${randomUUID()}.tmp`
+    let renamed = false
+    try {
+      await fs.writeFile(partial, decoded.bytes, { mode: 0o600, flag: "wx" })
+      await fs.rename(partial, file).then(
+        () => {
+          renamed = true
+        },
+        async (error) => {
+          // Another save may have put the same image there first; that is fine.
+          if (!(await fs.stat(file).then((stat) => stat.isFile(), () => false))) throw error
+        },
+      )
+    } finally {
+      // #198: never leave a partial file behind, whether the write or the rename failed.
+      if (!renamed) await fs.rm(partial, { force: true }).catch(() => undefined)
+    }
   }
   return file
 }
