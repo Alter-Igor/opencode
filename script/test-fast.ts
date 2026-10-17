@@ -105,14 +105,20 @@ function helpersOf(pkg: string): string[] {
   return helpers
 }
 
-/** True when `source` imports `src/<module>` (with or without its extension). */
-const importsModule = (source: string, module: string) =>
-  ["", ".ts", ".tsx"].some((ext) => [`"`, `'`].some((quote) => source.includes(`src/${module}${ext}${quote}`)))
+/** The extensions an import may carry: none, or one CODE accepts (CodeRabbit on #218). */
+const IMPORT_EXTS = ["", ".ts", ".tsx", ".js", ".mjs", ".cjs"]
+const imports = (source: string, target: string) =>
+  IMPORT_EXTS.some((ext) => [`"`, `'`].some((quote) => source.includes(`${target}${ext}${quote}`)))
 
-/** True when `source` imports the helper file `abs` by its name (with or without its extension). */
+/** True when `source` imports `src/<module>`; `inner` is the path with an explicit `/index` kept. */
+const importsModule = (source: string, module: string, inner = module) =>
+  imports(source, `src/${module}`) || (inner !== module && imports(source, `src/${inner}`))
+
+/** True when `source` imports the helper file `abs` by its name, or by its folder for an index file. */
 const importsHelper = (source: string, abs: string) => {
   const name = path.basename(abs).replace(CODE, "")
-  return ["", ".ts", ".tsx"].some((ext) => [`"`, `'`].some((quote) => source.includes(`/${name}${ext}${quote}`)))
+  if (imports(source, `/${name}`)) return true
+  return name === "index" && imports(source, `/${path.basename(path.dirname(abs))}`)
 }
 
 /** Test files (relative to the package) mapped to one changed file (relative to the package). */
@@ -124,7 +130,7 @@ function mapToTests(pkg: string, rel: string): string[] {
   const name = path.posix.basename(inner)
   const first = dir === "." ? "" : dir.split("/")[0]
   const module = inner.endsWith("/index") ? inner.slice(0, -"/index".length) : inner
-  const helpers = helpersOf(pkg).filter((abs) => importsModule(readFileSync(abs, "utf8"), module))
+  const helpers = helpersOf(pkg).filter((abs) => importsModule(readFileSync(abs, "utf8"), module, inner))
   return testsOf(pkg).filter((test) => {
     const testDir = path.posix.dirname(test.slice("test/".length))
     const testName = path.posix.basename(test)
@@ -134,7 +140,7 @@ function mapToTests(pkg: string, rel: string): string[] {
     if (testDir === "." && testName.startsWith(name)) return true
     // A direct import of the changed module, or of a test helper that imports it.
     const source = readFileSync(path.join(root, pkg, test), "utf8")
-    return importsModule(source, module) || helpers.some((abs) => importsHelper(source, abs))
+    return importsModule(source, module, inner) || helpers.some((abs) => importsHelper(source, abs))
   })
 }
 
