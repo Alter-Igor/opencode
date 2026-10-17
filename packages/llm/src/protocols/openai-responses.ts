@@ -906,7 +906,11 @@ const providerError = (event: OpenAIResponsesEvent, fallback: string) => {
   const message = providerErrorMessage(event, fallback)
   return LLMEvent.providerError({
     message,
-    classification: code === "context_length_exceeded" || isContextOverflow(message) ? "context-overflow" : undefined,
+    // context_overflow: Synapse's code (#196, #200); the text pattern only matches it in JSON form.
+    classification:
+      code === "context_length_exceeded" || code === "context_overflow" || isContextOverflow(message)
+        ? "context-overflow"
+        : undefined,
   })
 }
 
