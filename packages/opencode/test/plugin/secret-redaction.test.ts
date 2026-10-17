@@ -202,3 +202,18 @@ describe("observer redactSensitiveData (#26)", () => {
     expect(redactSensitiveData(`ran: echo ${KEYS.openrouter}`)).toBe("ran: echo [REDACTED:openrouter]")
   })
 })
+
+describe("opencode import (#207)", () => {
+  test("import.ts redacts each tool part before it inserts it (a direct PartTable insert skips Session.updatePart)", async () => {
+    const source = await Bun.file(new URL("../../src/cli/cmd/import.ts", import.meta.url)).text()
+    const redact = source.indexOf("redactToolPart(partInfo)")
+    expect(redact).toBeGreaterThan(-1)
+    expect(redact).toBeLessThan(source.indexOf(".insert(PartTable)"))
+  })
+
+  test("a decoded imported tool part is redacted in place", () => {
+    const part = { type: "tool", state: { status: "completed", input: { command: "env" }, output: `KEY=${KEYS.openrouter}` } }
+    expect(redactToolPart(part)).toBe(1)
+    expect(part.state.output).toBe("KEY=[REDACTED:openrouter]")
+  })
+})
