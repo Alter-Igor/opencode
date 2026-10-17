@@ -2041,9 +2041,14 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
         async execute(args) {
           const needle = (args.lesson || "").trim()
           if (!needle) return "Please provide the rule text to remove."
-          const removed = await sessionObserver.forgetLearning(needle, input.directory)
-          return removed > 0
-            ? 'Removed ' + removed + ' rule(s) matching "' + needle + '". They will not be applied in future sessions.'
+          const result = await sessionObserver.forgetLearningResult(needle, input.directory)
+          // #212: a refused forget is not "no match"; the rule may still be there.
+          if (result.refused === "unreadable")
+            return 'Could not remove rules matching "' + needle + '": a rule store could not be read, so nothing was changed. The rule may still apply.'
+          if (result.refused === "write_failed")
+            return 'Could not remove rules matching "' + needle + '": a rule store could not be written, so nothing was changed. Try again.'
+          return result.forgotten > 0
+            ? 'Removed ' + result.forgotten + ' rule(s) matching "' + needle + '". They will not be applied in future sessions.'
             : 'No rule matched "' + needle + '". Use synapse_list_rules to see the recorded rules.'
         },
       }),      synapse_buddy_review: tool({
