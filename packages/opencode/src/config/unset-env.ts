@@ -13,7 +13,7 @@ const ENV_TOKEN = /\{env:([^}]+)\}/g
 export function unsetEnvReferences(text: string, env?: Record<string, string>): string[] {
   const names: string[] = []
   for (const match of text.matchAll(ENV_TOKEN)) {
-    const name = match[1]!
+    const name = match[1]
     if (names.includes(name)) continue
     const lineStart = text.lastIndexOf("\n", (match.index ?? 0) - 1) + 1
     if (text.slice(lineStart, match.index).trimStart().startsWith("//")) continue
