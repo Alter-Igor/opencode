@@ -15,6 +15,8 @@ export const SYNAPSE_VISION_MAX_BYTES = 20 * 1024 * 1024
 export const SYNAPSE_VISION_TIMEOUT_MS = 120_000
 /** Vision models on Synapse may reason first; a small budget leaves the answer empty. */
 export const SYNAPSE_VISION_MAX_TOKENS = 4000
+/** Saved images older than this are deleted the first time an image is saved in a process. */
+export const SYNAPSE_VISION_KEEP_MS = 7 * 24 * 60 * 60 * 1000
 
 const IMAGE_TYPES: Record<string, string> = {
   ".png": "image/png",
@@ -32,18 +34,6 @@ const EXTENSIONS: Record<string, string> = {
   "image/gif": ".gif",
   "image/webp": ".webp",
   "image/bmp": ".bmp",
-}
-
-// Set by the Synapse plugin once it is loaded and Synapse is configured, so the vision proxy
-// only points a model at the tool when the tool can actually run.
-let visionReady = false
-
-export function markSynapseVisionReady(ready: boolean): void {
-  visionReady = ready
-}
-
-export function synapseVisionReady(): boolean {
-  return visionReady
 }
 
 export interface SynapseVisionTarget {
@@ -90,12 +80,6 @@ export async function resolveVisionImage(
 /** Where images a text-only model cannot see are saved for the tool (see saveImageForVision). */
 export function visionImageDir(): string {
   return path.join(Global.Path.tmp, "vision")
-}
-
-/** True when `file` is `root` or inside it. Windows compares case-insensitively. */
-export function isInsideDir(file: string, root: string): boolean {
-  const rel = path.relative(path.resolve(root), path.resolve(file))
-  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel))
 }
 
 /** The OpenAI-shape request: the question first, then the image, in one user message. */
@@ -193,28 +177,58 @@ function imageBytes(value: string, mediaType: string): { bytes: Buffer; mediaTyp
   return { bytes, mediaType: match ? match[1] : mediaType }
 }
 
+const swept = new Set<string>()
+
+/** Best effort: delete saved images older than `keepMs`. Errors are ignored. */
+async function sweepOldImages(dir: string, keepMs: number): Promise<void> {
+  const names = await fs.readdir(dir).catch(() => [] as string[])
+  const cutoff = Date.now() - keepMs
+  await Promise.all(
+    names.map(async (name) => {
+      const file = path.join(dir, name)
+      const stat = await fs.stat(file).catch(() => undefined)
+      if (stat?.isFile() && stat.mtimeMs < cutoff) await fs.rm(file, { force: true }).catch(() => undefined)
+    }),
+  )
+}
+
 /**
  * Save an image a text-only model cannot see, so the agent can pass the path to
  * `synapse_vision`. Named by content hash: the same image on every step reuses one file.
- * Returns the path, the URL itself for an http(s) image, or undefined when nothing usable.
+ * The folder and files are private to the user (they may be client-confidential screenshots),
+ * and files older than SYNAPSE_VISION_KEEP_MS are deleted once per process.
+ * Returns the path, the URL itself for an http(s) image, or undefined when the image is empty,
+ * not a type the tool accepts (e.g. SVG), or larger than SYNAPSE_VISION_MAX_BYTES.
  */
 export async function saveImageForVision(
   value: string,
   mediaType = "image/png",
   dir: string = visionImageDir(),
+  keepMs: number = SYNAPSE_VISION_KEEP_MS,
 ): Promise<string | undefined> {
   if (/^https?:\/\//i.test(value)) return value
   const decoded = imageBytes(value, mediaType)
-  if (!decoded) return undefined
-  const ext = EXTENSIONS[decoded.mediaType.toLowerCase()] ?? ".png"
+  if (!decoded || decoded.bytes.length > SYNAPSE_VISION_MAX_BYTES) return undefined
+  const ext = EXTENSIONS[decoded.mediaType.toLowerCase()]
+  if (!ext) return undefined
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 })
+  if (!swept.has(dir)) {
+    swept.add(dir)
+    await sweepOldImages(dir, keepMs)
+  }
   const file = path.join(dir, createHash("sha256").update(decoded.bytes).digest("hex").slice(0, 32) + ext)
   const exists = await fs.stat(file).then(
     (stat) => stat.size === decoded.bytes.length,
     () => false,
   )
   if (!exists) {
-    await fs.mkdir(dir, { recursive: true })
-    await fs.writeFile(file, decoded.bytes)
+    // Write then rename, so a concurrent step never reads a half-written file.
+    const partial = `${file}.${process.pid}.${Date.now()}.tmp`
+    await fs.writeFile(partial, decoded.bytes, { mode: 0o600 })
+    await fs.rename(partial, file).catch(async (error) => {
+      await fs.rm(partial, { force: true }).catch(() => undefined)
+      if (!(await fs.stat(file).catch(() => undefined))) throw error
+    })
   }
   return file
 }

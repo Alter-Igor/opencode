@@ -1,6 +1,6 @@
 ﻿import type { ModelMessage } from "ai"
 import type * as Provider from "./provider"
-import { saveImageForVision, synapseVisionReady, visionNote } from "@/plugin/synapse-vision"
+import { SYNAPSE_VISION_TOOL, saveImageForVision, visionNote } from "@/plugin/synapse-vision"
 
 export interface VisionProxyConfig {
   model: string
@@ -166,13 +166,16 @@ export async function proxyUnsupportedImages(
   providerOptions: Record<string, unknown> | undefined,
   providerInfo: { api?: { url?: string }; options?: { apiKey?: string; baseURL?: string } } | undefined,
   globalConfig: { provider?: Record<string, { options?: Record<string, unknown> }> } | undefined,
+  /** Tool names this request offers the model; the note is only added when synapse_vision is one. */
+  toolNames?: Iterable<string>,
 ): Promise<ModelMessage[]> {
   if (model.capabilities.input.image) return msgs
 
   const proxyConfig = getVisionProxyConfig(providerOptions, globalConfig)
   // #193: with no vision_proxy configured, a Synapse user gets the image as a saved file and a
   // note to ask the synapse_vision tool about it, instead of an error the model cannot act on.
-  const synapseEyes = !proxyConfig && synapseVisionReady()
+  const synapseEyes =
+    !proxyConfig && Boolean(globalConfig?.provider?.synapse) && new Set(toolNames ?? []).has(SYNAPSE_VISION_TOOL)
   if (!proxyConfig && !synapseEyes) return msgs
 
   // If the proxy config doesn't include its own apiKey, try the provider's
@@ -200,7 +203,7 @@ export async function proxyUnsupportedImages(
             type: "text",
             text: location
               ? visionNote(location, imageLike.filename)
-              : "[Image was provided but could not be saved for the synapse_vision tool.]",
+              : "[An image was provided but could not be prepared for the synapse_vision tool (empty, an unsupported type such as SVG, or larger than 20 MB). Tell the user; do not guess what it shows.]",
           })
           continue
         }

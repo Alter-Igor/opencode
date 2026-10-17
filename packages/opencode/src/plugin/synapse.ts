@@ -7,6 +7,7 @@ import { OauthCallbackPage } from "@opencode-ai/core/oauth/page"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { Global } from "@opencode-ai/core/global"
 import { Flock } from "@opencode-ai/core/util/flock"
+import { FSUtil } from "@opencode-ai/core/fs-util"
 import { INJECTED_LEARNINGS_LIMIT, learningStorePaths, sessionObserver, sanitizeJsonSchemaForOpenAI } from "./observer"
 import { EscalationTracker, declaredTier, classifyFailure, malformedToolCallFromEvent } from "./synapse-escalation"
 import {
@@ -36,8 +37,6 @@ import {
 import {
   SYNAPSE_VISION_MODEL,
   askSynapseVision,
-  isInsideDir,
-  markSynapseVisionReady,
   resolveVisionImage,
   visionImageDir,
 } from "./synapse-vision"
@@ -988,14 +987,14 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
     return tokens.access_token
   }
 
-  // #193: the credential for a direct Synapse call from a tool. A configured apiKey (the delegate
-  // box) wins; else the stored sign-in, refreshed first when it is about to expire. Undefined
-  // means no credential: the request still goes out and a front proxy may add one.
+  // #193: the credential for a direct Synapse call from a tool, in the `/models` call's order: the
+  // stored sign-in (refreshed first when it is about to expire), else a configured apiKey (the
+  // delegate box). Undefined means no credential: the request still goes out and a front proxy
+  // may add one.
   async function synapseToolToken(): Promise<string | undefined> {
-    if (modelsTarget?.apiKey) return modelsTarget.apiKey
     await synapseCredentialState.save
     const stored = await readStoredSynapseCredential().catch(() => undefined)
-    if (!stored) return undefined
+    if (!stored) return modelsTarget?.apiKey
     const cred = currentSynapseCredential(stored)
     if (synapseModelsToken(cred).expired && cred.refreshToken) {
       const refreshed = await waitAtMost(
@@ -1014,8 +1013,6 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
       // #101: before the model list is read, so that call carries the tier too.
       if (privacyTier) applyPrivacyTierHeader(cfg, privacyTier)
       modelsTarget = synapseModelsTarget(cfg, inferenceUrl)
-      // #193: the vision proxy points text-only models at synapse_vision only when it can run.
-      if (modelsTarget) markSynapseVisionReady(true)
       await loadSynapseModels(cfg, {
         defaultBaseURL: inferenceUrl,
         userAgent,
@@ -2176,17 +2173,32 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
           const question = (args.question || "").trim()
           if (!question) return "Please say what to look for in the image (the question argument)."
           if (!modelsTarget) return "Synapse is not configured in this opencode, so synapse_vision cannot run."
+          // A refused permission or a cancel must stop the turn like a built-in tool, not become text.
+          let askFailed = false
           try {
-            const image = await resolveVisionImage(args.image || "", context.directory || input.directory, async (file) => {
-              const roots = [context.worktree, context.directory, input.directory, visionImageDir()].filter(Boolean)
-              if (roots.some((root) => isInsideDir(file, root))) return
-              const glob = path.join(path.dirname(file), "*")
-              await context.ask({
-                permission: "external_directory",
-                patterns: [glob],
-                always: [glob],
-                metadata: { filepath: file, parentDir: path.dirname(file) },
-              })
+            const directory = context.directory || input.directory
+            const image = await resolveVisionImage(args.image || "", directory, async (file) => {
+              // Same rule and pattern as src/tool/external-directory.ts (a non-git worktree is "/").
+              const win = process.platform === "win32"
+              const full = win ? FSUtil.normalizePath(file) : file
+              const inside = (root: string) => FSUtil.contains(win ? FSUtil.normalizePath(root) : root, full)
+              if (inside(directory) || (context.worktree !== "/" && inside(context.worktree))) return
+              if (inside(visionImageDir())) return
+              const dir = path.dirname(full)
+              const glob = win
+                ? FSUtil.normalizePathPattern(path.join(dir, "*"))
+                : path.join(dir, "*").replaceAll("\\", "/")
+              try {
+                await context.ask({
+                  permission: "external_directory",
+                  patterns: [glob],
+                  always: [glob],
+                  metadata: { filepath: full, parentDir: dir },
+                })
+              } catch (error) {
+                askFailed = true
+                throw error
+              }
             })
             context.metadata({ title: `Looking at ${path.basename(image.label)}` })
             const answer = await askSynapseVision({
@@ -2203,6 +2215,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
 
 [Seen by Synapse model ${answer.servedModel}]` : answer.text
           } catch (err) {
+            if (askFailed || context.abort.aborted) throw err
             return `synapse_vision error: ${err instanceof Error ? err.message : String(err)}`
           }
         },

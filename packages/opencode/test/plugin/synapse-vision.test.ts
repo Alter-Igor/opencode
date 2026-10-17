@@ -5,14 +5,13 @@ import * as path from "path"
 import type { ModelMessage } from "ai"
 import {
   askSynapseVision,
-  isInsideDir,
-  markSynapseVisionReady,
   resolveVisionImage,
   saveImageForVision,
   synapseVisionBody,
   visionNote,
 } from "@/plugin/synapse-vision"
 import { proxyUnsupportedImages } from "@/provider/vision-proxy"
+import { SynapseAuthPlugin } from "@/plugin/synapse"
 
 // 1x1 transparent PNG.
 const PNG_BASE64 =
@@ -26,7 +25,6 @@ describe("synapse_vision (#193)", () => {
   })
 
   afterEach(async () => {
-    markSynapseVisionReady(false)
     await fs.rm(dir, { recursive: true, force: true })
   })
 
@@ -72,10 +70,20 @@ describe("synapse_vision (#193)", () => {
     ).rejects.toThrow("denied")
   })
 
-  test("isInsideDir", () => {
-    expect(isInsideDir(path.join(dir, "a", "b.png"), dir)).toBe(true)
-    expect(isInsideDir(dir, dir)).toBe(true)
-    expect(isInsideDir(path.join(dir, "..", "x.png"), dir)).toBe(false)
+  test("SVG, empty and oversized images are not saved; old saved files are swept", async () => {
+    expect(await saveImageForVision("PHN2Zz48L3N2Zz4=", "image/svg+xml", dir)).toBeUndefined()
+    expect(await saveImageForVision("", "image/png", dir)).toBeUndefined()
+    const big = Buffer.alloc(20 * 1024 * 1024 + 1).toString("base64")
+    expect(await saveImageForVision(big, "image/png", dir)).toBeUndefined()
+    const sweepDir = path.join(dir, "sweep")
+    await fs.mkdir(sweepDir)
+    const old = path.join(sweepDir, "old.png")
+    await fs.writeFile(old, "x")
+    const past = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000)
+    await fs.utimes(old, past, past)
+    const saved = await saveImageForVision(PNG_BASE64, "image/png", sweepDir)
+    expect(await fs.readdir(sweepDir)).toEqual([path.basename(saved!)])
+    if (process.platform !== "win32") expect((await fs.stat(saved!)).mode & 0o777).toBe(0o600)
   })
 
   test("sends the credential, privacy tier and question, and returns the answer and served model", async () => {
@@ -157,8 +165,8 @@ describe("synapse_vision (#193)", () => {
       },
     ] as unknown as ModelMessage[]
     const model = { providerID: "synapse", capabilities: { input: { image: false } } } as any
-    markSynapseVisionReady(true)
-    const result = await proxyUnsupportedImages(msgs, model, undefined, undefined, undefined)
+    const cfg = { provider: { synapse: {} } }
+    const result = await proxyUnsupportedImages(msgs, model, undefined, undefined, cfg, ["read", "synapse_vision"])
     const parts = (result[0] as any).content
     expect(parts[0]).toEqual({ type: "text", text: "what does the page show?" })
     expect(parts[1].type).toBe("text")
@@ -172,9 +180,102 @@ describe("synapse_vision (#193)", () => {
     ] as unknown as ModelMessage[]
     const seeing = { providerID: "synapse", capabilities: { input: { image: true } } } as any
     const textOnly = { providerID: "synapse", capabilities: { input: { image: false } } } as any
-    markSynapseVisionReady(true)
-    expect(await proxyUnsupportedImages(msgs, seeing, undefined, undefined, undefined)).toBe(msgs)
-    markSynapseVisionReady(false)
-    expect(await proxyUnsupportedImages(msgs, textOnly, undefined, undefined, { provider: {} })).toBe(msgs)
+    const cfg = { provider: { synapse: {} } }
+    const tools = ["synapse_vision"]
+    expect(await proxyUnsupportedImages(msgs, seeing, undefined, undefined, cfg, tools)).toBe(msgs)
+    // No Synapse in this config, or the tool is not offered to this agent: no note.
+    expect(await proxyUnsupportedImages(msgs, textOnly, undefined, undefined, { provider: {} }, tools)).toBe(msgs)
+    expect(await proxyUnsupportedImages(msgs, textOnly, undefined, undefined, cfg, ["read"])).toBe(msgs)
+  })
+})
+
+describe("synapse_vision tool permissions (#193)", () => {
+  const BASE = "https://synapse-vision.example.test/v1"
+  const pluginInput = {
+    client: {} as never,
+    project: {} as never,
+    directory: "",
+    worktree: "",
+    experimental_workspace: { register() {} },
+    serverUrl: new URL("https://example.com"),
+    $: {} as never,
+  }
+  let project: string
+  let outside: string
+  const realFetch = globalThis.fetch
+
+  beforeEach(async () => {
+    project = await fs.mkdtemp(path.join(os.tmpdir(), "vision-project-"))
+    outside = await fs.mkdtemp(path.join(os.tmpdir(), "vision-outside-"))
+    await fs.writeFile(path.join(project, "in.png"), Buffer.from(PNG_BASE64, "base64"))
+    await fs.writeFile(path.join(outside, "out.png"), Buffer.from(PNG_BASE64, "base64"))
+    const stub = async (url: RequestInfo | URL, init?: RequestInit) => {
+      const href = typeof url === "string" ? url : url instanceof URL ? url.href : url.url
+      if (!href.startsWith(BASE)) return realFetch(url, init)
+      if (href === `${BASE}/models`) return Response.json({ object: "list", data: [] })
+      return Response.json({ model: "vision-1", choices: [{ message: { content: "a red banner" } }] })
+    }
+    globalThis.fetch = Object.assign(stub, { preconnect: realFetch.preconnect })
+  })
+
+  afterEach(async () => {
+    globalThis.fetch = realFetch
+    await fs.rm(project, { recursive: true, force: true })
+    await fs.rm(outside, { recursive: true, force: true })
+  })
+
+  async function visionTool() {
+    const hooks = await SynapseAuthPlugin(pluginInput, { inferenceUrl: BASE })
+    await hooks.config?.({ provider: { synapse: { options: { baseURL: BASE, apiKey: "k" }, models: {} } } } as never)
+    return hooks.tool!.synapse_vision
+  }
+
+  function context(worktree: string, ask: (input: unknown) => Promise<void>) {
+    return {
+      sessionID: "s",
+      messageID: "m",
+      agent: "build",
+      directory: project,
+      worktree,
+      abort: new AbortController().signal,
+      metadata() {},
+      ask,
+    } as never
+  }
+
+  test("a file inside the project is read without asking", async () => {
+    const asked: unknown[] = []
+    const tool = await visionTool()
+    const out = await tool.execute({ image: "in.png", question: "what?" }, context(project, async (i) => {
+      asked.push(i)
+    }))
+    expect(asked).toHaveLength(0)
+    expect(out).toContain("a red banner")
+  })
+
+  test("a non-git project (worktree '/') still asks before reading a file outside it", async () => {
+    const asked: any[] = []
+    const tool = await visionTool()
+    const out = await tool.execute(
+      { image: path.join(outside, "out.png"), question: "what?" },
+      context("/", async (i) => {
+        asked.push(i)
+      }),
+    )
+    expect(asked).toHaveLength(1)
+    expect(asked[0].permission).toBe("external_directory")
+    expect(out).toContain("a red banner")
+  })
+
+  test("a refused permission stops the tool instead of becoming text", async () => {
+    const tool = await visionTool()
+    await expect(
+      tool.execute(
+        { image: path.join(outside, "out.png"), question: "what?" },
+        context("/", async () => {
+          throw new Error("rejected by user")
+        }),
+      ),
+    ).rejects.toThrow("rejected by user")
   })
 })
