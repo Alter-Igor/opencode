@@ -33,6 +33,14 @@ import {
   type SynapseModelsTarget,
   type SynapseStoredCredential,
 } from "./synapse-models"
+import {
+  SYNAPSE_VISION_MODEL,
+  askSynapseVision,
+  isInsideDir,
+  markSynapseVisionReady,
+  resolveVisionImage,
+  visionImageDir,
+} from "./synapse-vision"
 
 export const KEYSTONE_ISSUER = "https://identity.alterspective.com.au"
 export const KEYSTONE_REGISTER = `${KEYSTONE_ISSUER}/api/oauth/register`
@@ -980,6 +988,25 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
     return tokens.access_token
   }
 
+  // #193: the credential for a direct Synapse call from a tool. A configured apiKey (the delegate
+  // box) wins; else the stored sign-in, refreshed first when it is about to expire. Undefined
+  // means no credential: the request still goes out and a front proxy may add one.
+  async function synapseToolToken(): Promise<string | undefined> {
+    if (modelsTarget?.apiKey) return modelsTarget.apiKey
+    await synapseCredentialState.save
+    const stored = await readStoredSynapseCredential().catch(() => undefined)
+    if (!stored) return undefined
+    const cred = currentSynapseCredential(stored)
+    if (synapseModelsToken(cred).expired && cred.refreshToken) {
+      const refreshed = await waitAtMost(
+        refreshSynapseCredential({ ...cred, refreshToken: cred.refreshToken }),
+        options?.refreshWaitMs ?? SYNAPSE_CHAT_REFRESH_WAIT_MS,
+      )
+      if (refreshed) return refreshed
+    }
+    return cred.token
+  }
+
   return {
     // Fork-only (#74): the live Synapse model list replaces a hand-typed one.
     // Core reads cfg.provider after this hook resolves (provider/provider.ts).
@@ -987,6 +1014,8 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
       // #101: before the model list is read, so that call carries the tier too.
       if (privacyTier) applyPrivacyTierHeader(cfg, privacyTier)
       modelsTarget = synapseModelsTarget(cfg, inferenceUrl)
+      // #193: the vision proxy points text-only models at synapse_vision only when it can run.
+      if (modelsTarget) markSynapseVisionReady(true)
       await loadSynapseModels(cfg, {
         defaultBaseURL: inferenceUrl,
         userAgent,
@@ -2122,6 +2151,59 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
             return finalContent
           } catch (err: any) {
             return `Buddy review error: ${err.message}`
+          }
+        },
+      }),
+      synapse_vision: tool({
+        description: [
+          "Look at an image with Synapse vision and answer a question about it. Use this when the current model cannot see images",
+          "(for example a pasted screenshot shows up as a note with a file path, or a browser screenshot was saved to a file).",
+          "Say exactly what to look for: e.g. 'Is there an error banner? Quote its text', 'List every button label',",
+          "'Is the sidebar overlapping the main panel?'. Ask again with a new question for more detail.",
+          "The answer is text from a vision model: treat it as an observation, and check anything important.",
+        ].join(" "),
+        args: {
+          image: tool.schema
+            .string()
+            .describe("Image to look at: a file path (absolute, or relative to the project), a data:image/...;base64 URL, or an http(s) URL."),
+          question: tool.schema.string().describe("What to look for or answer about the image. Be specific."),
+          model: tool.schema
+            .string()
+            .optional()
+            .describe(`Synapse model id. Default "${SYNAPSE_VISION_MODEL}", which routes to a vision model.`),
+        },
+        async execute(args, context) {
+          const question = (args.question || "").trim()
+          if (!question) return "Please say what to look for in the image (the question argument)."
+          if (!modelsTarget) return "Synapse is not configured in this opencode, so synapse_vision cannot run."
+          try {
+            const image = await resolveVisionImage(args.image || "", context.directory || input.directory, async (file) => {
+              const roots = [context.worktree, context.directory, input.directory, visionImageDir()].filter(Boolean)
+              if (roots.some((root) => isInsideDir(file, root))) return
+              const glob = path.join(path.dirname(file), "*")
+              await context.ask({
+                permission: "external_directory",
+                patterns: [glob],
+                always: [glob],
+                metadata: { filepath: file, parentDir: path.dirname(file) },
+              })
+            })
+            context.metadata({ title: `Looking at ${path.basename(image.label)}` })
+            const answer = await askSynapseVision({
+              target: modelsTarget,
+              token: await synapseToolToken(),
+              imageUrl: image.url,
+              question,
+              model: args.model,
+              privacyTier,
+              userAgent,
+              signal: context.abort,
+            })
+            return answer.servedModel ? `${answer.text}
+
+[Seen by Synapse model ${answer.servedModel}]` : answer.text
+          } catch (err) {
+            return `synapse_vision error: ${err instanceof Error ? err.message : String(err)}`
           }
         },
       }),
