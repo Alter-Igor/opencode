@@ -14,6 +14,48 @@ export interface ToolExecutionRecord {
   outputSnippet?: string
   isError?: boolean
   errorMessage?: string
+  /** Set when the result had the MCP shape (`content` items); see `isMcpRecord`. */
+  mcp?: boolean
+}
+
+/** A raw MCP `CallToolResult`, which core hands to `tool.execute.after` for MCP tools. */
+function isMcpResult(value: unknown): value is { content: unknown[]; isError?: unknown } {
+  return !!value && typeof value === "object" && Array.isArray((value as { content?: unknown }).content)
+}
+
+/**
+ * #18: error texts core writes when the user stops or refuses a call, or a permission rule blocks
+ * it (`processor.ts` abort, `core/src/v1/permission.ts`, `question/index.ts`).
+ */
+const NOT_A_FAILURE = [
+  "Tool execution aborted",
+  "The user rejected permission to use this specific tool call",
+  "The user has specified a rule which prevents you from using this specific tool call",
+  "The user dismissed this question",
+]
+
+/** #18: a `message.part.updated` event for a tool part that failed, as the observer needs it. */
+export function failedToolFromEvent(event: {
+  type: string
+  properties?: any
+}): { sessionID: string; callID: string; tool: string; error: string } | undefined {
+  if (event.type !== "message.part.updated") return undefined
+  const part = event.properties?.part
+  if (!part || part.type !== "tool" || part.state?.status !== "error") return undefined
+  const sessionID = part.sessionID ?? event.properties?.sessionID
+  if (typeof sessionID !== "string" || typeof part.callID !== "string" || typeof part.tool !== "string") return undefined
+  return { sessionID, callID: part.callID, tool: part.tool, error: typeof part.state.error === "string" ? part.state.error : "" }
+}
+
+function mcpText(result: { content: unknown[] }): string {
+  return result.content
+    .flatMap((item) => {
+      const entry = item as { type?: unknown; text?: unknown; resource?: { text?: unknown } }
+      if (entry?.type === "text" && typeof entry.text === "string") return [entry.text]
+      if (entry?.type === "resource" && typeof entry.resource?.text === "string") return [entry.resource.text]
+      return []
+    })
+    .join("\n")
 }
 
 export interface SessionAnomaly {
@@ -116,6 +158,7 @@ class SessionObserverManager {
   private sessionStartTimes = new Map<string, number>()
   private latestRetrospectives: SessionRetrospective[] = []
   private diagnosticLogs: DiagnosticLogEntry[] = []
+  private nativeTools = new Set<string>()
 
   public logDiagnostic(entry: DiagnosticLogEntry, workspaceDir?: string) {
     const safeEntry: DiagnosticLogEntry = {
@@ -167,12 +210,54 @@ class SessionObserverManager {
     this.trajectories.set(sessionId, records)
   }
 
+  /**
+   * #18: opencode names MCP tools `<server>_<tool>` (`alterspective-rag_rag_search`), so a name
+   * check alone misses them. Every native and plugin tool is announced through `tool.definition`
+   * first; MCP tools never are.
+   */
+  public markNativeTool(toolId: string) {
+    this.nativeTools.add(toolId)
+  }
+
+  private isMcpRecord(record: ToolExecutionRecord): boolean {
+    if (record.mcp) return true
+    if (record.tool.startsWith("mcp__") || record.tool.includes("mcp")) return true
+    return this.nativeTools.size > 0 && !this.nativeTools.has(record.tool)
+  }
+
+  /**
+   * #18: a failed tool never reaches `tool.execute.after` (an MCP error result is thrown by core),
+   * so the failure is taken from the stored tool part instead (`message.part.updated`, status error).
+   * Only a call this observer saw start is updated: a fork or compaction re-publishes old failed
+   * parts, which must not be counted again. A call the user stopped, refused or blocked by a rule is
+   * not a service failure (QA on #18).
+   */
+  public onToolFailed(sessionId: string, callId: string, tool: string, error: string) {
+    const record = this.trajectories.get(sessionId)?.find((r) => r.callId === callId && r.tool === tool)
+    if (!record) return
+    if (NOT_A_FAILURE.some((prefix) => error.startsWith(prefix))) {
+      record.endTime ??= Date.now()
+      record.durationMs = record.endTime - record.startTime
+      return
+    }
+    record.endTime ??= Date.now()
+    record.durationMs = record.endTime - record.startTime
+    record.isError = true
+    record.errorMessage = error.slice(0, 200)
+  }
+
   public onToolAfter(sessionId: string, callId: string, tool: string, output: unknown) {
-    const text = typeof output === "string" ? output : output == null ? "" : JSON.stringify(output) ?? ""
+    // #18: an MCP result carries its text in `content` items, not in `output`.
+    const mcp = isMcpResult(output)
+    const text = typeof output === "string" ? output : mcp ? mcpText(output) : output == null ? "" : JSON.stringify(output) ?? ""
     const records = this.trajectories.get(sessionId) ?? []
     const record = records.find((r) => r.callId === callId)
-    const isError =
-      text.includes("Error:") ||
+    if (record && mcp) record.mcp = true
+    // A real MCP error result is thrown by core and arrives through onToolFailed; the words in a
+    // successful MCP result (a log or search tool's text) are data, not a failure (QA on #18).
+    const isError = mcp
+      ? output.isError === true
+      : text.includes("Error:") ||
       text.includes("error:") ||
       text.includes("Failed to") ||
       text.includes("Unauthorized") ||
@@ -228,7 +313,7 @@ class SessionObserverManager {
     }
 
     // 2. Check for MCP Tool Failures
-    const mcpFailures = records.filter((r) => (r.tool.startsWith("mcp__") || r.tool.includes("mcp")) && r.isError)
+    const mcpFailures = records.filter((r) => this.isMcpRecord(r) && r.isError)
     for (const failure of mcpFailures) {
       anomalies.push({
         type: "MCP_TOOL_FAILURE",
