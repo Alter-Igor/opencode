@@ -297,8 +297,8 @@ export const MIRROR_ADDRESSES = ["npm-cache:4873", "pypi-cache:5000"] as const
  * Every changed file counts, not only diffs that touch an address: an unchanged address line in a
  * changed file breaks the build just the same (CodeRabbit on #185). git grep --text searches the
  * branch tree, so a repo's `-diff` / `binary` attributes cannot hide a file (QA on #185). It reads
- * only the changed files while their names fit on one command line (literal pathspecs, so `[i]` is
- * a name, not a glob), else the whole branch tree; either way the hits are intersected with the
+ * only the changed files while their names are safe to pass back and fit on one command line
+ * (grepPathspecs; literal pathspecs, so `[i]` is a name, not a glob), else the whole branch tree; either way the hits are intersected with the
  * changed files (#186: a whole-tree read of a very large repo can hit the short timeout).
  * `files: null`: the check itself failed, and `reason` says why. The branch is already fetched, so
  * that is a warning, never an error.
@@ -309,8 +309,7 @@ async function mirrorAddressChanges(ctx: Ctx, repo: string, base: string, branch
     if (listed.code !== 0) return { files: null, reason: checkFailure("git diff", listed) }
     const changed = new Set(listed.stdout.split("\0").filter(Boolean))
     if (changed.size === 0) return { files: [] }
-    const named = [...changed]
-    const pathspecs = named.reduce((n, file) => n + file.length + 1, 0) <= MAX_PATHSPEC_CHARS ? named : []
+    const pathspecs = grepPathspecs([...changed])
     // `--` after the revision: a host path named like the branch must not make git read it as a file.
     const grep = await ctx.host(["git", "--literal-pathspecs", "-C", repo, "grep", "-l", "-z", "--text", "-F", ...MIRROR_ADDRESSES.flatMap((a) => ["-e", a]), branch, "--", ...pathspecs], { timeoutMs: ctx.timeouts.short })
     if (grep.code === 1) return { files: [] } // no match in the searched files
@@ -321,13 +320,26 @@ async function mirrorAddressChanges(ctx: Ctx, repo: string, base: string, branch
   }
 }
 
-/** Changed-file names passed to git grep at most; past this it reads the whole tree (Windows caps a command line near 32k characters). */
+/** Command-line budget for the changed-file names passed to git grep; past it, the whole tree is read (Windows caps a command line near 32k characters). */
 export const MAX_PATHSPEC_CHARS = 16_000
+
+/**
+ * The pathspecs for git grep, or [] for the whole tree. A narrowed read must never miss a file, so
+ * it is only used when every name is safe to pass back to git (QA on #186):
+ * - a `\` in a name (legal in the Linux tree the box writes) is a folder break to Git for Windows,
+ *   even with --literal-pathspecs, so that file would never be read;
+ * - U+FFFD means the name was not UTF-8 and was decoded lossily; passed back, it matches nothing.
+ * Each name counts twice plus 3: Windows argument quoting can turn `"` into `\"` and adds quotes.
+ */
+export function grepPathspecs(names: readonly string[]): string[] {
+  if (names.some((name) => name.includes("\\") || name.includes("�"))) return []
+  return names.reduce((n, name) => n + name.length * 2 + 3, 0) <= MAX_PATHSPEC_CHARS ? [...names] : []
+}
 
 /** #186: why the cache-address check failed, for the trace and the tool's output (a timeout and a corrupt repo must not look the same). */
 function checkFailure(step: string, result: { code: number; stderr: string; timedOut?: boolean }): string {
   if (result.timedOut) return `${step} timed out`
-  const line = result.stderr.trim().split(/\r?\n/)[0]?.slice(0, 200)
+  const line = result.stderr.trim().split(/\r\n|\r|\n/)[0]?.slice(0, 200)
   return `${step} exited ${result.code}${line ? `: ${line}` : ""}`
 }
 

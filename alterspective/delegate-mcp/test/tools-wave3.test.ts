@@ -308,6 +308,7 @@ describe("#186: oc_land and oc_verify report the collect warnings", () => {
     expect(failed.isError).toBe(true)
     expect(text(failed)).toContain("[Step: verify]")
     expect(text(failed)).toContain("still names the sandbox's package cache")
+    expect(text(failed)).toContain("oc_collect lists the files")
   })
 })
 

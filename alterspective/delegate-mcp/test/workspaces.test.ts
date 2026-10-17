@@ -5,7 +5,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:tes
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import path from "node:path"
 import type { ErrorCode } from "../src/shared/errors.ts"
-import { MAX_PATHSPEC_CHARS, runCommand, TIMEOUT_CODE, type ExecResult } from "../src/supervisor/workspaces.ts"
+import { grepPathspecs, MAX_PATHSPEC_CHARS, runCommand, TIMEOUT_CODE, type ExecResult } from "../src/supervisor/workspaces.ts"
 import { code, git, posix, T, WorkspaceFixture } from "./workspaces-fixture.ts"
 
 const fx = new WorkspaceFixture("ocd-ws-")
@@ -260,6 +260,49 @@ describe("workspaces: collect names files that still hold a cache address (#162)
     },
     T,
   )
+
+  // QA on #186: names Windows cannot write to disk but the box's Linux tree can hold. Built with
+  // plumbing (raw bytes in, no checkout) so the test runs on Windows too.
+  const commitRawName = async (key: string, name: Uint8Array, content: string) => {
+    const run = async (args: string[], input?: Uint8Array) => {
+      const p = Bun.spawn(["git", "-C", fx.boxClone(key), ...args], { stdin: input ?? "ignore", stdout: "pipe", stderr: "pipe", env: fx.boxEnv })
+      const [out, err, exit] = [await new Response(p.stdout).arrayBuffer(), await new Response(p.stderr).text(), await p.exited]
+      if (exit !== 0) throw new Error(`git ${args.join(" ")}: ${err}`)
+      return new Uint8Array(out)
+    }
+    const text = (b: Uint8Array) => new TextDecoder().decode(b).trim()
+    const blob = text(await run(["hash-object", "-w", "--stdin"], new TextEncoder().encode(content)))
+    const entries = await run(["ls-tree", "-z", "HEAD"])
+    const added = Buffer.concat([Buffer.from(entries), Buffer.from(`100644 blob ${blob}\t`), Buffer.from(name), Buffer.from([0])])
+    const tree = text(await run(["mktree", "-z"], added))
+    const commit = text(await run(["commit-tree", tree, "-p", "HEAD", "-m", `raw name ${key}`]))
+    await run(["update-ref", "HEAD", commit])
+  }
+  for (const [label, name] of [
+    ["a backslash", Buffer.from("back\\slash.lock")],
+    ["bytes that are not UTF-8", Buffer.from([0x62, 0x61, 0x64, 0xe9, 0x2e, 0x6c, 0x6f, 0x63, 0x6b])],
+  ] as const) {
+    test(
+      `a changed name with ${label} is still searched`,
+      async () => {
+        const key = `mirror-raw-${label.split(" ")[1]}`
+        const workspaces = fx.workspaces()
+        const ws = await workspaces.open(fx.hostRepo, key)
+        await commitRawName(key, name, "registry=http://npm-cache:4873/\n")
+        const result = await workspaces.collect(ws)
+        expect(result.mirrorAddressFiles).toHaveLength(1)
+      },
+      T,
+    )
+  }
+
+  test("grepPathspecs: unsafe names and long lists read the whole tree", () => {
+    expect(grepPathspecs(["a.lock", "[i]"])).toEqual(["a.lock", "[i]"])
+    expect(grepPathspecs(["a.lock", "b\\c.lock"])).toEqual([])
+    expect(grepPathspecs(["a.lock", "bad�.lock"])).toEqual([])
+    // Counted twice plus 3: 3,000 names of 2 characters would be 9,000 raw but 21,000 counted.
+    expect(grepPathspecs(Array.from({ length: 3000 }, (_, i) => String(i % 100).padStart(2, "0")))).toEqual([])
+  })
 
   test(
     "a branch without the address lists nothing",

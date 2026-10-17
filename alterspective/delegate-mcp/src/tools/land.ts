@@ -38,8 +38,10 @@ export const landTool = defineTool({
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   async run(args, ctx, correlationId) {
     let step = "collect"
-    // #186: the collect warnings ride on the result, and on a later step's error too.
+    // #186: the collect warnings ride on the result, and on a later step's error too. The error
+    // carries only the sentences; the file lists come from oc_collect (it is idempotent).
     let warnings: ReturnType<typeof collectWarnings> | undefined
+    const failedWarnings = () => (warnings?.summary ? ` ${warnings.summary} oc_collect lists the files.` : "")
     try {
       const box = await ctx.box()
       const { record } = await ownSession(ctx, box, args.sessionID, correlationId)
@@ -148,9 +150,9 @@ export const landTool = defineTool({
       })
     } catch (error) {
       if (isDelegateError(error)) {
-        throw new DelegateError(error.code, `[Step: ${step}] ${error.message}${warnings?.summary ? ` ${warnings.summary}` : ""}`, error.action, error.detail)
+        throw new DelegateError(error.code, `[Step: ${step}] ${error.message}${failedWarnings()}`, error.action, error.detail)
       }
-      throw new DelegateError("upstream_error", `[Step: ${step}] Landing failed unexpectedly: ${String(error)}${warnings?.summary ? ` ${warnings.summary}` : ""}`, "Check step failure details and retry.")
+      throw new DelegateError("upstream_error", `[Step: ${step}] Landing failed unexpectedly: ${String(error)}${failedWarnings()}`, "Check step failure details and retry.")
     }
   },
 })
