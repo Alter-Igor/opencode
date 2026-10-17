@@ -159,6 +159,7 @@ const layer = Layer.effect(
     const auth = yield* Auth.Service
     const session = yield* Session.Service
     const prompt = yield* SessionPrompt.Service
+    // Fork (#214): what Workspace.remove needs to stop its sessions' runs (with the two node deps below).
     const statusSvc = yield* SessionStatus.Service
     const runState = yield* SessionRunState.Service
     const cancelDeps = {
@@ -806,7 +807,23 @@ const layer = Layer.effect(
       const sessionIDs = new Set(sessions.map((sessionInfo) => sessionInfo.id))
       const roots = sessions.filter((sessionInfo) => !sessionInfo.parentID || !sessionIDs.has(sessionInfo.parentID))
       // Fork (#214): stop each session's running reply, and its sub-sessions', before they are removed.
-      yield* Effect.forEach(roots, (sessionInfo) => cancelSessionTree(cancelDeps, sessionInfo.id), { discard: true })
+      // A local workspace's prompts are routed to its own folder, so its runs and statuses live in
+      // that folder's instance: cancel there, and here too (QA on #229; the idle check makes a pass
+      // with nothing running a no-op). A remote workspace's run is in another process; only the
+      // adapter's remove below stops it.
+      const cancelRoots = Effect.forEach(roots, (sessionInfo) => cancelSessionTree(cancelDeps, sessionInfo.id), {
+        discard: true,
+      })
+      const existing = roots.length > 0 ? yield* get(id) : undefined
+      const target = existing
+        ? yield* WorkspaceAdapterRuntime.target(existing).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+        : undefined
+      if (target?.type === "local")
+        yield* Effect.gen(function* () {
+          const store = yield* InstanceStore.Service
+          yield* store.provide({ directory: target.directory }, cancelRoots)
+        }).pipe(Effect.provide(AppNodeBuilderV1.build(InstanceStore.node)))
+      yield* cancelRoots
       yield* Effect.forEach(
         roots,
         (sessionInfo) =>
@@ -970,6 +987,7 @@ export const node = LayerNode.make({
     Auth.node,
     Session.node,
     SessionPrompt.node,
+    // Fork (#214): Workspace.remove cancels its sessions' runs.
     SessionStatus.node,
     SessionRunState.node,
     httpClient,

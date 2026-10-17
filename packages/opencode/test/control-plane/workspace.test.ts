@@ -827,22 +827,29 @@ describe("workspace CRUD", () => {
         const workspace = yield* Workspace.Service
         const sessionSvc = yield* SessionNs.Service
         const status = yield* SessionStatus.Service
+        const store = yield* InstanceStore.Service
         const type = unique("remove-busy")
-        const recorded = localAdapter(path.join(dir, "remove-busy"))
+        const folder = path.join(dir, "remove-busy")
+        const recorded = localAdapter(folder)
         registerAdapter(instance.project.id, type, recorded.adapter)
         const info = yield* workspace.create({ type, branch: null, projectID: instance.project.id, extra: null })
         const busy = yield* sessionSvc.create({})
         const quiet = yield* sessionSvc.create({})
         yield* attachSessionToWorkspace(busy.id, info.id)
         yield* attachSessionToWorkspace(quiet.id, info.id)
-        yield* status.set(busy.id, { type: "busy" })
+        // A workspace session's prompts run in the workspace folder's instance (QA on #229), so its
+        // busy status lives there, not in the instance that calls remove.
+        const inFolder = <A, E, R>(effect: Effect.Effect<A, E, R>) => store.provide({ directory: folder }, effect)
+        yield* inFolder(status.set(busy.id, { type: "busy" }))
+        expect((yield* status.get(busy.id)).type).toBe("idle")
         const captured = captureGlobalEvents()
         const idled = (id: SessionID) =>
           captured.events.some((event) => event.payload?.type === "session.idle" && event.payload.properties?.sessionID === id)
         try {
           yield* workspace.remove(info.id)
-          // The busy session was cancelled: with no runner, cancel sets it idle, which publishes session.idle.
-          expect((yield* status.get(busy.id)).type).toBe("idle")
+          // The busy session was cancelled in its folder's instance: with no runner, cancel sets it
+          // idle, which publishes session.idle.
+          expect((yield* inFolder(status.get(busy.id))).type).toBe("idle")
           yield* eventuallyEffect(Effect.sync(() => expect(idled(busy.id)).toBe(true)))
           // The idle one was not cancelled, so no idle event woke listeners for it.
           expect(idled(quiet.id)).toBe(false)
