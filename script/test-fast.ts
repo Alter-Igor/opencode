@@ -221,11 +221,18 @@ for (const [pkg, tests] of plan) {
   // #224: a package whose test:unit script sets --conditions (packages/app: solid) needs it here too.
   const script = String(JSON.parse(readFileSync(path.join(root, pkg, "package.json"), "utf8")).scripts?.["test:unit"] ?? "")
   const conditions = script.match(/--conditions=\S+/g) ?? []
-  const run = Bun.spawnSync(["bun", "test", "--timeout", "30000", ...conditions, ...[...tests].sort().map((test) => `./${test}`)], {
-    cwd: path.join(root, pkg),
-    stdout: "inherit",
-    stderr: "inherit",
-  })
-  if (run.exitCode !== 0) failed = true
+  const files = [...tests].sort().map((test) => `./${test}`)
+  // #224: a `mock.module` lasts for the whole bun process, so one file's mock (packages/app's
+  // child-store.test.ts replaces @tanstack/solid-query) broke the next file's imports. When any
+  // mapped file mocks a module, each file runs in its own process.
+  const isolate = files.some((file) => readFileSync(path.join(root, pkg, file), "utf8").includes("mock.module("))
+  for (const batch of isolate ? files.map((file) => [file]) : [files]) {
+    const run = Bun.spawnSync(["bun", "test", "--timeout", "30000", ...conditions, ...batch], {
+      cwd: path.join(root, pkg),
+      stdout: "inherit",
+      stderr: "inherit",
+    })
+    if (run.exitCode !== 0) failed = true
+  }
 }
 process.exit(failed ? 1 : 0)
