@@ -8,7 +8,7 @@ import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { Global } from "@opencode-ai/core/global"
 import { Flock } from "@opencode-ai/core/util/flock"
 import { FSUtil } from "@opencode-ai/core/fs-util"
-import { INJECTED_LEARNINGS_LIMIT, learningStorePaths, sessionObserver, sanitizeJsonSchemaForOpenAI } from "./observer"
+import { failedToolFromEvent, INJECTED_LEARNINGS_LIMIT, learningStorePaths, sessionObserver, sanitizeJsonSchemaForOpenAI } from "./observer"
 import { redactToolResult } from "./secret-redaction"
 import { EscalationTracker, declaredTier, classifyFailure, malformedToolCallFromEvent } from "./synapse-escalation"
 import {
@@ -1815,6 +1815,9 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
       }
       // AIESC follow-up (#15): completed sessions free their tracker slot.
       if (sessionID && event.type === "session.deleted") escalations.release(sessionID)
+      // #18: a failed tool call skips tool.execute.after; its stored part carries the error.
+      const failed = failedToolFromEvent(event as { type: string; properties?: any })
+      if (failed) sessionObserver.onToolFailed(failed.sessionID, failed.callID, failed.tool, failed.error)
       // AIESC-02: a malformed native tool call (200 response, garbage tool name) is
       // invisible to the HTTP hooks; charge it here, deduped per part id.
       const hit = malformedToolCallFromEvent(event as { type: string; properties?: any })
@@ -1829,6 +1832,11 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
         }
         escalations.recordFailure(hit.sessionID, "malformed-output")
       }
+    },
+    // #18: every native and plugin tool is announced here; MCP tools never are, which is how the
+    // observer tells an MCP tool (`<server>_<tool>`) from a native one.
+    "tool.definition": async (definitionInput) => {
+      sessionObserver.markNativeTool(definitionInput.toolID)
     },
     "tool.execute.before": async (toolInput, output) => {
       // 1. Policy Enforcement: Block raw browser scraping of corporate email / M365
@@ -1886,7 +1894,13 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
       redactToolResult(output)
       // #95: core calls this hook with no output when a tool fails (a failed subtask, for one).
       // Reading output.output then threw inside the failure path and lost the error metadata.
-      sessionObserver.onToolAfter(toolInput.sessionID, toolInput.callID, toolInput.tool, output?.output)
+      // #18: an MCP tool's result is the raw MCP result, with no `output`; pass it whole.
+      sessionObserver.onToolAfter(
+        toolInput.sessionID,
+        toolInput.callID,
+        toolInput.tool,
+        typeof output?.output === "string" ? output.output : output,
+      )
     },
     "experimental.chat.system.transform": async (_input, output) => {
       // #95: these instructions are about Synapse (its gateway, on-prem tools and text tool-call

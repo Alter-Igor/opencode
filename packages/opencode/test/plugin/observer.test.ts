@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test"
-import { defaultDiagnosticsLogDir, learningStorePaths, sessionObserver } from "../../src/plugin/observer"
+import { defaultDiagnosticsLogDir, failedToolFromEvent, learningStorePaths, sessionObserver } from "../../src/plugin/observer"
+import { SynapseAuthPlugin } from "../../src/plugin/synapse"
 import { tmpdir } from "../fixture/fixture"
 import * as fs from "fs/promises"
 import * as path from "path"
@@ -399,5 +400,99 @@ describe("observer paths (#83)", () => {
       text = await fs.readFile(log, "utf8").catch(() => "")
     }
     expect(text).toContain("obs-83-fallback")
+  })
+})
+
+// #18: opencode names MCP tools <server>_<tool>, so the old name check never matched them, and a
+// failed call never reaches tool.execute.after at all.
+describe("MCP tool failures with real remote tool names (#18)", () => {
+  const mcpAnomalies = async (sessionId: string) => {
+    const retro = await sessionObserver.finalizeSessionRetrospective(sessionId)
+    if (!retro) throw new Error("no retrospective found")
+    return retro.anomalies.filter((a) => a.type === "MCP_TOOL_FAILURE")
+  }
+
+  test("an error in an MCP result's content is flagged, by its result shape", async () => {
+    const sessionId = "obs-18-shape"
+    sessionObserver.onToolBefore(sessionId, "c1", "keystone-dynamic_execute-tool", {})
+    sessionObserver.onToolAfter(sessionId, "c1", "keystone-dynamic_execute-tool", {
+      content: [{ type: "text", text: "Error: Unauthorized (token expired)" }],
+    })
+    const found = await mcpAnomalies(sessionId)
+    expect(found.map((a) => a.tool)).toEqual(["keystone-dynamic_execute-tool"])
+    expect(found[0]?.detail).toContain("Unauthorized")
+  })
+
+  test("an MCP result with isError set is flagged even when its text looks clean", async () => {
+    const sessionId = "obs-18-iserror"
+    sessionObserver.onToolBefore(sessionId, "c1", "alterspective-rag_rag_search", {})
+    sessionObserver.onToolAfter(sessionId, "c1", "alterspective-rag_rag_search", {
+      content: [{ type: "text", text: "quota reached" }],
+      isError: true,
+    })
+    expect((await mcpAnomalies(sessionId)).map((a) => a.tool)).toEqual(["alterspective-rag_rag_search"])
+  })
+
+  test("a failed call is flagged from its stored part when the tool was never announced as native", async () => {
+    sessionObserver.markNativeTool("read")
+    const sessionId = "obs-18-failed"
+    sessionObserver.onToolBefore(sessionId, "c1", "alterspective-rag_rag_search", {})
+    sessionObserver.onToolFailed(sessionId, "c1", "alterspective-rag_rag_search", "MCP error -32001: Request timed out")
+    sessionObserver.onToolBefore(sessionId, "c2", "read", {})
+    sessionObserver.onToolFailed(sessionId, "c2", "read", "File not found: /tmp/x")
+    const found = await mcpAnomalies(sessionId)
+    expect(found.map((a) => a.tool)).toEqual(["alterspective-rag_rag_search"])
+    expect(found[0]?.detail).toContain("Request timed out")
+  })
+
+  test("a failure for a call the observer never saw start is ignored (a fork or compaction replays old parts)", async () => {
+    const sessionId = "obs-18-replay"
+    sessionObserver.onToolFailed(sessionId, "old-call", "alterspective-rag_rag_search", "Error: old failure")
+    const retro = await sessionObserver.finalizeSessionRetrospective(sessionId)
+    expect(retro?.totalToolCalls).toBe(0)
+    expect(retro?.anomalies.filter((a) => a.type === "MCP_TOOL_FAILURE")).toEqual([])
+  })
+
+  test("failedToolFromEvent reads only failed tool parts", () => {
+    const part = { type: "tool", sessionID: "s1", callID: "c1", tool: "x_y", state: { status: "error", error: "boom" } }
+    expect(failedToolFromEvent({ type: "message.part.updated", properties: { part } })).toEqual({
+      sessionID: "s1",
+      callID: "c1",
+      tool: "x_y",
+      error: "boom",
+    })
+    expect(failedToolFromEvent({ type: "message.part.updated", properties: { part: { ...part, state: { status: "completed" } } } })).toBeUndefined()
+    expect(failedToolFromEvent({ type: "message.part.updated", properties: { part: { ...part, type: "text" } } })).toBeUndefined()
+    expect(failedToolFromEvent({ type: "session.idle", properties: { part } })).toBeUndefined()
+  })
+
+  test("wiring: the Synapse plugin's hooks feed a failed MCP call into the retrospective", async () => {
+    const hooks = await SynapseAuthPlugin({
+      client: {} as never,
+      project: {} as never,
+      directory: "/test/dir",
+      worktree: "",
+      experimental_workspace: { register() {} },
+      serverUrl: new URL("https://example.com"),
+      $: {} as never,
+    } as never)
+    const sessionId = "obs-18-wiring"
+    await hooks["tool.definition"]?.({ toolID: "bash" }, { description: "", parameters: {} })
+    await hooks["tool.execute.before"]?.({ tool: "imprint_imprint_get_instructions", sessionID: sessionId, callID: "c1" }, { args: {} })
+    await hooks.event?.({
+      event: {
+        type: "message.part.updated",
+        properties: {
+          part: {
+            type: "tool",
+            sessionID: sessionId,
+            callID: "c1",
+            tool: "imprint_imprint_get_instructions",
+            state: { status: "error", error: "MCP error: Unauthorized" },
+          },
+        },
+      } as never,
+    })
+    expect((await mcpAnomalies(sessionId)).map((a) => a.tool)).toEqual(["imprint_imprint_get_instructions"])
   })
 })
