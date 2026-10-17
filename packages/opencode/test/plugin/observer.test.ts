@@ -584,6 +584,116 @@ describe("rule visibility", () => {
     }
   })
 
+  test("synapse_list_rules marks the global group as skipped when the global store is unreadable (CodeRabbit on #221)", async () => {
+    await using home = await tmpdir()
+    await using ws = await tmpdir()
+    const prev = process.env.OPENCODE_TEST_HOME
+    process.env.OPENCODE_TEST_HOME = home.path
+    try {
+      await sessionObserver.recordLearning({ lesson: "project copy stays listed", source: "user_feedback" }, ws.path)
+      await fs.writeFile(learningStorePaths(ws.path).global!, "[bad", "utf8")
+      expect(await sessionObserver.unreadableRuleStores(ws.path)).toEqual(["global"])
+      const hooks = await SynapseAuthPlugin({
+        client: {} as never,
+        project: {} as never,
+        directory: ws.path,
+        worktree: "",
+        experimental_workspace: { register() {} },
+        serverUrl: new URL("https://example.com"),
+        $: {} as never,
+      } as never)
+      const reply = String(await hooks.tool?.synapse_list_rules?.execute({}, {} as never))
+      const global = reply.slice(reply.indexOf("Global - every project on this machine:"))
+      expect(global).toContain("skipped: this store could not be read")
+      expect(reply.slice(0, reply.indexOf("Global - every project on this machine:"))).toContain("project copy stays listed")
+    } finally {
+      restoreTestHome(prev)
+    }
+  })
+
+  test("injection writes one diagnostics line for a skipped store, and another after it breaks again (#217)", async () => {
+    await using home = await tmpdir()
+    await using ws = await tmpdir()
+    const prev = process.env.OPENCODE_TEST_HOME
+    process.env.OPENCODE_TEST_HOME = home.path
+    try {
+      await sessionObserver.recordLearning({ lesson: "kept", source: "user_feedback" }, ws.path)
+      const project = learningStorePaths(ws.path).project!
+      const skipped = () =>
+        sessionObserver
+          .getDiagnosticLogs()
+          .filter((e) => e.type === "LEARNING_STORE" && e.details.event === "skipped_unreadable" && e.details.file === project)
+          .length
+      const good = await fs.readFile(project, "utf8")
+      await fs.writeFile(project, "[bad", "utf8")
+      await sessionObserver.getRecentLearnings(5, ws.path)
+      await sessionObserver.getRecentLearnings(5, ws.path)
+      expect(skipped()).toBe(1)
+      await fs.writeFile(project, good, "utf8")
+      await sessionObserver.getRecentLearnings(5, ws.path)
+      await fs.writeFile(project, "[bad", "utf8")
+      await sessionObserver.getRecentLearnings(5, ws.path)
+      expect(skipped()).toBe(2)
+    } finally {
+      restoreTestHome(prev)
+    }
+  })
+
+  test("a write whose lock cannot be taken still saves where it can and logs lock_failed (#217)", async () => {
+    await using home = await tmpdir()
+    await using ws = await tmpdir()
+    const prev = process.env.OPENCODE_TEST_HOME
+    process.env.OPENCODE_TEST_HOME = home.path
+    try {
+      // A file where the global store's folder should be: the lock folder cannot be made there.
+      const folder = path.dirname(learningStorePaths(ws.path).global!)
+      await fs.mkdir(path.dirname(folder), { recursive: true })
+      await fs.writeFile(folder, "not a folder", "utf8")
+      const recorded = await sessionObserver.recordLearning({ lesson: "saved without the lock", source: "user_feedback" }, ws.path)
+      expect(recorded.savedTo).toEqual(["project"])
+      const failed = sessionObserver
+        .getDiagnosticLogs()
+        .filter((e) => e.type === "LEARNING_STORE" && e.details.event === "lock_failed" && e.details.file === learningStorePaths(ws.path).global)
+      expect(failed.length).toBeGreaterThan(0)
+    } finally {
+      restoreTestHome(prev)
+    }
+  })
+
+  test(
+    "two processes recording rules at once lose none of them (#217)",
+    async () => {
+      await using home = await tmpdir()
+      await using ws = await tmpdir()
+      const writer = path.join(import.meta.dir, "fixture", "record-rules.ts")
+      const run = (prefix: string) =>
+        Bun.spawn(["bun", "run", writer, prefix, "12", ws.path], {
+          cwd: path.join(import.meta.dir, "..", ".."),
+          env: { ...process.env, OPENCODE_TEST_HOME: home.path },
+          stdout: "pipe",
+          stderr: "pipe",
+        })
+      const children = [run("alpha"), run("beta")]
+      const codes = await Promise.all(children.map((child) => child.exited))
+      if (codes.some((code) => code !== 0))
+        throw new Error(await Promise.all(children.map((child) => new Response(child.stderr).text())).then((t) => t.join("\n")))
+      const prev = process.env.OPENCODE_TEST_HOME
+      process.env.OPENCODE_TEST_HOME = home.path
+      try {
+        const paths = learningStorePaths(ws.path)
+        for (const file of [paths.global!, paths.project!]) {
+          const rows = JSON.parse(await fs.readFile(file, "utf8")) as Array<{ lesson: string }>
+          expect(rows.map((r) => r.lesson).sort()).toEqual(
+            ["alpha", "beta"].flatMap((prefix) => Array.from({ length: 12 }, (_, i) => `${prefix} rule ${i}`)).sort(),
+          )
+        }
+      } finally {
+        restoreTestHome(prev)
+      }
+    },
+    60_000,
+  )
+
   test("a rule recorded in a project is mirrored to the global store by design (#38)", async () => {
     await using home = await tmpdir()
     await using ws = await tmpdir()

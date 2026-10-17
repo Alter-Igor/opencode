@@ -3,6 +3,7 @@ import * as path from "node:path"
 import { truthy } from "@opencode-ai/core/flag/flag"
 import { getLatestSynapseServing } from "./synapse"
 import { redactSecrets } from "./secret-redaction"
+import { Flock } from "@opencode-ai/core/util/flock"
 
 export interface ToolExecutionRecord {
   callId: string
@@ -95,7 +96,15 @@ export interface SessionRetrospective {
 
 export interface DiagnosticLogEntry {
   timestamp: string
-  type: "INFERENCE_REQUEST" | "ESCALATION" | "INFERENCE_RESPONSE" | "INFERENCE_ERROR" | "TOOL_EXECUTION" | "AUTH_EVENT" | "FALLBACK_TRIGGERED"
+  type:
+    | "INFERENCE_REQUEST"
+    | "ESCALATION"
+    | "INFERENCE_RESPONSE"
+    | "INFERENCE_ERROR"
+    | "TOOL_EXECUTION"
+    | "AUTH_EVENT"
+    | "FALLBACK_TRIGGERED"
+    | "LEARNING_STORE"
   sessionId?: string
   correlationId?: string
   details: Record<string, any>
@@ -415,7 +424,7 @@ class SessionObserverManager {
     }
     let stored = entry
     const savedTo: Array<"global" | "project"> = []
-    await this.mutate(async () => {
+    await this.mutateStores(workspaceDir, async () => {
       for (const file of files) {
         const scope: "global" | "project" = file === paths.project ? "project" : "global"
         try {
@@ -456,12 +465,13 @@ class SessionObserverManager {
     // Always read from disk, from the right stores for THIS workspace. One process
     // can serve several projects, so no cached list may be reused across them.
     return this.mutate(async () => {
+      const paths = learningStorePaths(workspaceDir)
       // #212: the same row check as a forget, so a malformed row cannot throw in isLive.
       const read = async (file?: string): Promise<SessionLearning[]> => {
         const rows = file ? await readRuleStore(file) : undefined
+        if (file) this.noteSkippedStore(file, file === paths.project ? "project" : "global", rows === "unreadable", workspaceDir)
         return Array.isArray(rows) ? rows : []
       }
-      const paths = learningStorePaths(workspaceDir)
       // Project rules first: a committed, reviewed repo rule outranks an ad-hoc
       // global note (AIMETH-008 - shared repo facts win). One entry per rule text.
       const seen = new Set<string>()
@@ -480,6 +490,31 @@ class SessionObserverManager {
     return this.selectInjected(limit, workspaceDir)
   }
 
+  /** Stores already reported as skipped, so the prompt path writes one line per store, not one per turn. */
+  private skippedStores = new Set<string>()
+
+  /**
+   * #217: injection reads an unreadable store as empty, so its rules stop applying with no trace.
+   * Write one diagnostics line when that starts, and again if it breaks again after a good read.
+   */
+  private noteSkippedStore(file: string, store: "global" | "project", unreadable: boolean, workspaceDir?: string) {
+    if (!unreadable) {
+      this.skippedStores.delete(file)
+      return
+    }
+    if (this.skippedStores.has(file)) return
+    this.skippedStores.add(file)
+    this.logDiagnostic(
+      {
+        timestamp: new Date().toISOString(),
+        type: "LEARNING_STORE",
+        details: { event: "skipped_unreadable", store, file },
+        error: "rule store could not be read; its rules are not injected until it is fixed or removed",
+      },
+      workspaceDir,
+    )
+  }
+
   private mutation: Promise<unknown> = Promise.resolve()
 
   /** Serialise file mutations so a record and a forget cannot interleave on one file. */
@@ -487,6 +522,44 @@ class SessionObserverManager {
     const run = this.mutation.then(fn, fn)
     this.mutation = run.catch(() => {})
     return run
+  }
+
+  /**
+   * #217: `mutate` serialises one process only, so a TUI and `opencode serve` could both read a
+   * store, and the later write dropped the other's rule (or a forget's put-back overwrote it).
+   * Writes also take a machine-wide lock (the #75 `Flock` pattern) in the global store's folder,
+   * which every writer shares, or the project store's folder when there is no home. If the lock
+   * cannot be taken in time, the write goes ahead under the in-process lock alone, as before
+   * #217, and a diagnostics line says so.
+   */
+  private mutateStores<T>(workspaceDir: string | undefined, fn: () => Promise<T>): Promise<T> {
+    return this.mutate(async () => {
+      const paths = learningStorePaths(workspaceDir)
+      const anchor = paths.global ?? paths.project
+      if (!anchor) return fn()
+      let lease: Flock.Lease | undefined
+      try {
+        lease = await Flock.acquire(`learning-store:${anchor}`, {
+          dir: path.dirname(anchor),
+          timeoutMs: LEARNING_STORE_LOCK_TIMEOUT_MS,
+        })
+      } catch (error) {
+        this.logDiagnostic(
+          {
+            timestamp: new Date().toISOString(),
+            type: "LEARNING_STORE",
+            details: { event: "lock_failed", file: anchor },
+            error: error instanceof Error ? error.message : String(error),
+          },
+          workspaceDir,
+        )
+      }
+      try {
+        return await fn()
+      } finally {
+        await lease?.release().catch(() => {})
+      }
+    })
   }
 
   /**
@@ -557,8 +630,8 @@ class SessionObserverManager {
     const matches = (l: SessionLearning) => String(l.lesson ?? "").toLowerCase().includes(needle)
     const paths = learningStorePaths(workspaceDir)
     const files = [paths.global, paths.project].filter((file): file is string => Boolean(file))
-    // One mutation for both stores, so a record cannot interleave between them.
-    return this.mutate(async () => {
+    // One mutation for both stores, so a record cannot interleave between them (in this process or another, #217).
+    return this.mutateStores(workspaceDir, async () => {
       // #38: read and check every store before writing any. If a store cannot be read, we
       // cannot claim its copy is gone, so we report nothing AND change nothing: a refused
       // forget used to tombstone the global copy before it found the project store unreadable.
@@ -604,6 +677,9 @@ class SessionObserverManager {
 
 /** How many of the most-recent rules are injected into a session system prompt. */
 export const INJECTED_LEARNINGS_LIMIT = 5
+
+/** How long a rule-store write waits for another process holding the machine-wide store lock (#217). */
+const LEARNING_STORE_LOCK_TIMEOUT_MS = 10_000
 
 /**
  * Where the machine-wide diagnostics.log goes: OPENCODE_DIAGNOSTICS_DIR, else
@@ -698,12 +774,32 @@ function trimRules(rows: SessionLearning[]): SessionLearning[] {
   ]
 }
 
+/**
+ * #217: on Windows a rename onto a file another handle has open (antivirus, the indexer, a
+ * reader in another process) fails with EPERM, EBUSY or EACCES for a moment; QA's 3-writer
+ * harness lost rules this way (15 bad results in 10 runs, 0 with this retry). Retry those briefly
+ * (EACCES only on Windows, where it means the same; elsewhere it is a real permission error);
+ * anything else, or the last attempt, throws.
+ */
+async function renameWithRetry(from: string, to: string): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fs.rename(from, to)
+    } catch (error) {
+      const code = error && typeof error === "object" && "code" in error ? (error as { code?: unknown }).code : undefined
+      const retry = code === "EPERM" || code === "EBUSY" || (code === "EACCES" && process.platform === "win32")
+      if (attempt >= 5 || !retry) throw error
+      await new Promise((resolve) => setTimeout(resolve, 20 * 2 ** attempt))
+    }
+  }
+}
+
 /** Write a rule store through a temp file and a rename, so a reader never sees a half-written file. Exported for tests (#217). */
 export async function writeJsonAtomic(file: string, rows: SessionLearning[]): Promise<void> {
   const tmp = `${file}.${process.pid}.${Math.random().toString(36).slice(2, 7)}.tmp`
   try {
     await fs.writeFile(tmp, JSON.stringify(rows, null, 2), "utf8")
-    await fs.rename(tmp, file)
+    await renameWithRetry(tmp, file)
   } catch (error) {
     // #217: a failed rename (Windows EPERM/EBUSY) used to leave learnings.json.*.tmp behind.
     await fs.rm(tmp, { force: true }).catch(() => {})
