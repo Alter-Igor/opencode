@@ -1533,7 +1533,7 @@ describe("session.message-v2.fromError", () => {
   test("detects Synapse context overflow from the body code or reason alone (#196)", () => {
     for (const body of [{ error: { code: "context_overflow" } }, { error: { reason: "context_overflow" } }]) {
       const error = new APICallError({
-        message: "Bad Request",
+        message: "Request rejected", // not the HTTP status text: message() would append the body, and the regex alone would match
         url: "https://synapse2-api.alterspective.com.au/v1/chat/completions",
         requestBodyValues: {},
         statusCode: 400,
