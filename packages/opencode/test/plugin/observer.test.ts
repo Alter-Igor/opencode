@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test"
-import { defaultDiagnosticsLogDir, failedToolFromEvent, learningStorePaths, sessionObserver } from "../../src/plugin/observer"
+import { defaultDiagnosticsLogDir, failedToolFromEvent, learningStorePaths, sessionObserver, writeJsonAtomic } from "../../src/plugin/observer"
 import { SynapseAuthPlugin } from "../../src/plugin/synapse"
 import { tmpdir } from "../fixture/fixture"
 import * as fs from "fs/promises"
@@ -543,6 +543,42 @@ describe("rule visibility", () => {
       const reply = String(await hooks.tool?.synapse_forget_rule?.execute({ lesson: "still here" }, {} as never))
       expect(reply).toContain("could not be read")
       expect(reply).not.toContain("No rule matched")
+    } finally {
+      restoreTestHome(prev)
+    }
+  })
+
+  test("a failed rule-store write leaves no temp file behind (#217)", async () => {
+    await using dir = await tmpdir()
+    // A non-empty folder where the store should be: the rename onto it fails on every OS.
+    const target = path.join(dir.path, "learnings.json")
+    await fs.mkdir(target)
+    await fs.writeFile(path.join(target, "keep"), "x")
+    await expect(writeJsonAtomic(target, [])).rejects.toThrow()
+    expect((await fs.readdir(dir.path)).filter((name) => name.endsWith(".tmp"))).toEqual([])
+  })
+
+  test("unreadable rule stores are named, and synapse_list_rules shows them as skipped (#217)", async () => {
+    await using home = await tmpdir()
+    await using ws = await tmpdir()
+    const prev = process.env.OPENCODE_TEST_HOME
+    process.env.OPENCODE_TEST_HOME = home.path
+    try {
+      await sessionObserver.recordLearning({ lesson: "hidden by a bad row", source: "user_feedback" }, ws.path)
+      await fs.writeFile(learningStorePaths(ws.path).project!, JSON.stringify([null]), "utf8")
+      expect(await sessionObserver.unreadableRuleStores(ws.path)).toEqual(["project"])
+      const hooks = await SynapseAuthPlugin({
+        client: {} as never,
+        project: {} as never,
+        directory: ws.path,
+        worktree: "",
+        experimental_workspace: { register() {} },
+        serverUrl: new URL("https://example.com"),
+        $: {} as never,
+      } as never)
+      const reply = String(await hooks.tool?.synapse_list_rules?.execute({}, {} as never))
+      expect(reply).toContain("skipped: this store could not be read")
+      expect(reply).toContain("hidden by a bad row")
     } finally {
       restoreTestHome(prev)
     }
