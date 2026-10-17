@@ -30,7 +30,7 @@ describe("small model delegation plugin", () => {
     expect(parseThreshold("65536", 8192)).toBe(65536)
   })
 
-  test("injects delegation prompt when model context <= default threshold (32768)", async () => {
+  test("injects delegation prompt when model context <= default threshold (300000)", async () => {
     const hooks = await createPlugin()
     const output = { system: ["base prompt"] }
     const model = {
@@ -51,7 +51,7 @@ describe("small model delegation plugin", () => {
     const hooks = await createPlugin()
     const output = { system: ["base prompt"] }
     const model = {
-      limit: { context: 128000 },
+      limit: { context: 500000 },
     } as unknown as Model
 
     await hooks["experimental.chat.system.transform"]?.(
@@ -145,7 +145,7 @@ describe("small model delegation plugin", () => {
     const hooks = await createPlugin()
     const output = { system: ["base prompt"] }
     const model = {
-      limit: { context: 200000 },
+      limit: { context: 500000 },
     } as unknown as Model
 
     await hooks["experimental.chat.system.transform"]?.(
@@ -221,7 +221,7 @@ describe("small model delegation plugin", () => {
     const hooks = await createPlugin()
     const output = { system: ["base prompt"] }
     const largeModel = {
-      limit: { context: 128000 },
+      limit: { context: 500000 },
     } as unknown as Model
 
     await hooks["experimental.chat.system.transform"]?.(

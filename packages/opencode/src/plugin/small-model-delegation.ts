@@ -1,6 +1,6 @@
 import type { Config, Hooks, PluginInput } from "@opencode-ai/plugin"
 
-export const DEFAULT_SMALL_MODEL_CONTEXT_THRESHOLD = 32768
+export const DEFAULT_SMALL_MODEL_CONTEXT_THRESHOLD = 300000
 export const RESTRICTED_TOOLS = new Set(["grep", "read"])
 
 export function smallModelDelegationPrompt(limit?: number): string {
