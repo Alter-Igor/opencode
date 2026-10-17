@@ -412,15 +412,30 @@ describe("MCP tool failures with real remote tool names (#18)", () => {
     return retro.anomalies.filter((a) => a.type === "MCP_TOOL_FAILURE")
   }
 
-  test("an error in an MCP result's content is flagged, by its result shape", async () => {
+  test("error words in a successful MCP result are data, not a failure (QA on #18)", async () => {
     const sessionId = "obs-18-shape"
-    sessionObserver.onToolBefore(sessionId, "c1", "keystone-dynamic_execute-tool", {})
-    sessionObserver.onToolAfter(sessionId, "c1", "keystone-dynamic_execute-tool", {
-      content: [{ type: "text", text: "Error: Unauthorized (token expired)" }],
+    sessionObserver.onToolBefore(sessionId, "c1", "seqlogs_search", {})
+    sessionObserver.onToolAfter(sessionId, "c1", "seqlogs_search", {
+      content: [{ type: "text", text: "app error: ECONNRESET (recovered); Error: retry timed out" }],
     })
-    const found = await mcpAnomalies(sessionId)
-    expect(found.map((a) => a.tool)).toEqual(["keystone-dynamic_execute-tool"])
-    expect(found[0]?.detail).toContain("Unauthorized")
+    expect(await mcpAnomalies(sessionId)).toEqual([])
+  })
+
+  test("a call the user stopped or refused, or a rule blocked, is not an MCP failure (QA on #18)", async () => {
+    const sessionId = "obs-18-refused"
+    const errors = [
+      "Tool execution aborted",
+      "The user rejected permission to use this specific tool call.",
+      "The user rejected permission to use this specific tool call with the following feedback: not now",
+      'The user has specified a rule which prevents you from using this specific tool call. Here are some of the relevant rules []',
+    ]
+    errors.forEach((error, i) => {
+      sessionObserver.onToolBefore(sessionId, `c${i}`, "alterspective-rag_rag_search", {})
+      sessionObserver.onToolFailed(sessionId, `c${i}`, "alterspective-rag_rag_search", error)
+    })
+    const retro = await sessionObserver.finalizeSessionRetrospective(sessionId)
+    expect(retro?.totalToolCalls).toBe(errors.length)
+    expect(retro?.anomalies.filter((a) => a.type === "MCP_TOOL_FAILURE")).toEqual([])
   })
 
   test("an MCP result with isError set is flagged even when its text looks clean", async () => {
