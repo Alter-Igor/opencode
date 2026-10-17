@@ -320,6 +320,26 @@ describe("synapse_vision tool permissions (#193)", () => {
     } as never
   }
 
+  test("a project opened through a link is still inside the project (#199)", async () => {
+    const link = `${project}-link`
+    const linked = await fs.symlink(project, link, "dir").then(
+      () => true,
+      () => false,
+    )
+    // Windows without the symlink privilege cannot make one; the check then has nothing to prove.
+    if (!linked) return
+    try {
+      const asked: unknown[] = []
+      const tool = await visionTool()
+      const ctx = { ...(context("/", async (i) => void asked.push(i)) as object), directory: link } as never
+      const out = await tool.execute({ image: "in.png", question: "what?" }, ctx)
+      expect(asked).toHaveLength(0)
+      expect(out).toContain("a red banner")
+    } finally {
+      await fs.rm(link, { force: true, recursive: false }).catch(() => fs.unlink(link))
+    }
+  })
+
   test("a file inside the project is read without asking", async () => {
     const asked: unknown[] = []
     const tool = await visionTool()

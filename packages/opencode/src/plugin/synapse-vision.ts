@@ -103,10 +103,20 @@ export async function resolveVisionImage(
     if (opened.size > BigInt(SYNAPSE_VISION_MAX_BYTES)) {
       throw new Error(`Image is too large (${opened.size} bytes). The limit is ${SYNAPSE_VISION_MAX_BYTES} bytes.`)
     }
-    const bytes = await handle.readFile()
+    // Read at most one byte over the limit, so a file that grew after the check is refused.
+    const buffer = Buffer.alloc(Number(opened.size) + 1)
+    let length = 0
+    while (length < buffer.length) {
+      const { bytesRead } = await handle.read(buffer, length, buffer.length - length, length)
+      if (bytesRead === 0) break
+      length += bytesRead
+    }
+    if (length > Number(opened.size)) throw new Error(`Image file changed after it was approved: ${real}`)
+    const bytes = buffer.subarray(0, length)
     return { url: `data:${type};base64,${bytes.toString("base64")}`, label: target }
   } finally {
-    await handle.close()
+    // A failed close must not hide the real error.
+    await handle.close().catch(() => undefined)
   }
 }
 
