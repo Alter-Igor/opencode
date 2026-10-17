@@ -38,10 +38,12 @@ const NOT_A_FAILURE = [
 /**
  * #209: an MCP call stopped by its abort signal (the user stopped the reply) fails with the SDK's
  * wrapped text, e.g. `MCP error -32001: AbortError: The operation was aborted.` (Bun) or
- * "... This operation was aborted" (Node), so it is matched anywhere in the text, not as a prefix.
- * A real timeout reads `MCP error -32001: Request timed out` and still counts.
+ * "... This operation was aborted" (Node). It is matched at the start of the text (optionally after
+ * `Error: `) or right after `AbortError: `, not anywhere: an MCP server's own error that happens to
+ * say "operation was aborted" further in is a real failure. A real timeout reads
+ * `MCP error -32001: Request timed out` and still counts.
  */
-const ABORTED = /operation was aborted/i
+const ABORTED = /(?:^(?:Error: )?|AbortError: )(?:The|This) operation was aborted/i
 
 /** #18: a `message.part.updated` event for a tool part that failed, as the observer needs it. */
 export function failedToolFromEvent(event: {
@@ -306,6 +308,9 @@ class SessionObserverManager {
     // arguments in memory for the life of the process.
     this.trajectories.delete(sessionId)
     this.sessionStartTimes.delete(sessionId)
+    // #209: a turn with no tool calls, or a session.deleted right after an idle, has nothing to
+    // report; it used to write a file and POST a retrospective with 0 calls.
+    if (records.length === 0) return null
 
     const anomalies: SessionAnomaly[] = []
     const learnings: string[] = []
