@@ -280,7 +280,7 @@ async function fetchBranch(ctx: Ctx, repo: string, bundle: string, branch: strin
 }
 
 async function executableChanges(ctx: Ctx, repo: string, base: string, branch: string): Promise<string[]> {
-  const args = ["-C", repo, "diff", "--raw", "-z", "--no-abbrev", "--no-renames", "--no-ext-diff", "--no-textconv", base, branch, "--"]
+  const args = ["-C", repo, "diff", "--no-color", "--raw", "-z", "--no-abbrev", "--no-renames", "--no-ext-diff", "--no-textconv", base, branch, "--"]
   const entries = parseRawDiff(await hostGit(ctx, args, "list changed files"))
   return flagChanges(entries, base, branch, async (rev, file) => {
     const result = await ctx.host(["git", "-C", repo, "cat-file", "blob", `${rev}:${file}`], { timeoutMs: ctx.timeouts.short })
@@ -305,13 +305,15 @@ export const MIRROR_ADDRESSES = ["npm-cache:4873", "pypi-cache:5000"] as const
  */
 async function mirrorAddressChanges(ctx: Ctx, repo: string, base: string, branch: string): Promise<{ files: string[] | null; reason?: string }> {
   try {
-    const listed = await ctx.host(["git", "-C", repo, "diff", "--name-only", "-z", "--no-renames", base, branch, "--"], { timeoutMs: ctx.timeouts.short })
+    const listed = await ctx.host(["git", "-C", repo, "diff", "--no-color", "--name-only", "-z", "--no-renames", base, branch, "--"], { timeoutMs: ctx.timeouts.short })
     if (listed.code !== 0) return { files: null, reason: checkFailure("git diff", listed) }
     const changed = new Set(listed.stdout.split("\0").filter(Boolean))
     if (changed.size === 0) return { files: [] }
     const pathspecs = grepPathspecs([...changed])
     // `--` after the revision: a host path named like the branch must not make git read it as a file.
-    const grep = await ctx.host(["git", "--literal-pathspecs", "-C", repo, "grep", "-l", "-z", "--text", "-F", ...MIRROR_ADDRESSES.flatMap((a) => ["-e", a]), branch, "--", ...pathspecs], { timeoutMs: ctx.timeouts.short })
+    // --no-color: an owner config of color.grep=always would wrap every hit in colour codes, and no
+    // hit would match a changed name, so the check would read clean (#188).
+    const grep = await ctx.host(["git", "--literal-pathspecs", "-C", repo, "grep", "--no-color", "-l", "-z", "--text", "-F", ...MIRROR_ADDRESSES.flatMap((a) => ["-e", a]), branch, "--", ...pathspecs], { timeoutMs: ctx.timeouts.short })
     if (grep.code === 1) return { files: [] } // no match in the searched files
     if (grep.code !== 0) return { files: null, reason: checkFailure("git grep", grep) }
     return { files: grep.stdout.split("\0").filter(Boolean).map((hit) => hit.slice(branch.length + 1)).filter((file) => changed.has(file)) }

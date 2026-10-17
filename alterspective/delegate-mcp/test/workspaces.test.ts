@@ -338,6 +338,21 @@ describe("workspaces: collect names files that still hold a cache address (#162)
   })
 
   test(
+    "#188: host git config that forces colour does not hide a file or a host-executable change",
+    async () => {
+      // As if the owner's global config set color.ui / color.grep / color.diff = always.
+      const colour = ["-c", "color.ui=always", "-c", "color.grep=always", "-c", "color.diff=always"]
+      const workspaces = fx.workspaces({ hostExec: async (argv, o) => runCommand(argv[0] === "git" ? ["git", ...colour, ...argv.slice(1)] : argv, undefined, o?.timeoutMs) })
+      const ws = await workspaces.open(fx.hostRepo, "mirror-colour")
+      await fx.boxCommit("mirror-colour", { "uv.lock": 'source = { registry = "http://pypi-cache:5000/index/" }\n', ".githooks/pre-commit": "echo hi\n" }, "colour")
+      const result = await workspaces.collect(ws)
+      expect(result.mirrorAddressFiles).toEqual(["uv.lock"])
+      expect(result.hostExecutableChanges).toContain(".githooks/pre-commit")
+    },
+    T,
+  )
+
+  test(
     "a branch without the address lists nothing",
     async () => {
       const workspaces = fx.workspaces()
