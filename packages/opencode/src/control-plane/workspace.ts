@@ -23,6 +23,9 @@ import { type Target, type WorkspaceInfo, WorkspaceInfo as WorkspaceInfoSchema }
 import { WorkspaceV2 } from "@opencode-ai/core/workspace"
 import { Session } from "@/session/session"
 import { SessionPrompt } from "@/session/prompt"
+import { SessionRunState } from "@/session/run-state"
+import { SessionStatus } from "@/session/status"
+import { cancelSessionTree, idleWhenQuiet } from "@/session/cancel-tree"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionID } from "@/session/schema"
 import { NotFoundError } from "@/storage/storage"
@@ -156,6 +159,16 @@ const layer = Layer.effect(
     const auth = yield* Auth.Service
     const session = yield* Session.Service
     const prompt = yield* SessionPrompt.Service
+    const statusSvc = yield* SessionStatus.Service
+    const runState = yield* SessionRunState.Service
+    const cancelDeps = {
+      cancel: (id: SessionID) => prompt.cancel(id),
+      children: (id: SessionID) => session.children(id),
+      isIdle: idleWhenQuiet(
+        (id: SessionID) => statusSvc.get(id),
+        (id: SessionID) => runState.assertNotBusy(id),
+      ),
+    }
     const http = yield* HttpClient.HttpClient
     const events = yield* EventV2Bridge.Service
     const vcs = yield* Vcs.Service
@@ -791,8 +804,11 @@ const layer = Layer.effect(
         .all()
         .pipe(Effect.orDie)
       const sessionIDs = new Set(sessions.map((sessionInfo) => sessionInfo.id))
+      const roots = sessions.filter((sessionInfo) => !sessionInfo.parentID || !sessionIDs.has(sessionInfo.parentID))
+      // Fork (#214): stop each session's running reply, and its sub-sessions', before they are removed.
+      yield* Effect.forEach(roots, (sessionInfo) => cancelSessionTree(cancelDeps, sessionInfo.id), { discard: true })
       yield* Effect.forEach(
-        sessions.filter((sessionInfo) => !sessionInfo.parentID || !sessionIDs.has(sessionInfo.parentID)),
+        roots,
         (sessionInfo) =>
           session.remove(sessionInfo.id).pipe(Effect.catchIf(NotFoundError.isInstance, () => Effect.void)),
         { discard: true },
@@ -954,6 +970,8 @@ export const node = LayerNode.make({
     Auth.node,
     Session.node,
     SessionPrompt.node,
+    SessionStatus.node,
+    SessionRunState.node,
     httpClient,
     EventV2Bridge.node,
     Vcs.node,
