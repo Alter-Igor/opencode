@@ -7,7 +7,9 @@
 //   - a changed *.test.ts(x) file runs itself;
 //   - src/<dir>/<name>.ts maps to test/<dir>/<name>*.test.ts, test/<dir>/<name>/**, the flat
 //     layout test/<dir>-*.test.ts and test/<name>*.test.ts;
-//   - plus every test file in the package that imports the changed module directly.
+//   - plus every test file in the package that imports the changed module directly, or imports a
+//     helper under test/ that does (one hop: the TUI sync tests reach src/context/sync.tsx only
+//     through sync-fixture.tsx, so a sync.tsx change ran none of them, #215 QA).
 // The full suite still runs in CI on Linux (Tier 2); this is not a substitute for it.
 //
 // Usage: bun run test:fast [--base origin/dev] [--list] [--no-lint]
@@ -81,6 +83,38 @@ function testsOf(pkg: string): string[] {
   return tests
 }
 
+const helpersByPackage = new Map<string, string[]>()
+/** Code files under test/ that are not tests themselves (fixtures, shared helpers). */
+function helpersOf(pkg: string): string[] {
+  let helpers = helpersByPackage.get(pkg)
+  if (!helpers) {
+    const found: string[] = []
+    const visit = (dir: string) => {
+      if (!existsSync(dir)) return
+      for (const entry of readdirSync(dir)) {
+        if (entry === "node_modules") continue
+        const abs = path.join(dir, entry)
+        if (statSync(abs).isDirectory()) visit(abs)
+        else if (CODE.test(entry) && !TEST.test(entry)) found.push(abs)
+      }
+    }
+    visit(path.join(root, pkg, "test"))
+    helpers = found
+    helpersByPackage.set(pkg, helpers)
+  }
+  return helpers
+}
+
+/** True when `source` imports `src/<module>` (with or without its extension). */
+const importsModule = (source: string, module: string) =>
+  ["", ".ts", ".tsx"].some((ext) => [`"`, `'`].some((quote) => source.includes(`src/${module}${ext}${quote}`)))
+
+/** True when `source` imports the helper file `abs` by its name (with or without its extension). */
+const importsHelper = (source: string, abs: string) => {
+  const name = path.basename(abs).replace(CODE, "")
+  return ["", ".ts", ".tsx"].some((ext) => [`"`, `'`].some((quote) => source.includes(`/${name}${ext}${quote}`)))
+}
+
 /** Test files (relative to the package) mapped to one changed file (relative to the package). */
 function mapToTests(pkg: string, rel: string): string[] {
   if (TEST.test(rel)) return [rel]
@@ -90,6 +124,7 @@ function mapToTests(pkg: string, rel: string): string[] {
   const name = path.posix.basename(inner)
   const first = dir === "." ? "" : dir.split("/")[0]
   const module = inner.endsWith("/index") ? inner.slice(0, -"/index".length) : inner
+  const helpers = helpersOf(pkg).filter((abs) => importsModule(readFileSync(abs, "utf8"), module))
   return testsOf(pkg).filter((test) => {
     const testDir = path.posix.dirname(test.slice("test/".length))
     const testName = path.posix.basename(test)
@@ -97,9 +132,9 @@ function mapToTests(pkg: string, rel: string): string[] {
     if (test.startsWith(`test/${inner}/`)) return true
     if (testDir === "." && first && testName.startsWith(`${first}-`)) return true
     if (testDir === "." && testName.startsWith(name)) return true
-    // A direct import of the changed module, with or without its extension.
+    // A direct import of the changed module, or of a test helper that imports it.
     const source = readFileSync(path.join(root, pkg, test), "utf8")
-    return ["", ".ts", ".tsx"].some((ext) => [`"`, `'`].some((quote) => source.includes(`src/${module}${ext}${quote}`)))
+    return importsModule(source, module) || helpers.some((abs) => importsHelper(source, abs))
   })
 }
 

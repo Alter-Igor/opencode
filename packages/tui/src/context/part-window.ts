@@ -4,23 +4,19 @@
 // hold. Nothing freed it, not even `session.deleted`, which frees parts by the messages it lists.
 
 /**
- * True when a part belongs to a message older than every message loaded for its session, so it
- * would only create an orphan. Message IDs ascend with creation (`MessageID.ascending`). A part
- * of a session with no loaded messages, or of a newer message, passes.
+ * True when a part's message is not among the session's loaded messages. sync.tsx drops such a
+ * part only for a session it has fully synced: the server publishes `message.updated` before that
+ * message's parts, so in a synced session an unlisted message is one outside the window (trimmed,
+ * never loaded, or removed). Message IDs are not compared: their 48-bit time wraps (QA on #215).
  */
-export function outsideWindow(messages: ReadonlyArray<{ id: string }> | undefined, messageID: string): boolean {
-  if (!messages || messages.length === 0) return false
-  let oldest = messages[0]!.id
-  for (const message of messages) {
-    if (message.id === messageID) return false
-    if (message.id < oldest) oldest = message.id
-  }
-  return messageID < oldest
+export function unlistedMessage(messages: ReadonlyArray<{ id: string }> | undefined, messageID: string): boolean {
+  return !!messages && !messages.some((message) => message.id === messageID)
 }
 
 /** Free every stored part of a session, including orphans of messages the store no longer lists. */
 export function freeSessionParts(parts: Record<string, ReadonlyArray<{ sessionID?: string }> | undefined>, sessionID: string) {
   for (const [messageID, list] of Object.entries(parts)) {
-    if (list?.some((part) => part.sessionID === sessionID)) delete parts[messageID]
+    // Every part of one message shares its session, so the first one tells.
+    if (list?.[0]?.sessionID === sessionID) delete parts[messageID]
   }
 }

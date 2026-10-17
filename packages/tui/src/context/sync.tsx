@@ -24,7 +24,7 @@ import { createStore, produce, reconcile } from "solid-js/store"
 import { useProject } from "./project"
 import { useEvent } from "./event"
 import { createDeletedSessions } from "./deleted-sessions"
-import { freeSessionParts, outsideWindow } from "./part-window"
+import { freeSessionParts, unlistedMessage } from "./part-window"
 import { useSDK } from "./sdk"
 import { useTuiStartup } from "./runtime"
 import { createSimpleContext } from "./helper"
@@ -388,8 +388,8 @@ export const {
         }
         case "message.part.updated": {
           if (
-            !hydratingSessions.has(event.properties.part.sessionID) &&
-            outsideWindow(store.message[event.properties.part.sessionID], event.properties.part.messageID)
+            fullSyncedSessions.has(event.properties.part.sessionID) &&
+            unlistedMessage(store.message[event.properties.part.sessionID], event.properties.part.messageID)
           )
             break
           touchPart(event.properties.part.sessionID, event.properties.part.id)
