@@ -126,6 +126,14 @@ describe("oc_collect", () => {
     expect(data(result)).toMatchObject({ commits: 2, mirrorAddressFiles: { checked: false } })
   })
 
+  test("a failed check carries git's reason as untrusted text (#186)", async () => {
+    const f = fakeContext()
+    f.ctx.sessions.set(SID, record())
+    f.ctx.workspaces.collect = async (ws) => ({ branch: ws.branch, commits: 1, hostExecutableChanges: [], mirrorAddressFiles: null, mirrorCheckError: "git grep timed out" })
+    const result = await invoke(collectTool, { sessionID: SID }, f.ctx)
+    expect(data(result).mirrorAddressFiles).toMatchObject({ checked: false, reason: { text: "git grep timed out", truncated: false } })
+  })
+
   test("a clean collect reports no cache address files and no warning", async () => {
     const f = fakeContext()
     f.ctx.sessions.set(SID, record())

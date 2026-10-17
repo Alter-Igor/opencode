@@ -296,23 +296,55 @@ export const MIRROR_ADDRESSES = ["npm-cache:4873", "pypi-cache:5000"] as const
  * clean filter does not cover (uv.lock, a lockfile under another name, a hand-written config).
  * Every changed file counts, not only diffs that touch an address: an unchanged address line in a
  * changed file breaks the build just the same (CodeRabbit on #185). git grep --text searches the
- * branch tree, so a repo's `-diff` / `binary` attributes cannot hide a file (QA on #185); it takes
- * no pathspecs (no command-line cap, no glob matching) and is intersected with the changed files.
- * null: the check itself failed. The branch is already fetched, so that is a warning, never an error.
+ * branch tree, so a repo's `-diff` / `binary` attributes cannot hide a file (QA on #185). It reads
+ * only the changed files while their names are safe to pass back and fit on one command line
+ * (grepPathspecs; literal pathspecs, so `[i]` is a name, not a glob), else the whole branch tree; either way the hits are intersected with the
+ * changed files (#186: a whole-tree read of a very large repo can hit the short timeout).
+ * `files: null`: the check itself failed, and `reason` says why. The branch is already fetched, so
+ * that is a warning, never an error.
  */
-async function mirrorAddressChanges(ctx: Ctx, repo: string, base: string, branch: string): Promise<string[] | null> {
+async function mirrorAddressChanges(ctx: Ctx, repo: string, base: string, branch: string): Promise<{ files: string[] | null; reason?: string }> {
   try {
-    const listed = await hostGit(ctx, ["-C", repo, "diff", "--name-only", "-z", "--no-renames", base, branch, "--"], "list changed files")
-    const changed = new Set(listed.split("\0").filter(Boolean))
-    if (changed.size === 0) return []
+    const listed = await ctx.host(["git", "-C", repo, "diff", "--name-only", "-z", "--no-renames", base, branch, "--"], { timeoutMs: ctx.timeouts.short })
+    if (listed.code !== 0) return { files: null, reason: checkFailure("git diff", listed) }
+    const changed = new Set(listed.stdout.split("\0").filter(Boolean))
+    if (changed.size === 0) return { files: [] }
+    const pathspecs = grepPathspecs([...changed])
     // `--` after the revision: a host path named like the branch must not make git read it as a file.
-    const grep = await ctx.host(["git", "-C", repo, "grep", "-l", "-z", "--text", "-F", ...MIRROR_ADDRESSES.flatMap((a) => ["-e", a]), branch, "--"], { timeoutMs: ctx.timeouts.short })
-    if (grep.code === 1) return [] // no match anywhere on the branch
-    if (grep.code !== 0) return null
-    return grep.stdout.split("\0").filter(Boolean).map((hit) => hit.slice(branch.length + 1)).filter((file) => changed.has(file))
-  } catch {
-    return null
+    const grep = await ctx.host(["git", "--literal-pathspecs", "-C", repo, "grep", "-l", "-z", "--text", "-F", ...MIRROR_ADDRESSES.flatMap((a) => ["-e", a]), branch, "--", ...pathspecs], { timeoutMs: ctx.timeouts.short })
+    if (grep.code === 1) return { files: [] } // no match in the searched files
+    if (grep.code !== 0) return { files: null, reason: checkFailure("git grep", grep) }
+    return { files: grep.stdout.split("\0").filter(Boolean).map((hit) => hit.slice(branch.length + 1)).filter((file) => changed.has(file)) }
+  } catch (error) {
+    return { files: null, reason: `error: ${String(error).slice(0, 200)}` }
   }
+}
+
+/** Command-line budget for the changed-file names passed to git grep; past it, the whole tree is read (Windows caps a command line near 32k characters). */
+export const MAX_PATHSPEC_CHARS = 16_000
+
+/** One path part git passes back unchanged on every host: plain characters, and not `.` or `..`. */
+const PLAIN_PART = /^(?!\.\.?$)[A-Za-z0-9._@+-]+$/
+
+/**
+ * The pathspecs for git grep, or [] for the whole tree. A narrowed read must never miss a file, and
+ * git rewrites some names it is handed back even with --literal-pathspecs (QA on #186: each of
+ * these read as clean): `\` is a folder break to Git for Windows; `C:/<repo>/x` becomes `x`;
+ * `a/../x` and `a/./x` are tidied; a name that was not UTF-8 decodes to U+FFFD and matches
+ * nothing. So it narrows only when every part of every name is plain (an allowlist, not a list of
+ * known traps); any other name reads the whole tree, which is always right, only slower.
+ * Each name counts twice plus 3 for Windows argument quoting.
+ */
+export function grepPathspecs(names: readonly string[]): string[] {
+  if (!names.every((name) => name.split("/").every((part) => PLAIN_PART.test(part)))) return []
+  return names.reduce((n, name) => n + name.length * 2 + 3, 0) <= MAX_PATHSPEC_CHARS ? [...names] : []
+}
+
+/** #186: why the cache-address check failed, for the trace and the tool's output (a timeout and a corrupt repo must not look the same). */
+function checkFailure(step: string, result: { code: number; stderr: string; timedOut?: boolean }): string {
+  if (result.timedOut) return `${step} timed out`
+  const line = result.stderr.trim().split(/\r\n|\r|\n/)[0]?.slice(0, 200)
+  return `${step} exited ${result.code}${line ? `: ${line}` : ""}`
 }
 
 async function collect(ctx: Ctx, ws: Workspace) {
@@ -331,8 +363,8 @@ async function collect(ctx: Ctx, ws: Workspace) {
   }
   const count = await hostGit(ctx, ["-C", state.hostRepo, "rev-list", "--count", `${state.base}..${branch}`], "count commits")
   const hostExecutableChanges = await executableChanges(ctx, state.hostRepo, state.base, branch)
-  const mirrorAddressFiles = await mirrorAddressChanges(ctx, state.hostRepo, state.base, branch)
-  return { branch, commits: Number(count.trim()), hostExecutableChanges, mirrorAddressFiles }
+  const mirror = await mirrorAddressChanges(ctx, state.hostRepo, state.base, branch)
+  return { branch, commits: Number(count.trim()), hostExecutableChanges, mirrorAddressFiles: mirror.files, ...(mirror.reason ? { mirrorCheckError: mirror.reason } : {}) }
 }
 
 export type SyncResult =
@@ -479,7 +511,7 @@ export function createWorkspaces(options: WorkspacesOptions): DelegateWorkspaces
     open: (hostRepo: string, sessionKey: string, call?: CallOptions) =>
       traced(logger, "open", call, { sessionKey }, () => open(ctx, hostRepo, sessionKey), (ws) => ({ branch: ws.branch })),
     collect: (ws: Workspace, call?: CallOptions) =>
-      traced(logger, "collect", call, { sessionKey: ws.sessionKey }, () => collect(ctx, ws), (r) => ({ branch: r.branch, commits: r.commits, hostExecutableChanges: r.hostExecutableChanges.length, mirrorAddressFiles: r.mirrorAddressFiles?.length ?? "check failed" })),
+      traced(logger, "collect", call, { sessionKey: ws.sessionKey }, () => collect(ctx, ws), (r) => ({ branch: r.branch, commits: r.commits, hostExecutableChanges: r.hostExecutableChanges.length, mirrorAddressFiles: r.mirrorAddressFiles?.length ?? `check failed: ${r.mirrorCheckError ?? "unknown"}` })),
     sync: (ws: Workspace, ref: string, call?: CallOptions) =>
       traced(logger, "sync", call, { sessionKey: ws.sessionKey, ref }, () => sync(ctx, ws, ref), (r) => ({ synced: r.synced, head: r.synced ? r.head : "" })),
     resolveRepo: (hostRepo: string, call?: CallOptions) => traced(logger, "resolveRepo", call, {}, () => resolveRepo(ctx, hostRepo)),

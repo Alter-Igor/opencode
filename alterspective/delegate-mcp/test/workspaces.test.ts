@@ -5,6 +5,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:tes
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import path from "node:path"
 import type { ErrorCode } from "../src/shared/errors.ts"
+import { grepPathspecs, MAX_PATHSPEC_CHARS, runCommand, TIMEOUT_CODE, type ExecResult } from "../src/supervisor/workspaces.ts"
 import { code, git, posix, T, WorkspaceFixture } from "./workspaces-fixture.ts"
 
 const fx = new WorkspaceFixture("ocd-ws-")
@@ -202,6 +203,139 @@ describe("workspaces: collect names files that still hold a cache address (#162)
     },
     T,
   )
+
+  // #186: real git, with one host step swapped for a failure. A failed check is null with a reason,
+  // never [] (that would read as clean).
+  const failing = (match: string, failure: ExecResult) => fx.workspaces({ hostExec: async (argv, o) => (argv.includes(match) ? failure : runCommand(argv, undefined, o?.timeoutMs)) })
+  for (const [name, match, failure, reason] of [
+    ["git diff fails", "--name-only", { code: 128, stdout: "", stderr: "fatal: bad object\nmore" }, "git diff exited 128: fatal: bad object"],
+    ["git diff times out", "--name-only", { code: TIMEOUT_CODE, stdout: "", stderr: "", timedOut: true }, "git diff timed out"],
+    ["git grep exits 2", "grep", { code: 2, stdout: "", stderr: "fatal: corrupt" }, "git grep exited 2: fatal: corrupt"],
+    ["git grep times out", "grep", { code: TIMEOUT_CODE, stdout: "", stderr: "", timedOut: true }, "git grep timed out"],
+  ] as const) {
+    const key = `mirror-fail-${name.replaceAll(" ", "-")}`
+    test(
+      `${name}: the check reports null and the reason`,
+      async () => {
+        const workspaces = failing(match, failure)
+        const ws = await workspaces.open(fx.hostRepo, key)
+        await fx.boxCommit(key, { "uv.lock": 'source = { registry = "http://pypi-cache:5000/index/" }\n' }, "lockfile")
+        const result = await workspaces.collect(ws)
+        expect(result.mirrorAddressFiles).toBeNull()
+        expect(result.mirrorCheckError).toBe(reason)
+        expect(result.commits).toBe(1)
+      },
+      T,
+    )
+  }
+
+  test(
+    "too many changed names for one command line: the whole tree is read and still intersected",
+    async () => {
+      const files: Record<string, string> = { "uv.lock": 'source = { registry = "http://pypi-cache:5000/index/" }\n' }
+      for (let i = 0; i < 200; i++) files[`many/${"n".repeat(90)}-${i}.txt`] = `${i}\n`
+      expect(Object.keys(files).join(" ").length).toBeGreaterThan(MAX_PATHSPEC_CHARS)
+      const seen: (readonly string[])[] = []
+      const watched = fx.workspaces({ hostExec: async (argv, o) => (argv.includes("grep") && seen.push(argv), runCommand(argv, undefined, o?.timeoutMs)) })
+      const ws = await watched.open(fx.hostRepo, "mirror-many")
+      await fx.boxCommit("mirror-many", files, "many files")
+      const result = await watched.collect(ws)
+      expect(result.mirrorAddressFiles).toEqual(["uv.lock"])
+      expect(seen[0]?.at(-1)).toBe("--") // no pathspecs: the whole tree
+    },
+    T,
+  )
+
+  test(
+    "a few changed names: only those files are read",
+    async () => {
+      const seen: (readonly string[])[] = []
+      const workspaces = fx.workspaces({ hostExec: async (argv, o) => (argv.includes("grep") && seen.push(argv), runCommand(argv, undefined, o?.timeoutMs)) })
+      const ws = await workspaces.open(fx.hostRepo, "mirror-few")
+      await fx.boxCommit("mirror-few", { "uv.lock": 'source = { registry = "http://pypi-cache:5000/index/" }\n', "docs/notes.md": "plain\n" }, "few")
+      expect((await workspaces.collect(ws)).mirrorAddressFiles).toEqual(["uv.lock"])
+      const argv = seen[0] ?? []
+      expect(argv).toContain("--literal-pathspecs")
+      expect(argv.slice(argv.indexOf("--") + 1).sort()).toEqual(["docs/notes.md", "uv.lock"])
+    },
+    T,
+  )
+
+  // QA on #186: names Windows cannot write to disk but the box's Linux tree can hold. Built with
+  // plumbing (raw bytes in, no checkout) so the test runs on Windows too.
+  const commitRawName = async (key: string, name: Uint8Array, content: string) => {
+    const run = async (args: string[], input?: Uint8Array) => {
+      const p = Bun.spawn(["git", "-C", fx.boxClone(key), ...args], { stdin: input ?? "ignore", stdout: "pipe", stderr: "pipe", env: fx.boxEnv })
+      const [out, err, exit] = [await new Response(p.stdout).arrayBuffer(), await new Response(p.stderr).text(), await p.exited]
+      if (exit !== 0) throw new Error(`git ${args.join(" ")}: ${err}`)
+      return new Uint8Array(out)
+    }
+    const text = (b: Uint8Array) => new TextDecoder().decode(b).trim()
+    const entry = (type: "blob" | "tree", sha: string, part: Uint8Array) => Buffer.concat([Buffer.from(`${type === "blob" ? "100644" : "040000"} ${type} ${sha}\t`), Buffer.from(part), Buffer.from([0])])
+    // Split on "/" (0x2f) and build the trees bottom-up, so a part can be ".." or "C:".
+    const parts: Uint8Array[] = []
+    let start = 0
+    for (let i = 0; i <= name.length; i++) {
+      if (i < name.length && name[i] !== 0x2f) continue
+      parts.push(name.slice(start, i))
+      start = i + 1
+    }
+    let sha = text(await run(["hash-object", "-w", "--stdin"], new TextEncoder().encode(content)))
+    let type: "blob" | "tree" = "blob"
+    for (let i = parts.length - 1; i > 0; i--) {
+      sha = text(await run(["mktree", "-z"], entry(type, sha, parts[i]!)))
+      type = "tree"
+    }
+    const top = Buffer.concat([Buffer.from(await run(["ls-tree", "-z", "HEAD"])), entry(type, sha, parts[0]!)])
+    const tree = text(await run(["mktree", "-z"], top))
+    const commit = text(await run(["commit-tree", tree, "-p", "HEAD", "-m", `raw name ${key}`]))
+    await run(["update-ref", "HEAD", commit])
+  }
+  // Names are built when the test runs: fx.hostRepo is set in beforeAll.
+  for (const [label, key, name] of [
+    ["a backslash", "mirror-raw-backslash", () => Buffer.from("back\\slash.lock")],
+    ["bytes that are not UTF-8", "mirror-raw-utf8", () => Buffer.from([0x62, 0x61, 0x64, 0xe9, 0x2e, 0x6c, 0x6f, 0x63, 0x6b])],
+    // Git for Windows reads this as a path inside the host repo and drops the prefix.
+    ["the host repo's own path", "mirror-raw-hostpath", () => Buffer.from(`${posix(fx.hostRepo).replace(/^\//, "")}/evil.lock`)],
+  ] as const) {
+    test(
+      `a changed name with ${label} is still searched`,
+      async () => {
+        const workspaces = fx.workspaces()
+        const ws = await workspaces.open(fx.hostRepo, key)
+        await commitRawName(key, name(), "registry=http://npm-cache:4873/\n")
+        const result = await workspaces.collect(ws)
+        expect(result.mirrorAddressFiles).toHaveLength(1)
+      },
+      T,
+    )
+  }
+
+  // `.` and `..` parts never reach the check: collect's fetch runs git's object check, which refuses them.
+  for (const [label, key, name] of [
+    ["a .. part", "mirror-raw-dotdot", "dir/../evil.lock"],
+    ["a . part", "mirror-raw-dot", "dir/./evil.lock"],
+  ] as const) {
+    test(
+      `a branch with ${label} in a name is refused at fetch`,
+      async () => {
+        const workspaces = fx.workspaces()
+        const ws = await workspaces.open(fx.hostRepo, key)
+        await commitRawName(key, Buffer.from(name), "registry=http://npm-cache:4873/\n")
+        expect(await code(workspaces.collect(ws))).toBe("policy_violation")
+      },
+      T,
+    )
+  }
+
+  test("grepPathspecs: unsafe names and long lists read the whole tree", () => {
+    expect(grepPathspecs(["a.lock", "sub/b-1_2@x+y.json"])).toEqual(["a.lock", "sub/b-1_2@x+y.json"])
+    for (const unsafe of ["[i]", "a b", "C:/x.lock", "dir/../x", "dir/./x", "a//b", "/abs", "x/"]) expect(grepPathspecs(["a.lock", unsafe])).toEqual([])
+    expect(grepPathspecs(["a.lock", "b\\c.lock"])).toEqual([])
+    expect(grepPathspecs(["a.lock", "bad�.lock"])).toEqual([])
+    // Counted twice plus 3: 3,000 names of 2 characters would be 9,000 raw but 21,000 counted.
+    expect(grepPathspecs(Array.from({ length: 3000 }, (_, i) => String(i % 100).padStart(2, "0")))).toEqual([])
+  })
 
   test(
     "a branch without the address lists nothing",

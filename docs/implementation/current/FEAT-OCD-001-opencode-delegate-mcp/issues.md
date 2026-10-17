@@ -54,3 +54,10 @@ Reproductions, second checks and exact validation are in [the fresh review](evid
 | OB-9 | Improvement | `oc_result` truncation cuts the verdict off the end of long reviews: prefer head+tail for a single reply, or page by messageID. | Open |
 | OB-10 | Improvement | Long waits: bridge cap is 240 s but the client tool timeout is ~120 s, so a 20-min build needs ~10 calls. One idle notification (channels already exist, off by default), and fix the gate's Bun.serve default 10 s idleTimeout (seen: "request timed out after 10 seconds" — kills long-polls). | Open |
 | OB-11 | Decision | `dynamic` should leave the default/allowed set until its scenario runs (owner improvement #6; matches the doctor's high-risk warning). The ceiling mismatch (OB-1a) also needs a distinct doctor verdict: "box reachable, this bridge's set differs" instead of `unavailable`. | Open |
+
+## Cache-address check follow-ups (#186, 2026-10-17)
+
+| ID | Type | Description | Status |
+|---|---|---|---|
+| CA-1 | Bug (Minor) | #188 — host `color.grep=always` / `color.ui=always` wraps `git grep` hits in colour codes, so the check returns `[]` (clean). Fix: `--no-color` + a test. Pre-existing (#185). | Open |
+| CA-2 | Gap | The tag-vs-branch ambiguity (`delegate/<key>` tag wins) affects collect's grep, rev-list and host-executable check alike. Documented in `docker/caches/README.md`; not fixed. | Open — documented |
