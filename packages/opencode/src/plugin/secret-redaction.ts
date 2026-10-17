@@ -15,6 +15,8 @@ type Rule = {
   name: string
   pattern: RegExp
   hints?: ReadonlyArray<string>
+  /** The hints are lower case and checked against the text in lower case (`BeArEr`, `SeCrEt`). */
+  caseless?: boolean
   replace?: (match: string, ...groups: string[]) => string
 }
 
@@ -35,11 +37,14 @@ const RULES: ReadonlyArray<Rule> = [
   key("anthropic", ["sk-ant-"], "sk-ant-", "[A-Za-z0-9_-]{32,}"),
   key("stripe", ["_live_", "_test_"], "[sr]k_(?:live|test)_", "[A-Za-z0-9]{20,}"),
   // A real OpenAI key is random: about one character in six is a digit. A name like
-  // sk-project-management-v2 or sk-ReactComponentLibraryVersion2BuildOutput has one or none, and
-  // the old mixed-case check missed a key with no upper case (#207). So: a lower-case letter and at
-  // least three digits after the prefix.
+  // sk-project-management-v2 or sk-ReactComponentLibraryVersion2BuildOutput has one, and the old
+  // mixed-case check missed a key with no upper case (#207). So: a lower-case letter and at least
+  // two digits after the prefix (QA on #228: three missed 0.7% of legacy keys), or the `T3BlbkFJ`
+  // marker (base64 of "OpenAI") that every legacy key holds.
   key("openai", ["sk-"], "sk-", "(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{32,}", (match) =>
-    /[a-z]/.test(match.slice(3)) && (match.slice(3).match(/\d/g)?.length ?? 0) >= 3 ? "[REDACTED:openai]" : match,
+    match.includes("T3BlbkFJ") || (/[a-z]/.test(match.slice(3)) && (match.slice(3).match(/\d/g)?.length ?? 0) >= 2)
+      ? "[REDACTED:openai]"
+      : match,
   ),
   key("github", ["ghp_", "gho_", "ghu_", "ghs_", "ghr_"], "gh[pousr]_", "[A-Za-z0-9]{36,}"),
   key("github", ["github_pat_"], "github_pat_", "[A-Za-z0-9_]{60,}"),
@@ -48,11 +53,15 @@ const RULES: ReadonlyArray<Rule> = [
   key("huggingface", ["hf_"], "hf_", "[A-Za-z0-9]{30,}"),
   key("aws", ["AKIA", "ASIA"], "A[KS]IA", "[0-9A-Z]{16}(?![0-9A-Z])"),
   {
-    // aws_secret_access_key = …, and the JSON and SDK spelling "SecretAccessKey": "…" (#207).
+    // aws_secret_access_key = …, the JSON and SDK spelling "SecretAccessKey": "…", the CLI
+    // forms `--secret-access-key=…` and `aws configure set aws_secret_access_key …` (#207). The
+    // whole value goes (one longer than 40 used to keep its tail). A value with no digit, `/` or
+    // `+` is a word, not a key (`awsCredentialsSecretAccessKeyValueFromVaultX`, QA on #228).
     name: "aws",
-    hints: ["ecret", "ECRET"],
-    pattern: /((?:aws_)?secret_?access_?key["']?\s*[=:]\s*["']?)[A-Za-z0-9/+=]{40}/gi,
-    replace: (_match, name) => `${name}[REDACTED:aws]`,
+    hints: ["secret"],
+    caseless: true,
+    pattern: /((?:aws[_-]?)?secret[_-]?access[_-]?key["']?(?:\s*[=:]\s*|[ \t]+)["']?)([A-Za-z0-9/+=]{40,})/gi,
+    replace: (match, name, value) => (/[\d/+]/.test(value) ? `${name}[REDACTED:aws]` : match),
   },
   {
     name: "azure",
@@ -72,7 +81,8 @@ const RULES: ReadonlyArray<Rule> = [
     // #228). A placeholder (`Bearer YOUR_API_TOKEN_GOES_HERE`), a file path (`Bearer src/plugin/x.ts`)
     // or plain lower-case words (`the bearer authentication-mechanism`) are left alone.
     name: "bearer",
-    hints: ["Bearer", "bearer", "BEARER"],
+    hints: ["bearer"],
+    caseless: true,
     pattern: /(Bearer[ \t]+)([A-Za-z0-9._~+/-]{20,}=*)/gi,
     replace: (match, prefix, token) =>
       match.includes("[REDACTED") || isPlaceholder(token) || isPath(token) || isWords(token)
@@ -107,11 +117,12 @@ function isPlaceholder(token: string): boolean {
 
 /**
  * A file path (`src/plugin/x.ts`, `./a/b.json`), not a token: it starts with `./` or `../`, or
- * holds a `/` and ends in a lower-case extension. A base64 token can start with `/` and can hold
- * `/`, but has no `.`, so it is not taken for a path.
+ * holds a `/` and ends in an extension of lower-case letters only. A base64 token can start with
+ * `/` and can hold `/`, but not `.`; an opaque token ending in `.abc1` is not a path either (QA on
+ * #228).
  */
 function isPath(token: string): boolean {
-  return /^\.\.?\//.test(token) || (token.includes("/") && /\.[a-z][a-z0-9]{0,4}$/.test(token))
+  return /^\.\.?\//.test(token) || (token.includes("/") && /\.[a-z]{1,5}$/.test(token))
 }
 
 /** Plain lower-case words (`authentication-mechanism-documentation`): a random token has a digit or a capital. */
@@ -147,14 +158,18 @@ function redactPem(text: string): string {
 /** Replace every high-confidence credential in `text` with `[REDACTED:<kind>]`. */
 export function redactSecrets(text: string): string {
   let out = redactPem(text)
+  let lower: string | undefined
   for (const rule of RULES) {
-    if (rule.hints && !rule.hints.some((hint) => out.includes(hint))) continue
+    const haystack = rule.caseless ? (lower ??= out.toLowerCase()) : out
+    if (rule.hints && !rule.hints.some((hint) => haystack.includes(hint))) continue
+    const before = out
     const replace = rule.replace
     out = replace
       ? out.replace(rule.pattern, (match: string, ...groups: unknown[]) =>
           replace(match, ...groups.filter((group): group is string => typeof group === "string")),
         )
       : out.replace(rule.pattern, `[REDACTED:${rule.name}]`)
+    if (out !== before) lower = undefined
   }
   return out
 }

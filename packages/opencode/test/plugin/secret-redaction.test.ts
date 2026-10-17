@@ -116,6 +116,26 @@ describe("redactSecrets pattern follow-ups (#207)", () => {
     for (const [input, output] of cases) expect(redactSecrets(input)).toBe(output)
   })
 
+  test("QA on #228: legacy OpenAI keys, CLI and mixed-case AWS forms, the whole AWS value", () => {
+    // A legacy key: the T3BlbkFJ marker holds one digit, and the rest may hold one more or none.
+    const legacy = "sk-" + "abcdefghijklmnopqrst" + "T3Blbk" + "FJ" + "uvwxyzABCDEFGHIJKLMN"
+    expect(redactSecrets(legacy)).toBe("[REDACTED:openai]")
+    expect(redactSecrets(`sk-${fake("", "qxzrwvbnmlkj", 46)}a1b2`)).toBe("[REDACTED:openai]")
+    const value = fake("", "aB3/+", 40)
+    const cases: Array<[string, string]> = [
+      [`aws configure set aws_secret_access_key ${value}`, "aws configure set aws_secret_access_key [REDACTED:aws]"],
+      [`--secret-access-key=${value}`, "--secret-access-key=[REDACTED:aws]"],
+      [`SeCrEtAcCeSsKeY=${value}`, "SeCrEtAcCeSsKeY=[REDACTED:aws]"],
+      [`aws_secret_access_key=${value}aB3/+`, "aws_secret_access_key=[REDACTED:aws]"],
+      [`BeArEr ${fake("", "aB3._~", 32)}`, "BeArEr [REDACTED:bearer]"],
+    ]
+    for (const [input, output] of cases) expect(redactSecrets(input)).toBe(output)
+    // A word-like value is not a key; an opaque token ending in .abc1 is not a path.
+    const word = "secretAccessKey: awsCredentialsSecretAccessKeyValueFromVaultX"
+    expect(redactSecrets(word)).toBe(word)
+    expect(redactSecrets(`Bearer ${"aB3dE5fG7hJ9/kLmN0pQ" + "rStUv.abc1"}`)).toBe("Bearer [REDACTED:bearer]")
+  })
+
   test("hides a PGP private key block, with or without its END line", () => {
     const begin = "-----BEGIN " + "PGP PRIVATE KEY BLOCK-----"
     const end = "-----END " + "PGP PRIVATE KEY BLOCK-----"
