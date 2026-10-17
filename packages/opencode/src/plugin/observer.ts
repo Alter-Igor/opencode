@@ -518,6 +518,18 @@ class SessionObserverManager {
   }
 
   /**
+   * #217: the rule stores that exist but cannot be read. List and inject read such a store as
+   * empty, so its rules silently stop applying; synapse_list_rules names it instead.
+   */
+  public async unreadableRuleStores(workspaceDir?: string): Promise<Array<"global" | "project">> {
+    const paths = learningStorePaths(workspaceDir)
+    const out: Array<"global" | "project"> = []
+    if (paths.project && (await readRuleStore(paths.project)) === "unreadable") out.push("project")
+    if (paths.global && (await readRuleStore(paths.global)) === "unreadable") out.push("global")
+    return out
+  }
+
+  /**
    * Forget rules whose text matches (case-insensitive substring): mark them deleted
    * (tombstone) in both persisted stores. Returns the number of distinct rules newly
    * forgotten; a rule present in both stores is counted once. A rule recorded in a project
@@ -686,11 +698,17 @@ function trimRules(rows: SessionLearning[]): SessionLearning[] {
   ]
 }
 
-/** Write JSON via a temp file + rename so a reader never sees a half-written file. */
-async function writeJsonAtomic(file: string, rows: SessionLearning[]): Promise<void> {
+/** Write a rule store through a temp file and a rename, so a reader never sees a half-written file. Exported for tests (#217). */
+export async function writeJsonAtomic(file: string, rows: SessionLearning[]): Promise<void> {
   const tmp = `${file}.${process.pid}.${Math.random().toString(36).slice(2, 7)}.tmp`
-  await fs.writeFile(tmp, JSON.stringify(rows, null, 2), "utf8")
-  await fs.rename(tmp, file)
+  try {
+    await fs.writeFile(tmp, JSON.stringify(rows, null, 2), "utf8")
+    await fs.rename(tmp, file)
+  } catch (error) {
+    // #217: a failed rename (Windows EPERM/EBUSY) used to leave learnings.json.*.tmp behind.
+    await fs.rm(tmp, { force: true }).catch(() => {})
+    throw error
+  }
 }
 
 export interface SessionLearning {

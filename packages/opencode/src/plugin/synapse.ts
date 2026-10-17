@@ -2003,6 +2003,8 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
         async execute() {
           const rules = await sessionObserver.listLearnings(input.directory)
           const paths = learningStorePaths(input.directory)
+          // #217: a store that cannot be read is listed as skipped, not as empty.
+          const unreadable = await sessionObserver.unreadableRuleStores(input.directory)
           const injected = rules.filter((r) => r.injected).length
           const line = (r: (typeof rules)[number]) =>
             "  " +
@@ -2016,6 +2018,8 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
             ")"
           const group = (title: string, file: string | undefined, origin: "global" | "project") => {
             const rows = rules.filter((r) => r.origin === origin)
+            if (unreadable.includes(origin))
+              return [title + "  " + file, "  (skipped: this store could not be read, so none of its rules are applied; fix or remove the file)"]
             return [title + "  " + (file ?? "(unavailable)"), ...(rows.length > 0 ? rows.map(line) : ["  (none)"])]
           }
           return [
