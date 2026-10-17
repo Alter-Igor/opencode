@@ -89,6 +89,30 @@ describe("box package managers (#167)", () => {
     expect(settings.length).toBeGreaterThanOrEqual(6)
     for (const [, value] of settings) expect(String(value)).toMatch(/^http:\/\/(npm-cache:4873|pypi-cache:5000)(\/|$)/)
   })
+
+  test("Yarn 2+ reads the cache and may use plain http to it only (#169)", () => {
+    const env = compose.services.box.environment
+    expect(env.YARN_NPM_REGISTRY_SERVER).toBe("http://npm-cache:4873")
+    expect(env.YARN_UNSAFE_HTTP_WHITELIST).toBe("npm-cache")
+  })
+})
+
+describe("lockfiles leave the box with public registry URLs (#162)", () => {
+  const dockerfile = readFileSync(path.join(CACHES, "..", "box", "Dockerfile"), "utf8")
+  const filters = new Map([...dockerfile.matchAll(/git config --system filter\.([\w-]+)\.clean '([^']*)'/g)].map(([, name, cmd]) => [name, cmd]))
+  const attributes = [...dockerfile.matchAll(/^\s*'(\S+) filter=([\w-]+)'/gm)].map(([, file, filter]) => [file, filter] as const)
+
+  test("each lockfile with registry URLs has a clean filter", () => {
+    expect(attributes.map(([file]) => file).sort()).toEqual(["bun.lock", "npm-shrinkwrap.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock"])
+    for (const [, filter] of attributes) expect(filters.has(filter)).toBe(true)
+    expect(dockerfile).toMatch(/> \/etc\/gitattributes/)
+  })
+
+  test("each filter swaps only the cache address for a public registry", () => {
+    expect(filters.size).toBe(2)
+    for (const cmd of filters.values()) expect(cmd).toMatch(/^sed -e s#http:\/\/npm-cache:4873\/#https:\/\/registry\.(npmjs\.org|yarnpkg\.com)\/#g$/)
+    expect(Object.fromEntries(attributes)["yarn.lock"]).toBe("box-yarn-registry")
+  })
 })
 
 describe("pypi-cache (nginx)", () => {

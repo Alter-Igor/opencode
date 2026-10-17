@@ -98,12 +98,40 @@ describe("oc_collect", () => {
   test("host-executable changes are warned about in the summary; paths only under untrusted", async () => {
     const f = fakeContext()
     f.ctx.sessions.set(SID, record())
-    f.ctx.workspaces.collect = async (ws) => ({ branch: ws.branch, commits: 3, hostExecutableChanges: [".githooks/pre-commit", "package.json"] })
+    f.ctx.workspaces.collect = async (ws) => ({ branch: ws.branch, commits: 3, hostExecutableChanges: [".githooks/pre-commit", "package.json"], mirrorAddressFiles: [] })
     const result = await invoke(collectTool, { sessionID: SID }, f.ctx)
     const first = text(result).split("\n")[0] ?? ""
     expect(first).toContain("WARNING: 2 changed files can run on the host")
     expect(first).not.toContain(".githooks")
     expect(data(result).hostExecutableChanges).toMatchObject({ count: 2, paths: { text: ".githooks/pre-commit\npackage.json", truncated: false } })
+  })
+
+  test("files that still name the package cache are warned about (#162); paths only under untrusted", async () => {
+    const f = fakeContext()
+    f.ctx.sessions.set(SID, record())
+    f.ctx.workspaces.collect = async (ws) => ({ branch: ws.branch, commits: 1, hostExecutableChanges: [], mirrorAddressFiles: ["uv.lock"] })
+    const result = await invoke(collectTool, { sessionID: SID }, f.ctx)
+    const first = text(result).split("\n")[0] ?? ""
+    expect(first).toContain("WARNING: 1 changed file still names the sandbox's package cache")
+    expect(first).not.toContain("uv.lock")
+    expect(data(result).mirrorAddressFiles).toMatchObject({ count: 1, paths: { text: "uv.lock", truncated: false } })
+  })
+
+  test("a failed cache address check is a warning, not an error; the branch result stands", async () => {
+    const f = fakeContext()
+    f.ctx.sessions.set(SID, record())
+    f.ctx.workspaces.collect = async (ws) => ({ branch: ws.branch, commits: 2, hostExecutableChanges: [], mirrorAddressFiles: null })
+    const result = await invoke(collectTool, { sessionID: SID }, f.ctx)
+    expect(text(result).split("\n")[0]).toContain("could not run")
+    expect(data(result)).toMatchObject({ commits: 2, mirrorAddressFiles: { checked: false } })
+  })
+
+  test("a clean collect reports no cache address files and no warning", async () => {
+    const f = fakeContext()
+    f.ctx.sessions.set(SID, record())
+    const result = await invoke(collectTool, { sessionID: SID }, f.ctx)
+    expect(text(result)).not.toContain("package cache")
+    expect(data(result).mirrorAddressFiles).toEqual({ count: 0 })
   })
 })
 

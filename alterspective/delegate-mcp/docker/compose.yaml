@@ -125,6 +125,11 @@ services:
       # box cannot reach it (#167). Point it at the same read-only cache. No prompt: there is no user.
       COREPACK_NPM_REGISTRY: http://npm-cache:4873
       COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+      # Yarn 2+ reads only its own settings and refuses a plain-http registry unless the host is
+      # whitelisted; without these it went to registry.yarnpkg.com and failed (#169).
+      YARN_NPM_REGISTRY_SERVER: http://npm-cache:4873
+      YARN_UNSAFE_HTTP_WHITELIST: npm-cache
+      YARN_ENABLE_TELEMETRY: "0"
       OPENCODE_DISABLE_MODELS_FETCH: "1"
       OPENCODE_DISABLE_AUTOUPDATE: "1"
       # The fork's retrospective POST has no authenticated route in the box (#55).

@@ -288,6 +288,33 @@ async function executableChanges(ctx: Ctx, repo: string, base: string, branch: s
   })
 }
 
+/** The caches' addresses inside the sealed network (compose.yaml); a build outside the box cannot reach them. */
+export const MIRROR_ADDRESSES = ["npm-cache:4873", "pypi-cache:5000"] as const
+
+/**
+ * #162: changed files whose branch version still holds a cache address, i.e. a file the box's git
+ * clean filter does not cover (uv.lock, a lockfile under another name, a hand-written config).
+ * Every changed file counts, not only diffs that touch an address: an unchanged address line in a
+ * changed file breaks the build just the same (CodeRabbit on #185). git grep --text searches the
+ * branch tree, so a repo's `-diff` / `binary` attributes cannot hide a file (QA on #185); it takes
+ * no pathspecs (no command-line cap, no glob matching) and is intersected with the changed files.
+ * null: the check itself failed. The branch is already fetched, so that is a warning, never an error.
+ */
+async function mirrorAddressChanges(ctx: Ctx, repo: string, base: string, branch: string): Promise<string[] | null> {
+  try {
+    const listed = await hostGit(ctx, ["-C", repo, "diff", "--name-only", "-z", "--no-renames", base, branch, "--"], "list changed files")
+    const changed = new Set(listed.split("\0").filter(Boolean))
+    if (changed.size === 0) return []
+    // `--` after the revision: a host path named like the branch must not make git read it as a file.
+    const grep = await ctx.host(["git", "-C", repo, "grep", "-l", "-z", "--text", "-F", ...MIRROR_ADDRESSES.flatMap((a) => ["-e", a]), branch, "--"], { timeoutMs: ctx.timeouts.short })
+    if (grep.code === 1) return [] // no match anywhere on the branch
+    if (grep.code !== 0) return null
+    return grep.stdout.split("\0").filter(Boolean).map((hit) => hit.slice(branch.length + 1)).filter((file) => changed.has(file))
+  } catch {
+    return null
+  }
+}
+
 async function collect(ctx: Ctx, ws: Workspace) {
   checkKey(ws.sessionKey)
   const state = readState(ctx, ws.sessionKey)
@@ -304,7 +331,8 @@ async function collect(ctx: Ctx, ws: Workspace) {
   }
   const count = await hostGit(ctx, ["-C", state.hostRepo, "rev-list", "--count", `${state.base}..${branch}`], "count commits")
   const hostExecutableChanges = await executableChanges(ctx, state.hostRepo, state.base, branch)
-  return { branch, commits: Number(count.trim()), hostExecutableChanges }
+  const mirrorAddressFiles = await mirrorAddressChanges(ctx, state.hostRepo, state.base, branch)
+  return { branch, commits: Number(count.trim()), hostExecutableChanges, mirrorAddressFiles }
 }
 
 export type SyncResult =
@@ -451,7 +479,7 @@ export function createWorkspaces(options: WorkspacesOptions): DelegateWorkspaces
     open: (hostRepo: string, sessionKey: string, call?: CallOptions) =>
       traced(logger, "open", call, { sessionKey }, () => open(ctx, hostRepo, sessionKey), (ws) => ({ branch: ws.branch })),
     collect: (ws: Workspace, call?: CallOptions) =>
-      traced(logger, "collect", call, { sessionKey: ws.sessionKey }, () => collect(ctx, ws), (r) => ({ branch: r.branch, commits: r.commits, hostExecutableChanges: r.hostExecutableChanges.length })),
+      traced(logger, "collect", call, { sessionKey: ws.sessionKey }, () => collect(ctx, ws), (r) => ({ branch: r.branch, commits: r.commits, hostExecutableChanges: r.hostExecutableChanges.length, mirrorAddressFiles: r.mirrorAddressFiles?.length ?? "check failed" })),
     sync: (ws: Workspace, ref: string, call?: CallOptions) =>
       traced(logger, "sync", call, { sessionKey: ws.sessionKey, ref }, () => sync(ctx, ws, ref), (r) => ({ synced: r.synced, head: r.synced ? r.head : "" })),
     resolveRepo: (hostRepo: string, call?: CallOptions) => traced(logger, "resolveRepo", call, {}, () => resolveRepo(ctx, hostRepo)),

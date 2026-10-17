@@ -169,7 +169,7 @@ describe("Wave 3: #142 oc_verify allowlisted command runner", () => {
     let collectedKey = ""
     f.ctx.workspaces.collect = async (ws) => {
       collectedKey = ws.sessionKey
-      return { branch: ws.branch, commits: 1, hostExecutableChanges: [] }
+      return { branch: ws.branch, commits: 1, hostExecutableChanges: [], mirrorAddressFiles: [] }
     }
     let commandRun: string[] = []
     f.ctx.hostExec = async (argv) => {
@@ -193,7 +193,7 @@ describe("Wave 3: #147 oc_land composite landing flow", () => {
     let collected = false
     f.ctx.workspaces.collect = async () => {
       collected = true
-      return { branch: "delegate/s-0000000001", commits: 2, hostExecutableChanges: [] }
+      return { branch: "delegate/s-0000000001", commits: 2, hostExecutableChanges: [], mirrorAddressFiles: [] }
     }
 
     const executedHostCommands: string[][] = []

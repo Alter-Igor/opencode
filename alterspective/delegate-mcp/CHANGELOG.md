@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Supported lockfiles staged in the box get public registry URLs (#162). npm and Yarn 1 wrote `http://npm-cache:4873/...` into `package-lock.json` and `yarn.lock`, so `npm ci` and image builds outside the box failed. The box image now sets git clean filters (`/etc/gitattributes`) that swap the cache address for `https://registry.npmjs.org/` (`yarn.lock`: `https://registry.yarnpkg.com/`) at `git add`. The working copy keeps the cache address; repository attributes can override the filters. `oc_collect` also returns `mirrorAddressFiles` and warns on remaining `npm-cache:4873` or `pypi-cache:5000` references in changed files (for example `uv.lock`, which is not rewritten). This is advisory: every changed file (`git diff --name-only`) whose branch version names an address is listed, found with `git grep --text` on the branch, so a repo that marks lockfiles `-diff` or `binary` cannot hide them. A failed or timed-out check becomes `mirrorAddressFiles: { checked: false, warning }`, never a failed collect. See `docker/caches/README.md` for coverage and Yarn 1 checkout limitations.
+- Yarn 2+ installs through the cache (#169): the box sets `YARN_NPM_REGISTRY_SERVER`, `YARN_UNSAFE_HTTP_WHITELIST` and `YARN_ENABLE_TELEMETRY=0`, and `YARN_` is now a reserved box env prefix.
+- Checked live on 2026-10-17: npm, Yarn 1 and Yarn 4.9.2 in the running box; the git filter on the box's base image (`node:22-slim`, same digest) as uid 10001. The full new box image was not built; it builds on the next bridge start.
+
 - `oc_cleanup` resolves the box before it reads its candidate records. Before, the first call after a bridge start picked records for the old box project, then moved to the newer generation and refused every one as "other box", so nothing was swept (#174).
 - `oc_cleanup` now logs the error `reason` and `detail`, not only the code, when it skips a session (#174).
 - A refused close or sweep ownership check now names which check failed (other bridge, other box, session id differs, record unreadable) in the error detail (#174).
@@ -38,7 +42,7 @@ Checked with `bun run typecheck` and the generation tests (fake docker). Not run
 
 - `npm-cache` no longer runs out of memory. At 512 MB Verdaccio hit its heap limit on big packuments (`vite`, `typescript`, `@types/node`) and restarted in the middle of installs (10 restarts in one day). It now has 2 GB and a 1536 MB Node heap.
 - The box image has `pnpm` (pinned, 11.28.2). It reads through `npm-cache` via `pnpm_config_registry`: pnpm 11 ignores `npm_config_registry`, so `npx pnpm` went straight to `registry.npmjs.org` and failed with `EAI_AGAIN` (the "no network" error). Tested live on a sealed network with the new settings: `pnpm install` of vite, vitest, typescript, @types/node and jsdom finished in 9.6 s. Not tested: a repo whose `packageManager` pins another pnpm version (pnpm should fetch it through the same cache).
-- corepack now fetches through `npm-cache` (`COREPACK_NPM_REGISTRY`); before, it tried `registry.npmjs.org`, which the box cannot reach. Tested live: `corepack pnpm@9.15.9` and `corepack yarn@1.22.22`. Shims are not enabled, so call `corepack <tool>` directly. Yarn 2+ still uses its own registry setting and is not covered. `COREPACK_*` and `PNPM_CONFIG_*` names are reserved, so a host box-env list cannot override them.
+- corepack now fetches through `npm-cache` (`COREPACK_NPM_REGISTRY`); before, it tried `registry.npmjs.org`, which the box cannot reach. Tested live: `corepack pnpm@9.15.9` and `corepack yarn@1.22.22`. Shims are not enabled, so call `corepack <tool>` directly. Yarn 2+ was not covered by #167; #169 above adds its own registry settings. `COREPACK_*` and `PNPM_CONFIG_*` names are reserved, so a host box-env list cannot override them.
 - No new egress host. The box still never reaches a public registry (review N3). The box and npm-cache images rebuild once.
 
 ## 0.5.1 — 2026-10-05
