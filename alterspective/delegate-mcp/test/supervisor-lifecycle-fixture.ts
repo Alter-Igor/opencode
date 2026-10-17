@@ -23,7 +23,7 @@ export const L = {
 }
 
 export type Call = { argv: string[]; env?: Record<string, string>; cwd?: string }
-export type Box = { running: boolean; labels: Record<string, string>; env: string[] }
+export type Box = { running: boolean; labels: Record<string, string>; env: string[]; health?: string }
 export type Overrides = {
   up?: (env: Record<string, string>) => ExecResult | undefined
   down?: ExecResult
@@ -78,7 +78,7 @@ export function fakeDocker(state: Box, calls: Call[], over: Overrides = {}): Exe
       if (over.inspect) return over.inspect
       const box = boxes.get(projectOf(name))
       if (!box?.running) return { code: 1, stdout: "", stderr: `Error: No such container: ${name}` }
-      return { code: 0, stdout: JSON.stringify({ state: { Running: true, Health: { Status: "healthy" } }, labels: box.labels, env: box.env, image: IMAGE }), stderr: "" }
+      return { code: 0, stdout: JSON.stringify({ state: { Running: true, Health: { Status: box.health ?? "healthy" } }, labels: box.labels, env: box.env, image: IMAGE }), stderr: "" }
     }
     if (argv.includes("up")) {
       const env = options?.env ?? {}

@@ -13,7 +13,6 @@ import { PROJECT_RE, mcpAllowPolicy, type BridgeConfig } from "../shared/config.
 import { DYNAMIC_ID, saveKeystoneSet } from "../shared/keystone.ts"
 import type { Supervisor } from "../shared/contracts.ts"
 import { DelegateError, isDelegateError } from "../shared/errors.ts"
-import { createApi } from "../shared/opencode-api.ts"
 import type { Logger } from "../shared/log.ts"
 import type { ApiTarget } from "../shared/opencode-api.ts"
 import { FRONT_SERVERS_NAME } from "../guard/egress.ts"
@@ -24,7 +23,7 @@ import type { RegisteredModels } from "../synapse/models.ts"
 import { INSPECT_ENV, MCP_ALLOW_ENV, PASSWORD_ENV, approvedValues, boxEnvOverride, composeDownEnv, composeEnv, containerName, dynamicProfileFor, paths, siblingContainers } from "./compose-env.ts"
 import { GENERATION_CAP, generationProject, readGenerations, rememberGeneration } from "./generations.ts"
 import { LABEL, dockerArgs, imageExists, inspectBox, redactAll, requireDocker, type BoxInspect, type Exec, type ExecResult } from "./docker.ts"
-import { waitHealthy } from "./health.ts"
+import { boxAnswers, waitHealthy } from "./health.ts"
 import { pruneSignIns, verifyLive } from "./live.ts"
 import { createLeases, type LeaseFs } from "./leases.ts"
 import { relocateIdle } from "./relocate.ts"
@@ -388,6 +387,13 @@ async function sweepOthers(run: Run, projects: readonly string[]): Promise<void>
 export const SILENT_BOX_WAIT_MS = 15 * 60_000
 
 /**
+ * The longest gap between two silent checks that still counts as one silent stretch (#234 QA):
+ * checks come every 30 s revalidate while a bridge is active. A longer gap (an idle bridge, a
+ * sleeping PC) starts the wait again, so a box that may have answered in between is not stopped.
+ */
+export const SILENT_GAP_MS = 2 * 60_000
+
+/**
  * Stop another running box only after it has stayed silent for the wait.
  * A box that answers stays up. The first silent check only remembers the time.
  * compose down never uses -v, and the host records stay.
@@ -400,8 +406,15 @@ async function stopSilentBoxes(run: Run): Promise<void> {
   for (const project of known) {
     if (project === here) continue
     const box = await inspectBox(run.deps.exec, [PASSWORD_ENV], project).catch(() => undefined)
-    if (!box) continue
-    if (!box.running) {
+    // Gone (swept or downed by hand): forget its stamp, so a box recreated under that name starts
+    // a fresh wait (#234 QA).
+    if (!box) {
+      await clearSilent(home, project)
+      continue
+    }
+    // A box that is stopped, or still starting (recreated since the last check), starts its wait
+    // again, so an old silent stamp cannot stop a fresh box early (architect on #234).
+    if (!box.running || box.health === "starting") {
       await clearSilent(home, project)
       continue
     }
@@ -410,17 +423,32 @@ async function stopSilentBoxes(run: Run): Promise<void> {
       await clearSilent(home, project)
       continue
     }
-    if (await boxAnswers(run, box, project, pinned[0]!.sessionKey)) {
+    // One probe of the box itself (3 s cap), not of one pinned session's folder: a box that hangs
+    // must not hold the start lock for the 30 s API default on every revalidate (architect on #234).
+    // A box missing its port or password cannot be reached either: targetOf throws, so it counts as
+    // silent here instead of failing this bridge's own start.
+    const target = (() => {
+      try {
+        return targetOf(box, project)
+      } catch {
+        return undefined
+      }
+    })()
+    if (target && (await boxAnswers(run.deps.fetch, target))) {
       await clearSilent(home, project)
       continue
     }
-    const since = await readSilent(home, project)
-    if (since === undefined) {
-      await writeSilent(home, project, run.deps.now())
+    const now = run.deps.now()
+    const stamp = await readSilent(home, project)
+    if (stamp === undefined || now - stamp.last > SILENT_GAP_MS) {
+      await writeSilent(home, project, { since: now, last: now })
       run.note("info", "old sandbox did not answer; it stays up for now", { project })
       continue
     }
-    if (run.deps.now() - since < SILENT_BOX_WAIT_MS) continue
+    if (now - stamp.since < SILENT_BOX_WAIT_MS) {
+      await writeSilent(home, project, { since: stamp.since, last: now })
+      continue
+    }
     const stopped = await downProject(run, project).then(
       () => true,
       (error: unknown) => {
@@ -434,39 +462,31 @@ async function stopSilentBoxes(run: Run): Promise<void> {
   }
 }
 
-async function boxAnswers(run: Run, box: BoxInspect, project: string, sessionKey: string | undefined): Promise<boolean> {
-  if (!sessionKey) return false
-  try {
-    const status = await createApi(targetOf(box, project), run.deps.fetch).call<unknown>({
-      path: "/session/status",
-      directory: `/sessions/${sessionKey}`,
-    })
-    return status.status === 200
-  } catch {
-    return false
-  }
-}
-
 function silentPath(home: string, project: string): string | undefined {
   if (!PROJECT_RE.test(project)) return undefined
   return path.join(home, "silent", project)
 }
 
-async function readSilent(home: string, project: string): Promise<number | undefined> {
+/** `<since> <last>`: when the silence began and the last check that found it. A one-number stamp has last = since. */
+type SilentStamp = { since: number; last: number }
+
+async function readSilent(home: string, project: string): Promise<SilentStamp | undefined> {
   const file = silentPath(home, project)
   if (!file) return undefined
   const raw = await readFile(file, "utf8").catch(() => undefined)
   if (raw === undefined) return undefined
-  const since = Number(raw)
-  return Number.isFinite(since) ? since : undefined
+  const [since, last] = raw.trim().split(/\s+/).map(Number)
+  if (since === undefined || !Number.isFinite(since)) return undefined
+  const seen = last ?? since
+  return Number.isFinite(seen) ? { since, last: seen } : undefined
 }
 
-async function writeSilent(home: string, project: string, now: number): Promise<void> {
+async function writeSilent(home: string, project: string, stamp: SilentStamp): Promise<void> {
   const file = silentPath(home, project)
   if (!file) return
   await mkdir(path.dirname(file), { recursive: true })
   const tmp = `${file}.${process.pid}.tmp`
-  await writeFile(tmp, `${now}\n`)
+  await writeFile(tmp, `${stamp.since} ${stamp.last}\n`)
   await rename(tmp, file)
 }
 
@@ -519,7 +539,11 @@ async function ensure(run: Run): Promise<ApiTarget> {
   await prepareHost(run)
   const made = await plan(run)
   return withStartLock(run.deps.leaseFs, run.dirs.startLock, async () => {
-    await stopSilentBoxes(run)
+    // Maintenance only: a marker file error (Windows EPERM, #190) or a docker hiccup must not fail
+    // every request (#234 QA).
+    await stopSilentBoxes(run).catch((error: unknown) =>
+      run.note("warn", "silent sandbox check skipped", { detail: error instanceof Error ? error.message.slice(0, 200) : "unknown" }),
+    )
     const box = await inspectBox(run.deps.exec, INSPECT_ENV, run.container)
     if (!box?.running) {
       const next = generationProject(run.root.baseProject, run.deps.image)
