@@ -2046,7 +2046,9 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
           if (result.refused === "unreadable")
             return 'Could not remove rules matching "' + needle + '": a rule store could not be read, so nothing was changed. The rule may still apply.'
           if (result.refused === "write_failed")
-            return 'Could not remove rules matching "' + needle + '": a rule store could not be written, so nothing was changed. Try again.'
+            return result.restored === false
+              ? 'Could not remove rules matching "' + needle + '": a rule store could not be written, and putting the other store back failed too, so the rule may now be removed in one store only. Run synapse_list_rules, then try again.'
+              : 'Could not remove rules matching "' + needle + '": a rule store could not be written, so nothing was changed. Try again.'
           return result.forgotten > 0
             ? 'Removed ' + result.forgotten + ' rule(s) matching "' + needle + '". They will not be applied in future sessions.'
             : 'No rule matched "' + needle + '". Use synapse_list_rules to see the recorded rules.'

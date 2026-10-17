@@ -483,11 +483,15 @@ describe("rule visibility", () => {
         await fs.chmod(projectDir, 0o555)
         // Root ignores the mode; then this case cannot be set up here.
         const probe = path.join(projectDir, "probe")
-        if (await fs.writeFile(probe, "x").then(() => true, () => false)) return void (await fs.rm(probe))
+        if (await fs.writeFile(probe, "x").then(() => true, () => false)) {
+          await fs.rm(probe)
+          return
+        }
 
         expect(await sessionObserver.forgetLearningResult("roll me back", ws.path)).toEqual({
           forgotten: 0,
           refused: "write_failed",
+          restored: true,
         })
         const global = JSON.parse(await fs.readFile(learningStorePaths().global!, "utf8")) as Array<{
           lesson: string

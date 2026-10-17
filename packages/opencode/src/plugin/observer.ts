@@ -514,7 +514,8 @@ class SessionObserverManager {
    * forgotten; a rule present in both stores is counted once. A rule recorded in a project
    * lives in both stores (see `recordLearning`), so one forget from that workspace removes both
    * copies; from another workspace only the global copy is reached. If any
-   * store cannot be read, nothing is changed and 0 is returned (#38).
+   * store cannot be read, nothing is changed and 0 is returned (#38); if a write fails, the stores
+   * already written are put back where possible and 0 is returned (#212).
    */
   public async forgetLearning(lessonText: string, workspaceDir?: string): Promise<number> {
     return (await this.forgetLearningResult(lessonText, workspaceDir)).forgotten
@@ -523,12 +524,13 @@ class SessionObserverManager {
   /**
    * `forgetLearning` with the reason a forget was refused (#212): `unreadable` (a store could not
    * be read; nothing was changed) or `write_failed` (a write failed; stores already written were
-   * put back). A refused forget always reports 0 forgotten.
+   * put back, best effort: `restored` is false when that put-back failed too, so a rule may be
+   * half forgotten). A refused forget always reports 0 forgotten.
    */
   public async forgetLearningResult(
     lessonText: string,
     workspaceDir?: string,
-  ): Promise<{ forgotten: number; refused?: "unreadable" | "write_failed" }> {
+  ): Promise<{ forgotten: number; refused?: "unreadable" | "write_failed"; restored?: boolean }> {
     const needle = lessonText.trim().toLowerCase()
     if (!needle) return { forgotten: 0 }
     const matches = (l: SessionLearning) => String(l.lesson ?? "").toLowerCase().includes(needle)
@@ -556,8 +558,12 @@ class SessionObserverManager {
         } catch {
           // #212: one store written and the next not would leave a rule half forgotten; put the
           // written stores back (best effort) so a refused forget changes nothing here either.
-          for (const done of written) await writeJsonAtomic(done.file, done.before).catch(() => {})
-          return { forgotten: 0, refused: "write_failed" as const }
+          let restored = true
+          for (const done of written)
+            await writeJsonAtomic(done.file, done.before).catch(() => {
+              restored = false
+            })
+          return { forgotten: 0, refused: "write_failed" as const, restored }
         }
         written.push({ file: store.file, before })
         for (const key of keys) forgotten.add(key)
