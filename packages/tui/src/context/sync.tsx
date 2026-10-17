@@ -24,6 +24,7 @@ import { createStore, produce, reconcile } from "solid-js/store"
 import { useProject } from "./project"
 import { useEvent } from "./event"
 import { createDeletedSessions } from "./deleted-sessions"
+import { freeSessionParts, outsideWindow } from "./part-window"
 import { useSDK } from "./sdk"
 import { useTuiStartup } from "./runtime"
 import { createSimpleContext } from "./helper"
@@ -281,6 +282,7 @@ export const {
             produce((draft) => {
               if (result.found) draft.session.splice(result.index, 1)
               for (const message of draft.message[id] ?? []) delete draft.part[message.id]
+              freeSessionParts(draft.part, id)
               delete draft.message[id]
               delete draft.todo[id]
               delete draft.session_diff[id]
@@ -385,6 +387,7 @@ export const {
           break
         }
         case "message.part.updated": {
+          if (outsideWindow(store.message[event.properties.part.sessionID], event.properties.part.messageID)) break
           touchPart(event.properties.part.sessionID, event.properties.part.id)
           const parts = store.part[event.properties.part.messageID]
           if (!parts) {
