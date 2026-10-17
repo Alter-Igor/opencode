@@ -253,8 +253,9 @@ export async function proxyUnsupportedImages(
 /**
  * Replace image items inside one tool-result part's `content` output with text. Handles the
  * ModelMessage shape (`media`, as message-v2.ts builds it) and the provider prompt shapes the
- * middleware sees (`image-data`, `file-data` with an image media type). Returns the part itself
- * when nothing changed.
+ * middleware sees (`image-data`, `file-data` with an image media type). URL and file-id items
+ * (`image-url`, `file-url`, `*-file-id`) are left alone: message-v2.ts only puts `data:` media in
+ * tool results today. Returns the part itself when nothing changed.
  */
 async function swapToolResultImages(
   part: unknown,

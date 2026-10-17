@@ -250,10 +250,22 @@ const live: Layer.Layer<
       // either returns a ready LLMEvent stream or a concrete fallback reason.
       if (flags.experimentalNativeLlm) {
         // #235: the native runtime skips the AI SDK middleware below, so give it the same image
-        // swap for text-only models (a no-op when the model can see images).
-        const nativeMessages = yield* Effect.promise(() =>
-          proxyUnsupportedImages(prepared.messages, input.model, item.options, item, cfg, Object.keys(prepared.tools)),
-        )
+        // swap for text-only models (a no-op when the model can see images). Only when native will
+        // really run: on fallback the middleware swaps, and a paid vision_proxy must not run twice.
+        // A failed swap keeps the original messages instead of ending the turn.
+        const nativeMessages =
+          LLMNativeRuntime.status({ model: input.model, provider: item, auth: info }).type === "supported"
+            ? yield* Effect.tryPromise(() =>
+                proxyUnsupportedImages(
+                  prepared.messages,
+                  input.model,
+                  item.options,
+                  item,
+                  cfg,
+                  Object.keys(prepared.tools),
+                ),
+              ).pipe(Effect.orElseSucceed(() => prepared.messages))
+            : prepared.messages
         const native = LLMNativeRuntime.stream({
           model: input.model,
           provider: item,
