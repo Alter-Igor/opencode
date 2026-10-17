@@ -12,6 +12,8 @@ import {
 } from "@/plugin/synapse-vision"
 import { proxyUnsupportedImages } from "@/provider/vision-proxy"
 import { SynapseAuthPlugin } from "@/plugin/synapse"
+import { Global } from "@opencode-ai/core/global"
+import { pathToFileURL } from "url"
 
 // 1x1 transparent PNG.
 const PNG_BASE64 =
@@ -50,7 +52,7 @@ describe("synapse_vision (#193)", () => {
       seen.push(file)
     })
     expect(image.url).toBe(`data:image/png;base64,${PNG_BASE64}`)
-    expect(seen).toEqual([path.join(dir, "shot.png")])
+    expect(seen).toEqual([await fs.realpath(path.join(dir, "shot.png"))])
   })
 
   test("data and http(s) URLs pass through; bad input is refused with a clear reason", async () => {
@@ -59,6 +61,38 @@ describe("synapse_vision (#193)", () => {
     await expect(resolveVisionImage("notes.txt", dir)).rejects.toThrow("Not a supported image file")
     await expect(resolveVisionImage("missing.png", dir)).rejects.toThrow("Image file not found")
     await expect(resolveVisionImage("  ", dir)).rejects.toThrow("No image given")
+  })
+
+  test("a file:// URL resolves to the same absolute path (#198)", async () => {
+    const file = path.join(dir, "shot.png")
+    await fs.writeFile(file, Buffer.from(PNG_BASE64, "base64"))
+    const seen: string[] = []
+    await resolveVisionImage(pathToFileURL(file).href, "/elsewhere", async (f) => {
+      seen.push(f)
+    })
+    expect(seen).toEqual([await fs.realpath(file)])
+  })
+
+  test("a link is checked at its real target, not at the link (#198)", async () => {
+    const outside = await fs.mkdtemp(path.join(os.tmpdir(), "vision-link-"))
+    try {
+      const real = path.join(outside, "secret.png")
+      await fs.writeFile(real, Buffer.from(PNG_BASE64, "base64"))
+      const link = path.join(dir, "link.png")
+      const linked = await fs.symlink(real, link).then(
+        () => true,
+        () => false,
+      )
+      // Windows without the symlink privilege cannot make one; the check then has nothing to prove.
+      if (!linked) return
+      const seen: string[] = []
+      await resolveVisionImage("link.png", dir, async (f) => {
+        seen.push(f)
+      })
+      expect(seen).toEqual([await fs.realpath(real)])
+    } finally {
+      await fs.rm(outside, { recursive: true, force: true })
+    }
   })
 
   test("a refused permission stops the file from being read", async () => {
@@ -84,6 +118,16 @@ describe("synapse_vision (#193)", () => {
     const saved = await saveImageForVision(PNG_BASE64, "image/png", sweepDir)
     expect(await fs.readdir(sweepDir)).toEqual([path.basename(saved!)])
     if (process.platform !== "win32") expect((await fs.stat(saved!)).mode & 0o777).toBe(0o600)
+  })
+
+  test("concurrent saves of one image wait for the sweep and leave one complete file (#198)", async () => {
+    const saveDir = path.join(dir, "concurrent")
+    const results = await Promise.all(
+      Array.from({ length: 8 }, () => saveImageForVision(PNG_BASE64, "image/png", saveDir)),
+    )
+    expect(new Set(results).size).toBe(1)
+    expect(await fs.readdir(saveDir)).toEqual([path.basename(results[0]!)])
+    expect((await fs.readFile(results[0]!)).toString("base64")).toBe(PNG_BASE64)
   })
 
   test("sends the credential, privacy tier and question, and returns the answer and served model", async () => {
@@ -204,6 +248,7 @@ describe("synapse_vision tool permissions (#193)", () => {
   }
   let project: string
   let outside: string
+  const authSeen: (string | null)[] = []
   const realFetch = globalThis.fetch
 
   beforeEach(async () => {
@@ -215,9 +260,11 @@ describe("synapse_vision tool permissions (#193)", () => {
       const href = typeof url === "string" ? url : url instanceof URL ? url.href : url.url
       if (!href.startsWith(BASE)) return realFetch(url, init)
       if (href === `${BASE}/models`) return Response.json({ object: "list", data: [] })
+      authSeen.push(new Headers(init?.headers).get("authorization"))
       return Response.json({ model: "vision-1", choices: [{ message: { content: "a red banner" } }] })
     }
     globalThis.fetch = Object.assign(stub, { preconnect: realFetch.preconnect })
+    authSeen.length = 0
   })
 
   afterEach(async () => {
@@ -226,9 +273,10 @@ describe("synapse_vision tool permissions (#193)", () => {
     await fs.rm(outside, { recursive: true, force: true })
   })
 
-  async function visionTool() {
+  async function visionTool(options: { apiKey?: string } = { apiKey: "k" }) {
     const hooks = await SynapseAuthPlugin(pluginInput, { inferenceUrl: BASE })
-    await hooks.config?.({ provider: { synapse: { options: { baseURL: BASE, apiKey: "k" }, models: {} } } } as never)
+    const synapseOptions = { baseURL: BASE, ...(options.apiKey ? { apiKey: options.apiKey } : {}) }
+    await hooks.config?.({ provider: { synapse: { options: synapseOptions, models: {} } } } as never)
     return hooks.tool!.synapse_vision
   }
 
@@ -279,5 +327,26 @@ describe("synapse_vision tool permissions (#193)", () => {
         }),
       ),
     ).rejects.toThrow("rejected by user")
+  })
+
+  test("credential choice through the tool: stored sign-in first, else the configured apiKey (#198)", async () => {
+    const authFile = path.join(Global.Path.data, "auth.json")
+    const previous = await fs.readFile(authFile, "utf8").catch(() => undefined)
+    try {
+      await fs.rm(authFile, { force: true })
+      const keyOnly = await visionTool({ apiKey: "configured-key" })
+      await keyOnly.execute({ image: "in.png", question: "what?" }, context(project, async () => {}))
+      expect(authSeen.at(-1)).toBe("Bearer configured-key")
+
+      await fs.mkdir(Global.Path.data, { recursive: true })
+      const expiresAt = String(Date.now() + 60 * 60 * 1000)
+      await fs.writeFile(authFile, JSON.stringify({ synapse: { type: "api", key: "stored-token", metadata: { expiresAt } } }))
+      const both = await visionTool({ apiKey: "configured-key" })
+      await both.execute({ image: "in.png", question: "what?" }, context(project, async () => {}))
+      expect(authSeen.at(-1)).toBe("Bearer stored-token")
+    } finally {
+      if (previous === undefined) await fs.rm(authFile, { force: true })
+      else await fs.writeFile(authFile, previous)
+    }
   })
 })
