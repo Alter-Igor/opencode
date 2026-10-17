@@ -776,9 +776,10 @@ function trimRules(rows: SessionLearning[]): SessionLearning[] {
 
 /**
  * #217: on Windows a rename onto a file another handle has open (antivirus, the indexer, a
- * reader in another process) fails with EPERM, EBUSY or EACCES for a moment; QA saw 3 of 6
- * single-process runs of 120 writes lose a rule this way. Retry those briefly; anything else, or
- * the last attempt, throws.
+ * reader in another process) fails with EPERM, EBUSY or EACCES for a moment; QA's 3-writer
+ * harness lost rules this way (15 bad results in 10 runs, 0 with this retry). Retry those briefly
+ * (EACCES only on Windows, where it means the same; elsewhere it is a real permission error);
+ * anything else, or the last attempt, throws.
  */
 async function renameWithRetry(from: string, to: string): Promise<void> {
   for (let attempt = 0; ; attempt++) {
@@ -786,7 +787,8 @@ async function renameWithRetry(from: string, to: string): Promise<void> {
       return await fs.rename(from, to)
     } catch (error) {
       const code = error && typeof error === "object" && "code" in error ? (error as { code?: unknown }).code : undefined
-      if (attempt >= 5 || (code !== "EPERM" && code !== "EBUSY" && code !== "EACCES")) throw error
+      const retry = code === "EPERM" || code === "EBUSY" || (code === "EACCES" && process.platform === "win32")
+      if (attempt >= 5 || !retry) throw error
       await new Promise((resolve) => setTimeout(resolve, 20 * 2 ** attempt))
     }
   }
