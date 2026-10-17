@@ -622,12 +622,17 @@ describe("MCP tool failures with real remote tool names (#18)", () => {
   })
 
   test("a call the user stopped or refused, or a rule blocked, is not an MCP failure (QA on #18)", async () => {
+    // #209: with a native tool known, the tool below counts as MCP, so this guards the skip list.
+    sessionObserver.markNativeTool("read")
     const sessionId = "obs-18-refused"
     const errors = [
       "Tool execution aborted",
       "The user rejected permission to use this specific tool call.",
       "The user rejected permission to use this specific tool call with the following feedback: not now",
       'The user has specified a rule which prevents you from using this specific tool call. Here are some of the relevant rules []',
+      "The user dismissed this question",
+      "MCP error -32001: AbortError: The operation was aborted.",
+      "MCP error -32001: AbortError: This operation was aborted",
     ]
     errors.forEach((error, i) => {
       sessionObserver.onToolBefore(sessionId, `c${i}`, "alterspective-rag_rag_search", {})
@@ -636,6 +641,29 @@ describe("MCP tool failures with real remote tool names (#18)", () => {
     const retro = await sessionObserver.finalizeSessionRetrospective(sessionId)
     expect(retro?.totalToolCalls).toBe(errors.length)
     expect(retro?.anomalies.filter((a) => a.type === "MCP_TOOL_FAILURE")).toEqual([])
+  })
+
+  test("a real MCP timeout still counts as a failure (#209)", async () => {
+    sessionObserver.markNativeTool("read")
+    const sessionId = "obs-209-timeout"
+    sessionObserver.onToolBefore(sessionId, "c1", "alterspective-rag_rag_search", {})
+    sessionObserver.onToolFailed(sessionId, "c1", "alterspective-rag_rag_search", "MCP error -32001: Request timed out")
+    const retro = await sessionObserver.finalizeSessionRetrospective(sessionId)
+    expect(retro?.anomalies.filter((a) => a.type === "MCP_TOOL_FAILURE")).toHaveLength(1)
+  })
+
+  test("a retrospective covers the calls since the last one, so a failure is reported once (#209)", async () => {
+    const sessionId = "obs-209-once"
+    sessionObserver.onToolBefore(sessionId, "c1", "mcp__keystone__execute-tool", {})
+    sessionObserver.onToolAfter(sessionId, "c1", "mcp__keystone__execute-tool", "Error: Unauthorized")
+    const first = await sessionObserver.finalizeSessionRetrospective(sessionId)
+    expect(first?.anomalies.filter((a) => a.type === "MCP_TOOL_FAILURE")).toHaveLength(1)
+    // The next turn makes one clean call; the earlier failure is not reported again.
+    sessionObserver.onToolBefore(sessionId, "c2", "read", {})
+    sessionObserver.onToolAfter(sessionId, "c2", "read", "ok")
+    const second = await sessionObserver.finalizeSessionRetrospective(sessionId)
+    expect(second?.totalToolCalls).toBe(1)
+    expect(second?.anomalies.filter((a) => a.type === "MCP_TOOL_FAILURE")).toEqual([])
   })
 
   test("an MCP result with isError set is flagged even when its text looks clean", async () => {

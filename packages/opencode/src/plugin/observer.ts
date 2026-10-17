@@ -34,6 +34,14 @@ const NOT_A_FAILURE = [
   "The user dismissed this question",
 ]
 
+/**
+ * #209: an MCP call stopped by its abort signal (the user stopped the reply) fails with the SDK's
+ * wrapped text, e.g. `MCP error -32001: AbortError: The operation was aborted.` (Bun) or
+ * "... This operation was aborted" (Node), so it is matched anywhere in the text, not as a prefix.
+ * A real timeout reads `MCP error -32001: Request timed out` and still counts.
+ */
+const ABORTED = /operation was aborted/i
+
 /** #18: a `message.part.updated` event for a tool part that failed, as the observer needs it. */
 export function failedToolFromEvent(event: {
   type: string
@@ -235,13 +243,9 @@ class SessionObserverManager {
   public onToolFailed(sessionId: string, callId: string, tool: string, error: string) {
     const record = this.trajectories.get(sessionId)?.find((r) => r.callId === callId && r.tool === tool)
     if (!record) return
-    if (NOT_A_FAILURE.some((prefix) => error.startsWith(prefix))) {
-      record.endTime ??= Date.now()
-      record.durationMs = record.endTime - record.startTime
-      return
-    }
     record.endTime ??= Date.now()
     record.durationMs = record.endTime - record.startTime
+    if (NOT_A_FAILURE.some((prefix) => error.startsWith(prefix)) || ABORTED.test(error)) return
     record.isError = true
     record.errorMessage = error.slice(0, 200)
   }
@@ -288,6 +292,11 @@ class SessionObserverManager {
     const records = this.trajectories.get(sessionId) ?? []
     const startTime = this.sessionStartTimes.get(sessionId) ?? Date.now()
     const endTime = Date.now()
+    // #209: a retrospective covers the calls since the last one. The records used to stay, so every
+    // later idle reported the same failures again, and a long-running server kept every call's
+    // arguments in memory for the life of the process.
+    this.trajectories.delete(sessionId)
+    this.sessionStartTimes.delete(sessionId)
 
     const anomalies: SessionAnomaly[] = []
     const learnings: string[] = []
