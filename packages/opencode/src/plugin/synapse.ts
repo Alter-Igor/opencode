@@ -2181,9 +2181,14 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
               // Same rule and pattern as src/tool/external-directory.ts (a non-git worktree is "/").
               const win = process.platform === "win32"
               const full = win ? FSUtil.normalizePath(file) : file
-              const inside = (root: string) => FSUtil.contains(win ? FSUtil.normalizePath(root) : root, full)
-              if (inside(directory) || (context.worktree !== "/" && inside(context.worktree))) return
-              if (inside(visionImageDir())) return
+              // `file` is already a real path (#198), so compare it with real roots too: a project
+              // behind a link, or macOS's /var -> /private/var temp folder, must not ask.
+              const real = async (root: string) =>
+                win ? FSUtil.normalizePath(root) : await fs.realpath(root).catch(() => root)
+              const inside = async (root: string) => FSUtil.contains(await real(root), full)
+              if (await inside(directory)) return
+              if (context.worktree !== "/" && (await inside(context.worktree))) return
+              if (await inside(visionImageDir())) return
               const dir = path.dirname(full)
               const glob = win
                 ? FSUtil.normalizePathPattern(path.join(dir, "*"))
