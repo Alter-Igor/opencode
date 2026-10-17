@@ -364,6 +364,112 @@ describe("rule visibility", () => {
       await fs.writeFile(wsFile, JSON.stringify("not a rules array"), "utf8")
 
       expect(await sessionObserver.forgetLearning("fragile", ws.path)).toBe(0)
+      // #38: a refused forget changes nothing; the global copy used to be tombstoned anyway.
+      const global = JSON.parse(await fs.readFile(learningStorePaths().global!, "utf8"))
+      expect(global.find((l: { lesson: string }) => l.lesson === "fragile")?.deletedAt).toBeUndefined()
+      expect((await sessionObserver.listLearnings(ws.path)).map((l) => l.lesson)).toContain("fragile")
+    } finally {
+      restoreTestHome(prev)
+    }
+  })
+
+  test("a refused forget leaves the project store alone when the global store is unreadable (#38)", async () => {
+    await using home = await tmpdir()
+    await using ws = await tmpdir()
+    const prev = process.env.OPENCODE_TEST_HOME
+    process.env.OPENCODE_TEST_HOME = home.path
+    try {
+      await sessionObserver.recordLearning({ lesson: "keep me", source: "user_feedback" }, ws.path)
+      await fs.writeFile(learningStorePaths().global!, "{ not json", "utf8")
+      const before = await fs.readFile(learningStorePaths(ws.path).project!, "utf8")
+
+      expect(await sessionObserver.forgetLearning("keep me", ws.path)).toBe(0)
+      expect(await fs.readFile(learningStorePaths(ws.path).project!, "utf8")).toBe(before)
+    } finally {
+      restoreTestHome(prev)
+    }
+  })
+
+  test("recording a rule never overwrites a store it cannot read (#38)", async () => {
+    await using home = await tmpdir()
+    await using ws = await tmpdir()
+    const prev = process.env.OPENCODE_TEST_HOME
+    process.env.OPENCODE_TEST_HOME = home.path
+    try {
+      const project = learningStorePaths(ws.path).project!
+      await fs.mkdir(path.dirname(project), { recursive: true })
+      await fs.writeFile(project, "{ half-written", "utf8")
+
+      const recorded = await sessionObserver.recordLearning({ lesson: "new rule", source: "user_feedback" }, ws.path)
+
+      expect(recorded.savedTo).toEqual(["global"])
+      expect(await fs.readFile(project, "utf8")).toBe("{ half-written")
+      const global = JSON.parse(await fs.readFile(learningStorePaths().global!, "utf8")) as Array<{ lesson: string }>
+      expect(global.map((l) => l.lesson)).toContain("new rule")
+    } finally {
+      restoreTestHome(prev)
+    }
+  })
+
+  test("a store holding a malformed row counts as unreadable: forget changes nothing (CodeRabbit on #38)", async () => {
+    await using home = await tmpdir()
+    await using ws = await tmpdir()
+    const prev = process.env.OPENCODE_TEST_HOME
+    process.env.OPENCODE_TEST_HOME = home.path
+    try {
+      await sessionObserver.recordLearning({ lesson: "row check", source: "user_feedback" }, ws.path)
+      await fs.writeFile(learningStorePaths(ws.path).project!, JSON.stringify([null, { lesson: "row check" }]), "utf8")
+      const global = await fs.readFile(learningStorePaths().global!, "utf8")
+
+      expect(await sessionObserver.forgetLearning("row check", ws.path)).toBe(0)
+      expect(await fs.readFile(learningStorePaths().global!, "utf8")).toBe(global)
+    } finally {
+      restoreTestHome(prev)
+    }
+  })
+
+  test("synapse_record_learning says when a rule was saved for this project only (CodeRabbit on #38)", async () => {
+    await using home = await tmpdir()
+    await using ws = await tmpdir()
+    const prev = process.env.OPENCODE_TEST_HOME
+    process.env.OPENCODE_TEST_HOME = home.path
+    try {
+      const global = learningStorePaths().global!
+      await fs.mkdir(path.dirname(global), { recursive: true })
+      await fs.writeFile(global, "{ broken", "utf8")
+      const hooks = await SynapseAuthPlugin({
+        client: {} as never,
+        project: {} as never,
+        directory: ws.path,
+        worktree: "",
+        experimental_workspace: { register() {} },
+        serverUrl: new URL("https://example.com"),
+        $: {} as never,
+      } as never)
+      const reply = await hooks.tool?.synapse_record_learning?.execute({ lesson: "local only" }, {} as never)
+      expect(String(reply)).toContain("for this project only")
+      expect(await fs.readFile(global, "utf8")).toBe("{ broken")
+    } finally {
+      restoreTestHome(prev)
+    }
+  })
+
+  test("a rule recorded in a project is mirrored to the global store by design (#38)", async () => {
+    await using home = await tmpdir()
+    await using ws = await tmpdir()
+    const prev = process.env.OPENCODE_TEST_HOME
+    process.env.OPENCODE_TEST_HOME = home.path
+    try {
+      const recorded = await sessionObserver.recordLearning({ lesson: "mirrored rule", source: "user_feedback" }, ws.path)
+      expect(recorded.savedTo).toEqual(["global", "project"])
+      const paths = learningStorePaths(ws.path)
+      for (const file of [paths.global!, paths.project!]) {
+        const rows = JSON.parse(await fs.readFile(file, "utf8")) as Array<{ lesson: string }>
+        expect(rows.map((l) => l.lesson)).toContain("mirrored rule")
+      }
+      // One forget removes both copies and counts the rule once.
+      expect(await sessionObserver.forgetLearning("mirrored rule", ws.path)).toBe(1)
+      expect((await sessionObserver.listLearnings(ws.path)).map((l) => l.lesson)).not.toContain("mirrored rule")
     } finally {
       restoreTestHome(prev)
     }
