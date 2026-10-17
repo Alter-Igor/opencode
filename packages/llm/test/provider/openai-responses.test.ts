@@ -1434,19 +1434,24 @@ describe("OpenAI Responses route", () => {
 
   it.effect("classifies the Synapse context_overflow code as context overflow, whatever the message (#200)", () =>
     Effect.gen(function* () {
-      const response = yield* LLMClient.generate(request).pipe(
-        Effect.provide(
-          fixedResponse(sseEvents({ type: "error", response: { error: { code: "context_overflow", message: "Request rejected" } } })),
-        ),
-      )
+      const error = { code: "context_overflow", message: "Request rejected" }
+      // The three shapes providerError reads the code from: nested, top-level, and response.failed.
+      const shapes = [
+        { type: "error", response: { error } },
+        { type: "error", ...error },
+        { type: "response.failed", response: { id: "resp_overflow", error } },
+      ]
+      for (const event of shapes) {
+        const response = yield* LLMClient.generate(request).pipe(Effect.provide(fixedResponse(sseEvents(event))))
 
-      expect(response.events).toEqual([
-        {
-          type: "provider-error",
-          message: "context_overflow: Request rejected",
-          classification: "context-overflow",
-        },
-      ])
+        expect(response.events).toEqual([
+          {
+            type: "provider-error",
+            message: "context_overflow: Request rejected",
+            classification: "context-overflow",
+          },
+        ])
+      }
     }),
   )
 
