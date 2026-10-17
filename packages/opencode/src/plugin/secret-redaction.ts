@@ -49,9 +49,10 @@ const RULES: ReadonlyArray<Rule> = [
     replace: (match, prefix) => (match.includes("[REDACTED") ? match : `${prefix}[REDACTED:bearer]`),
   },
   {
-    // user:password@ in a URL; the user name stays, the password goes.
+    // user:password@ in a URL; the user name stays, the password goes. The scheme must not follow
+    // a scheme character: with `\b` a long `a.b.c...` run made this rule quadratic (architect on #26).
     name: "url-credentials",
-    pattern: /(\b[a-z][a-z0-9+.-]*:\/\/[^\s:/@]+:)[^\s@/]{3,}@/gi,
+    pattern: /((?<![a-z0-9+.-])[a-z][a-z0-9+.-]*:\/\/[^\s:/@]+:)[^\s@/]{3,}@/gi,
     replace: (_match, prefix) => `${prefix}[REDACTED:url-credentials]@`,
   },
 ]

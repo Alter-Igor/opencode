@@ -79,6 +79,15 @@ describe("redactSecrets (#26)", () => {
     expect(performance.now() - began).toBeLessThan(1000)
     expect(out).toBe("start\n[REDACTED:private-key]")
   })
+
+  test("long runs of scheme characters stay fast (architect on #26: url-credentials was quadratic)", () => {
+    for (const text of ["a.".repeat(50_000), "a-b-".repeat(25_000), "1.2.".repeat(25_000)]) {
+      const began = performance.now()
+      expect(redactSecrets(text)).toBe(text)
+      expect(performance.now() - began).toBeLessThan(1000)
+    }
+    expect(redactSecrets(`x git+ssh://u:${"pw" + "1234"}@h/r`)).toBe("x git+ssh://u:[REDACTED:url-credentials]@h/r")
+  })
 })
 
 describe("redactToolResult (#26)", () => {
