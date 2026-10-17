@@ -7,6 +7,7 @@ import { OauthCallbackPage } from "@opencode-ai/core/oauth/page"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { Global } from "@opencode-ai/core/global"
 import { Flock } from "@opencode-ai/core/util/flock"
+import { FSUtil } from "@opencode-ai/core/fs-util"
 import { INJECTED_LEARNINGS_LIMIT, learningStorePaths, sessionObserver, sanitizeJsonSchemaForOpenAI } from "./observer"
 import { EscalationTracker, declaredTier, classifyFailure, malformedToolCallFromEvent } from "./synapse-escalation"
 import {
@@ -33,6 +34,12 @@ import {
   type SynapseModelsTarget,
   type SynapseStoredCredential,
 } from "./synapse-models"
+import {
+  SYNAPSE_VISION_MODEL,
+  askSynapseVision,
+  resolveVisionImage,
+  visionImageDir,
+} from "./synapse-vision"
 
 export const KEYSTONE_ISSUER = "https://identity.alterspective.com.au"
 export const KEYSTONE_REGISTER = `${KEYSTONE_ISSUER}/api/oauth/register`
@@ -978,6 +985,25 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
       void updateSynapseModelsCache({ target: modelsTarget, token: latest.token, userAgent })
     }
     return tokens.access_token
+  }
+
+  // #193: the credential for a direct Synapse call from a tool, in the `/models` call's order: the
+  // stored sign-in (refreshed first when it is about to expire), else a configured apiKey (the
+  // delegate box). Undefined means no credential: the request still goes out and a front proxy
+  // may add one.
+  async function synapseToolToken(): Promise<string | undefined> {
+    await synapseCredentialState.save
+    const stored = await readStoredSynapseCredential().catch(() => undefined)
+    if (!stored) return modelsTarget?.apiKey
+    const cred = currentSynapseCredential(stored)
+    if (synapseModelsToken(cred).expired && cred.refreshToken) {
+      const refreshed = await waitAtMost(
+        refreshSynapseCredential({ ...cred, refreshToken: cred.refreshToken }),
+        options?.refreshWaitMs ?? SYNAPSE_CHAT_REFRESH_WAIT_MS,
+      )
+      if (refreshed) return refreshed
+    }
+    return cred.token
   }
 
   return {
@@ -2122,6 +2148,75 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
             return finalContent
           } catch (err: any) {
             return `Buddy review error: ${err.message}`
+          }
+        },
+      }),
+      synapse_vision: tool({
+        description: [
+          "Look at an image with Synapse vision and answer a question about it. Use this when the current model cannot see images",
+          "(for example a pasted screenshot shows up as a note with a file path, or a browser screenshot was saved to a file).",
+          "Say exactly what to look for: e.g. 'Is there an error banner? Quote its text', 'List every button label',",
+          "'Is the sidebar overlapping the main panel?'. Ask again with a new question for more detail.",
+          "The answer is text from a vision model: treat it as an observation, and check anything important.",
+        ].join(" "),
+        args: {
+          image: tool.schema
+            .string()
+            .describe("Image to look at: a file path (absolute, or relative to the project), a data:image/...;base64 URL, or an http(s) URL."),
+          question: tool.schema.string().describe("What to look for or answer about the image. Be specific."),
+          model: tool.schema
+            .string()
+            .optional()
+            .describe(`Synapse model id. Default "${SYNAPSE_VISION_MODEL}", which routes to a vision model.`),
+        },
+        async execute(args, context) {
+          const question = (args.question || "").trim()
+          if (!question) return "Please say what to look for in the image (the question argument)."
+          if (!modelsTarget) return "Synapse is not configured in this opencode, so synapse_vision cannot run."
+          // A refused permission or a cancel must stop the turn like a built-in tool, not become text.
+          let askFailed = false
+          try {
+            const directory = context.directory || input.directory
+            const image = await resolveVisionImage(args.image || "", directory, async (file) => {
+              // Same rule and pattern as src/tool/external-directory.ts (a non-git worktree is "/").
+              const win = process.platform === "win32"
+              const full = win ? FSUtil.normalizePath(file) : file
+              const inside = (root: string) => FSUtil.contains(win ? FSUtil.normalizePath(root) : root, full)
+              if (inside(directory) || (context.worktree !== "/" && inside(context.worktree))) return
+              if (inside(visionImageDir())) return
+              const dir = path.dirname(full)
+              const glob = win
+                ? FSUtil.normalizePathPattern(path.join(dir, "*"))
+                : path.join(dir, "*").replaceAll("\\", "/")
+              try {
+                await context.ask({
+                  permission: "external_directory",
+                  patterns: [glob],
+                  always: [glob],
+                  metadata: { filepath: full, parentDir: dir },
+                })
+              } catch (error) {
+                askFailed = true
+                throw error
+              }
+            })
+            context.metadata({ title: `Looking at ${path.basename(image.label)}` })
+            const answer = await askSynapseVision({
+              target: modelsTarget,
+              token: await synapseToolToken(),
+              imageUrl: image.url,
+              question,
+              model: args.model,
+              privacyTier,
+              userAgent,
+              signal: context.abort,
+            })
+            return answer.servedModel ? `${answer.text}
+
+[Seen by Synapse model ${answer.servedModel}]` : answer.text
+          } catch (err) {
+            if (askFailed || context.abort.aborted) throw err
+            return `synapse_vision error: ${err instanceof Error ? err.message : String(err)}`
           }
         },
       }),
