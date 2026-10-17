@@ -1,8 +1,10 @@
 // Fork (#176): the server deletes a session without stopping a reply that is still running, and
 // it publishes message and part events before it writes them. Late events for a deleted session
 // would re-create its store entries in sync.tsx after `session.deleted` freed them (#173), and a
-// `sync()` still fetching would write the session back. Session IDs are never reused, so a small
-// set of deleted IDs is enough to ignore them.
+// `sync()` still fetching would write the session back. A deleted ID does not come back in normal
+// use (fork makes new IDs; there is no undo), so a small set of deleted IDs is enough to ignore
+// them. Not covered: `opencode import` of a session deleted in the same TUI run keeps its old ID,
+// so that TUI shows it empty until restart.
 
 /** How many deleted session IDs are remembered; the oldest is forgotten first. */
 const LIMIT = 200
