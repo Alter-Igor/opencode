@@ -319,15 +319,17 @@ export const cleanupTool = defineTool({
     if (days === 0) return ok(`The session sweep is disabled (${TTL_ENV}=0).`, { disabled: true, dryRun, ttlDays: 0, ...out })
     const cutoff = Date.now() - days * DAY_MS
     // A dry run leaves the sweep cursor where it is, so the real run then sees the same records.
+    // The box first: its first bind can move this bridge to a newer box generation (#171), and candidates are chosen by the current box project (#174).
+    const box = await ctx.box()
     const candidates = await ctx.workspaces.closeCandidates(ctx.supervisor, new Date(cutoff), MAX_EXAMINED, { moveCursor: !dryRun })
-    const run: SweepRun = { ctx, box: await ctx.box(), cutoff, dryRun, deleteBranch: args.deleteBranch === true, correlationId, out }
+    const run: SweepRun = { ctx, box, cutoff, dryRun, deleteBranch: args.deleteBranch === true, correlationId, out }
     for (const state of candidates.states) {
       if (out.closed.length + out.wouldClose.length >= MAX_CLOSED) break
       try {
         await sweepOne(run, state)
       } catch (error) {
         out.skipped.unknown++
-        ctx.log.log("warn", "tools", "session sweep skipped a session", { sessionKey: state.sessionKey, correlationId, code: error instanceof DelegateError ? error.code : "unexpected" })
+        ctx.log.log("warn", "tools", "session sweep skipped a session", { sessionKey: state.sessionKey, correlationId, code: error instanceof DelegateError ? error.code : "unexpected", ...(error instanceof DelegateError ? { reason: error.message, detail: error.detail } : {}) })
       }
     }
     const summary = sweepSummary(out, dryRun, days, candidates.states.length, candidates.otherBridge)

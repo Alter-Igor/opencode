@@ -4,6 +4,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } fr
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs"
 import path from "node:path"
 import type { SessionState, SessionView } from "../src/shared/contracts.ts"
+import { DelegateError } from "../src/shared/errors.ts"
 import type { Call } from "../src/shared/opencode-api.ts"
 import { writeHostState, type HostSessionState } from "../src/supervisor/workspaces-state.ts"
 import { cleanupTool, closeSessionTool } from "../src/tools/close-session.ts"
@@ -330,6 +331,83 @@ describe("oc_cleanup", () => {
     },
     T * 2,
   )
+
+  test(
+    "#174: an old record whose session is gone from the box is swept, not skipped as unknown",
+    async () => {
+      const f = context()
+      const gone = await start(f, { ageDays: 30, track: false })
+      f.api.on(`GET /session/${gone.sessionID}`, { status: 404, data: { name: "NotFoundError" } })
+      const dry = await invoke(cleanupTool, {}, f.ctx)
+      // earlier tests leave records in the shared state dir, so check this key, not the whole list
+      expect(data(dry).wouldClose as string[]).toContain(gone.key)
+      expect(data(dry)).toMatchObject({ skipped: { unknown: 0 } })
+      expect(existsSync(recordFile(gone.key))).toBe(true)
+
+      const real = await invoke(cleanupTool, { dryRun: false }, f.ctx)
+      expect(data(real).closed as string[]).toContain(gone.key)
+      expect(data(real)).toMatchObject({ skipped: { unknown: 0 } })
+      expect(existsSync(recordFile(gone.key))).toBe(false)
+      expect(fx.leftovers(gone.key)).toEqual([])
+    },
+    T * 2,
+  )
+
+  test("#174: a skipped record logs the reason and detail, not just the code", async () => {
+    const f = context()
+    await start(f, { ageDays: 30, track: false })
+    const lines: Array<{ msg: string; fields?: Record<string, unknown> }> = []
+    f.ctx.log = { log: (_level, _component, msg, fields) => void lines.push({ msg, fields }) }
+    f.ctx.workspaces = {
+      ...f.ctx.workspaces,
+      inspectClose: async () => {
+        throw new DelegateError("not_found", "no such record", "look elsewhere", "close refused: probe")
+      },
+    }
+    const dry = await invoke(cleanupTool, {}, f.ctx)
+    expect(Number((data(dry).skipped as { unknown: number }).unknown)).toBeGreaterThanOrEqual(1)
+    const skipped = lines.find((l) => l.msg === "session sweep skipped a session")
+    expect(skipped?.fields).toMatchObject({ code: "not_found", reason: "no such record", detail: "close refused: probe" })
+  }, T * 2)
+
+  test("#174: a refused ownership check names which check failed, with no record data", async () => {
+    const f = context()
+    const other = await start(f, { supervisor: "supervisor:other-bridge" })
+    const boxed = await start(f, { track: false })
+    const { boxProject: _dropped, ...rest } = boxed.state
+    writeHostState(stateDir(), { ...rest, boxProject: "some-other-box" })
+    const refusal = async (s: Started, owner: { supervisor: string; sessionID: string }) => {
+      const error = await f.ctx.workspaces.inspectClose(s.key, owner, { deleteBranch: false }).then(
+        () => undefined,
+        (e: unknown) => e as DelegateError,
+      )
+      return error?.detail
+    }
+    expect(await refusal(other, { supervisor: f.ctx.supervisor, sessionID: other.sessionID })).toBe(`close refused: ${other.key} (other bridge)`)
+    expect(await refusal(boxed, { supervisor: f.ctx.supervisor, sessionID: boxed.sessionID })).toBe(`close refused: ${boxed.key} (other box)`)
+    expect(await refusal(boxed, { supervisor: f.ctx.supervisor, sessionID: "ses_wrong" })).toBe(`close refused: ${boxed.key} (session id differs)`)
+  }, T * 2)
+
+  test("#174: the box is resolved before the sweep reads its candidates (the first bind can change the box project)", async () => {
+    const f = context()
+    await start(f, { ageDays: 30, track: false })
+    const order: string[] = []
+    const box = f.ctx.box.bind(f.ctx)
+    f.ctx.box = async () => {
+      order.push("box")
+      return box()
+    }
+    const candidates = f.ctx.workspaces.closeCandidates.bind(f.ctx.workspaces)
+    f.ctx.workspaces = {
+      ...f.ctx.workspaces,
+      closeCandidates: async (...args: Parameters<typeof candidates>) => {
+        order.push("candidates")
+        return candidates(...args)
+      },
+    }
+    await invoke(cleanupTool, {}, f.ctx)
+    expect(order.slice(0, 2)).toEqual(["box", "candidates"])
+  }, T * 2)
 
   test("a TTL of 0 disables the sweep", async () => {
     process.env[TTL_ENV] = "0"

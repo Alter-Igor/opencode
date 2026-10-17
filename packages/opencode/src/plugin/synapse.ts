@@ -7,7 +7,9 @@ import { OauthCallbackPage } from "@opencode-ai/core/oauth/page"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { Global } from "@opencode-ai/core/global"
 import { Flock } from "@opencode-ai/core/util/flock"
-import { INJECTED_LEARNINGS_LIMIT, learningStorePaths, sessionObserver, sanitizeJsonSchemaForOpenAI } from "./observer"
+import { FSUtil } from "@opencode-ai/core/fs-util"
+import { failedToolFromEvent, INJECTED_LEARNINGS_LIMIT, learningStorePaths, sessionObserver, sanitizeJsonSchemaForOpenAI } from "./observer"
+import { redactToolResult } from "./secret-redaction"
 import { EscalationTracker, declaredTier, classifyFailure, malformedToolCallFromEvent } from "./synapse-escalation"
 import {
   PinnedFallbackMemory,
@@ -33,6 +35,12 @@ import {
   type SynapseModelsTarget,
   type SynapseStoredCredential,
 } from "./synapse-models"
+import {
+  SYNAPSE_VISION_MODEL,
+  askSynapseVision,
+  resolveVisionImage,
+  visionImageDir,
+} from "./synapse-vision"
 
 export const KEYSTONE_ISSUER = "https://identity.alterspective.com.au"
 export const KEYSTONE_REGISTER = `${KEYSTONE_ISSUER}/api/oauth/register`
@@ -980,6 +988,25 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
     return tokens.access_token
   }
 
+  // #193: the credential for a direct Synapse call from a tool, in the `/models` call's order: the
+  // stored sign-in (refreshed first when it is about to expire), else a configured apiKey (the
+  // delegate box). Undefined means no credential: the request still goes out and a front proxy
+  // may add one.
+  async function synapseToolToken(): Promise<string | undefined> {
+    await synapseCredentialState.save
+    const stored = await readStoredSynapseCredential().catch(() => undefined)
+    if (!stored) return modelsTarget?.apiKey
+    const cred = currentSynapseCredential(stored)
+    if (synapseModelsToken(cred).expired && cred.refreshToken) {
+      const refreshed = await waitAtMost(
+        refreshSynapseCredential({ ...cred, refreshToken: cred.refreshToken }),
+        options?.refreshWaitMs ?? SYNAPSE_CHAT_REFRESH_WAIT_MS,
+      )
+      if (refreshed) return refreshed
+    }
+    return cred.token
+  }
+
   return {
     // Fork-only (#74): the live Synapse model list replaces a hand-typed one.
     // Core reads cfg.provider after this hook resolves (provider/provider.ts).
@@ -1788,6 +1815,9 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
       }
       // AIESC follow-up (#15): completed sessions free their tracker slot.
       if (sessionID && event.type === "session.deleted") escalations.release(sessionID)
+      // #18: a failed tool call skips tool.execute.after; its stored part carries the error.
+      const failed = failedToolFromEvent(event as { type: string; properties?: any })
+      if (failed) sessionObserver.onToolFailed(failed.sessionID, failed.callID, failed.tool, failed.error)
       // AIESC-02: a malformed native tool call (200 response, garbage tool name) is
       // invisible to the HTTP hooks; charge it here, deduped per part id.
       const hit = malformedToolCallFromEvent(event as { type: string; properties?: any })
@@ -1802,6 +1832,11 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
         }
         escalations.recordFailure(hit.sessionID, "malformed-output")
       }
+    },
+    // #18: every native and plugin tool is announced here; MCP tools never are, which is how the
+    // observer tells an MCP tool (`<server>_<tool>`) from a native one.
+    "tool.definition": async (definitionInput) => {
+      sessionObserver.markNativeTool(definitionInput.toolID)
     },
     "tool.execute.before": async (toolInput, output) => {
       // 1. Policy Enforcement: Block raw browser scraping of corporate email / M365
@@ -1853,9 +1888,19 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
       }
     },
     "tool.execute.after": async (toolInput, output) => {
+      // #26: hide credentials before the session store keeps the result and the model sees it
+      // again (a shell command once echoed a live API key into the transcript). In place: core
+      // returns this same object as the tool result.
+      redactToolResult(output)
       // #95: core calls this hook with no output when a tool fails (a failed subtask, for one).
       // Reading output.output then threw inside the failure path and lost the error metadata.
-      sessionObserver.onToolAfter(toolInput.sessionID, toolInput.callID, toolInput.tool, output?.output)
+      // #18: an MCP tool's result is the raw MCP result, with no `output`; pass it whole.
+      sessionObserver.onToolAfter(
+        toolInput.sessionID,
+        toolInput.callID,
+        toolInput.tool,
+        typeof output?.output === "string" ? output.output : output,
+      )
     },
     "experimental.chat.system.transform": async (_input, output) => {
       // #95: these instructions are about Synapse (its gateway, on-prem tools and text tool-call
@@ -1935,7 +1980,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
           if (!args.lesson || !args.lesson.trim()) {
             return "Please provide a valid lesson description."
           }
-          await sessionObserver.recordLearning(
+          const recorded = await sessionObserver.recordLearning(
             {
               lesson: args.lesson.trim(),
               context: args.context,
@@ -1943,6 +1988,11 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
             },
             input.directory,
           )
+          // #38: say what was really saved; a rule store that cannot be read is skipped.
+          if (recorded.savedTo.length === 0)
+            return `Could not record the rule "${args.lesson}": no rule store could be read and written. Nothing was saved.`
+          if (!recorded.savedTo.includes("global"))
+            return `Recorded the rule "${args.lesson}" for this project only: the machine-wide rule store could not be read, so other projects will not use it.`
           return `✅ Successfully recorded rule: "${args.lesson}". This knowledge is stored and will automatically guide future sessions.`
         },
       }),
@@ -1953,6 +2003,8 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
         async execute() {
           const rules = await sessionObserver.listLearnings(input.directory)
           const paths = learningStorePaths(input.directory)
+          // #217: a store that cannot be read is listed as skipped, not as empty.
+          const unreadable = await sessionObserver.unreadableRuleStores(input.directory)
           const injected = rules.filter((r) => r.injected).length
           const line = (r: (typeof rules)[number]) =>
             "  " +
@@ -1966,6 +2018,8 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
             ")"
           const group = (title: string, file: string | undefined, origin: "global" | "project") => {
             const rows = rules.filter((r) => r.origin === origin)
+            if (unreadable.includes(origin))
+              return [title + "  " + file, "  (skipped: this store could not be read, so none of its rules are applied; fix or remove the file)"]
             return [title + "  " + (file ?? "(unavailable)"), ...(rows.length > 0 ? rows.map(line) : ["  (none)"])]
           }
           return [
@@ -1991,9 +2045,16 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
         async execute(args) {
           const needle = (args.lesson || "").trim()
           if (!needle) return "Please provide the rule text to remove."
-          const removed = await sessionObserver.forgetLearning(needle, input.directory)
-          return removed > 0
-            ? 'Removed ' + removed + ' rule(s) matching "' + needle + '". They will not be applied in future sessions.'
+          const result = await sessionObserver.forgetLearningResult(needle, input.directory)
+          // #212: a refused forget is not "no match"; the rule may still be there.
+          if (result.refused === "unreadable")
+            return 'Could not remove rules matching "' + needle + '": a rule store could not be read, so nothing was changed. The rule may still apply.'
+          if (result.refused === "write_failed")
+            return result.restored === false
+              ? 'Could not remove rules matching "' + needle + '": a rule store could not be written, and putting the other store back failed too, so the rule may now be removed in one store only. Run synapse_list_rules, then try again.'
+              : 'Could not remove rules matching "' + needle + '": a rule store could not be written, so nothing was changed. Try again.'
+          return result.forgotten > 0
+            ? 'Removed ' + result.forgotten + ' rule(s) matching "' + needle + '". They will not be applied in future sessions.'
             : 'No rule matched "' + needle + '". Use synapse_list_rules to see the recorded rules.'
         },
       }),      synapse_buddy_review: tool({
@@ -2122,6 +2183,80 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
             return finalContent
           } catch (err: any) {
             return `Buddy review error: ${err.message}`
+          }
+        },
+      }),
+      synapse_vision: tool({
+        description: [
+          "Look at an image with Synapse vision and answer a question about it. Use this when the current model cannot see images",
+          "(for example a pasted screenshot shows up as a note with a file path, or a browser screenshot was saved to a file).",
+          "Say exactly what to look for: e.g. 'Is there an error banner? Quote its text', 'List every button label',",
+          "'Is the sidebar overlapping the main panel?'. Ask again with a new question for more detail.",
+          "The answer is text from a vision model: treat it as an observation, and check anything important.",
+        ].join(" "),
+        args: {
+          image: tool.schema
+            .string()
+            .describe("Image to look at: a file path (absolute, or relative to the project), a data:image/...;base64 URL, or an http(s) URL."),
+          question: tool.schema.string().describe("What to look for or answer about the image. Be specific."),
+          model: tool.schema
+            .string()
+            .optional()
+            .describe(`Synapse model id. Default "${SYNAPSE_VISION_MODEL}", which routes to a vision model.`),
+        },
+        async execute(args, context) {
+          const question = (args.question || "").trim()
+          if (!question) return "Please say what to look for in the image (the question argument)."
+          if (!modelsTarget) return "Synapse is not configured in this opencode, so synapse_vision cannot run."
+          // A refused permission or a cancel must stop the turn like a built-in tool, not become text.
+          let askFailed = false
+          try {
+            const directory = context.directory || input.directory
+            const image = await resolveVisionImage(args.image || "", directory, async (file) => {
+              // Same rule and pattern as src/tool/external-directory.ts (a non-git worktree is "/").
+              const win = process.platform === "win32"
+              const full = win ? FSUtil.normalizePath(file) : file
+              // `file` is already a real path (#198), so compare it with real roots too: a project
+              // behind a link, or macOS's /var -> /private/var temp folder, must not ask.
+              const real = async (root: string) =>
+                win ? FSUtil.normalizePath(root) : await fs.realpath(root).catch(() => root)
+              const inside = async (root: string) => FSUtil.contains(await real(root), full)
+              if (await inside(directory)) return
+              if (context.worktree !== "/" && (await inside(context.worktree))) return
+              if (await inside(visionImageDir())) return
+              const dir = path.dirname(full)
+              const glob = win
+                ? FSUtil.normalizePathPattern(path.join(dir, "*"))
+                : path.join(dir, "*").replaceAll("\\", "/")
+              try {
+                await context.ask({
+                  permission: "external_directory",
+                  patterns: [glob],
+                  always: [glob],
+                  metadata: { filepath: full, parentDir: dir },
+                })
+              } catch (error) {
+                askFailed = true
+                throw error
+              }
+            })
+            context.metadata({ title: `Looking at ${path.basename(image.label)}` })
+            const answer = await askSynapseVision({
+              target: modelsTarget,
+              token: await synapseToolToken(),
+              imageUrl: image.url,
+              question,
+              model: args.model,
+              privacyTier,
+              userAgent,
+              signal: context.abort,
+            })
+            return answer.servedModel ? `${answer.text}
+
+[Seen by Synapse model ${answer.servedModel}]` : answer.text
+          } catch (err) {
+            if (askFailed || context.abort.aborted) throw err
+            return `synapse_vision error: ${err instanceof Error ? err.message : String(err)}`
           }
         },
       }),

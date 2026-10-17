@@ -14,6 +14,7 @@ import { SessionInput } from "./input"
 import { WorkspaceV2 } from "../workspace"
 import { MessageTable, PartTable, SessionInputTable, SessionMessageTable, SessionTable } from "./sql"
 import type { DeepMutable } from "../schema"
+import { redactedToolPart } from "../util/secret-redaction"
 
 type DatabaseService = Database.Interface["db"]
 
@@ -312,7 +313,9 @@ const layer = Layer.effectDiscard(
         const id = event.data.part.id
         const messageID = event.data.part.messageID
         const sessionID = event.data.part.sessionID
-        const data = partData(event.data.part)
+        // Fork (#207): no credentials in a stored tool part, whoever published the event (a sync
+        // replay, a workspace sync stream, a build without #26).
+        const data = partData(redactedToolPart(event.data.part))
         const row = yield* db.select().from(PartTable).where(eq(PartTable.id, id)).get().pipe(Effect.orDie)
         yield* db
           .insert(PartTable)

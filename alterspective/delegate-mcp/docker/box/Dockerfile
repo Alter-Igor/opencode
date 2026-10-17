@@ -43,7 +43,20 @@ RUN useradd -m -u 10001 -s /bin/bash agent \
     && git config --system init.defaultBranch main \
     && git config --system user.name "OpenCode Delegate (Synapse)" \
     && git config --system user.email "opencode-delegate@users.noreply.github.com" \
+    && git config --system filter.box-npm-registry.clean 'sed -e s#http://npm-cache:4873/#https://registry.npmjs.org/#g' \
+    && git config --system filter.box-yarn-registry.clean 'sed -e s#http://npm-cache:4873/#https://registry.yarnpkg.com/#g' \
+    && printf '%s\n' \
+        'package-lock.json filter=box-npm-registry' \
+        'npm-shrinkwrap.json filter=box-npm-registry' \
+        'pnpm-lock.yaml filter=box-npm-registry' \
+        'bun.lock filter=box-npm-registry' \
+        'yarn.lock filter=box-yarn-registry' \
+        > /etc/gitattributes \
     && opencode --version
+# #162: npm and Yarn 1 write the cache address (http://npm-cache:4873) into lockfiles, and a build
+# outside the box cannot reach it. The clean filters above run at `git add`: the commit gets the
+# public registry, the working copy keeps the cache address, so installs in the box still work.
+# /etc/gitattributes is git's system attributes file (root-owned; a repo's own .gitattributes can override it).
 ARG OPENCODE_VERSION=0.0.0-alterspective-local
 LABEL org.opencontainers.image.title="opencode-delegate-box" \
       org.opencontainers.image.version="${OPENCODE_VERSION}" \

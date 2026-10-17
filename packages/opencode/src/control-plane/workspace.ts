@@ -23,6 +23,9 @@ import { type Target, type WorkspaceInfo, WorkspaceInfo as WorkspaceInfoSchema }
 import { WorkspaceV2 } from "@opencode-ai/core/workspace"
 import { Session } from "@/session/session"
 import { SessionPrompt } from "@/session/prompt"
+import { SessionRunState } from "@/session/run-state"
+import { SessionStatus } from "@/session/status"
+import { cancelSessionTree, idleWhenQuiet } from "@/session/cancel-tree"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionID } from "@/session/schema"
 import { NotFoundError } from "@/storage/storage"
@@ -156,6 +159,17 @@ const layer = Layer.effect(
     const auth = yield* Auth.Service
     const session = yield* Session.Service
     const prompt = yield* SessionPrompt.Service
+    // Fork (#214): what Workspace.remove needs to stop its sessions' runs (with the two node deps below).
+    const statusSvc = yield* SessionStatus.Service
+    const runState = yield* SessionRunState.Service
+    const cancelDeps = {
+      cancel: (id: SessionID) => prompt.cancel(id),
+      children: (id: SessionID) => session.children(id),
+      isIdle: idleWhenQuiet(
+        (id: SessionID) => statusSvc.get(id),
+        (id: SessionID) => runState.assertNotBusy(id),
+      ),
+    }
     const http = yield* HttpClient.HttpClient
     const events = yield* EventV2Bridge.Service
     const vcs = yield* Vcs.Service
@@ -791,8 +805,37 @@ const layer = Layer.effect(
         .all()
         .pipe(Effect.orDie)
       const sessionIDs = new Set(sessions.map((sessionInfo) => sessionInfo.id))
+      const roots = sessions.filter((sessionInfo) => !sessionInfo.parentID || !sessionIDs.has(sessionInfo.parentID))
+      // Fork (#214): stop each session's running reply, and its sub-sessions', before they are removed.
+      // A local workspace's prompts are routed to its own folder, so its runs and statuses live in
+      // that folder's instance: cancel there, and here too (QA on #229; the idle check makes a pass
+      // with nothing running a no-op). A remote workspace's run is in another process; only the
+      // adapter's remove below stops it.
+      const cancelRoots = Effect.forEach(roots, (sessionInfo) => cancelSessionTree(cancelDeps, sessionInfo.id), {
+        discard: true,
+      })
+      const existing = roots.length > 0 ? yield* get(id) : undefined
+      const target = existing
+        ? yield* WorkspaceAdapterRuntime.target(existing).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+        : undefined
+      // A folder whose instance cannot start (a broken config or plugin) must not stop the removal:
+      // remove keeps going when the adapter fails too (architect on #229).
+      if (target?.type === "local")
+        yield* Effect.gen(function* () {
+          const store = yield* InstanceStore.Service
+          yield* store.provide({ directory: target.directory }, cancelRoots)
+        }).pipe(
+          Effect.provide(AppNodeBuilderV1.build(InstanceStore.node)),
+          Effect.catchCause((cause) =>
+            Effect.logWarning("could not stop runs in the workspace folder before removing it", {
+              workspaceID: id,
+              cause,
+            }),
+          ),
+        )
+      yield* cancelRoots
       yield* Effect.forEach(
-        sessions.filter((sessionInfo) => !sessionInfo.parentID || !sessionIDs.has(sessionInfo.parentID)),
+        roots,
         (sessionInfo) =>
           session.remove(sessionInfo.id).pipe(Effect.catchIf(NotFoundError.isInstance, () => Effect.void)),
         { discard: true },
@@ -954,6 +997,9 @@ export const node = LayerNode.make({
     Auth.node,
     Session.node,
     SessionPrompt.node,
+    // Fork (#214): Workspace.remove cancels its sessions' runs.
+    SessionStatus.node,
+    SessionRunState.node,
     httpClient,
     EventV2Bridge.node,
     Vcs.node,

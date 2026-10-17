@@ -5,6 +5,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:tes
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import path from "node:path"
 import type { ErrorCode } from "../src/shared/errors.ts"
+import { grepPathspecs, MAX_PATHSPEC_CHARS, runCommand, TIMEOUT_CODE, type ExecResult } from "../src/supervisor/workspaces.ts"
 import { code, git, posix, T, WorkspaceFixture } from "./workspaces-fixture.ts"
 
 const fx = new WorkspaceFixture("ocd-ws-")
@@ -38,7 +39,7 @@ describe("workspaces: collect never runs hooks planted in the box clone (red tes
       const tip = await fx.boxGit("hook-test", ["rev-parse", "delegate/hook-test"])
       const result = await fx.workspaces().collect(ws)
       expect(existsSync(fx.marker)).toBe(false)
-      expect(result).toEqual({ branch: "delegate/hook-test", commits: 1, hostExecutableChanges: [] })
+      expect(result).toEqual({ branch: "delegate/hook-test", commits: 1, hostExecutableChanges: [], mirrorAddressFiles: [] })
       expect(await git(fx.hostRepo, ["rev-parse", "delegate/hook-test"])).toBe(tip)
       expect(await git(fx.hostRepo, ["branch", "--show-current"])).toBe("main")
       expect(fx.handoffFiles()).toEqual([])
@@ -122,6 +123,242 @@ describe("workspaces: host-executable changes are reported", () => {
           "CLAUDE.md", "Makefile", "docs/link", "package.json", "pyproject.toml", "tools/build", "tools/go.cmd", "tools/go.sh", "tools/run.PS1", "vendor/sub",
         ].sort(),
       )
+    },
+    T,
+  )
+})
+
+describe("workspaces: collect names files that still hold a cache address (#162)", () => {
+  test(
+    "only files whose branch version has the address are listed",
+    async () => {
+      const workspaces = fx.workspaces()
+      const ws = await workspaces.open(fx.hostRepo, "mirror-test")
+      await fx.boxCommit(
+        "mirror-test",
+        {
+          "package-lock.json": '{"resolved": "http://npm-cache:4873/a/-/a-1.0.0.tgz"}\n',
+          "py/uv.lock": 'source = { registry = "http://pypi-cache:5000/index/" }\n',
+          "fixed.json": '{"url": "http://npm-cache:4873/b"}\n',
+          "notes.md": "no address here\n",
+        },
+        "lockfiles",
+      )
+      await fx.boxCommit("mirror-test", { "fixed.json": '{"url": "https://registry.npmjs.org/b"}\n' }, "fix one")
+      const result = await workspaces.collect(ws)
+      expect([...(result.mirrorAddressFiles ?? [])].sort()).toEqual(["package-lock.json", "py/uv.lock"])
+    },
+    T,
+  )
+
+  test(
+    "a repo that marks lockfiles -diff or binary does not hide them; a glob-like name is a plain name",
+    async () => {
+      // Host-side git reads attributes from the owner's checkout, so they go in the host repo.
+      const attributes = path.join(fx.hostRepo, ".git", "info", "attributes")
+      mkdirSync(path.dirname(attributes), { recursive: true })
+      writeFileSync(attributes, "*.lock -diff\n*.bin binary\n")
+      try {
+        const workspaces = fx.workspaces()
+        const ws = await workspaces.open(fx.hostRepo, "mirror-binary")
+        await fx.boxCommit(
+          "mirror-binary",
+          {
+            "uv.lock": 'source = { registry = "http://pypi-cache:5000/index/" }\n',
+            "deps.bin": "http://npm-cache:4873/a\n",
+            "[i]": "http://npm-cache:4873/b\n",
+          },
+          "lockfiles",
+        )
+        const result = await workspaces.collect(ws)
+        expect([...(result.mirrorAddressFiles ?? [])].sort()).toEqual(["[i]", "deps.bin", "uv.lock"])
+      } finally {
+        rmSync(attributes, { force: true })
+      }
+    },
+    T,
+  )
+
+  test(
+    "a changed file is listed when its address line is old and untouched; a host path named like the branch does not confuse git",
+    async () => {
+      const file = path.join(fx.hostRepo, "registry.conf")
+      writeFileSync(file, "registry=http://npm-cache:4873/\nretries=1\n")
+      await git(fx.hostRepo, ["add", "registry.conf"])
+      await git(fx.hostRepo, ["commit", "-q", "-m", "old address"])
+      const lookalike = path.join(fx.hostRepo, "delegate", "mirror-old")
+      try {
+        const workspaces = fx.workspaces()
+        const ws = await workspaces.open(fx.hostRepo, "mirror-old")
+        mkdirSync(path.dirname(lookalike), { recursive: true })
+        writeFileSync(lookalike, "untracked file named like the branch\n")
+        await fx.boxCommit("mirror-old", { "registry.conf": "registry=http://npm-cache:4873/\nretries=2\n" }, "other line")
+        const result = await workspaces.collect(ws)
+        expect(result.mirrorAddressFiles).toEqual(["registry.conf"])
+      } finally {
+        rmSync(path.join(fx.hostRepo, "delegate"), { recursive: true, force: true })
+        await git(fx.hostRepo, ["rm", "-q", "registry.conf"])
+        await git(fx.hostRepo, ["commit", "-q", "-m", "drop old address"])
+      }
+    },
+    T,
+  )
+
+  // #186: real git, with one host step swapped for a failure. A failed check is null with a reason,
+  // never [] (that would read as clean).
+  const failing = (match: string, failure: ExecResult) => fx.workspaces({ hostExec: async (argv, o) => (argv.includes(match) ? failure : runCommand(argv, undefined, o?.timeoutMs)) })
+  for (const [name, match, failure, reason] of [
+    ["git diff fails", "--name-only", { code: 128, stdout: "", stderr: "fatal: bad object\nmore" }, "git diff exited 128: fatal: bad object"],
+    ["git diff times out", "--name-only", { code: TIMEOUT_CODE, stdout: "", stderr: "", timedOut: true }, "git diff timed out"],
+    ["git grep exits 2", "grep", { code: 2, stdout: "", stderr: "fatal: corrupt" }, "git grep exited 2: fatal: corrupt"],
+    ["git grep times out", "grep", { code: TIMEOUT_CODE, stdout: "", stderr: "", timedOut: true }, "git grep timed out"],
+  ] as const) {
+    const key = `mirror-fail-${name.replaceAll(" ", "-")}`
+    test(
+      `${name}: the check reports null and the reason`,
+      async () => {
+        const workspaces = failing(match, failure)
+        const ws = await workspaces.open(fx.hostRepo, key)
+        await fx.boxCommit(key, { "uv.lock": 'source = { registry = "http://pypi-cache:5000/index/" }\n' }, "lockfile")
+        const result = await workspaces.collect(ws)
+        expect(result.mirrorAddressFiles).toBeNull()
+        expect(result.mirrorCheckError).toBe(reason)
+        expect(result.commits).toBe(1)
+      },
+      T,
+    )
+  }
+
+  test(
+    "too many changed names for one command line: the whole tree is read and still intersected",
+    async () => {
+      const files: Record<string, string> = { "uv.lock": 'source = { registry = "http://pypi-cache:5000/index/" }\n' }
+      for (let i = 0; i < 200; i++) files[`many/${"n".repeat(90)}-${i}.txt`] = `${i}\n`
+      expect(Object.keys(files).join(" ").length).toBeGreaterThan(MAX_PATHSPEC_CHARS)
+      const seen: (readonly string[])[] = []
+      const watched = fx.workspaces({ hostExec: async (argv, o) => (argv.includes("grep") && seen.push(argv), runCommand(argv, undefined, o?.timeoutMs)) })
+      const ws = await watched.open(fx.hostRepo, "mirror-many")
+      await fx.boxCommit("mirror-many", files, "many files")
+      const result = await watched.collect(ws)
+      expect(result.mirrorAddressFiles).toEqual(["uv.lock"])
+      expect(seen[0]?.at(-1)).toBe("--") // no pathspecs: the whole tree
+    },
+    T,
+  )
+
+  test(
+    "a few changed names: only those files are read",
+    async () => {
+      const seen: (readonly string[])[] = []
+      const workspaces = fx.workspaces({ hostExec: async (argv, o) => (argv.includes("grep") && seen.push(argv), runCommand(argv, undefined, o?.timeoutMs)) })
+      const ws = await workspaces.open(fx.hostRepo, "mirror-few")
+      await fx.boxCommit("mirror-few", { "uv.lock": 'source = { registry = "http://pypi-cache:5000/index/" }\n', "docs/notes.md": "plain\n" }, "few")
+      expect((await workspaces.collect(ws)).mirrorAddressFiles).toEqual(["uv.lock"])
+      const argv = seen[0] ?? []
+      expect(argv).toContain("--literal-pathspecs")
+      expect(argv.slice(argv.indexOf("--") + 1).sort()).toEqual(["docs/notes.md", "uv.lock"])
+    },
+    T,
+  )
+
+  // QA on #186: names Windows cannot write to disk but the box's Linux tree can hold. Built with
+  // plumbing (raw bytes in, no checkout) so the test runs on Windows too.
+  const commitRawName = async (key: string, name: Uint8Array, content: string) => {
+    const run = async (args: string[], input?: Uint8Array) => {
+      const p = Bun.spawn(["git", "-C", fx.boxClone(key), ...args], { stdin: input ?? "ignore", stdout: "pipe", stderr: "pipe", env: fx.boxEnv })
+      const [out, err, exit] = [await new Response(p.stdout).arrayBuffer(), await new Response(p.stderr).text(), await p.exited]
+      if (exit !== 0) throw new Error(`git ${args.join(" ")}: ${err}`)
+      return new Uint8Array(out)
+    }
+    const text = (b: Uint8Array) => new TextDecoder().decode(b).trim()
+    const entry = (type: "blob" | "tree", sha: string, part: Uint8Array) => Buffer.concat([Buffer.from(`${type === "blob" ? "100644" : "040000"} ${type} ${sha}\t`), Buffer.from(part), Buffer.from([0])])
+    // Split on "/" (0x2f) and build the trees bottom-up, so a part can be ".." or "C:".
+    const parts: Uint8Array[] = []
+    let start = 0
+    for (let i = 0; i <= name.length; i++) {
+      if (i < name.length && name[i] !== 0x2f) continue
+      parts.push(name.slice(start, i))
+      start = i + 1
+    }
+    let sha = text(await run(["hash-object", "-w", "--stdin"], new TextEncoder().encode(content)))
+    let type: "blob" | "tree" = "blob"
+    for (let i = parts.length - 1; i > 0; i--) {
+      sha = text(await run(["mktree", "-z"], entry(type, sha, parts[i]!)))
+      type = "tree"
+    }
+    const top = Buffer.concat([Buffer.from(await run(["ls-tree", "-z", "HEAD"])), entry(type, sha, parts[0]!)])
+    const tree = text(await run(["mktree", "-z"], top))
+    const commit = text(await run(["commit-tree", tree, "-p", "HEAD", "-m", `raw name ${key}`]))
+    await run(["update-ref", "HEAD", commit])
+  }
+  // Names are built when the test runs: fx.hostRepo is set in beforeAll.
+  for (const [label, key, name] of [
+    ["a backslash", "mirror-raw-backslash", () => Buffer.from("back\\slash.lock")],
+    ["bytes that are not UTF-8", "mirror-raw-utf8", () => Buffer.from([0x62, 0x61, 0x64, 0xe9, 0x2e, 0x6c, 0x6f, 0x63, 0x6b])],
+    // Git for Windows reads this as a path inside the host repo and drops the prefix.
+    ["the host repo's own path", "mirror-raw-hostpath", () => Buffer.from(`${posix(fx.hostRepo).replace(/^\//, "")}/evil.lock`)],
+  ] as const) {
+    test(
+      `a changed name with ${label} is still searched`,
+      async () => {
+        const workspaces = fx.workspaces()
+        const ws = await workspaces.open(fx.hostRepo, key)
+        await commitRawName(key, name(), "registry=http://npm-cache:4873/\n")
+        const result = await workspaces.collect(ws)
+        expect(result.mirrorAddressFiles).toHaveLength(1)
+      },
+      T,
+    )
+  }
+
+  // `.` and `..` parts never reach the check: collect's fetch runs git's object check, which refuses them.
+  for (const [label, key, name] of [
+    ["a .. part", "mirror-raw-dotdot", "dir/../evil.lock"],
+    ["a . part", "mirror-raw-dot", "dir/./evil.lock"],
+  ] as const) {
+    test(
+      `a branch with ${label} in a name is refused at fetch`,
+      async () => {
+        const workspaces = fx.workspaces()
+        const ws = await workspaces.open(fx.hostRepo, key)
+        await commitRawName(key, Buffer.from(name), "registry=http://npm-cache:4873/\n")
+        expect(await code(workspaces.collect(ws))).toBe("policy_violation")
+      },
+      T,
+    )
+  }
+
+  test("grepPathspecs: unsafe names and long lists read the whole tree", () => {
+    expect(grepPathspecs(["a.lock", "sub/b-1_2@x+y.json"])).toEqual(["a.lock", "sub/b-1_2@x+y.json"])
+    for (const unsafe of ["[i]", "a b", "C:/x.lock", "dir/../x", "dir/./x", "a//b", "/abs", "x/"]) expect(grepPathspecs(["a.lock", unsafe])).toEqual([])
+    expect(grepPathspecs(["a.lock", "b\\c.lock"])).toEqual([])
+    expect(grepPathspecs(["a.lock", "bad�.lock"])).toEqual([])
+    // Counted twice plus 3: 3,000 names of 2 characters would be 9,000 raw but 21,000 counted.
+    expect(grepPathspecs(Array.from({ length: 3000 }, (_, i) => String(i % 100).padStart(2, "0")))).toEqual([])
+  })
+
+  test(
+    "#188: host git config that forces colour does not hide a file or a host-executable change",
+    async () => {
+      // As if the owner's global config set color.ui / color.grep / color.diff = always.
+      const colour = ["-c", "color.ui=always", "-c", "color.grep=always", "-c", "color.diff=always"]
+      const workspaces = fx.workspaces({ hostExec: async (argv, o) => runCommand(argv[0] === "git" ? ["git", ...colour, ...argv.slice(1)] : argv, undefined, o?.timeoutMs) })
+      const ws = await workspaces.open(fx.hostRepo, "mirror-colour")
+      await fx.boxCommit("mirror-colour", { "uv.lock": 'source = { registry = "http://pypi-cache:5000/index/" }\n', ".githooks/pre-commit": "echo hi\n" }, "colour")
+      const result = await workspaces.collect(ws)
+      expect(result.mirrorAddressFiles).toEqual(["uv.lock"])
+      expect(result.hostExecutableChanges).toContain(".githooks/pre-commit")
+    },
+    T,
+  )
+
+  test(
+    "a branch without the address lists nothing",
+    async () => {
+      const workspaces = fx.workspaces()
+      const ws = await workspaces.open(fx.hostRepo, "mirror-clean")
+      await fx.boxCommit("mirror-clean", { "package-lock.json": '{"resolved": "https://registry.npmjs.org/a/-/a-1.0.0.tgz"}\n' }, "clean")
+      expect((await workspaces.collect(ws)).mirrorAddressFiles).toEqual([])
     },
     T,
   )

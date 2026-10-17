@@ -15,6 +15,7 @@ import * as SessionExecutionLocal from "@opencode-ai/core/session/execution/loca
 import { locationServiceMapLayer } from "@opencode-ai/core/location-services"
 
 import { NotFoundError } from "@/storage/storage"
+import { redactToolPart } from "@/plugin/secret-redaction"
 import { eq } from "drizzle-orm"
 import { and } from "drizzle-orm"
 import { gte } from "drizzle-orm"
@@ -634,9 +635,13 @@ const layer: Layer.Layer<
 
     const updatePart = <T extends SessionV1.Part>(part: T): Effect.Effect<T> =>
       Effect.gen(function* () {
+        const stored = structuredClone(part)
+        // Fork (#26): no credentials in any stored copy of a tool part (running, completed or
+        // failed). The published event is durable, so streamed shell output counts too.
+        redactToolPart(stored)
         yield* events.publish(SessionV1.Event.PartUpdated, {
           sessionID: part.sessionID,
-          part: structuredClone(part),
+          part: stored,
           time: Date.now(),
         })
         return part

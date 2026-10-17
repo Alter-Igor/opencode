@@ -361,6 +361,7 @@ const live: Layer.Layer<
                       item.options,
                       item,
                       cfg,
+                      Object.keys(prepared.tools),
                     )
                     args.params.prompt = ProviderTransform.message(
                       proxied,

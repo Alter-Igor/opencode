@@ -12,6 +12,7 @@ import path from "path"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Effect, Schema } from "effect"
 import type { InstanceContext } from "@/project/instance-context"
+import { redactToolPart } from "@/plugin/secret-redaction"
 
 const decodeMessageInfo = Schema.decodeUnknownSync(SessionV1.Info)
 const decodePart = Schema.decodeUnknownSync(SessionV1.Part)
@@ -210,6 +211,8 @@ const runImport = Effect.fn("Cli.import.body")(function* (file: string, ctx: Ins
 
     for (const part of msg.parts) {
       const partInfo = decodePart(part) as SessionV1.Part
+      // Fork (#207): imported tool parts are redacted like every stored copy (#26, Session.updatePart).
+      redactToolPart(partInfo)
       const { id: partId, sessionID: _s, messageID, ...partData } = partInfo
       yield* db
         .insert(PartTable)

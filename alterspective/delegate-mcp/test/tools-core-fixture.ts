@@ -166,7 +166,7 @@ function fakeServices(f: Fake): Pick<ToolContext, "supervisorService" | "workspa
       },
       collect: async (ws) => {
         f.collected.push(ws.sessionKey)
-        return { branch: ws.branch, commits: 1, hostExecutableChanges: [] }
+        return { branch: ws.branch, commits: 1, hostExecutableChanges: [], mirrorAddressFiles: [] }
       },
       sync: async (_ws, _ref) => ({ synced: true, head: BASE, commitsSynced: 1 }),
       bindSession: async (key, binding) => {

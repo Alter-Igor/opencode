@@ -14,8 +14,10 @@ export type FrontFiles = { servers: string; hash: string }
 
 export const PASSWORD_ENV = "OPENCODE_SERVER_PASSWORD"
 export const MCP_ALLOW_ENV = "OPENCODE_MCP_ALLOW"
+export const SMALL_MODEL_THRESHOLD_ENV = "OPENCODE_SMALL_MODEL_THRESHOLD"
+export const SMALL_MODEL_DELEGATION_ENV = "OPENCODE_SMALL_MODEL_DELEGATION"
 /** Container env the supervisor reads back from `docker inspect`; everything else is discarded unread. */
-export const INSPECT_ENV = [PASSWORD_ENV, MCP_ALLOW_ENV]
+export const INSPECT_ENV = [PASSWORD_ENV, MCP_ALLOW_ENV, SMALL_MODEL_THRESHOLD_ENV, SMALL_MODEL_DELEGATION_ENV]
 /**
  * MOD-05 inbox sidecar admin token: generated per box start like the password, given to the
  * `docker compose up` child and so to the INBOX container only (never the box), and read back by
@@ -80,7 +82,7 @@ export function siblingContainers(config: Pick<BridgeConfig, "project">): Array<
 /** TLS trust settings: the box trusts front's internal CA only, and nothing may turn checks off (R3-01). */
 const TLS_TRUST_ENV = ["NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO", "GIT_SSL_NO_VERIFY", "REQUESTS_CA_BUNDLE", "NODE_TLS_REJECT_UNAUTHORIZED"]
 const RESERVED_EXACT = new Set(["INBOX_ADMIN_TOKEN", "GATE_ADMIN_TOKEN", "GATE_PROFILE", "HOME", "PATH", "BUN_CONFIG_REGISTRY", ...TLS_TRUST_ENV])
-const RESERVED_PREFIX = ["OCD_", "OPENCODE_", "INBOX_", "XDG_", "NPM_CONFIG_", "PIP_", "UV_", "COREPACK_", "PNPM_CONFIG_"]
+const RESERVED_PREFIX = ["OCD_", "OPENCODE_", "INBOX_", "XDG_", "NPM_CONFIG_", "PIP_", "UV_", "COREPACK_", "PNPM_CONFIG_", "YARN_"]
 const RESERVED_SUFFIX = ["_PROXY"]
 
 export function isReservedBoxEnv(name: string): boolean {
@@ -174,6 +176,8 @@ export function composeEnv(inputs: ComposeInputs, start: StartValues): Record<st
     ...frontEnv(inputs.hostEnv),
     [MCP_ALLOW_ENV]: mcpAllowPolicy(inputs.config),
     [PASSWORD_ENV]: start.password,
+    ...(inputs.hostEnv[SMALL_MODEL_THRESHOLD_ENV] !== undefined ? { [SMALL_MODEL_THRESHOLD_ENV]: inputs.hostEnv[SMALL_MODEL_THRESHOLD_ENV]! } : {}),
+    ...(inputs.hostEnv[SMALL_MODEL_DELEGATION_ENV] !== undefined ? { [SMALL_MODEL_DELEGATION_ENV]: inputs.hostEnv[SMALL_MODEL_DELEGATION_ENV]! } : {}),
     ...inboxEnv,
     ...gateEnv,
   })

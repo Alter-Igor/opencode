@@ -33,6 +33,7 @@ import { ConfigParse } from "./parse"
 import { ConfigPaths } from "./paths"
 import { ConfigPlugin } from "./plugin"
 import { ConfigVariable } from "./variable"
+import { ConfigUnsetEnv } from "./unset-env"
 import { ConfigV2Compat } from "./v2-compat"
 import { Npm } from "@opencode-ai/core/npm"
 import { withTransientReadRetry } from "@/util/effect-http-client"
@@ -230,6 +231,13 @@ const layer = Layer.effect(
       env?: Record<string, string>,
     ) {
       const source = "path" in options ? options.path : options.source
+      // Fork (#24): name the {env:VAR} references this process cannot resolve (they become "").
+      const unset = ConfigUnsetEnv.unsetEnvReferences(text, env)
+      if (unset.length > 0)
+        yield* Effect.logWarning("config references environment variables this process does not have; they resolve to empty", {
+          path: source,
+          variables: unset,
+        })
       const expanded = yield* Effect.promise(() =>
         ConfigVariable.substitute(
           "path" in options

@@ -5,7 +5,7 @@ const patterns = [
   /prompt is too long/i,
   /request_too_large/i,
   /input is too long for requested model/i,
-  /exceeds the context window/i,
+  /exceeds (?:the )?(?:largest feasible )?context window/i,
   /exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))/i,
   /input token count.*exceeds the maximum/i,
   /tokens in request more than max tokens allowed/i,
@@ -20,6 +20,7 @@ const patterns = [
   /context window exceeds limit/i,
   /exceeded model token limit/i,
   /context[_ ]length[_ ]exceeded/i,
+  /"(?:code|reason)"\s*:\s*"context_overflow"/i, // Synapse's code or reason as JSON (#196); plain text such as a parameter name does not match
   /request entity too large/i,
   /context length is only \d+ tokens/i,
   /input length.*exceeds.*context length/i,

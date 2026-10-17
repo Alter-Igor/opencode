@@ -4,6 +4,7 @@ import { z } from "zod"
 import { DelegateError } from "../shared/errors.ts"
 import { ownSession, sessionIdSchema } from "./core-session.ts"
 import { defineTool } from "./define.ts"
+import { collectWarnings } from "./collect-warnings.ts"
 import { ok, untrusted } from "./shape.ts"
 
 export const ALLOWED_BINARIES = new Set([
@@ -64,11 +65,11 @@ export const verifyTool = defineTool({
     const argv = parseCommand(args.command)
     const targetDir = args.worktree ? await ctx.workspaces.resolveRepo(args.worktree) : record.hostRepo
     // Ensure the host has the session's latest commits
-    await ctx.workspaces.collect({ sessionKey: record.sessionKey, hostRepo: record.hostRepo, boxPath: record.boxPath, branch: record.branch })
+    const warnings = collectWarnings(await ctx.workspaces.collect({ sessionKey: record.sessionKey, hostRepo: record.hostRepo, boxPath: record.boxPath, branch: record.branch }))
     const began = Date.now()
     const res = await ctx.hostExec(argv, args.timeoutMs ?? 60_000, targetDir)
     const durationMs = Date.now() - began
-    const summary = `Command '${args.command}' completed with exit code ${res.code} in ${Math.round(durationMs / 100) / 10} s.`
+    const summary = `Command '${args.command}' completed with exit code ${res.code} in ${Math.round(durationMs / 100) / 10} s.${warnings.summary ? ` ${warnings.summary}` : ""}`
     return ok(summary, {
       sessionID: record.sessionID,
       command: args.command,
@@ -77,6 +78,7 @@ export const verifyTool = defineTool({
       timedOut: res.timedOut === true,
       stdout: untrusted(res.stdout, 8000),
       stderr: untrusted(res.stderr, 8000),
+      ...warnings.fields,
     })
   },
 })

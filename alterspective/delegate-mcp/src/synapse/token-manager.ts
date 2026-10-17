@@ -22,6 +22,7 @@ import { DelegateError } from "../shared/errors.ts"
 import { safeLog, type Logger } from "../shared/log.ts"
 import type { Exec } from "../supervisor/docker.ts"
 import { writeAuthConf } from "./auth-conf.ts"
+import type { FrontTarget } from "./front-targets.ts"
 import { renameWithRetry } from "./fs-retry.ts"
 import { catchHandoff } from "./handoff-login.ts"
 import { exchangeHandoff, jwtClaims, type Fetch, type TokenSet } from "./keystone-token.ts"
@@ -81,6 +82,12 @@ export type SynapseDeps = {
   frontDir: string
   origin: string
   frontContainer: string
+  /**
+   * #178: every front this bridge home runs (front-targets.ts), this bridge's own first. The state is
+   * one per home, so a renewal must reach every box, not only the one this bridge is bound to.
+   * Unset: this bridge's front only.
+   */
+  targets?: () => Promise<FrontTarget[]>
   store: SecretStore
   /** A rotated refresh token the store could not save yet (this bridge only, never on disk unencrypted). */
   memory: { pendingRefresh?: { token: string; obtainedAt: number; unpublishedAt?: number }; id: string }
@@ -145,6 +152,35 @@ export async function reloadFront(deps: Pick<SynapseDeps, "exec" | "frontContain
   return result
 }
 
+/** #178: the other boxes' fronts (never this bridge's own). A failed listing is none. */
+async function otherFronts(deps: Pick<SynapseDeps, "targets" | "frontDir" | "frontContainer">): Promise<FrontTarget[]> {
+  const all = deps.targets ? await deps.targets().catch(() => []) : []
+  return all.filter((t) => t.frontContainer !== deps.frontContainer && t.frontDir !== deps.frontDir)
+}
+
+/**
+ * #178: write the Synapse include into this bridge's front (a failure throws, as before), then into
+ * every other box's front folder. Another box's failure is logged, never thrown: it must not undo
+ * this bridge's renewal. Call under the lock.
+ */
+export async function publishAuthConf(deps: Pick<SynapseDeps, "targets" | "frontDir" | "frontContainer" | "log">, token: string | undefined): Promise<void> {
+  await writeAuthConf(deps.frontDir, token)
+  for (const other of await otherFronts(deps)) {
+    await writeAuthConf(other.frontDir, token).catch(() => safeLog(deps.log, "warn", "synapse", "could not write another box's Synapse include", { front: other.frontContainer }))
+  }
+}
+
+/**
+ * #178: reload this bridge's front (recorded and returned, as reloadFront), then every other box's
+ * front (logged only). Lock hold time: one more bounded reload (about 50 s worst case) per other
+ * box folder this home remembers, not only running ones.
+ */
+export async function reloadFronts(deps: Pick<SynapseDeps, "targets" | "frontDir" | "exec" | "frontContainer" | "home" | "now" | "log">, options: { record?: boolean; component?: string } = {}): Promise<Reload> {
+  const own = await reloadFront(deps, options)
+  for (const other of await otherFronts(deps)) await reloadFront({ ...deps, frontContainer: other.frontContainer }, { ...options, record: false })
+  return own
+}
+
 async function notReloaded(deps: Pick<SynapseDeps, "exec" | "frontContainer">, code: number): Promise<Reload> {
   const running = await deps.exec(["docker", "inspect", "--type", "container", "--format", "{{.State.Running}}", deps.frontContainer], { timeoutMs: 20_000 })
   if (running.code !== 0 || running.stdout.trim() !== "true") return "front_not_running"
@@ -159,7 +195,7 @@ async function notReloaded(deps: Pick<SynapseDeps, "exec" | "frontContainer">, c
 export async function adopt(deps: SynapseDeps, tokens: TokenSet): Promise<Reload> {
   const now = deps.now()
   if (tokens.refreshToken) await keepRotated(deps, tokens.refreshToken)
-  await writeAuthConf(deps.frontDir, tokens.accessToken)
+  await publishAuthConf(deps, tokens.accessToken)
   const claims = jwtClaims(tokens.accessToken) ?? {}
   const act = claims.act && typeof claims.act === "object" ? (claims.act as Record<string, unknown>).sub : undefined
   const user = typeof claims.email === "string" ? claims.email : typeof claims.sub === "string" ? claims.sub : undefined
@@ -170,7 +206,7 @@ export async function adopt(deps: SynapseDeps, tokens: TokenSet): Promise<Reload
     delete deps.memory.pendingRefresh.unpublishedAt
     await savePending(deps)
   }
-  return reloadFront(deps)
+  return reloadFronts(deps)
 }
 
 /**
@@ -224,12 +260,12 @@ export async function savePending(deps: SynapseDeps, initial?: TokenState): Prom
 
 /** Keystone refused, or nothing is stored (call under the lock): empty the include; only a sign-in helps. */
 export async function failClosed(deps: SynapseDeps, reason: string): Promise<Refreshed> {
-  await writeAuthConf(deps.frontDir, undefined)
+  await publishAuthConf(deps, undefined)
   deps.memory.pendingRefresh = undefined
   const state = await readState(deps.home)
   await writeState(deps.home, { obtainedAt: state?.obtainedAt ?? 0, expiresAt: state?.expiresAt ?? 0, ...(state?.user ? { user: state.user } : {}), lastError: reason.slice(0, 200), needsSignIn: true, includeAt: deps.now() })
   safeLog(deps.log, "warn", "synapse", "synapse token failed closed", { reason: reason.slice(0, 200) })
-  return { outcome: "failed_closed", reload: await reloadFront(deps), error: reason }
+  return { outcome: "failed_closed", reload: await reloadFronts(deps), error: reason }
 }
 
 /** Sign the owner in on the host and adopt the exchanged token. */

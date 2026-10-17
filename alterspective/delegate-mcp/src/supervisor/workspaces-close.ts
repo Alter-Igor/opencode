@@ -86,12 +86,14 @@ type Owned = { state: HostSessionState & { sessionID: string }; snapshot: NonNul
 type CloneState = Counts & { clone: ClosePlan["clone"]; failed?: boolean; checkError?: string }
 type BranchState = { plan: BranchPlan; tip?: string; repo?: string }
 
-const notOurs = (key: string) =>
-  new DelegateError("not_found", "That session is not one of this bridge's sessions in this sandbox.", "Use oc_list_sessions to see this bridge's sessions.", `close refused: ${key}`)
+/** `why` names the failed check (a fixed word, never record data) so a skipped sweep record can be diagnosed from the log. */
+const notOurs = (key: string, why: string) =>
+  new DelegateError("not_found", "That session is not one of this bridge's sessions in this sandbox.", "Use oc_list_sessions to see this bridge's sessions.", `close refused: ${key} (${why})`)
 
 /** The record, only when it names this session id, this bridge and this box. */
 function owned(deps: CloseDeps, key: string, owner: CloseOwner): Owned {
-  if (!SESSION_KEY.test(key) || !SUPERVISOR_RE.test(owner.supervisor)) throw notOurs(key)
+  if (!SESSION_KEY.test(key)) throw notOurs(key, "bad session key")
+  if (!SUPERVISOR_RE.test(owner.supervisor)) throw notOurs(key, "bad supervisor name")
   const file = path.join(deps.stateDir, `${key}.json`)
   let snapshot: Owned["snapshot"] | undefined
   try {
@@ -100,7 +102,11 @@ function owned(deps: CloseDeps, key: string, owner: CloseOwner): Owned {
     snapshot = undefined
   }
   const state = snapshot ? parseHostState(snapshot.raw, key) : undefined
-  if (!snapshot || !state?.sessionID || state.sessionID !== owner.sessionID || state.supervisor !== owner.supervisor || state.boxProject !== deps.boxProject) throw notOurs(key)
+  if (!snapshot) throw notOurs(key, "record unreadable or changing")
+  if (!state?.sessionID) throw notOurs(key, "record not valid")
+  if (state.sessionID !== owner.sessionID) throw notOurs(key, "session id differs")
+  if (state.supervisor !== owner.supervisor) throw notOurs(key, "other bridge")
+  if (state.boxProject !== deps.boxProject) throw notOurs(key, "other box")
   return { state: { ...state, sessionID: state.sessionID }, snapshot, file }
 }
 
