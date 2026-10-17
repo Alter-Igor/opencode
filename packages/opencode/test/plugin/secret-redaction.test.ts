@@ -2,7 +2,7 @@
 // Fixtures are assembled at run time so this file never holds a string that looks like a real
 // key to a secret scanner (GitHub push protection, gitleaks).
 import { describe, expect, test } from "bun:test"
-import { redactSecrets, redactToolPart, redactToolResult } from "../../src/plugin/secret-redaction"
+import { redactedCopy, redactSecrets, redactToolPart, redactToolResult } from "../../src/plugin/secret-redaction"
 import { redactSensitiveData } from "../../src/plugin/observer"
 import { SynapseAuthPlugin } from "../../src/plugin/synapse"
 
@@ -87,6 +87,24 @@ describe("redactSecrets (#26)", () => {
       expect(performance.now() - began).toBeLessThan(1000)
     }
     expect(redactSecrets(`x git+ssh://u:${"pw" + "1234"}@h/r`)).toBe("x git+ssh://u:[REDACTED:url-credentials]@h/r")
+  })
+
+  test("a streamed shell chunk is cheap to scan (QA on #26: a leading look-behind cost ~7 ms per 30 KB)", () => {
+    const chunk = "src/session/processor.ts:352 ok sk-short ghp-not a.b.c-d https://example.com/x\n".repeat(400)
+    redactSecrets(chunk)
+    const began = performance.now()
+    for (let i = 0; i < 50; i++) expect(redactSecrets(chunk)).toBe(chunk)
+    expect(performance.now() - began).toBeLessThan(250)
+  })
+})
+
+describe("redactedCopy (#26, QA: doom-loop guard)", () => {
+  test("returns a redacted deep copy and leaves the value alone", () => {
+    const input = { command: `curl -H "x-api-key: ${KEYS.synapse}"`, n: 1 }
+    const copy = redactedCopy(input)
+    expect(copy).toEqual({ command: 'curl -H "x-api-key: [REDACTED:synapse]"', n: 1 })
+    expect(input.command).toContain(KEYS.synapse)
+    expect(JSON.stringify(redactedCopy(input))).toBe(JSON.stringify(copy))
   })
 })
 

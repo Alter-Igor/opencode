@@ -25,6 +25,7 @@ import { isRecord } from "@/util/record"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
 import { Usage, type LLMEvent } from "@opencode-ai/llm"
+import { redactedCopy } from "@/plugin/secret-redaction"
 
 const DOOM_LOOP_THRESHOLD = 3
 export type Result = "compact" | "stop" | "continue"
@@ -354,6 +355,8 @@ const layer = Layer.effect(
               Effect.provideService(Database.Service, database),
             )
             const recentParts = parts.slice(-DOOM_LOOP_THRESHOLD)
+            // Fork (#26): stored inputs are redacted, so compare against a redacted copy.
+            const storedInput = JSON.stringify(redactedCopy(input))
 
             if (
               recentParts.length !== DOOM_LOOP_THRESHOLD ||
@@ -362,7 +365,7 @@ const layer = Layer.effect(
                   part.type === "tool" &&
                   part.tool === value.name &&
                   part.state.status !== "pending" &&
-                  JSON.stringify(part.state.input) === JSON.stringify(input),
+                  JSON.stringify(part.state.input) === storedInput,
               )
             ) {
               return

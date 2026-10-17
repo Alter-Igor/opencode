@@ -4,29 +4,45 @@
 // Only high-confidence key shapes are matched, so ordinary output is not changed.
 // Two callers: the Synapse plugin's `tool.execute.after` hook (the result object the model gets
 // back) and `Session.updatePart` (every stored copy of a tool part: running, completed, failed).
+// The doom-loop guard in `session/processor.ts` uses `redactedCopy` to compare with stored inputs.
 
-/** Not preceded by a letter or digit: like `\b`, but a key glued to `_` (`X_sk-...`) still counts. */
-const START = "(?<![A-Za-z0-9])"
+/**
+ * A rule runs only when the text holds one of its `hints` (QA on #26: running every rule on every
+ * streamed shell chunk cost ~7 ms per 30 KB; most output holds none of these prefixes).
+ */
+type Rule = {
+  name: string
+  pattern: RegExp
+  hints?: ReadonlyArray<string>
+  replace?: (match: string, ...groups: string[]) => string
+}
 
-type Rule = { name: string; pattern: RegExp; replace?: (match: string, ...groups: string[]) => string }
+/**
+ * A key that starts with a fixed prefix, not preceded by a letter or digit: like `\b`, but a key
+ * glued to `_` (`X_sk-...`) still counts. The prefix comes first and the check looks back from it.
+ */
+const key = (name: string, hints: ReadonlyArray<string>, prefix: string, body: string, replace?: Rule["replace"]): Rule => ({
+  name,
+  hints,
+  pattern: new RegExp(`${prefix}(?<![A-Za-z0-9]${prefix})${body}`, "g"),
+  replace,
+})
 
 const RULES: ReadonlyArray<Rule> = [
   // Most specific first: an OpenRouter or Anthropic key also starts with "sk-".
-  { name: "openrouter", pattern: new RegExp(`${START}sk-or-v1-[A-Za-z0-9]{32,}`, "g") },
-  { name: "anthropic", pattern: new RegExp(`${START}sk-ant-[A-Za-z0-9_-]{32,}`, "g") },
-  { name: "stripe", pattern: new RegExp(`${START}(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{20,}`, "g") },
-  {
-    // A real OpenAI key mixes digits, upper and lower case; a name like sk-project-management-v2 does not.
-    name: "openai",
-    pattern: new RegExp(`${START}sk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{32,}`, "g"),
-    replace: (match) => (/\d/.test(match) && /[A-Z]/.test(match) && /[a-z]/.test(match) ? "[REDACTED:openai]" : match),
-  },
-  { name: "github", pattern: new RegExp(`${START}(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}`, "g") },
-  { name: "github", pattern: new RegExp(`${START}github_pat_[A-Za-z0-9_]{60,}`, "g") },
-  { name: "gitlab", pattern: new RegExp(`${START}glpat-[A-Za-z0-9_-]{20,}`, "g") },
-  { name: "npm", pattern: new RegExp(`${START}npm_[A-Za-z0-9]{36,}`, "g") },
-  { name: "huggingface", pattern: new RegExp(`${START}hf_[A-Za-z0-9]{30,}`, "g") },
-  { name: "aws", pattern: new RegExp(`${START}(?:AKIA|ASIA)[0-9A-Z]{16}(?![0-9A-Z])`, "g") },
+  key("openrouter", ["sk-or-v1-"], "sk-or-v1-", "[A-Za-z0-9]{32,}"),
+  key("anthropic", ["sk-ant-"], "sk-ant-", "[A-Za-z0-9_-]{32,}"),
+  key("stripe", ["_live_", "_test_"], "[sr]k_(?:live|test)_", "[A-Za-z0-9]{20,}"),
+  // A real OpenAI key mixes digits, upper and lower case; a name like sk-project-management-v2 does not.
+  key("openai", ["sk-"], "sk-", "(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{32,}", (match) =>
+    /\d/.test(match) && /[A-Z]/.test(match) && /[a-z]/.test(match) ? "[REDACTED:openai]" : match,
+  ),
+  key("github", ["ghp_", "gho_", "ghu_", "ghs_", "ghr_"], "gh[pousr]_", "[A-Za-z0-9]{36,}"),
+  key("github", ["github_pat_"], "github_pat_", "[A-Za-z0-9_]{60,}"),
+  key("gitlab", ["glpat-"], "glpat-", "[A-Za-z0-9_-]{20,}"),
+  key("npm", ["npm_"], "npm_", "[A-Za-z0-9]{36,}"),
+  key("huggingface", ["hf_"], "hf_", "[A-Za-z0-9]{30,}"),
+  key("aws", ["AKIA", "ASIA"], "A[KS]IA", "[0-9A-Z]{16}(?![0-9A-Z])"),
   {
     name: "aws",
     pattern: /(aws_secret_access_key\s*[=:]\s*["']?)[A-Za-z0-9/+=]{40}/gi,
@@ -34,26 +50,30 @@ const RULES: ReadonlyArray<Rule> = [
   },
   {
     name: "azure",
+    hints: ["AccountKey"],
     pattern: /(AccountKey\s*=\s*)[A-Za-z0-9+/=]{20,}/g,
     replace: (_match, name) => `${name}[REDACTED:azure]`,
   },
-  { name: "google", pattern: new RegExp(`${START}AIza[0-9A-Za-z_-]{35}`, "g") },
-  { name: "slack", pattern: new RegExp(`${START}xox[abposr]-[A-Za-z0-9-]{10,}`, "g") },
-  { name: "slack", pattern: new RegExp(`${START}xapp-\\d-[A-Za-z0-9-]{10,}`, "g") },
-  { name: "synapse", pattern: new RegExp(`${START}gpapp_[A-Za-z0-9_-]{16,}`, "g") },
+  key("google", ["AIza"], "AIza", "[0-9A-Za-z_-]{35}"),
+  key("slack", ["xox"], "xox[abposr]-", "[A-Za-z0-9-]{10,}"),
+  key("slack", ["xapp-"], "xapp-\\d-", "[A-Za-z0-9-]{10,}"),
+  key("synapse", ["gpapp_"], "gpapp_", "[A-Za-z0-9_-]{16,}"),
   // A JWT: three base64url parts, the first two starting with "eyJ" (a JSON object).
-  { name: "jwt", pattern: new RegExp(`${START}eyJ[A-Za-z0-9_-]{10,}\\.eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}`, "g") },
+  key("jwt", ["eyJ"], "eyJ", "[A-Za-z0-9_-]{10,}\\.eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}"),
   {
     name: "bearer",
+    hints: ["Bearer"],
     pattern: /(Bearer\s+)[A-Za-z0-9._~+/-]{20,}=*/g,
     replace: (match, prefix) => (match.includes("[REDACTED") ? match : `${prefix}[REDACTED:bearer]`),
   },
   {
-    // user:password@ in a URL; the user name stays, the password goes. The scheme must not follow
-    // a scheme character: with `\b` a long `a.b.c...` run made this rule quadratic (architect on #26).
+    // user:password@ in a URL; the user name stays, the password goes. Anchored on "://" after a
+    // scheme character: a rule that started at the scheme was quadratic on long `a.b.c...` runs
+    // (architect on #26) and slow on text with many URLs.
     name: "url-credentials",
-    pattern: /((?<![a-z0-9+.-])[a-z][a-z0-9+.-]*:\/\/[^\s:/@]+:)[^\s@/]{3,}@/gi,
-    replace: (_match, prefix) => `${prefix}[REDACTED:url-credentials]@`,
+    hints: ["://"],
+    pattern: /:\/\/(?<=[a-z0-9+.-]:\/\/)([^\s:/@]+:)[^\s@/]{3,}@/gi,
+    replace: (_match, user) => `://${user}[REDACTED:url-credentials]@`,
   },
 ]
 
@@ -85,6 +105,7 @@ function redactPem(text: string): string {
 export function redactSecrets(text: string): string {
   let out = redactPem(text)
   for (const rule of RULES) {
+    if (rule.hints && !rule.hints.some((hint) => out.includes(hint))) continue
     const replace = rule.replace
     out = replace
       ? out.replace(rule.pattern, (match: string, ...groups: unknown[]) =>
@@ -144,6 +165,11 @@ export function redactToolResult(
     }
   }
   return changed()
+}
+
+/** A redacted deep copy of a value, the same as a stored tool input; the value itself is not changed. */
+export function redactedCopy<T>(value: T): T {
+  return scrubber().scrub(structuredClone(value)) as T
 }
 
 /**
