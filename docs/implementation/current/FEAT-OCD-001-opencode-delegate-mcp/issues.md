@@ -59,5 +59,5 @@ Reproductions, second checks and exact validation are in [the fresh review](evid
 
 | ID | Type | Description | Status |
 |---|---|---|---|
-| CA-1 | Bug (Minor) | #188 — host `color.grep=always` / `color.ui=always` wraps `git grep` hits in colour codes, so the check returns `[]` (clean). Pre-existing (#185). | **Fixed 2026-10-17 (`23e056e8be`):** the host `git grep`, `git diff --name-only` and `git diff --raw` calls behind `oc_collect` now pass `--no-color`; a real-git test forces all three colour settings and fails without the fix. |
+| CA-1 | Bug (Minor) | #188 — host `color.grep=always` / `color.ui=always` wraps `git grep` hits in colour codes, so the check returns `[]` (clean). Pre-existing (#185). | **Fixed 2026-10-17 by PR #191:** the host `git grep`, `git diff --name-only` and `git diff --raw` calls behind `oc_collect` now pass `--no-color`; a real-git test forces all three colour settings and fails without the fix. |
 | CA-2 | Gap | The tag-vs-branch ambiguity (`delegate/<key>` tag wins) affects collect's grep, rev-list and host-executable check alike. Documented in `docker/caches/README.md`; not fixed. | Open — documented |

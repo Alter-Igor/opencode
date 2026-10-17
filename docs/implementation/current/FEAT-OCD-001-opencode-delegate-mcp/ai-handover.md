@@ -27,7 +27,7 @@ Branch `delegate-mirror-check-followups` (worktree `C:\GitHub\opencode---delegat
 - [x] Fresh QA: round 1 FAIL (fixed in `b2f28467f0`), round 2 FAIL (fixed in `e8fc2f60d6`), round 3 PASS on `e8fc2f60d6`.
 - [x] Architect (`synapse/moonshotai/kimi-k3`, standing in because gpt-6-astra was not listed): ALIGNED on `9bbdeefb00` (its README fix), then ALIGNED on `e8fc2f60d6`.
 - [x] Typecheck clean; oxlint on changed files 0 errors.
-- [x] Follow-up filed: #188 — cache check reads clean under forced git colour. **Fixed 2026-10-17 on `dev` (`23e056e8be`):** the host `git grep`, `git diff --name-only` and `git diff --raw` calls behind `oc_collect` now pass `--no-color`, and a real-git test runs collect with `color.ui` / `color.grep` / `color.diff` all forced to `always`.
+- [x] Follow-up filed: #188 — cache check reads clean under forced git colour. **Fixed 2026-10-17 by PR #191:** the host `git grep`, `git diff --name-only` and `git diff --raw` calls behind `oc_collect` now pass `--no-color`, and a real-git test runs collect with `color.ui` / `color.grep` / `color.diff` all forced to `always`.
 
 ## Next, in order
 
