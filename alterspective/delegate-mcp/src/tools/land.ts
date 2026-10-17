@@ -3,6 +3,7 @@ import { z } from "zod"
 import { DelegateError, isDelegateError } from "../shared/errors.ts"
 import { ownSession, sessionIdSchema } from "./core-session.ts"
 import { defineTool } from "./define.ts"
+import { collectWarnings } from "./collect-warnings.ts"
 import { ok, untrusted } from "./shape.ts"
 import { parseCommand } from "./verify.ts"
 
@@ -37,13 +38,15 @@ export const landTool = defineTool({
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   async run(args, ctx, correlationId) {
     let step = "collect"
+    // #186: the collect warnings ride on the result, and on a later step's error too.
+    let warnings: ReturnType<typeof collectWarnings> | undefined
     try {
       const box = await ctx.box()
       const { record } = await ownSession(ctx, box, args.sessionID, correlationId)
 
       // Step 1: Collect session's commits into the host repository
       step = "collect"
-      await ctx.workspaces.collect({ sessionKey: record.sessionKey, hostRepo: record.hostRepo, boxPath: record.boxPath, branch: record.branch }, { correlationId })
+      warnings = collectWarnings(await ctx.workspaces.collect({ sessionKey: record.sessionKey, hostRepo: record.hostRepo, boxPath: record.boxPath, branch: record.branch }, { correlationId }))
 
       // Step 2: Validate worktree
       step = "worktree"
@@ -134,19 +137,20 @@ export const landTool = defineTool({
         ...(args.pr ? ["pr"] : []),
       ]
 
-      return ok(`Landed ${args.branch} (HEAD at ${headSha.slice(0, 10)})${prUrl ? `; PR opened: ${prUrl}` : ""}.`, {
+      return ok(`Landed ${args.branch} (HEAD at ${headSha.slice(0, 10)})${prUrl ? `; PR opened: ${prUrl}` : ""}.${warnings.summary ? ` ${warnings.summary}` : ""}`, {
         landed: true,
         branch: args.branch,
         head: headSha,
         verify: verifyResults,
         prUrl,
         stepsCompleted,
+        ...warnings.fields,
       })
     } catch (error) {
       if (isDelegateError(error)) {
-        throw new DelegateError(error.code, `[Step: ${step}] ${error.message}`, error.action, error.detail)
+        throw new DelegateError(error.code, `[Step: ${step}] ${error.message}${warnings?.summary ? ` ${warnings.summary}` : ""}`, error.action, error.detail)
       }
-      throw new DelegateError("upstream_error", `[Step: ${step}] Landing failed unexpectedly: ${String(error)}`, "Check step failure details and retry.")
+      throw new DelegateError("upstream_error", `[Step: ${step}] Landing failed unexpectedly: ${String(error)}${warnings?.summary ? ` ${warnings.summary}` : ""}`, "Check step failure details and retry.")
     }
   },
 })

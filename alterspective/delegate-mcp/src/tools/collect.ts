@@ -14,6 +14,7 @@ import { defineTool } from "./define.ts"
 import { ownSession, ownedStates, recordFromState, sessionIdSchema } from "./core-session.ts"
 import { ok, untrusted } from "./shape.ts"
 import { parseCommand } from "./verify.ts"
+import { collectWarnings } from "./collect-warnings.ts"
 
 export const MAX_VERIFY_COMMANDS = 20
 export const VERIFY_TIMEOUT_MS = 120_000
@@ -79,28 +80,14 @@ export const collectTool = defineTool({
     const result = await ctx.workspaces.collect({ sessionKey: record.sessionKey, hostRepo: record.hostRepo, boxPath: record.boxPath, branch: record.branch })
     recordCollect(ctx, record, result.commits)
     const rows = argvs?.length ? await runVerify(ctx, record, argvs, args.verify ?? [], args.verifyTimeoutMs ?? VERIFY_TIMEOUT_MS) : undefined
-    const risky = result.hostExecutableChanges
-    const warning = risky.length
-      ? `WARNING: ${risky.length} changed file${risky.length === 1 ? "" : "s"} can run on the host (hooks, scripts or CI). Review them before running anything from ${result.branch}.`
-      : undefined
-    // #162: the box's git filter rewrites the npm lockfiles; anything it misses is flagged here.
-    // null: the host check failed after the fetch; the branch is still here, so it is a warning.
-    const mirror = result.mirrorAddressFiles ?? []
-    const mirrorWarning = result.mirrorAddressFiles === null
-      ? "WARNING: the check for the sandbox's package cache address (npm-cache:4873, pypi-cache:5000) in changed files could not run. Search the branch for those addresses before merging."
-      : mirror.length
-        ? `WARNING: ${mirror.length} changed file${mirror.length === 1 ? "" : "s"} still name${mirror.length === 1 ? "s" : ""} the sandbox's package cache (http://npm-cache:4873 or http://pypi-cache:5000), which a build outside the sandbox cannot reach. Point them at the public registry before merging.`
-        : undefined
-    const summary = `${result.branch} fetched into the owner's repo with ${result.commits} commit${result.commits === 1 ? "" : "s"}.${warning ? ` ${warning}` : ""}${mirrorWarning ? ` ${mirrorWarning}` : ""}${rows ? ` ${verifySummary(rows)}` : ""}`
+    const warnings = collectWarnings(result)
+    const summary = `${result.branch} fetched into the owner's repo with ${result.commits} commit${result.commits === 1 ? "" : "s"}.${warnings.summary ? ` ${warnings.summary}` : ""}${rows ? ` ${verifySummary(rows)}` : ""}`
     return ok(summary, {
       sessionID: record.sessionID,
       hostRepo: record.hostRepo,
       branch: result.branch,
       commits: result.commits,
-      hostExecutableChanges: { count: risky.length, ...(warning ? { warning, paths: untrusted(risky.join("\n"), 4000) } : {}) },
-      mirrorAddressFiles: result.mirrorAddressFiles === null
-        ? { checked: false, warning: mirrorWarning }
-        : { count: mirror.length, ...(mirrorWarning ? { warning: mirrorWarning, paths: untrusted(mirror.join("\n"), 4000) } : {}) },
+      ...warnings.fields,
       ...(rows ? { verify: { passed: rows.every((r) => r.exitCode === 0), rows } } : {}),
     })
   },

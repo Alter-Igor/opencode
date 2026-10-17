@@ -275,6 +275,42 @@ describe("Wave 3: #147 oc_land composite landing flow", () => {
   })
 })
 
+describe("#186: oc_land and oc_verify report the collect warnings", () => {
+  const risky = async (ws: { branch: string }) => ({ branch: ws.branch, commits: 1, hostExecutableChanges: [".githooks/pre-commit"], mirrorAddressFiles: ["uv.lock"] })
+  const host = async (argv: string[]) => {
+    const cmd = argv.join(" ")
+    if (cmd.includes("branch --show-current")) return { code: 0, stdout: "feature-test\n", stderr: "" }
+    if (cmd.includes("rev-parse HEAD")) return { code: 0, stdout: "sha\n", stderr: "" }
+    if (cmd.includes("bun test")) return { code: 1, stdout: "", stderr: "assertion failed" }
+    return { code: 0, stdout: "", stderr: "" }
+  }
+
+  test("oc_verify", async () => {
+    const f = fakeContext()
+    f.ctx.sessions.set(SID, record({ sessionID: SID }))
+    f.ctx.workspaces.collect = risky
+    f.ctx.hostExec = host
+    const res = await invoke(verifyTool, { sessionID: SID, command: "npm test" }, f.ctx)
+    expect(text(res)).toContain("can run on the host")
+    expect(text(res)).toContain("still names the sandbox's package cache")
+    expect(data(res)).toMatchObject({ exitCode: 0, hostExecutableChanges: { count: 1 }, mirrorAddressFiles: { count: 1, paths: { text: "uv.lock", truncated: false } } })
+  })
+
+  test("oc_land, on success and when a later step fails", async () => {
+    const f = fakeContext()
+    f.ctx.sessions.set(SID, record({ sessionID: SID }))
+    f.ctx.workspaces.collect = risky
+    f.ctx.hostExec = host
+    const landed = await invoke(landTool, { sessionID: SID, worktree: "X:\\some\\repo", branch: "feature-test", push: false }, f.ctx)
+    expect(text(landed)).toContain("still names the sandbox's package cache")
+    expect(data(landed)).toMatchObject({ landed: true, hostExecutableChanges: { count: 1 }, mirrorAddressFiles: { count: 1 } })
+    const failed = await invoke(landTool, { sessionID: SID, worktree: "X:\\some\\repo", branch: "feature-test", verify: ["bun test"] }, f.ctx)
+    expect(failed.isError).toBe(true)
+    expect(text(failed)).toContain("[Step: verify]")
+    expect(text(failed)).toContain("still names the sandbox's package cache")
+  })
+})
+
 describe("Wave 3: #148 oc_report { groupBy: 'servedModel' } shows out-of-scope count", () => {
   test("summarise counts outOfScope per servedModel and in totals", async () => {
     const { newTaskRecord } = await import("../src/reporting/record.ts")

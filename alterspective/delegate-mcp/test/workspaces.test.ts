@@ -5,6 +5,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:tes
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import path from "node:path"
 import type { ErrorCode } from "../src/shared/errors.ts"
+import { MAX_PATHSPEC_CHARS, runCommand, TIMEOUT_CODE, type ExecResult } from "../src/supervisor/workspaces.ts"
 import { code, git, posix, T, WorkspaceFixture } from "./workspaces-fixture.ts"
 
 const fx = new WorkspaceFixture("ocd-ws-")
@@ -199,6 +200,63 @@ describe("workspaces: collect names files that still hold a cache address (#162)
         await git(fx.hostRepo, ["rm", "-q", "registry.conf"])
         await git(fx.hostRepo, ["commit", "-q", "-m", "drop old address"])
       }
+    },
+    T,
+  )
+
+  // #186: real git, with one host step swapped for a failure. A failed check is null with a reason,
+  // never [] (that would read as clean).
+  const failing = (match: string, failure: ExecResult) => fx.workspaces({ hostExec: async (argv, o) => (argv.includes(match) ? failure : runCommand(argv, undefined, o?.timeoutMs)) })
+  for (const [name, match, failure, reason] of [
+    ["git diff fails", "--name-only", { code: 128, stdout: "", stderr: "fatal: bad object\nmore" }, "git diff exited 128: fatal: bad object"],
+    ["git diff times out", "--name-only", { code: TIMEOUT_CODE, stdout: "", stderr: "", timedOut: true }, "git diff timed out"],
+    ["git grep exits 2", "grep", { code: 2, stdout: "", stderr: "fatal: corrupt" }, "git grep exited 2: fatal: corrupt"],
+    ["git grep times out", "grep", { code: TIMEOUT_CODE, stdout: "", stderr: "", timedOut: true }, "git grep timed out"],
+  ] as const) {
+    const key = `mirror-fail-${name.replaceAll(" ", "-")}`
+    test(
+      `${name}: the check reports null and the reason`,
+      async () => {
+        const workspaces = failing(match, failure)
+        const ws = await workspaces.open(fx.hostRepo, key)
+        await fx.boxCommit(key, { "uv.lock": 'source = { registry = "http://pypi-cache:5000/index/" }\n' }, "lockfile")
+        const result = await workspaces.collect(ws)
+        expect(result.mirrorAddressFiles).toBeNull()
+        expect(result.mirrorCheckError).toBe(reason)
+        expect(result.commits).toBe(1)
+      },
+      T,
+    )
+  }
+
+  test(
+    "too many changed names for one command line: the whole tree is read and still intersected",
+    async () => {
+      const files: Record<string, string> = { "uv.lock": 'source = { registry = "http://pypi-cache:5000/index/" }\n' }
+      for (let i = 0; i < 200; i++) files[`many/${"n".repeat(90)}-${i}.txt`] = `${i}\n`
+      expect(Object.keys(files).join(" ").length).toBeGreaterThan(MAX_PATHSPEC_CHARS)
+      const seen: (readonly string[])[] = []
+      const watched = fx.workspaces({ hostExec: async (argv, o) => (argv.includes("grep") && seen.push(argv), runCommand(argv, undefined, o?.timeoutMs)) })
+      const ws = await watched.open(fx.hostRepo, "mirror-many")
+      await fx.boxCommit("mirror-many", files, "many files")
+      const result = await watched.collect(ws)
+      expect(result.mirrorAddressFiles).toEqual(["uv.lock"])
+      expect(seen[0]?.at(-1)).toBe("--") // no pathspecs: the whole tree
+    },
+    T,
+  )
+
+  test(
+    "a few changed names: only those files are read",
+    async () => {
+      const seen: (readonly string[])[] = []
+      const workspaces = fx.workspaces({ hostExec: async (argv, o) => (argv.includes("grep") && seen.push(argv), runCommand(argv, undefined, o?.timeoutMs)) })
+      const ws = await workspaces.open(fx.hostRepo, "mirror-few")
+      await fx.boxCommit("mirror-few", { "uv.lock": 'source = { registry = "http://pypi-cache:5000/index/" }\n', "[i]": "plain\n" }, "few")
+      expect((await workspaces.collect(ws)).mirrorAddressFiles).toEqual(["uv.lock"])
+      const argv = seen[0] ?? []
+      expect(argv).toContain("--literal-pathspecs")
+      expect(argv.slice(argv.indexOf("--") + 1).sort()).toEqual(["[i]", "uv.lock"])
     },
     T,
   )
