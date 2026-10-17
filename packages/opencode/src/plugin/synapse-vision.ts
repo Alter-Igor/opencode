@@ -84,12 +84,27 @@ export async function resolveVisionImage(
   const real = await fs.realpath(target)
   const type = IMAGE_TYPES[path.extname(real).toLowerCase()]
   if (!type) throw new Error(`Not a supported image file: ${real}. Use .png, .jpg, .jpeg, .gif, .webp or .bmp.`)
-  if (stat.size > SYNAPSE_VISION_MAX_BYTES) {
-    throw new Error(`Image is too large (${stat.size} bytes). The limit is ${SYNAPSE_VISION_MAX_BYTES} bytes.`)
+  const approved = await fs.stat(real)
+  if (approved.size > SYNAPSE_VISION_MAX_BYTES) {
+    throw new Error(`Image is too large (${approved.size} bytes). The limit is ${SYNAPSE_VISION_MAX_BYTES} bytes.`)
   }
   await beforeRead?.(real)
-  const bytes = await fs.readFile(real)
-  return { url: `data:${type};base64,${bytes.toString("base64")}`, label: target }
+  // #199: read the file that was approved. Open without following a link (where the OS allows
+  // it) and check the handle is the same file, so swapping it after the ask reads nothing else.
+  const handle = await fs.open(real, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0))
+  try {
+    const opened = await handle.stat()
+    if (!opened.isFile() || opened.dev !== approved.dev || opened.ino !== approved.ino) {
+      throw new Error(`Image file changed after it was approved: ${real}`)
+    }
+    if (opened.size > SYNAPSE_VISION_MAX_BYTES) {
+      throw new Error(`Image is too large (${opened.size} bytes). The limit is ${SYNAPSE_VISION_MAX_BYTES} bytes.`)
+    }
+    const bytes = await handle.readFile()
+    return { url: `data:${type};base64,${bytes.toString("base64")}`, label: target }
+  } finally {
+    await handle.close()
+  }
 }
 
 /** Where images a text-only model cannot see are saved for the tool (see saveImageForVision). */
@@ -247,11 +262,22 @@ export async function saveImageForVision(
     // Write a file only this call owns, then rename, so a concurrent step never reads a
     // half-written file (#198).
     const partial = `${file}.${process.pid}.${randomUUID()}.tmp`
-    await fs.writeFile(partial, decoded.bytes, { mode: 0o600, flag: "wx" })
-    await fs.rename(partial, file).catch(async (error) => {
-      await fs.rm(partial, { force: true }).catch(() => undefined)
-      if (!(await fs.stat(file).catch(() => undefined))) throw error
-    })
+    let renamed = false
+    try {
+      await fs.writeFile(partial, decoded.bytes, { mode: 0o600, flag: "wx" })
+      await fs.rename(partial, file).then(
+        () => {
+          renamed = true
+        },
+        async (error) => {
+          // Another save may have put the same image there first; that is fine.
+          if (!(await fs.stat(file).then((stat) => stat.isFile(), () => false))) throw error
+        },
+      )
+    } finally {
+      // #199: never leave a partial file behind, whether the write or the rename failed.
+      if (!renamed) await fs.rm(partial, { force: true }).catch(() => undefined)
+    }
   }
   return file
 }

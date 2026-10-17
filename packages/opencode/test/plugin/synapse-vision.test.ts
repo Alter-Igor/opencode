@@ -95,6 +95,30 @@ describe("synapse_vision (#193)", () => {
     }
   })
 
+  test("a file swapped after the ask is not read (#199)", async () => {
+    const file = path.join(dir, "shot.png")
+    await fs.writeFile(file, Buffer.from(PNG_BASE64, "base64"))
+    await expect(
+      resolveVisionImage("shot.png", dir, async (approved) => {
+        // Replace the approved file with a different one before the read.
+        await fs.rm(approved)
+        await fs.writeFile(approved, Buffer.from(PNG_BASE64, "base64"))
+      }),
+    ).rejects.toThrow("changed after it was approved")
+  })
+
+  test("a failed write leaves no partial file (#199)", async () => {
+    const saveDir = path.join(dir, "readonly")
+    await fs.mkdir(saveDir)
+    // A folder where the final name should go makes the rename fail on every OS.
+    const blocked = await saveImageForVision(PNG_BASE64, "image/png", saveDir)
+    await fs.rm(blocked!)
+    await fs.mkdir(blocked!)
+    await fs.writeFile(path.join(blocked!, "x"), "x")
+    await expect(saveImageForVision(PNG_BASE64, "image/png", saveDir)).rejects.toThrow()
+    expect((await fs.readdir(saveDir)).filter((name) => name.endsWith(".tmp"))).toEqual([])
+  })
+
   test("a refused permission stops the file from being read", async () => {
     await fs.writeFile(path.join(dir, "shot.png"), Buffer.from(PNG_BASE64, "base64"))
     await expect(
