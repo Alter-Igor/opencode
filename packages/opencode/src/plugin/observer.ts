@@ -447,14 +447,10 @@ class SessionObserverManager {
     // Always read from disk, from the right stores for THIS workspace. One process
     // can serve several projects, so no cached list may be reused across them.
     return this.mutate(async () => {
+      // #212: the same row check as a forget, so a malformed row cannot throw in isLive.
       const read = async (file?: string): Promise<SessionLearning[]> => {
-        if (!file) return []
-        try {
-          const parsed = JSON.parse(await fs.readFile(file, "utf8"))
-          return Array.isArray(parsed) ? (parsed as SessionLearning[]) : []
-        } catch {
-          return []
-        }
+        const rows = file ? await readRuleStore(file) : undefined
+        return Array.isArray(rows) ? rows : []
       }
       const paths = learningStorePaths(workspaceDir)
       // Project rules first: a committed, reviewed repo rule outranks an ad-hoc
@@ -493,14 +489,10 @@ class SessionObserverManager {
   public async listLearnings(
     workspaceDir?: string,
   ): Promise<Array<SessionLearning & { origin: "global" | "project"; injected: boolean }>> {
+    // #212: the same row check as a forget, so a malformed row cannot throw in isLive.
     const read = async (file?: string): Promise<SessionLearning[]> => {
-      if (!file) return []
-      try {
-        const parsed = JSON.parse(await fs.readFile(file, "utf8"))
-        return Array.isArray(parsed) ? (parsed as SessionLearning[]) : []
-      } catch {
-        return []
-      }
+      const rows = file ? await readRuleStore(file) : undefined
+      return Array.isArray(rows) ? rows : []
     }
     const paths = learningStorePaths(workspaceDir)
     const global = (await read(paths.global)).filter(isLive)
@@ -522,11 +514,25 @@ class SessionObserverManager {
    * forgotten; a rule present in both stores is counted once. A rule recorded in a project
    * lives in both stores (see `recordLearning`), so one forget from that workspace removes both
    * copies; from another workspace only the global copy is reached. If any
-   * store cannot be read, nothing is changed and 0 is returned (#38).
+   * store cannot be read, nothing is changed and 0 is returned (#38); if a write fails, the stores
+   * already written are put back where possible and 0 is returned (#212).
    */
   public async forgetLearning(lessonText: string, workspaceDir?: string): Promise<number> {
+    return (await this.forgetLearningResult(lessonText, workspaceDir)).forgotten
+  }
+
+  /**
+   * `forgetLearning` with the reason a forget was refused (#212): `unreadable` (a store could not
+   * be read; nothing was changed) or `write_failed` (a write failed; stores already written were
+   * put back, best effort: `restored` is false when that put-back failed too, so a rule may be
+   * half forgotten). A refused forget always reports 0 forgotten.
+   */
+  public async forgetLearningResult(
+    lessonText: string,
+    workspaceDir?: string,
+  ): Promise<{ forgotten: number; refused?: "unreadable" | "write_failed"; restored?: boolean }> {
     const needle = lessonText.trim().toLowerCase()
-    if (!needle) return 0
+    if (!needle) return { forgotten: 0 }
     const matches = (l: SessionLearning) => String(l.lesson ?? "").toLowerCase().includes(needle)
     const paths = learningStorePaths(workspaceDir)
     const files = [paths.global, paths.project].filter((file): file is string => Boolean(file))
@@ -538,22 +544,31 @@ class SessionObserverManager {
       const stores: Array<{ file: string; rows: SessionLearning[] }> = []
       for (const file of files) {
         const read = await readRuleStore(file)
-        if (read === "unreadable") return 0
+        if (read === "unreadable") return { forgotten: 0, refused: "unreadable" as const }
         if (read) stores.push({ file, rows: read })
       }
       const forgotten = new Set<string>()
+      const written: Array<{ file: string; before: SessionLearning[] }> = []
       for (const store of stores) {
+        const before = structuredClone(store.rows)
         const keys = markForgotten(store.rows, matches)
         if (keys.size === 0) continue
         try {
           await writeJsonAtomic(store.file, trimRules(store.rows))
         } catch {
-          // A failed write leaves that copy live; an earlier store may already be written.
-          return 0
+          // #212: one store written and the next not would leave a rule half forgotten; put the
+          // written stores back (best effort) so a refused forget changes nothing here either.
+          let restored = true
+          for (const done of written)
+            await writeJsonAtomic(done.file, done.before).catch(() => {
+              restored = false
+            })
+          return { forgotten: 0, refused: "write_failed" as const, restored }
         }
+        written.push({ file: store.file, before })
         for (const key of keys) forgotten.add(key)
       }
-      return forgotten.size
+      return { forgotten: forgotten.size }
     })
   }
 
@@ -608,8 +623,8 @@ const isLive = (l: SessionLearning) => !l.deletedAt
 
 /**
  * One rule store's rows. `undefined`: the store does not exist, which is a real absence.
- * `"unreadable"`: any other read error, bad JSON, or JSON that is not an array; we cannot know
- * what the store holds.
+ * `"unreadable"`: any other read error, bad JSON, JSON that is not an array, or a row that is not
+ * a rule (an object with a string `lesson`); we cannot know what the store holds.
  */
 async function readRuleStore(file: string): Promise<SessionLearning[] | undefined | "unreadable"> {
   let raw: string
