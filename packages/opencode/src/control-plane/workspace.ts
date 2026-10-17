@@ -818,11 +818,21 @@ const layer = Layer.effect(
       const target = existing
         ? yield* WorkspaceAdapterRuntime.target(existing).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
         : undefined
+      // A folder whose instance cannot start (a broken config or plugin) must not stop the removal:
+      // remove keeps going when the adapter fails too (architect on #229).
       if (target?.type === "local")
         yield* Effect.gen(function* () {
           const store = yield* InstanceStore.Service
           yield* store.provide({ directory: target.directory }, cancelRoots)
-        }).pipe(Effect.provide(AppNodeBuilderV1.build(InstanceStore.node)))
+        }).pipe(
+          Effect.provide(AppNodeBuilderV1.build(InstanceStore.node)),
+          Effect.catchCause((cause) =>
+            Effect.logWarning("could not stop runs in the workspace folder before removing it", {
+              workspaceID: id,
+              cause,
+            }),
+          ),
+        )
       yield* cancelRoots
       yield* Effect.forEach(
         roots,
