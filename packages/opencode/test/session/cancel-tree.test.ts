@@ -12,6 +12,7 @@ describe("cancelSessionTree (#214)", () => {
         {
           cancel: (id: string) => Effect.sync(() => void cancelled.push(id)),
           children: (id: string) => Effect.succeed((tree[id] ?? []).map((child) => ({ id: child }))),
+          isIdle: () => Effect.succeed(false),
         },
         "root",
       ),
@@ -23,11 +24,28 @@ describe("cancelSessionTree (#214)", () => {
     const cancelled: string[] = []
     await Effect.runPromise(
       cancelSessionTree(
-        { cancel: (id: string) => Effect.sync(() => void cancelled.push(id)), children: () => Effect.succeed([]) },
+        { cancel: (id: string) => Effect.sync(() => void cancelled.push(id)), children: () => Effect.succeed([]), isIdle: () => Effect.succeed(false) },
         "solo",
       ),
     )
     expect(cancelled).toEqual(["solo"])
+  })
+
+  test("an idle session is not cancelled, but its children are still walked (architect on #214)", async () => {
+    const tree: Record<string, string[]> = { root: ["busy", "quiet"], busy: [], quiet: ["deep"], deep: [] }
+    const running = new Set(["busy", "deep"])
+    const cancelled: string[] = []
+    await Effect.runPromise(
+      cancelSessionTree(
+        {
+          cancel: (id: string) => Effect.sync(() => void cancelled.push(id)),
+          children: (id: string) => Effect.succeed((tree[id] ?? []).map((child) => ({ id: child }))),
+          isIdle: (id: string) => Effect.succeed(!running.has(id)),
+        },
+        "root",
+      ),
+    )
+    expect(cancelled).toEqual(["busy", "deep"])
   })
 
   test("the session delete handler cancels the tree before it removes the session", async () => {
