@@ -78,7 +78,7 @@ export class SegmentLog {
     return segment
   }
 
-  /** Retention only (never reachable from a route): remove the oldest file and report it. */
+  /** Retention only: remove the oldest file and report it. It runs inside `append` when a segment rotates, so a POST can reach it. */
   #dropOldest(): void {
     const oldest = this.#segments.shift()!
     rmSync(oldest.file, { force: true })
