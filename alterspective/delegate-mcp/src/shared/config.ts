@@ -10,7 +10,15 @@ import { DelegateError } from "./errors.ts"
 /** #104: the owner's delegation profile for /mcp/dynamic (launch env; see BridgeConfig.dynamicProfile). */
 export const DYNAMIC_PROFILE_ENV = "OPENCODE_DELEGATE_DYNAMIC_PROFILE"
 
+export type DelegateBackend = "docker" | "remote"
+
 export type BridgeConfig = {
+  /** Delegation backend: local docker containers or remote svc-coding-agent cloud microVMs. */
+  backend: DelegateBackend
+  /** URL for the remote svc-coding-agent (used when backend === 'remote'). */
+  remoteUrl: string
+  /** Auth token for remote svc-coding-agent. */
+  remoteToken?: string
   /** Host folder for lock-free state: logs, hand-off bundles, profile. Never mounted rw into the box except `handoff`. */
   home: string
   /** Owner repos a session may be started from (normalised, case-insensitive on Windows). */
@@ -51,7 +59,14 @@ export function defaultConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfi
   const home = env.OPENCODE_DELEGATE_HOME ?? path.join(os.homedir(), ".local", "share", "opencode-delegate")
   const keystone = envList(env.OPENCODE_DELEGATE_KEYSTONE)
   const allowed = envList(env[CEILING_ENV])
+  const backend: DelegateBackend =
+    env.OPENCODE_DELEGATE_BACKEND === "remote" || env.DELEGATE_BACKEND === "remote" || env.SVC_CODING_AGENT_URL
+      ? "remote"
+      : "docker"
   return {
+    backend,
+    remoteUrl: env.OPENCODE_DELEGATE_REMOTE_URL ?? env.SVC_CODING_AGENT_URL ?? "https://coding.alterspective.com.au",
+    remoteToken: env.OPENCODE_DELEGATE_REMOTE_TOKEN ?? env.SVC_CODING_AGENT_TOKEN,
     home,
     roots: (env.OPENCODE_DELEGATE_ROOTS ?? "C:\\GitHub").split(";").filter(Boolean),
     keystoneOrigin: "https://identity.alterspective.com.au",
