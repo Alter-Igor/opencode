@@ -85,16 +85,24 @@ export function createRemoteClient(options: RemoteClientOptions): RemoteCodingAg
         ...req,
         idempotencyKey: req.idempotencyKey ?? `idemp-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
       }
-      return request<RemoteTask>("/api/v1/tasks", {
+      const raw = await request<RemoteTask & { taskId?: string }>("/api/v1/tasks", {
         method: "POST",
         body: JSON.stringify(payload),
       })
+      return {
+        ...raw,
+        id: (raw.id ?? raw.taskId) as string,
+      }
     },
 
     async getTask(id: string): Promise<RemoteTask> {
-      return request<RemoteTask>(`/api/v1/tasks/${encodeURIComponent(id)}`, {
+      const raw = await request<RemoteTask & { taskId?: string }>(`/api/v1/tasks/${encodeURIComponent(id)}`, {
         method: "GET",
       })
+      return {
+        ...raw,
+        id: (raw.id ?? raw.taskId) as string,
+      }
     },
 
     async getPatch(id: string): Promise<string> {
@@ -120,8 +128,8 @@ export function createRemoteClient(options: RemoteClientOptions): RemoteCodingAg
 
       const contentType = res.headers.get("content-type") ?? ""
       if (contentType.includes("application/json")) {
-        const json = (await res.json()) as { patch?: string }
-        return json.patch ?? ""
+        const json = (await res.json()) as { patch?: string; untrusted?: { patch?: string } }
+        return json.untrusted?.patch ?? json.patch ?? ""
       }
       return res.text()
     },

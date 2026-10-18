@@ -114,6 +114,28 @@ describe("RemoteCodingAgentClient", () => {
     expect(patch).toContain("+bar")
   })
 
+  it("gets patch content from KeptPatchView JSON response", async () => {
+    const mockFetch = (async (url: unknown) => {
+      expect(String(url)).toBe("https://coding.test.local/api/v1/tasks/task_test_123/patch")
+      const json = {
+        taskId: "task_test_123",
+        kind: "complete",
+        untrusted: {
+          patch: "diff --git a/foo b/foo\n+untrusted_content",
+        },
+      }
+      return new Response(JSON.stringify(json), { status: 200, headers: { "Content-Type": "application/json" } })
+    }) as unknown as typeof fetch
+
+    const client = createRemoteClient({
+      baseUrl: "https://coding.test.local",
+      fetch: mockFetch,
+    })
+
+    const patch = await client.getPatch("task_test_123")
+    expect(patch).toContain("+untrusted_content")
+  })
+
   it("cancels a task via cancel endpoint", async () => {
     const mockFetch = (async (url: unknown, init?: RequestInit) => {
       expect(String(url)).toBe("https://coding.test.local/api/v1/tasks/task_test_123/cancel")
