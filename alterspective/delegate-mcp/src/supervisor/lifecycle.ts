@@ -21,7 +21,7 @@ import { KEYSTONE_HOST_AUTH_ENV, keystoneHostAuth } from "../guard/egress-identi
 import { SYNAPSE_LOCK_WAIT_MS } from "../synapse/lock.ts"
 import type { RegisteredModels } from "../synapse/models.ts"
 import { INSPECT_ENV, MCP_ALLOW_ENV, approvedValues, boxEnvOverride, composeDownEnv, composeEnv, containerName, dynamicProfileFor, paths, siblingContainers } from "./compose-env.ts"
-import { GENERATION_CAP, generationProject, readGenerations, rememberGeneration } from "./generations.ts"
+import { GENERATION_CAP, forgetGeneration, generationProject, readGenerations, rememberGeneration } from "./generations.ts"
 import { LABEL, dockerArgs, imageExists, inspectBox, redactAll, requireDocker, type BoxInspect, type Exec, type ExecResult } from "./docker.ts"
 import { waitHealthy } from "./health.ts"
 import { pruneSignIns, verifyLive } from "./live.ts"
@@ -367,19 +367,33 @@ async function downProject(run: Run, project: string): Promise<void> {
   }
 }
 
+async function anyProjectContainerRunning(run: Run, project: string): Promise<boolean> {
+  const box = await inspectBox(run.deps.exec, [], project).catch(() => undefined)
+  if (box?.running) return true
+  for (const { container } of siblingContainers({ project })) {
+    const sibling = await inspectBox(run.deps.exec, [], container).catch(() => undefined)
+    if (sibling?.running) return true
+  }
+  return false
+}
+
 async function sweepOthers(run: Run, projects: readonly string[]): Promise<void> {
   const here = run.deps.config.project
   // Every record, not the newest-200 display list: an older session must keep its box up.
   const states = listHostStates(path.join(run.deps.config.home, "workspaces"), Number.POSITIVE_INFINITY)
   for (const project of projects) {
     if (project === here) continue
-    const box = await inspectBox(run.deps.exec, [], project).catch(() => undefined)
-    if (!box?.running) continue
     if ((await heldLeases(run, project)) > 0) continue
     if (states.some((state) => state.boxProject === project)) continue
+    const running = await anyProjectContainerRunning(run, project)
+    if (!running) {
+      await forgetGeneration(run.deps.config.home, project).catch(() => undefined)
+      continue
+    }
     await downProject(run, project).catch((error: unknown) => {
       run.note("warn", "empty sandbox was not stopped", { project, detail: error instanceof Error ? error.message.slice(0, 200) : "unknown" })
     })
+    await forgetGeneration(run.deps.config.home, project).catch(() => undefined)
   }
 }
 

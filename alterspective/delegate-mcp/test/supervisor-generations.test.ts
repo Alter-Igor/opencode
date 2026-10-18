@@ -3,6 +3,7 @@ import { existsSync } from "node:fs"
 import { mkdir, readFile, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { mcpAllowPolicy } from "../src/shared/config.ts"
+import { readGenerations, rememberGeneration } from "../src/supervisor/generations.ts"
 import { planFor } from "../src/supervisor/plan.ts"
 import { readHostState, writeHostState } from "../src/supervisor/workspaces-state.ts"
 import { L, deps, fail, fakeDocker, home, leaseDir, recorder, supervisor, writeOwner, type Box, type Call, useSupervisorFixture } from "./supervisor-lifecycle-fixture.ts"
@@ -344,4 +345,24 @@ describe("supervisor generations (#171)", () => {
     expect(readHostState(dir, "old-kept-key")?.boxProject).toBe("opencode-delegate")
     expect(readHostState(dir, "old-kept-key")?.sessionID).toBe(CALLER)
   })
+
+  test("an old project with no lease and no sessions whose main box is stopped but a sibling is running is stopped", async () => {
+    await writeOwner()
+    const oldGen = "opencode-delegate-111111111111"
+    await rememberGeneration(home, oldGen)
+    const calls: Call[] = []
+    const containers = {
+      [`${oldGen}-front`]: {
+        code: 0,
+        stdout: JSON.stringify({ state: { Running: true, Health: { Status: "healthy" } }, labels: { [L.image]: IMAGE }, env: [] }),
+        stderr: "",
+      },
+    }
+    const docker = fakeDocker({ running: false, labels: {}, env: [] }, calls, { containers })
+    await supervisor(deps(docker, { image: IMAGE, fetch: fetchFor({}) })).ensure()
+    const down = downOf(calls, oldGen)
+    expect(down).toHaveLength(1)
+    expect(await readGenerations(home)).toEqual([])
+  })
 })
+

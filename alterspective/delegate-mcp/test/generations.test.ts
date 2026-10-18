@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { mkdtemp, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
-import { generationProject, parseImageTag, readGenerations } from "../src/supervisor/generations.ts"
+import { forgetGeneration, generationProject, parseImageTag, readGenerations, rememberGeneration } from "../src/supervisor/generations.ts"
 import { sessionIsIdle, sessionIsPending } from "../src/supervisor/relocate.ts"
 
 const COMMITTED = "img:1.0.0-abcdef012345"
@@ -37,6 +37,18 @@ describe("generation names", () => {
     expect(await readGenerations(home)).toEqual([])
     await writeFile(path.join(home, "generations.json"), JSON.stringify({ projects: ["opencode-delegate-abcdef012345", "Not Valid", 3] }))
     expect(await readGenerations(home)).toEqual(["opencode-delegate-abcdef012345"])
+  })
+
+  test("rememberGeneration and forgetGeneration manage the registry cleanly", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "ocd-gen-"))
+    expect(await readGenerations(home)).toEqual([])
+    await rememberGeneration(home, "opencode-delegate-abcdef012345")
+    expect(await readGenerations(home)).toEqual(["opencode-delegate-abcdef012345"])
+    await forgetGeneration(home, "opencode-delegate-abcdef012345")
+    expect(await readGenerations(home)).toEqual([])
+    // Forgetting a project that is not in the registry is a safe no-op
+    await forgetGeneration(home, "opencode-delegate-abcdef012345")
+    expect(await readGenerations(home)).toEqual([])
   })
 })
 
