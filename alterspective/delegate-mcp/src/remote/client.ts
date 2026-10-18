@@ -81,9 +81,13 @@ export function createRemoteClient(options: RemoteClientOptions): RemoteCodingAg
     },
 
     async startTask(req: StartRemoteTaskRequest): Promise<RemoteTask> {
+      const payload = {
+        ...req,
+        idempotencyKey: req.idempotencyKey ?? `idemp-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+      }
       return request<RemoteTask>("/api/v1/tasks", {
         method: "POST",
-        body: JSON.stringify(req),
+        body: JSON.stringify(payload),
       })
     },
 

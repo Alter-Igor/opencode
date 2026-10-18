@@ -8,6 +8,7 @@ export type StartRemoteTaskRequest = {
   seedPatch?: { patch: string }
   agent?: string
   model?: string
+  idempotencyKey?: string
 }
 
 export type RemoteTaskState =
