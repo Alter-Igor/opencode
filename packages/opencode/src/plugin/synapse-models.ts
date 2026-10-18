@@ -1,11 +1,17 @@
 // Fork-only: load the `synapse` provider's model list from the Synapse gateway at startup.
 //
-// The gateway's OpenAI-compatible `GET <baseURL>/models` is the source of truth for
-// which models exist. A hand-typed `provider.synapse.models` in a user's config goes
-// stale as Synapse adds and retires models, so the live list REPLACES it. When the
-// gateway cannot be reached, the last good live list (cached on disk, no token in it)
-// is used, and only without a cache the configured list. `auto` is Synapse's routing
-// alias. It is never in the gateway's list, so it is always added.
+// The gateway's OpenAI-compatible `GET <baseURL>/models` adds the models Synapse offers
+// and their metadata (limits, reasoning) to the configured `provider.synapse.models`.
+// When the gateway cannot be reached, the last good live list (cached on disk, no token
+// in it) is used in the same way. `auto` is Synapse's routing alias. It is never in the
+// gateway's list, so it is always added.
+//
+// A configured model is never dropped, even when the live list leaves it out (svc#366):
+// Synapse's list can omit a model it still serves (Synapse#2108), and the sandbox pins
+// its stages to configured, whitelisted models, so dropping one left the stage with no
+// model and no chat call. The live entry wins where both have the model. A configured
+// model the live list omits is kept and logged once ("synapse-models-configured-missing").
+// The gateway, not this list, decides what may be called (ADR-042).
 //
 // OPENCODE_DISABLE_MODELS_FETCH is deliberately NOT honoured here. That flag gates the
 // models.dev catalogue download (core/src/models-dev.ts); Synapse's own list is a
@@ -39,9 +45,11 @@ export type SynapseModelEntry = NonNullable<ProviderEntry["models"]>[string]
 export type SynapseModelsFetch = (url: string, init: RequestInit) => Promise<Response>
 
 export interface SynapseModelsLogEvent {
-  reason: "synapse-models-fetch-failed"
+  reason: "synapse-models-fetch-failed" | "synapse-models-configured-missing"
   url: string
   error: string
+  /** For "synapse-models-configured-missing": the configured ids the live list omits. */
+  models?: string[]
 }
 
 /** Last good live list per base URL. Holds model metadata only, never a credential. */
@@ -305,10 +313,12 @@ export async function updateSynapseModelsCache(input: {
 }
 
 /**
- * Replace `cfg.provider.synapse.models` with the gateway's live list plus `auto`.
- * With an expired stored token no request is made and the cached last good list is
- * used, else the configured models. On a failed fetch the same fallback applies and
- * the failure is logged. Never throws, and waits at most `timeoutMs` for the gateway.
+ * Merge the gateway's live list into `cfg.provider.synapse.models`, plus `auto`. Every
+ * configured model is kept; the live entry wins where both list a model, and configured
+ * models the live list omits are logged. With an expired stored token no request is made
+ * and the cached last good list is merged in instead, else the configured models stay as
+ * they are. On a failed fetch the same fallback applies and the failure is logged. Never
+ * throws, and waits at most `timeoutMs` for the gateway.
  */
 export async function loadSynapseModels(cfg: Config, deps: SynapseModelsDeps): Promise<SynapseModelsResult> {
   const target = synapseModelsTarget(cfg, deps.defaultBaseURL)
@@ -321,7 +331,7 @@ export async function loadSynapseModels(cfg: Config, deps: SynapseModelsDeps): P
   const cache = deps.cache ?? fileSynapseModelsCache()
   const useFallback = async (): Promise<SynapseModelsResult> => {
     const cached = await cache.read(target.baseURL)
-    provider.models = { ...(cached ?? configured), [SYNAPSE_AUTO_MODEL]: auto }
+    provider.models = { ...configured, ...cached, [SYNAPSE_AUTO_MODEL]: auto }
     return cached ? "cache" : "fallback"
   }
 
@@ -337,7 +347,15 @@ export async function loadSynapseModels(cfg: Config, deps: SynapseModelsDeps): P
       timeoutMs: deps.timeoutMs,
       userAgent: deps.userAgent,
     })
-    provider.models = { ...live, [SYNAPSE_AUTO_MODEL]: auto }
+    provider.models = { ...configured, ...live, [SYNAPSE_AUTO_MODEL]: auto }
+    const missing = Object.keys(configured).filter((id) => id !== SYNAPSE_AUTO_MODEL && !Object.hasOwn(live, id))
+    if (missing.length > 0)
+      deps.log?.({
+        reason: "synapse-models-configured-missing",
+        url,
+        error: `live model list omits configured models, kept: ${missing.join(", ")}`,
+        models: missing,
+      })
     await cache.write(target.baseURL, live)
     return "live"
   } catch (error) {

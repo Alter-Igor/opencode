@@ -1008,7 +1008,8 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
   }
 
   return {
-    // Fork-only (#74): the live Synapse model list replaces a hand-typed one.
+    // Fork-only (#74): the live Synapse model list is merged into the configured one
+    // (svc#366: a configured model is never dropped).
     // Core reads cfg.provider after this hook resolves (provider/provider.ts).
     config: async (cfg) => {
       // #101: before the model list is read, so that call carries the tier too.
