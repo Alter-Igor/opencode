@@ -10,6 +10,7 @@ import { closeCandidates, type CandidateOptions, type CloseCandidates, type Clos
 import type { DelegateWorkspaces, OpenedWorkspace } from "../supervisor/workspaces.ts"
 import type { RemoteCodingAgentClient } from "./client.ts"
 import { applyRemotePatch, captureSeedPatch, detectRemoteRepo, getHeadCommit } from "./git.ts"
+import { toTaskId } from "./types.ts"
 
 export type RemoteWorkspacesOptions = {
   config: BridgeConfig
@@ -73,7 +74,7 @@ export function createRemoteWorkspaces(options: RemoteWorkspacesOptions): Remote
         throw new Error(`Session ${ws.sessionKey} has no remote task ID bound.`)
       }
 
-      const patch = await client.getPatch(sessionId)
+      const patch = await client.getPatch(toTaskId(sessionId))
       const base = state.base ?? (await getHeadCommit(ws.hostRepo))
       const { filesChanged } = await applyRemotePatch(ws.hostRepo, ws.branch, base, patch)
 

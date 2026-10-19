@@ -55,8 +55,14 @@ describe("remote git helpers", () => {
     const executed: string[][] = []
     const mockRunner: GitRunner = async (argv) => {
       executed.push(argv)
-      if (argv.includes("--numstat")) {
-        return { code: 0, stdout: "1\t0\tsrc/file.ts\n", stderr: "" }
+      if (argv.includes("write-tree")) {
+        return { code: 0, stdout: "tree-sha-123\n", stderr: "" }
+      }
+      if (argv.includes("commit-tree")) {
+        return { code: 0, stdout: "commit-sha-456\n", stderr: "" }
+      }
+      if (argv.includes("diff") && argv.includes("--name-only")) {
+        return { code: 0, stdout: "src/file.ts\n", stderr: "" }
       }
       return { code: 0, stdout: "", stderr: "" }
     }

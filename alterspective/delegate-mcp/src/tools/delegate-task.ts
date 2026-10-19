@@ -113,14 +113,24 @@ export const delegateTaskTool = defineTool({
       }
 
       const views = (waitRes.structuredContent?.views ?? []) as typeof lastViews
+      const events = (waitRes.structuredContent?.events ?? []) as Array<{ sessionID?: string; state?: string }>
+
       if (views.length > 0 && views[0]) {
         lastViews = views
         const matched = views.find((v) => v.sessionID === sessionID) ?? views[0]
         finalState = matched.state
-        if (finalState === "idle" || finalState === "needs_input" || finalState === "error" || finalState === "aborted") {
-          break
+      } else {
+        const stateEvent = [...events].reverse().find((e) => e.sessionID === sessionID && e.state)
+        if (stateEvent?.state) {
+          finalState = stateEvent.state
         }
-      } else if (!waitRes.structuredContent?.still_running) {
+      }
+
+      if (finalState === "idle" || finalState === "needs_input" || finalState === "error" || finalState === "aborted") {
+        break
+      }
+
+      if (!waitRes.structuredContent?.still_running) {
         break
       }
     }

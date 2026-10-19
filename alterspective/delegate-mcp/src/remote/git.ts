@@ -3,9 +3,9 @@ import path from "node:path"
 import { DelegateError } from "../shared/errors.ts"
 import { cleanEnv, runCommand, type ExecResult } from "../supervisor/workspaces-exec.ts"
 
-export type GitRunner = (argv: string[], cwd?: string) => Promise<ExecResult>
+export type GitRunner = (argv: string[], cwd?: string, env?: NodeJS.ProcessEnv) => Promise<ExecResult>
 
-export const defaultGitRunner: GitRunner = (argv, cwd) => runCommand(argv, cleanEnv(), 30_000, cwd)
+export const defaultGitRunner: GitRunner = (argv, cwd, env) => runCommand(argv, env ?? cleanEnv(), 30_000, cwd)
 
 /** Extract "owner/repo" from GitHub remote URLs (ssh or https). */
 export function parseGitHubRepo(url: string): string | undefined {
@@ -48,7 +48,7 @@ export async function captureSeedPatch(hostRepo: string, run: GitRunner = defaul
   }
 }
 
-/** Apply a unified patch to the local repository on branch delegate/<key>. */
+/** Apply a unified patch to the local repository on branch delegate/<key> without touching the working tree. */
 export async function applyRemotePatch(
   hostRepo: string,
   branch: string,
@@ -60,46 +60,60 @@ export async function applyRemotePatch(
     return { branch, filesChanged: [] }
   }
 
-  // Ensure branch exists starting from baseSha
-  const branchCheck = await run(["git", "-C", hostRepo, "rev-parse", "--verify", branch])
-  if (branchCheck.code !== 0) {
-    const createBranch = await run(["git", "-C", hostRepo, "branch", branch, baseSha])
-    if (createBranch.code !== 0) {
-      throw new DelegateError("upstream_error", `Failed to create branch ${branch} from ${baseSha}.`, "Check git state.", createBranch.stderr)
-    }
-  }
+  const nonce = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  const gitDir = path.join(hostRepo, ".git")
+  const tempIndex = path.join(gitDir, `delegate-index-${nonce}`)
+  const tempPatch = path.join(gitDir, `delegate-${nonce}.patch`)
 
-  // Switch to branch temporarily or apply patch via git apply to tree
-  // Using git apply directly
-  const applyRes = await run(["git", "-C", hostRepo, "apply", "--whitespace=nowarn"], hostRepo)
-  // Wait, git apply reads from stdin or file. Let's pass via temp file or git apply --check.
-  // Using node:fs to write a temporary patch file in hostRepo or temp dir
-  const tempPatch = path.join(hostRepo, `.git`, `delegate-${Date.now()}.patch`)
   await Bun.write(tempPatch, patch)
+  const indexEnv = { ...cleanEnv(), GIT_INDEX_FILE: tempIndex }
 
   try {
-    const checkRes = await run(["git", "-C", hostRepo, "apply", "--check", "--whitespace=nowarn", tempPatch])
-    if (checkRes.code !== 0) {
-      throw new DelegateError("branch_diverged", "Remote patch cannot be cleanly applied to current workspace.", "Check for conflicting local changes.", checkRes.stderr)
+    // 1. Read baseSha tree into the isolated temp index
+    const readTreeRes = await run(["git", "--git-dir", gitDir, "read-tree", baseSha], hostRepo, indexEnv)
+    if (readTreeRes.code !== 0) {
+      throw new DelegateError("upstream_error", `Failed to read tree for base ${baseSha}.`, "Verify git history.", readTreeRes.stderr)
     }
 
-    const applyResult = await run(["git", "-C", hostRepo, "apply", "--whitespace=nowarn", tempPatch])
-    if (applyResult.code !== 0) {
-      throw new DelegateError("upstream_error", "Failed to apply remote patch.", "Check git apply error.", applyResult.stderr)
+    // 2. Apply patch to the isolated temp index
+    const applyRes = await run(["git", "--git-dir", gitDir, "apply", "--cached", "--whitespace=nowarn", tempPatch], hostRepo, indexEnv)
+    if (applyRes.code !== 0) {
+      throw new DelegateError("branch_diverged", "Remote patch cannot be cleanly applied to current workspace base.", "Check for conflicting local changes.", applyRes.stderr)
     }
 
-    // Read list of changed files from the patch
-    const numstat = await run(["git", "-C", hostRepo, "apply", "--numstat", tempPatch])
-    const filesChanged = numstat.stdout
+    // 3. Write tree object from the isolated temp index
+    const writeTreeRes = await run(["git", "--git-dir", gitDir, "write-tree"], hostRepo, indexEnv)
+    if (writeTreeRes.code !== 0) {
+      throw new DelegateError("upstream_error", "Failed to write git tree from applied patch.", "Check git repository state.", writeTreeRes.stderr)
+    }
+    const treeSha = writeTreeRes.stdout.trim()
+
+    // 4. Create commit object from tree
+    const commitRes = await run(["git", "--git-dir", gitDir, "commit-tree", treeSha, "-p", baseSha, "-m", `feat(delegate): remote task completion`], hostRepo)
+    if (commitRes.code !== 0) {
+      throw new DelegateError("upstream_error", "Failed to create git commit for remote patch.", "Check git repository state.", commitRes.stderr)
+    }
+    const commitSha = commitRes.stdout.trim()
+
+    // 5. Update branch ref
+    const updateRefRes = await run(["git", "-C", hostRepo, "update-ref", `refs/heads/${branch}`, commitSha], hostRepo)
+    if (updateRefRes.code !== 0) {
+      throw new DelegateError("upstream_error", `Failed to update branch ref for ${branch}.`, "Check git state.", updateRefRes.stderr)
+    }
+
+    // 6. Query changed files
+    const diffRes = await run(["git", "-C", hostRepo, "diff", "--name-only", `${baseSha}..${branch}`, "--"], hostRepo)
+    const filesChanged = diffRes.stdout
       .split(/\r?\n/)
-      .map((line) => line.split(/\t/)[2]?.trim())
-      .filter((file): file is string => Boolean(file))
+      .map((s) => s.trim())
+      .filter(Boolean)
 
     return { branch, filesChanged }
   } finally {
     try {
       const { unlinkSync } = await import("node:fs")
-      unlinkSync(tempPatch)
+      try { unlinkSync(tempPatch) } catch {}
+      try { unlinkSync(tempIndex) } catch {}
     } catch {
       // Ignore cleanup error
     }

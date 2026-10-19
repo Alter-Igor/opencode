@@ -1,10 +1,11 @@
 // Lightweight DelegateHub implementation for remote sessions on svc-coding-agent.
 import { randomUUID } from "node:crypto"
 import type { Cursor, HubEvent, InboxMessage, SessionState, SessionView } from "../shared/contracts.ts"
-import { EventBuffer, type Filter, type Page, type WaitInput, type WaitResult } from "../events/buffer.ts"
+import { EventBuffer, viewMatches, type Filter, type Page, type WaitInput, type WaitResult } from "../events/buffer.ts"
 import type { DelegateHub, Listener } from "../events/hub.ts"
 import { realTimers, type Timers } from "../events/timers.ts"
 import type { RemoteCodingAgentClient } from "./client.ts"
+import { toTaskId } from "./types.ts"
 
 export type RemoteHubOptions = {
   client: RemoteCodingAgentClient
@@ -24,18 +25,30 @@ export function createRemoteHub(options: RemoteHubOptions): DelegateHub {
   function mapState(remoteState: string): SessionState {
     switch (remoteState) {
       case "queued":
+      case "snapshotting":
+      case "provisioning":
+      case "engine-running":
       case "stage-starting":
       case "running":
+      case "publishing":
+      case "merging":
+      case "awaiting-merge":
         return "busy"
-      case "done":
+      case "awaiting-input":
+      case "awaiting-approval":
+        return "needs_input"
       case "patch-ready":
+      case "pr-open":
+      case "done":
         return "idle"
       case "failed":
+      case "rejected":
+      case "expired":
         return "error"
       case "cancelled":
         return "aborted"
       default:
-        return "unknown"
+        return "busy"
     }
   }
 
@@ -55,7 +68,7 @@ export function createRemoteHub(options: RemoteHubOptions): DelegateHub {
     const info = tracked.get(sessionID)
     if (!info) return
     try {
-      const task = await options.client.getTask(sessionID)
+      const task = await options.client.getTask(toTaskId(sessionID))
       if (task.state !== info.lastState) {
         info.lastState = task.state
         const mapped = mapState(task.state)
@@ -103,7 +116,7 @@ export function createRemoteHub(options: RemoteHubOptions): DelegateHub {
     async view(sessionID: string): Promise<SessionView> {
       const info = tracked.get(sessionID)
       try {
-        const task = await options.client.getTask(sessionID)
+        const task = await options.client.getTask(toTaskId(sessionID))
         return {
           sessionID,
           state: mapState(task.state),
@@ -122,7 +135,20 @@ export function createRemoteHub(options: RemoteHubOptions): DelegateHub {
     },
 
     async wait(input: WaitInput): Promise<WaitResult> {
-      return buffer.wait(input)
+      if (!input.cursor && input.sessionIDs.length > 0) {
+        const currentViews = await Promise.all(input.sessionIDs.map((id) => this.view(id)))
+        const matching = currentViews.filter((v) => input.until.some((u) => viewMatches(v, u)))
+        if (matching.length > 0) {
+          return { events: [], next: buffer.head(), timedOut: false, views: matching }
+        }
+      }
+
+      const result = await buffer.wait(input)
+      const views = input.sessionIDs.length > 0 ? await Promise.all(input.sessionIDs.map((id) => this.view(id))) : undefined
+      return {
+        ...result,
+        ...(views ? { views } : {}),
+      }
     },
 
     events(cursor: Cursor | undefined, filter?: Filter, limit?: number): Page {
