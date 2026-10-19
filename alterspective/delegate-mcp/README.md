@@ -1,6 +1,19 @@
-# opencode-delegate
+# code-delegate
 
-opencode-delegate is a small MCP server that runs on your PC. It lets an AI client (Claude Code, and later Codex or Gemini) hand coding work to OpenCode sessions. Those sessions run in a locked Docker box, not on your own account. The client gets a set of `oc_*` tools: start a session in a repo, give it a task, wait for it, answer its questions, and fetch its work back as a git branch. Nothing is merged for you.
+`code-delegate` (formerly `opencode-delegate`) is an MCP server that runs on your PC. It lets an AI client (Claude Code, Claude Desktop, Antigravity, or Codex) hand coding work to autonomous coding sessions.
+
+It provides:
+- **1-Step Delegation (`delegate_task` / `code_delegate_task`):** Give it a local repository directory and a task prompt. It creates an isolated workspace, runs the coding loop autonomously, and lands the completed work on a local `delegate/<key>` branch for human review.
+- **Modern `code_*` Tool Names:** First-class `code_*` aliases (`code_delegate_task`, `code_start_session`, `code_send`, `code_wait`, `code_collect`, etc.) alongside all backward-compatible `oc_*` tools.
+- **Dual Execution Backends:**
+  1. **Local Docker Sandbox (`OPENCODE_DELEGATE_BACKEND=local`, default):** Runs an OpenCode agent inside a locked Docker container on your machine with network egress strictly constrained to Keystone, Synapse, and read-only package caches.
+  2. **Remote Cloud Execution (`OPENCODE_DELEGATE_BACKEND=remote`):** Delegates directly to `svc-coding-agent` running in Azure microVM sandboxes over Keystone OAuth. Uses isolated git index plumbing (`GIT_INDEX_FILE`) to deliver changes directly onto `delegate/<sessionKey>` branches without dirtying the host workspace.
+- **Multi-Engine Execution:** Choose between `auto`, `deepseek`, or `opencode` engines.
+- **3-Tier Coding & Learning Architecture:**
+  - **Tier 1 (GPU Micro-Task):** `synapse-coder` (`coder_generate`, `coder_fix`, `coder_report_correction`) on on-prem RTX 5090 GPU for syntax/LSP fix loops.
+  - **Tier 2 (Workstation Delegation Bridge):** `code-delegate` (`delegate_task`, task scorecards, and local dashboard).
+  - **Tier 3 (Cloud Scale Repo Execution):** `svc-coding-agent` (`coding_start`, Azure microVMs) for full PR-scale cloud pipelines.
+  - **Shared Organizational Brain:** Alterspective RAG (`Practice/AI/lessons/`).
 
 Design and evidence: `docs/implementation/current/FEAT-OCD-001-opencode-delegate-mcp/` (start with `technical-design.md`).
 
@@ -310,14 +323,17 @@ What is pushed: a session became idle, needs input, hit an error, or did not sta
 
 ## Tools
 
+Each tool is available under both `code_*` and legacy `oc_*` naming (for example `code_start_session` and `oc_start_session`). The 1-step convenience tool is available as `delegate_task` and `code_delegate_task`.
+
 Each result is at most 32,000 characters. When a result is too big, whole list items are dropped from the end and `_truncated` says which list and how many. Paging keys such as `next` are always kept, so page on with them.
 
-| Tool | What it does |
-|---|---|
-| `oc_doctor` | Health report: Docker, box image and version, isolation level, MCP entries, the chosen Keystone services and their sign-in state, the owner's allowed list and high-risk warnings, egress (front config for that set, read-only mount, aliases, no CONNECT proxy), live checks (`live`: sign-ins stored in the box are only for the chosen set; the config files `nginx -T` shows (what nginx would load) equal the generated file; live mount modes from `docker inspect`; sign-ins removed earlier, to revoke), guard verdict. `verified` says whether every check could be done and passed. |
-| `oc_login` | Keystone sign-in. With no `server`, every `ks-<id>` entry that needs it, one at a time; or one entry, e.g. `{server: "ks-github"}`. `{server: "synapse"}` signs you in to the model gateway on your PC (see "Synapse sign-in"). Opens your browser. |
-| `oc_list_models` | Models the box can use (`synapse/<id>`, default `synapse/auto`; see "Models (Synapse only)"), the roles Synapse publishes fit data for (`roles`), and the Keystone services it can use. |
-| `oc_start_session` | Copies a repo into the box and starts a session. Returns `sessionID` and a web UI link. `keystone` narrows the session to some of the box's Keystone services (not a wall). `taskRole` sets the session's default model from Synapse's live fit data (see "Task roles"). |
+| Tool | Alias | What it does |
+|---|---|---|
+| `delegate_task` | `code_delegate_task` | **1-step autonomous task delegation.** Takes `{directory, prompt, engine?, model?, timeoutMs?}`. Orchestrates session creation, execution loop, waiting, and collecting commits. Returns status, branch, changed files, and summary of work in a single call. Works seamlessly against both local Docker and remote `svc-coding-agent` backends. |
+| `code_doctor` | `oc_doctor` | Health report: Docker, box image and version, isolation level, MCP entries, the chosen Keystone services and their sign-in state, the owner's allowed list and high-risk warnings, egress (front config for that set, read-only mount, aliases, no CONNECT proxy), live checks (`live`: sign-ins stored in the box are only for the chosen set; the config files `nginx -T` shows (what nginx would load) equal the generated file; live mount modes from `docker inspect`; sign-ins removed earlier, to revoke), guard verdict. `verified` says whether every check could be done and passed. |
+| `code_login` | `oc_login` | Keystone sign-in. With no `server`, every `ks-<id>` entry that needs it, one at a time; or one entry, e.g. `{server: "ks-github"}`. `{server: "synapse"}` signs you in to the model gateway on your PC (see "Synapse sign-in"). Opens your browser. |
+| `code_list_models` | `oc_list_models` | Models the box can use (`synapse/<id>`, default `synapse/auto`; see "Models (Synapse only)"), the roles Synapse publishes fit data for (`roles`), and the Keystone services it can use. |
+| `code_start_session` | `oc_start_session` | Copies a repo into the box and starts a session. Returns `sessionID` and a web UI link. `keystone` narrows the session to some of the box's Keystone services (not a wall). `taskRole` sets the session's default model from Synapse's live fit data (see "Task roles"). |
 | `oc_send` | Gives a session a task. Checks policy first. Returns a cursor for `oc_wait`. `taskRole` picks the model from Synapse's live fit data (see "Task roles"); explicit `model` wins. |
 | `oc_status` | A session's `state`, `since` when, `detail`, and `pending` request ids. (Todos are in `oc_result`.) |
 | `oc_wait` | Waits until sessions are idle, need input, error, or a message arrives. 100 s by default, at most 240 s. |
