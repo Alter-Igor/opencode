@@ -10,7 +10,7 @@ It provides:
   2. **Remote Cloud Execution (`OPENCODE_DELEGATE_BACKEND=remote`):** Delegates directly to `svc-coding-agent` running in Azure microVM sandboxes over Keystone OAuth. Uses isolated git index plumbing (`GIT_INDEX_FILE`) to deliver changes directly onto `delegate/<sessionKey>` branches without dirtying the host workspace.
 - **Multi-Engine Execution:** Choose between `auto`, `deepseek`, or `opencode` engines.
 - **3-Tier Coding & Learning Architecture:**
-  - **Tier 1 (GPU Micro-Task):** `synapse-coder` (`coder_generate`, `coder_fix`, `coder_report_correction`) on on-prem RTX 5090 GPU for syntax/LSP fix loops.
+  - **Tier 1 (GPU Micro-Task):** `synapse-coder` (`coder_generate`, `coder_fix`, `coder_report_correction`) on Synapse (GPU-accelerated) for syntax/LSP fix loops.
   - **Tier 2 (Workstation Delegation Bridge):** `code-delegate` (`delegate_task`, task scorecards, and local dashboard).
   - **Tier 3 (Cloud Scale Repo Execution):** `svc-coding-agent` (`coding_start`, Azure microVMs) for full PR-scale cloud pipelines.
   - **Shared Organizational Brain:** Alterspective RAG (`Practice/AI/lessons/`).
