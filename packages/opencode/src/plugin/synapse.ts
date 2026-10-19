@@ -48,19 +48,27 @@ export const KEYSTONE_AUTHORIZE = `${KEYSTONE_ISSUER}/api/oauth/authorize`
 export const KEYSTONE_TOKEN = `${KEYSTONE_ISSUER}/api/oidc/token`
 export const SYNAPSE_DEFAULT_INFERENCE_URL = "https://synapse2-api.alterspective.com.au/v1"
 export const SYNAPSE_RESOURCE = "https://synapse-mcp.alterspective.com.au/mcp"
-/** #80: the MCP bridge path's fallback model: Synapse's own routing, still local-only. */
+/** #80: the MCP bridge path's fallback model: Synapse's own routing, on the forced tier (local-only by default). */
 export const SYNAPSE_MCP_FALLBACK_MODEL = SYNAPSE_AUTO_ROUTE
-/** #101: when set, every Synapse call this plugin makes carries `x-privacy-tier: local-only`. */
+/** #101: when set, every Synapse call this plugin makes carries `x-privacy-tier` with the resolved tier. */
 export const SYNAPSE_PRIVACY_TIER_ENV = "SYNAPSE_PRIVACY_TIER"
-export type SynapsePrivacyTier = "local-only"
+export type SynapsePrivacyTier = "local-only" | "cloud-ok"
 
 /**
  * #101: the privacy tier forced on every Synapse call, or undefined when the variable is unset or
- * empty. Only `local-only` exists here. Any other non-empty value, even spaces only, is treated as
- * `local-only`, so a typo narrows routing and never widens it.
+ * empty. Fails closed: the answer is `cloud-ok` ONLY when the variable is exactly the string
+ * `cloud-ok` (no trimming, no other case). Any other non-empty value, even spaces only, a typo or
+ * `Cloud-OK`, is `local-only`, so a mistake narrows routing and never widens it.
+ *
+ * The decision to allow the cloud is not made here. The sandbox supervisor sets this variable from
+ * the task manifest's `privacyTier` (#161), which svc-coding-agent sets only for a repo its registry
+ * marks cloud-ok. Passing `cloud-ok` through is what lets a cloud-ok run reach a cloud model; before,
+ * every non-empty value was rewritten to `local-only` and the gateway answered 503 route.no_route.
  */
 export function forcedPrivacyTier(env: Record<string, string | undefined> = process.env): SynapsePrivacyTier | undefined {
-  return env[SYNAPSE_PRIVACY_TIER_ENV] ? "local-only" : undefined
+  const value = env[SYNAPSE_PRIVACY_TIER_ENV]
+  if (!value) return undefined
+  return value === "cloud-ok" ? "cloud-ok" : "local-only"
 }
 
 /** #101: put the forced tier on the `synapse` provider's headers, replacing any other value. */
@@ -847,7 +855,7 @@ interface SynapsePluginOptions {
   fallbackMemory?: PinnedFallbackMemory
   /** #80 follow-up: bounds for peeking at a stream's first event. Default 64 KB and 15 s. */
   ssePeek?: { maxBytes?: number; timeoutMs?: number }
-  /** #101: force `x-privacy-tier` on every Synapse call. Default: from SYNAPSE_PRIVACY_TIER. */
+  /** #101: force `x-privacy-tier` on every Synapse call. Default: from SYNAPSE_PRIVACY_TIER (`cloud-ok` only when exact). */
   privacyTier?: SynapsePrivacyTier
 }
 
@@ -1178,11 +1186,13 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                     : {}),
                 }
 
-                // #80: the fallback is Synapse's own routing (`auto`), kept local-only.
+                // #80: the fallback is Synapse's own routing (`auto`), kept on the forced tier and
+                // local-only when none is forced, so a cloud-ok run is not downgraded and an
+                // unforced run never widens.
                 const autoChatArgs = (): Record<string, any> => ({
                   messages: normalizedMessages,
                   model: SYNAPSE_MCP_FALLBACK_MODEL,
-                  privacyTier: "local-only",
+                  privacyTier: privacyTier ?? "local-only",
                   taskType: "code",
                   ...(typeof requestBodyJson?.max_tokens === "number"
                     ? { maxTokens: requestBodyJson.max_tokens }
@@ -1217,7 +1227,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                         status: mcpRes.status,
                         fallbackModel: SYNAPSE_MCP_FALLBACK_MODEL,
                         fallbackStatus: fallbackRes.status,
-                        localOnly: true,
+                        localOnly: (privacyTier ?? "local-only") === "local-only",
                       })
                       fallbackApplied = fallbackRes.ok
                     }
@@ -1313,7 +1323,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
 
 
                   if (fallbackApplied) {
-                    parsedContent = `[Notice: the requested model was unavailable. Switched to Synapse auto (local-only).]\n\n${parsedContent}`
+                    parsedContent = `[Notice: the requested model was unavailable. Switched to Synapse auto (${privacyTier ?? "local-only"}).]\n\n${parsedContent}`
                   }
 
                   const mcpCorrelationId = mcpRes.headers.get("x-correlation-id") || correlationId
