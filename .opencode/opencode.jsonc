@@ -49,6 +49,16 @@
         "callbackPort": 19876,
       },
     },
+        // Cloud Coding Agent Service (svc-coding-agent) — repo-scale autonomous coding.
+    // OAuth: `opencode mcp auth coding-agent` (Keystone OAuth, scope mcp:coding).
+    "coding-agent": {
+      "type": "remote",
+      "url": "https://staging.coding.alterspective.com.au/mcp",
+      "oauth": {
+        "scope": "mcp:coding",
+        "callbackPort": 19878,
+      },
+    },
     "keystone": {
       // Disabled 2026-09-19: ~102 static tool schemas duplicated by keystone-dynamic
       // (BFA-007 — route AI-tool MCP access through Keystone /mcp/dynamic).
