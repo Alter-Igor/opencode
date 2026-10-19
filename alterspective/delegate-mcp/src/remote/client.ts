@@ -17,26 +17,72 @@ export type RemoteCodingAgentClient = {
   cancelTask(id: string): Promise<{ cancelled: boolean }>
 }
 
+let cachedCanaryToken: { token: string; expiresAt: number } | undefined
+
+async function resolveToken(options: RemoteClientOptions, fetchFn: typeof fetch): Promise<string | undefined> {
+  if (options.token) return options.token
+  const secret = process.env.KEYSTONE_CANARY_CLIENT_SECRET || process.env.CANARY_CLIENT_SECRET
+  if (secret) {
+    const now = Date.now()
+    if (cachedCanaryToken && cachedCanaryToken.expiresAt > now + 60_000) {
+      return cachedCanaryToken.token
+    }
+    const tokenUrl = "https://identity.alterspective.com.au/api/oidc/token"
+    const body = new URLSearchParams({
+      grant_type: "client_credentials",
+      client_id: "svc-coding-agent-staging-canary",
+      client_secret: secret,
+      audience: "svc-coding-agent-staging",
+      scope: "coding:admin",
+    })
+    const res = await fetchFn(tokenUrl, {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        accept: "application/json",
+      },
+      body,
+    })
+    if (!res.ok) {
+      const err = await res.text().catch(() => "")
+      throw new DelegateError("needs_auth", "Failed to acquire Keystone token using client secret.", "Check client secret.", err.slice(0, 200))
+    }
+    const data = (await res.json()) as { access_token: string; expires_in?: number }
+    const expiresInMs = (data.expires_in ?? 3600) * 1000
+    cachedCanaryToken = { token: data.access_token, expiresAt: now + expiresInMs }
+    return data.access_token
+  }
+  return undefined
+}
+
 export function createRemoteClient(options: RemoteClientOptions): RemoteCodingAgentClient {
   const base = options.baseUrl.replace(/\/+$/, "")
   const timeoutMs = options.timeoutMs ?? 30_000
   const fetchFn = options.fetch ?? globalThis.fetch
 
-  const headers = (): Record<string, string> => ({
-    "Content-Type": "application/json",
-    Accept: "application/json",
-    ...(options.token ? { Authorization: `Bearer ${options.token}` } : {}),
-  })
+  async function getHeaders(): Promise<Record<string, string>> {
+    const token = await resolveToken(options, fetchFn)
+    return {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    }
+  }
 
   async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     const url = `${base}${path.startsWith("/") ? path : `/${path}`}`
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), timeoutMs)
+    const headers = {
+      ...(await getHeaders()),
+      ...(init.headers as Record<string, string> | undefined),
+    }
+
     let res: Response
     try {
       res = await fetchFn(url, {
         ...init,
-        headers: { ...headers(), ...(init.headers as Record<string, string> | undefined) },
+        headers,
         signal: controller.signal,
       })
     } catch (err) {
@@ -73,7 +119,8 @@ export function createRemoteClient(options: RemoteClientOptions): RemoteCodingAg
     async health() {
       try {
         const url = `${base}/health`
-        const res = await fetchFn(url, { headers: headers(), method: "GET" })
+        const headers = await getHeaders()
+        const res = await fetchFn(url, { headers, method: "GET" })
         return { healthy: res.ok, status: res.status }
       } catch (err) {
         return { healthy: false, error: String(err) }
@@ -111,8 +158,9 @@ export function createRemoteClient(options: RemoteClientOptions): RemoteCodingAg
       const timer = setTimeout(() => controller.abort(), timeoutMs)
       let res: Response
       try {
+        const headers = { ...(await getHeaders()), Accept: "text/plain, application/json" }
         res = await fetchFn(url, {
-          headers: { ...headers(), Accept: "text/plain, application/json" },
+          headers,
           signal: controller.signal,
         })
       } catch (err) {
