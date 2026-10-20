@@ -2223,6 +2223,21 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
           let askFailed = false
           try {
             const directory = context.directory || input.directory
+            // #235: Synapse fetches an http(s) image itself, so ask first, as the webfetch tool does.
+            const url = (args.image || "").trim().replace(/^["']|["']$/g, "")
+            if (/^https?:\/\//i.test(url)) {
+              try {
+                await context.ask({
+                  permission: "webfetch",
+                  patterns: [url],
+                  always: ["*"],
+                  metadata: { url, format: "image" },
+                })
+              } catch (error) {
+                askFailed = true
+                throw error
+              }
+            }
             const image = await resolveVisionImage(args.image || "", directory, async (file) => {
               // Same rule and pattern as src/tool/external-directory.ts (a non-git worktree is "/").
               const win = process.platform === "win32"
