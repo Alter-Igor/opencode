@@ -24,6 +24,7 @@ const UNITS: Record<string, number> = {
 export type ScheduleInfo = {
   version: 1
   id: string
+  directory?: string
   sessionID: string
   prompt: string
   next: number
@@ -180,7 +181,7 @@ export async function SchedulePlugin(
         .messages({ path: { id: current.sessionID } })
         .catch(() => undefined)
       const user = messages?.data?.findLast((m) => m.info.role === "user")?.info
-      await input.client.session
+      const delivered = await input.client.session
         .promptAsync({
           path: { id: current.sessionID },
           body: {
@@ -188,13 +189,25 @@ export async function SchedulePlugin(
             parts: [{ type: "text", text: current.prompt }],
           },
         })
-        .catch(() => undefined)
+        .then(
+          (res) => !res || !("error" in res) || !res.error,
+          () => false,
+        )
 
       if (disposed) return
       const latest = await load(id)
       if (!latest || latest.createdAt !== current.createdAt) return
       if (!current.every) {
-        await remove(id)
+        if (delivered) {
+          await remove(id)
+          return
+        }
+        const retry: ScheduleInfo = {
+          ...latest,
+          next: now() + 30_000,
+        }
+        await save(retry)
+        arm(retry)
         return
       }
       const updated: ScheduleInfo = {
@@ -238,6 +251,7 @@ export async function SchedulePlugin(
     const info: ScheduleInfo = {
       version: 1,
       id: createScheduleID(currentNow),
+      directory: input.directory,
       sessionID: params.sessionID,
       prompt,
       next,
@@ -259,6 +273,7 @@ export async function SchedulePlugin(
 
   const existing = await listAll()
   for (const item of existing) {
+    if (item.directory && item.directory !== input.directory) continue
     arm(item)
   }
 

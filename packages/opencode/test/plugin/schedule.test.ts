@@ -13,6 +13,15 @@ import {
 
 const SESSION = "ses_schedule_test"
 
+async function waitFor(check: () => boolean | Promise<boolean>, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (await check()) return
+    await new Promise((resolve) => setTimeout(resolve, 15))
+  }
+  throw new Error("waitFor timed out")
+}
+
 function toolCtx(sessionID = SESSION): ToolContext {
   return {
     sessionID,
@@ -167,17 +176,19 @@ describe("SchedulePlugin", () => {
     await createTool.execute({ prompt: "ping once", at: futureIso }, toolCtx())
 
     clock += 25
-    await new Promise((resolve) => setTimeout(resolve, 60))
+    await waitFor(() => prompts.length === 1)
 
     expect(prompts).toHaveLength(1)
     expect(prompts[0].sessionID).toBe(SESSION)
     expect(prompts[0].body.agent).toBe("general")
     expect(prompts[0].body.parts).toEqual([{ type: "text", text: "ping once" }])
 
-    const afterFire = JSON.parse(String(await listTool.execute({}, toolCtx()))) as {
-      schedules: unknown[]
-    }
-    expect(afterFire.schedules).toHaveLength(0)
+    await waitFor(async () => {
+      const parsed = JSON.parse(String(await listTool.execute({}, toolCtx()))) as {
+        schedules: unknown[]
+      }
+      return parsed.schedules.length === 0
+    })
   })
 
   test("fires a recurring schedule and advances next run time", async () => {
@@ -187,16 +198,17 @@ describe("SchedulePlugin", () => {
 
     await createTool.execute({ prompt: "poll status", every: "1s" }, toolCtx())
     clock += 1_000
-    await new Promise((resolve) => setTimeout(resolve, 1_100))
+    await waitFor(() => prompts.length >= 1)
 
     expect(prompts.length).toBeGreaterThanOrEqual(1)
     expect(prompts[0].body.parts).toEqual([{ type: "text", text: "poll status" }])
 
-    const afterFirst = JSON.parse(String(await listTool.execute({}, toolCtx()))) as {
-      schedules: { id: string; next: string; every?: number }[]
-    }
-    expect(afterFirst.schedules).toHaveLength(1)
-    expect(Date.parse(afterFirst.schedules[0].next)).toBeGreaterThan(clock)
+    await waitFor(async () => {
+      const afterFirst = JSON.parse(String(await listTool.execute({}, toolCtx()))) as {
+        schedules: { id: string; next: string; every?: number }[]
+      }
+      return afterFirst.schedules.length === 1 && Date.parse(afterFirst.schedules[0].next) > clock
+    })
   })
 
   test("/schedule command creates and cancels schedules, and session.deleted cleans up", async () => {

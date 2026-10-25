@@ -116,7 +116,7 @@ export function createDefaultCheckRunner(getShell?: () => string | undefined): C
     // Same launch rules as the shell tool: PowerShell takes -Command, and other shells get
     // their own process group so a timeout can stop the whole tree, not just the shell.
     const sh = Shell.preferred(getShell?.())
-    const psCommand = `& { ${command} }; if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE }; if (-not $?) { exit 1 }`
+    const psCommand = `$global:LASTEXITCODE = 0; $Error.Clear(); & { ${command} }; $ok = $? -and ($Error.Count -eq 0); if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; if (-not $ok) { exit 1 }; exit 0`
     const proc =
       process.platform === "win32" && Shell.ps(sh)
         ? spawn(sh, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", psCommand], {

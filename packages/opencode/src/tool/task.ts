@@ -253,20 +253,30 @@ export const TaskTool = Tool.define(
             parts,
           })
 
-          let goalSummary: string | undefined
-          while (true) {
-            const activeGoal = yield* Effect.promise(() =>
-              loadGoalState(nextSession.id, { directory: nextSession.directory }),
-            )
-            if (!activeGoal || activeGoal.status !== "active") break
-
-            const step = yield* Effect.promise(() =>
-              advanceGoalLoopTurn({
-                sessionID: nextSession.id,
+          const stopGoalOnError = (error: Error) =>
+            Effect.promise(() =>
+              stopGoalLoop(nextSession.id, `ERROR: ${error.message}`, {
                 directory: nextSession.directory,
-                messages: [{ info: result.info as never, parts: result.parts as never }],
               }),
             )
+
+          let goalSummary: string | undefined
+          while (true) {
+            const activeGoal = yield* Effect.tryPromise({
+              try: () => loadGoalState(nextSession.id, { directory: nextSession.directory }),
+              catch: (error) => (error instanceof Error ? error : new Error(String(error))),
+            }).pipe(Effect.tapError(stopGoalOnError))
+            if (!activeGoal || activeGoal.status !== "active") break
+
+            const step = yield* Effect.tryPromise({
+              try: () =>
+                advanceGoalLoopTurn({
+                  sessionID: nextSession.id,
+                  directory: nextSession.directory,
+                  messages: [{ info: result.info as never, parts: result.parts as never }],
+                }),
+              catch: (error) => (error instanceof Error ? error : new Error(String(error))),
+            }).pipe(Effect.tapError(stopGoalOnError))
             if (step.kind === "inactive") break
             if (step.kind !== "continue") {
               goalSummary = `[goal-loop] ${step.message}`
@@ -290,7 +300,11 @@ export const TaskTool = Tool.define(
               "message" in result.info.error.data && typeof result.info.error.data.message === "string"
                 ? result.info.error.data.message
                 : result.info.error.name
-            return yield* Effect.fail(new Error(`Subagent failed (task_id: ${nextSession.id}): ${message}`))
+            return yield* Effect.fail(
+              new Error(
+                `Subagent failed (task_id: ${nextSession.id}): ${message}${goalSummary ? `\n${goalSummary}` : ""}`,
+              ),
+            )
           }
           const failed = result.parts.findLast((item) => item.type === "tool" && item.state.status === "error")
           if (failed?.type === "tool" && failed.state.status === "error") {
