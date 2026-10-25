@@ -1,6 +1,6 @@
 // delegate_task (FEAT-CD-001): 1-step autonomous task delegation.
 // Orchestrates start -> send -> wait (long poll) -> collect -> result in a single call.
-// Works across both local Docker and remote svc-coding-agent cloud microVM backends.
+// Local Docker is supported; remote execution is blocked pending a verified contract (#241).
 import { z } from "zod"
 import { defineTool } from "./define.ts"
 import { ok, untrusted } from "./shape.ts"
@@ -44,7 +44,7 @@ export const delegateTaskTool = defineTool({
   description:
     "Autonomous 1-step delegation: starts a session on your repository, sends the task prompt, waits for completion, " +
     "and collects the finished work into local branch delegate/<key>. Supports 'auto', 'deepseek', or 'opencode' engines " +
-    "across local Docker and cloud backends.",
+    "in local Docker. Remote execution is temporarily blocked with policy_unverified pending a verified replacement contract (#241).",
   input: delegateTaskInput,
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   async run(args, ctx, correlationId) {

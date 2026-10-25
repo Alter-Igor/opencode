@@ -20,7 +20,7 @@ export function resolveServerName(env: NodeJS.ProcessEnv = process.env, requeste
   return SERVER_NAME
 }
 
-export const INSTRUCTIONS = `code-delegate runs coding tasks in sandboxed sessions (local Docker or remote svc-coding-agent).
+export const INSTRUCTIONS = `code-delegate runs coding tasks in local Docker sandbox sessions. Remote execution is temporarily blocked with policy_unverified pending a verified replacement contract (#241).
 
 Fastest flow (1-step autonomous):
   delegate_task { directory, prompt, engine?: 'auto'|'deepseek'|'opencode', timeoutMs? }

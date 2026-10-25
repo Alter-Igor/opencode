@@ -1,6 +1,7 @@
 // HTTP client for svc-coding-agent.
 import { DelegateError } from "../shared/errors.ts"
 import type { RemoteTask, StartRemoteTaskRequest } from "./types.ts"
+import type { RemoteObservation, RemoteReadiness } from "../tools/context.ts"
 
 export type RemoteClientOptions = {
   baseUrl: string
@@ -11,10 +12,56 @@ export type RemoteClientOptions = {
 
 export type RemoteCodingAgentClient = {
   health(): Promise<{ healthy: boolean; status?: number; error?: string }>
+  readiness(): Promise<RemoteReadiness>
   startTask(req: StartRemoteTaskRequest): Promise<RemoteTask>
   getTask(id: string): Promise<RemoteTask>
   getPatch(id: string): Promise<string>
   cancelTask(id: string): Promise<{ cancelled: boolean }>
+}
+
+/** Diagnostics never use resolveToken: a read must not mint a wider canary grant. */
+async function observeRemote(fetchFn: typeof fetch, url: string, kind: "health" | "authentication", timeoutMs: number, token?: string): Promise<RemoteObservation> {
+  const observedAt = new Date().toISOString()
+  const startedAt = Date.now()
+  const finish = (outcome: RemoteObservation["outcome"], httpStatus?: number, shapeValid?: boolean): RemoteObservation => ({
+    observedAt,
+    elapsedMs: Date.now() - startedAt,
+    outcome,
+    ...(httpStatus === undefined ? {} : { httpStatus }),
+    ...(shapeValid === undefined ? {} : { shapeValid }),
+  })
+  if (kind === "authentication" && !token?.trim()) return finish("needs_auth")
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const response = await fetchFn(url, {
+      method: "GET",
+      headers: { Accept: "application/json", ...(kind === "authentication" ? { Authorization: `Bearer ${token}` } : {}) },
+      redirect: "error",
+      signal: controller.signal,
+    })
+    if (!response.ok)
+      return finish(kind === "authentication" && (response.status === 401 || response.status === 403) ? "needs_auth" : "http_error", response.status)
+    let parsed: unknown
+    try {
+      parsed = await response.json()
+    } catch {
+      return finish(controller.signal.aborted ? "timeout" : "invalid_json", response.status, false)
+    }
+    const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value)
+    if (kind === "health") {
+      if (!isRecord(parsed) || parsed.service !== "svc-coding-agent" || typeof parsed.status !== "string") return finish("invalid_shape", response.status, false)
+      if (parsed.status === "healthy" || parsed.status === "degraded" || parsed.status === "unhealthy") return finish(parsed.status, response.status, true)
+      return finish("unknown", response.status, false)
+    }
+    if (!isRecord(parsed) || !Array.isArray(parsed.repos)) return finish("invalid_shape", response.status, false)
+    const valid = parsed.repos.every((repo: unknown) => isRecord(repo) && typeof repo.repo === "string" && typeof repo.repoClass === "string" && typeof repo.residency === "string")
+    return finish(valid ? "authenticated" : "invalid_shape", response.status, valid)
+  } catch {
+    return finish(controller.signal.aborted ? "timeout" : "unreachable")
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 let cachedCanaryToken: { token: string; expiresAt: number } | undefined
@@ -117,14 +164,16 @@ export function createRemoteClient(options: RemoteClientOptions): RemoteCodingAg
 
   return {
     async health() {
-      try {
-        const url = `${base}/health`
-        const headers = await getHeaders()
-        const res = await fetchFn(url, { headers, method: "GET" })
-        return { healthy: res.ok, status: res.status }
-      } catch (err) {
-        return { healthy: false, error: String(err) }
-      }
+      const observed = await observeRemote(fetchFn, `${base}/health`, "health", timeoutMs)
+      return { healthy: observed.outcome === "healthy", ...(observed.httpStatus === undefined ? {} : { status: observed.httpStatus }), ...(observed.outcome === "healthy" ? {} : { error: observed.outcome }) }
+    },
+
+    async readiness() {
+      const [health, authentication] = await Promise.all([
+        observeRemote(fetchFn, `${base}/health`, "health", timeoutMs),
+        observeRemote(fetchFn, `${base}/api/v1/repos`, "authentication", timeoutMs, options.token),
+      ])
+      return { health, authentication }
     },
 
     async startTask(req: StartRemoteTaskRequest): Promise<RemoteTask> {
