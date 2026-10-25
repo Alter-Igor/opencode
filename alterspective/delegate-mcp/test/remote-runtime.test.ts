@@ -141,7 +141,7 @@ describe("remote containment through initialized MCP", () => {
     try {
       const result = await f.client.callTool({ name: "code_doctor", arguments: {} })
       expect(result.structuredContent).toMatchObject({ verified: false, remote: { health: { outcome: "healthy" }, authentication: { outcome: "needs_auth" } } })
-      const remote = result.structuredContent?.remote as RemoteReadiness
+      const remote = (result.structuredContent as { remote: RemoteReadiness }).remote
       expect(remote.authentication.httpStatus).toBeUndefined()
       expect(remote.authentication.shapeValid).toBeUndefined()
       expect(f.requests).toEqual(["GET /health"])

@@ -1,11 +1,13 @@
 ---
 id: OCD-241-REMOTE-CONTAINMENT-PREBUILD
 title: Remote delegate containment proposal and prebuild review
-status: awaiting-owner-approval
+status: active
 category: implementation-evidence
 ---
 
 # Remote delegate containment — proposal and AIRUN-058 record
+
+**Current record:** named approval is recorded in the later appendix. Package verification has now run; see the [verification and delivery checkpoint](#verification-and-delivery-checkpoint). The frozen proposal and its original pending-state wording below are historical.
 
 **Date:** 2026-10-25 UTC / 2026-10-26 AEDT
 **Timed review phase:** 13:10:11–13:23:55 UTC; original consult start time was not retained.
@@ -504,3 +506,35 @@ The five-source-file freeze remains in force. Step 10 logging follows verificati
 The independent code review found that `cli.ts` calls the optional top-level `runtime.synapse.start()` hook. Source `synapse/refresh.ts:115–125` creates a refresh interval and runs an immediate tick. Remote runtime now omits that optional hook, while keeping the existing explicitly invoked context sign-in service. The test runs the same optional CLI startup-hook expressions and asserts no remote refresh hook exists. It does not claim a full spawned CLI test; the CLI's separate dashboard/marker behavior is not part of that assertion.
 
 The root also approved two necessary **text-only** additions to the frozen five behavior files: `src/server.ts` INSTRUCTIONS opening line, and `src/tools/delegate-task.ts` header/description. Their pre-existing promise of remote execution contradicted the containment; the text now states local Docker support and remote `policy_unverified` until a verified replacement contract. No behavior, dependency, schema or other source change is authorized in those two files.
+
+## Verification and delivery checkpoint
+
+Recorded at the observed UTC clock read **2026-10-25T21:34:31Z**. This section updates the current record; it does not rewrite the frozen prebuild review or assign a timestamp to the owner's reply.
+
+The saved implementation was `bfe17f10bdd01d04d862064567211e681ffaaa29`, based on current `origin/dev` `c4fa54c46bfeadd0b9488703161686cb1901b52f` when fetched before verification. Native queued Bun 1.3.14 installed the root's frozen dependencies: 4,695 packages, exit 0. No tracked lockfile or production-source change resulted. The queue reported one lingering compiler helper after the install and released its slot normally; no process or queue policy was changed to clear it.
+
+Package typecheck initially found three test-only errors: two callable fetch fixtures lacked Bun's required `preconnect` member, and the SDK result needed a narrow outer assertion before reading `remote`. The correction adds a real throwing `preconnect` stub and preserves the prior runtime shape check plus required dereferences. No assertion was removed or made optional. Independent Fresh QA read that two-file delta and reported a static PASS. The reviewed working-file SHA-256 values were `CE881E93D2F46B50A013F41E7909C8CC181C6AF2B8688EF689BFCBB9D20F237E` (`test/remote-api.test.ts`) and `5D1DE47667EDFD583B7492BAC0B3A6A17C66F88C93158D127ECA249FFBFE3347` (`test/remote-runtime.test.ts`).
+
+All Bun execution below used the unchanged native work queue from `alterspective/delegate-mcp`, except the root dependency install and root file-scoped lint. Exact commands and terminal output are retained in private logs; file identifiers below allow byte verification.
+
+| Check | Observed result |
+| --- | --- |
+| Focused remote runtime/client/adapter tests | 39 pass, 0 fail, 238 assertions across three files; exit 0 before and after the type correction |
+| Package `bun run typecheck` after correction | Exit 0 |
+| Initial full package run | 1,422 pass, 43 skip, 78 fail; exit 1. The output included Windows `sh`-not-found errors. This run is retained as a failure. |
+| Full package rerun | 1,500 pass, 43 skip, 0 fail; 6,192 assertions, 1,543 tests across 104 files, 286.67 seconds; exit 0. Git's `usr/bin` and `bin` were prepended only to this queued child PowerShell process's PATH so fixture shell calls could resolve `sh`. No global environment or queue setting was changed. |
+| File-scoped oxlint | All 10 changed source/test files examined; 46 warnings, 0 errors; exit 0. This is not a zero-warning claim. |
+| Runtime fault control | A temporary workspace-capture attempt before refusal made the selected fixture test fail at the no-capture assertion: `workspace:1` versus `0`; exit 1. Only the fixture's temporary repository was reached. |
+| Adapter fault control | A temporary task-request attempt before refusal made the injected-fetch fixture fail at the no-request assertion: `requests:1` versus `0`; exit 1. No network task was submitted. |
+| Byte restoration and focused recheck | Both production files restored from raw byte backups; Git diff empty for each. Restored focused run: 39 pass, 0 fail, 238 assertions; exit 0. |
+
+The restored production-file SHA-256 values are `D960A7219DDB2E483CBFFA6AD10FD4CD4599EE11D0FFC536DFA2C218FAC8E67D` (`src/runtime.ts`) and `93F0E5FCF3955ED9170C3D5901A1797529D323D60BEE2334C8950D9F7C166E3E` (`src/remote/api.ts`). Neither mutation is part of the delivery diff.
+
+| Private terminal log | SHA-256 |
+| --- | --- |
+| `package-tests-gitsh-fixed.log` | `2ECF3A40E098721ED45536302C9BA6872EAFEA17CDABE76ED0A6D38A2F394886` |
+| `runtime-fault-tests.log` | `9D29AF438938FC1E0C0F03F00670CBCB7984B59229B02F7BE648A40CE3FCE88A` |
+| `adapter-fault-tests.log` | `08EF569100532DB23D430345CFB7814B5848D60127C1B8A7509C35B240949582` |
+| `focused-tests-restored.log` | `8F7878C87C1C10EC8BF1E87A449C2585613B61B479A0F71D90CD23A36E2AC6DA` |
+
+At this checkpoint, normal pre-push root typecheck, current-head hosted Linux checks, final full-source review, Fresh QA, nonauthor `ARCH-GATE-02`, PR reviews and merge remain pending. The 43 explicit skips are not passes. These are fixture/package results; no live remote task, global installation, app deployment, shared-runtime operation or saved-record move was performed by this source-verification task. Remote doctor remains `verified:false`, and the usable remote replacement contract remains open under #241.

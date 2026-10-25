@@ -2,10 +2,13 @@ import { describe, expect, it } from "bun:test"
 import { createRemoteOpencodeApi } from "../src/remote/api.ts"
 import { createRemoteClient } from "../src/remote/client.ts"
 
+const fixtureFetch = (call: (...args: Parameters<typeof fetch>) => ReturnType<typeof fetch>) =>
+  Object.assign(call, { preconnect: () => { throw new Error("Unexpected fixture preconnect") } })
+
 describe("independent remote adapter containment", () => {
   it("refuses create/send before seed capture or scheduling the title/prompt", async () => {
     const calls = { seed: 0, requests: 0 }
-    const client = createRemoteClient({ baseUrl: "https://fixture.invalid", token: "fixture-token", fetch: (async () => { calls.requests++; return Response.json({ taskId: "ct_fixture" }) }) as typeof fetch })
+    const client = createRemoteClient({ baseUrl: "https://fixture.invalid", token: "fixture-token", fetch: fixtureFetch(async () => { calls.requests++; return Response.json({ taskId: "ct_fixture" }) }) })
     const api = createRemoteOpencodeApi({ client, getSeedPatch: async () => { calls.seed++; return { repo: "fixture/repo", patch: "fixture" } } })
     for (const input of [
       { path: "/session", body: { title: "TITLE_ONLY", metadata: { sessionKey: "s-1234567890" }, permission: [{ permission: "edit", pattern: "*", action: "deny" }] } },
@@ -15,7 +18,7 @@ describe("independent remote adapter containment", () => {
   })
 
   it("does not fabricate models, MCP entries or unknown successful operations", async () => {
-    const client = createRemoteClient({ baseUrl: "https://fixture.invalid", fetch: (async () => { throw new Error("Unexpected request") }) as typeof fetch })
+    const client = createRemoteClient({ baseUrl: "https://fixture.invalid", fetch: fixtureFetch(async () => { throw new Error("Unexpected request") }) })
     const api = createRemoteOpencodeApi({ client })
     for (const route of ["/mcp", "/models", "/config/providers", "/config", "/unknown"]) expect(await api.call({ path: route })).toEqual({ status: 501, data: undefined })
   })
