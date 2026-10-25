@@ -7,6 +7,8 @@ category: implementation-evidence
 
 # Remote delegate containment — proposal and AIRUN-058 record
 
+Navigation: [Evidence index](README.md) · [Feature brief](../README.md).
+
 **Current record:** named approval is recorded in the later appendix. Package verification has now run; see the [verification and delivery checkpoint](#verification-and-delivery-checkpoint). The frozen proposal and its original pending-state wording below are historical.
 
 **Date:** 2026-10-25 UTC / 2026-10-26 AEDT
