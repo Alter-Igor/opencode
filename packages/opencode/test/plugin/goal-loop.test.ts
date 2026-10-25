@@ -491,4 +491,35 @@ describe("GoalLoopPlugin", () => {
     // The whole process tree is stopped, so the 20 second child does not hold the check open.
     expect(Date.now() - started).toBeLessThan(10_000)
   }, 30_000)
+
+  test("goal_loop tool starts, inspects, and stops a session goal loop", async () => {
+    const hooks = await plugin()
+    const goalTool = hooks.tool?.goal_loop
+    expect(goalTool).toBeDefined()
+    const ctx = {
+      sessionID: SESSION,
+      messageID: "msg_1",
+      agent: "general",
+      directory: dir,
+      worktree: dir,
+      abort: new AbortController().signal,
+      metadata: () => {},
+      ask: async () => {},
+    }
+
+    const startReply = await goalTool!.execute(
+      { action: "start", goal: "subagent tests pass", check: "bun test", turns: 4 },
+      ctx,
+    )
+    expect(startReply).toContain("A goal loop has started for this session.")
+    expect((await load()).status).toBe("active")
+    expect((await load()).maxTurns).toBe(4)
+
+    const statusReply = await goalTool!.execute({ action: "status" }, ctx)
+    expect(statusReply).toContain("Goal loop: active")
+
+    const stopReply = await goalTool!.execute({ action: "stop" }, ctx)
+    expect(stopReply).toContain("The goal loop is stopped.")
+    expect((await load()).status).toBe("stopped")
+  })
 })
