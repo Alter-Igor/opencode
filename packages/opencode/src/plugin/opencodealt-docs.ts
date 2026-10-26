@@ -10,7 +10,7 @@ export const DOCS_COMMAND = "docs"
 
 export const DOCS_SYSTEM_LINE =
   "You are running opencodealt, Alterspective's fork of OpenCode. https://opencode.ai/docs covers upstream OpenCode only. " +
-  `For opencodealt features (/goal, CAS bridge, opencode-delegate, Synapse models, /docs) use the opencodealt user guide at ${OPENCODEALT_DOCS_URL} ` +
+  `For opencodealt features (/goal, goal_loop, /schedule, schedule_create/schedule_list/schedule_cancel, CAS bridge, opencode-delegate, Synapse models, /docs) use the opencodealt user guide at ${OPENCODEALT_DOCS_URL} ` +
   'and the alterspective-rag tools when they are available (search "opencodealt").'
 
 export const DOCS_TEMPLATE = [
@@ -23,7 +23,7 @@ export const DOCS_TEMPLATE = [
   "If there is a question, answer it in a few short sentences.",
   'Look up opencodealt features with the alterspective-rag tools when they are available (search "opencodealt").',
   "Use https://opencode.ai/docs only for upstream OpenCode features, and say which source you used.",
-  "If there is no question, list the guide's main topics in a few short lines: install and update through AI Office, Synapse models, /goal, CAS bridge, opencode-delegate.",
+  "If there is no question, list the guide's main topics in a few short lines: install and update through AI Office, Synapse models, /goal (and goal_loop), /schedule (and schedule_* tools), CAS bridge, opencode-delegate.",
 ].join("\n")
 
 export async function OpencodealtDocsPlugin(_input: PluginInput): Promise<Hooks> {

@@ -1,10 +1,12 @@
-# Goal loop (`/goal`)
+# Goal loop (`/goal`, `goal_loop`) and session schedules (`/schedule`, `schedule_*`)
 
-Issue: [#84](https://github.com/Alter-Igor/opencode/issues/84). Code: `packages/opencode/src/plugin/goal-loop.ts`. Tests: `packages/opencode/test/plugin/goal-loop.test.ts`.
+Issues: [#84](https://github.com/Alter-Igor/opencode/issues/84), [#243](https://github.com/Alter-Igor/opencode/issues/243) ([PR #244](https://github.com/Alter-Igor/opencode/pull/244)).
+Code: `packages/opencode/src/plugin/goal-loop.ts`, `packages/opencode/src/plugin/schedule.ts`, `packages/opencode/src/tool/task.ts`.
+Tests: `packages/opencode/test/plugin/goal-loop.test.ts`, `packages/opencode/test/plugin/schedule.test.ts`, `packages/opencode/test/tool/task.test.ts`.
 
-OpenCode stops after each turn. Claude Code has `/goal` and Codex has a goal mode, but OpenCode had nothing like them. This fork-only plugin keeps a session working until a check command passes.
+OpenCode stops after each turn. Claude Code has `/goal` and `/schedule`, and Codex has a goal mode, but OpenCode had nothing like them. These fork-only plugins keep a session or child sub-agent working until a check command passes, and allow sessions and sub-agents to schedule recurring or one-shot prompts.
 
-The plugin does nothing until someone types `/goal`. If your own config already defines a `goal` command, the plugin leaves it alone and stays off.
+The `/goal` command stays off in a project that defines its own `goal` command, and `/schedule` stays off in a project that defines its own `schedule` command.
 
 ## Use
 
@@ -55,8 +57,17 @@ flowchart LR
 - Two OpenCode processes serving the same session (for example the TUI and `opencode serve`) would each send a keep-going prompt. Run the loop from one process.
 
 - The model can still run the check command itself with its shell tool. That is harmless for a normal test command. It matters only for a check that changes state each time it runs.
-- The check runs with the same rights as OpenCode. Only the `/goal` command starts a loop or sets its check; the plugin gives the model no tool for it.
+- The check runs with the same rights as OpenCode. Starting from [#243](https://github.com/Alter-Igor/opencode/issues/243), agents and sub-agents can also start, inspect, stop, and resume a loop through the `goal_loop` tool (`action: "start" | "status" | "stop" | "resume"`), and `TaskTool` (`packages/opencode/src/tool/task.ts`) drives active child-session goal loops across turns until `GOAL_MET`, `STALLED`, `BUDGET_EXHAUSTED`, or `Paused` (started either via a leading `/goal ...` line in `task.prompt`, `command: "goal"`, or a `goal_loop` tool call inside the sub-agent).
 - The keep-going prompt tells the model not to edit the check or its tests. The plugin does not enforce that.
+
+## Session and sub-agent schedules (`/schedule` and `schedule_*` tools)
+
+Added in [#243](https://github.com/Alter-Igor/opencode/issues/243) (`packages/opencode/src/plugin/schedule.ts`):
+
+- Slash command: `/schedule <30s|15m|2h|1d> <prompt>`, `/schedule status`, `/schedule off`.
+- Agent and sub-agent tools: `schedule_create` (`prompt`, optional `every`, `at`, `session_id`), `schedule_list` (optional `session_id`), `schedule_cancel` (`id` or `"all"`, optional `session_id`).
+- State lives in `~/.local/state/opencode/schedule/<schedule id>.json`, scoped to the project `directory` so one project's process only arms its own schedules.
+- Failed one-shot (`at` without `every`) dispatches stay active and retry after 30 seconds instead of being marked completed.
 
 ## Live check (2026-10-03)
 
@@ -78,3 +89,12 @@ After merge, from the main checkout at `32ba864fe5`:
 | `--record`, no `--check` | `ses_efe23afefffe8JYcdjWl64Dnr8` | `state.json` started `ACTIVE`; the model did the work and set it to `READY_FOR_REVIEW`; the loop stopped with `READY_FOR_REVIEW: the portable record reached READY_FOR_REVIEW`. This run also found #86 (quote marks dropped from the goal text). |
 
 Not checked live: the TUI toast, the `PAUSED` and unreadable-record paths (unit tests only), and two processes serving one session. Full record: `Lab/AI/goal-runtime-adapters/opencode-fork-goal-loop-live.md` in the knowledge base.
+
+## Live check (2026-10-26, PR #244)
+
+Verified on `dev` at `6b00140634` via `opencode web` (`http://127.0.0.1:4098/`):
+
+| Scenario | Session | Result |
+|---|---|---|
+| Sub-agent schedule lifecycle | `ses_e8ab6e1b2ffef8knP20y5zRG16` | `general` sub-agent called `schedule_create` (`every: "30m"`, `prompt: "Check CI"`), `schedule_list`, and `schedule_cancel`, returning `Created and cancelled sch_mvofjbew_0001.` |
+| Sub-agent `goal_loop` tool lifecycle | `ses_e8ab47320ffeXnpSIa0IkeRfZK` | `general` sub-agent called `goal_loop` (`start` with failing baseline check `bun -e 'process.exit(1)'`, `turns: 3`), `status` (`active`, `0/3`), and `stop` (`CANCELLED`). |
