@@ -1,4 +1,7 @@
 import { describe, expect, it } from "bun:test"
+import { mkdir, mkdtemp, rm } from "node:fs/promises"
+import os from "node:os"
+import path from "node:path"
 import { applyRemotePatch, captureSeedPatch, detectRemoteRepo, getHeadCommit, parseGitHubRepo, type GitRunner } from "../src/remote/git.ts"
 
 describe("remote git helpers", () => {
@@ -67,8 +70,14 @@ describe("remote git helpers", () => {
       return { code: 0, stdout: "", stderr: "" }
     }
 
-    const res = await applyRemotePatch("/test/repo", "delegate/test-branch", "base-sha", "diff --git a/src/file.ts b/src/file.ts", mockRunner)
-    expect(res.branch).toBe("delegate/test-branch")
-    expect(res.filesChanged).toEqual(["src/file.ts"])
+    const hostRepo = await mkdtemp(path.join(os.tmpdir(), "ocd-remote-git-"))
+    try {
+      await mkdir(path.join(hostRepo, ".git"))
+      const res = await applyRemotePatch(hostRepo, "delegate/test-branch", "base-sha", "diff --git a/src/file.ts b/src/file.ts", mockRunner)
+      expect(res.branch).toBe("delegate/test-branch")
+      expect(res.filesChanged).toEqual(["src/file.ts"])
+    } finally {
+      await rm(hostRepo, { recursive: true, force: true })
+    }
   })
 })
