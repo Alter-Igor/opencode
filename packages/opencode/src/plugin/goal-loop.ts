@@ -2,15 +2,16 @@ import { spawn } from "child_process"
 import fs from "fs/promises"
 import { buffer } from "node:stream/consumers"
 import path from "path"
-import type { Hooks, PluginInput } from "@opencode-ai/plugin"
+import { tool, type Hooks, type PluginInput } from "@opencode-ai/plugin"
 import type { Message, Part } from "@opencode-ai/sdk"
 import { Global } from "@opencode-ai/core/global"
 import { Shell } from "@opencode-ai/core/shell"
 import { Filesystem } from "@/util/filesystem"
 
-// Fork-only (#84): `/goal` keeps a session working until a check command passes.
-// The plugin runs the check itself on every `session.idle`, so the model cannot
-// declare the goal met. It does nothing until a person starts a goal.
+// Fork-only (#84, #243): `/goal` and the `goal_loop` tool keep a session or
+// subagent working until a check command passes or a portable record reaches a
+// terminal state. The plugin runs the check itself after each turn, so the
+// model cannot declare the goal met on its own.
 
 export const GOAL_COMMAND = "goal"
 // `turnRetries`: a turn whose model reply failed (not a user abort) is retried this many times in a
@@ -74,6 +75,338 @@ export type CheckRunner = (input: { command: string; cwd: string; timeoutSeconds
 
 export const GOAL_USAGE =
   '/goal <what done looks like> --check "<command that exits 0 when done>" [--turns N] [--minutes N] [--timeout SECONDS] [--record <portable state.json>]  |  /goal status  |  /goal stop  |  /goal resume'
+
+type GoalRuntimeConfig = {
+  stateDir: string
+  directory: string
+  runCheck: CheckRunner
+  now: () => number
+}
+
+const claimedSessions = new Set<string>()
+const sessionLocks = new Map<string, Promise<unknown>>()
+const runtimeByDirectory = new Map<string, GoalRuntimeConfig>()
+let latestRuntime: GoalRuntimeConfig | undefined
+
+function withSessionLock<T>(sessionID: string, fn: () => Promise<T>) {
+  const run = (sessionLocks.get(sessionID) ?? Promise.resolve()).then(fn, fn)
+  sessionLocks.set(
+    sessionID,
+    run.catch(() => undefined),
+  )
+  return run
+}
+
+function goalFilePath(dir: string, sessionID: string) {
+  return path.join(dir, `${sessionID.replace(/[^\w.-]/g, "_")}.json`)
+}
+
+function resolveRuntime(directory?: string, overrides?: { stateDir?: string; runCheck?: CheckRunner; now?: () => number }) {
+  const registered = (directory ? runtimeByDirectory.get(directory) : undefined) ?? latestRuntime
+  return {
+    stateDir: overrides?.stateDir ?? registered?.stateDir ?? path.join(Global.Path.state, "goal-loop"),
+    directory: directory ?? registered?.directory ?? process.cwd(),
+    runCheck: overrides?.runCheck ?? registered?.runCheck ?? createDefaultCheckRunner(),
+    now: overrides?.now ?? registered?.now ?? Date.now,
+  }
+}
+
+export function createDefaultCheckRunner(getShell?: () => string | undefined): CheckRunner {
+  return async ({ command, cwd, timeoutSeconds }) => {
+    // Same launch rules as the shell tool: PowerShell takes -Command, and other shells get
+    // their own process group so a timeout can stop the whole tree, not just the shell.
+    const sh = Shell.preferred(getShell?.())
+    const psCommand = `$global:LASTEXITCODE = 0; $Error.Clear(); & { ${command} }; $ok = $? -and ($Error.Count -eq 0); if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; if (-not $ok) { exit 1 }; exit 0`
+    const proc =
+      process.platform === "win32" && Shell.ps(sh)
+        ? spawn(sh, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", psCommand], {
+            cwd,
+            stdio: ["ignore", "pipe", "pipe"],
+            windowsHide: true,
+          })
+        : spawn(command, [], {
+            cwd,
+            shell: sh,
+            stdio: ["ignore", "pipe", "pipe"],
+            detached: process.platform !== "win32",
+            windowsHide: true,
+          })
+    const exited = new Promise<number>((resolve, reject) => {
+      proc.once("exit", (code, signal) => resolve(code ?? (signal ? 1 : 0)))
+      proc.once("error", reject)
+    })
+    let timedOut = false
+    const timer = setTimeout(() => {
+      timedOut = true
+      void Shell.killTree(proc, { exited: () => proc.exitCode !== null || proc.signalCode !== null })
+    }, timeoutSeconds * 1000)
+    const [code, stdout, stderr] = await Promise.all([exited, buffer(proc.stdout), buffer(proc.stderr)]).finally(() =>
+      clearTimeout(timer),
+    )
+    const output = `${stdout.toString()}${stderr.toString()}`
+    if (!timedOut) return { code, output }
+    return { code: code || 124, output: `${output}\n(the check was stopped after ${timeoutSeconds} seconds)` }
+  }
+}
+
+/**
+ * Mark a session's goal loop as driven by a direct caller (such as `TaskTool.runTask`)
+ * so `GoalLoopPlugin`'s `session.idle` listener does not race with the caller.
+ */
+export function claimGoalLoopSession(sessionID: string) {
+  claimedSessions.add(sessionID)
+  return () => {
+    claimedSessions.delete(sessionID)
+  }
+}
+
+export async function loadGoalState(sessionID: string, options?: { directory?: string; stateDir?: string }) {
+  const runtime = resolveRuntime(options?.directory, { stateDir: options?.stateDir })
+  return Filesystem.readJson<GoalState>(goalFilePath(runtime.stateDir, sessionID)).catch(
+    (): GoalState | undefined => undefined,
+  )
+}
+
+export async function stopGoalLoop(
+  sessionID: string,
+  reason = "CANCELLED: stopped by the user",
+  options?: { directory?: string; stateDir?: string },
+) {
+  const runtime = resolveRuntime(options?.directory, { stateDir: options?.stateDir })
+  const file = goalFilePath(runtime.stateDir, sessionID)
+  return withSessionLock(sessionID, async () => {
+    const current = await Filesystem.readJson<GoalState>(file).catch((): GoalState | undefined => undefined)
+    if (!current) return undefined
+    if (current.status === "stopped") return current
+    const stopped: GoalState = { ...current, status: "stopped", reason }
+    await Filesystem.writeJson(file, stopped)
+    return stopped
+  })
+}
+
+async function readPortableRecord(
+  directory: string,
+  recordPath: string | undefined,
+): Promise<{ state?: string; error?: string } | undefined> {
+  if (!recordPath) return undefined
+  const target = path.resolve(directory, recordPath)
+  if (!(await Filesystem.exists(target))) return {}
+  return Filesystem.readJson<{ state?: unknown }>(target)
+    .then((data) => ({ state: typeof data.state === "string" ? data.state : undefined }))
+    .catch((error) => ({ error: error instanceof Error ? error.message : String(error) }))
+}
+
+async function runStateCheck(state: GoalState, directory: string, runCheck: CheckRunner) {
+  if (!state.check) return undefined
+  return runCheck({ command: state.check, cwd: directory, timeoutSeconds: state.timeoutSeconds }).catch(
+    (error): CheckResult => ({
+      code: 1,
+      output: `The check could not run: ${error instanceof Error ? error.message : String(error)}`,
+    }),
+  )
+}
+
+export async function startGoalLoop(input: {
+  sessionID: string
+  directory?: string
+  goal: string
+  check?: string
+  record?: string
+  turns?: number
+  minutes?: number
+  timeoutSeconds?: number
+  stateDir?: string
+  runCheck?: CheckRunner
+  now?: () => number
+}): Promise<{ started: boolean; state: GoalState; message: string }> {
+  const runtime = resolveRuntime(input.directory, {
+    stateDir: input.stateDir,
+    runCheck: input.runCheck,
+    now: input.now,
+  })
+  const file = goalFilePath(runtime.stateDir, input.sessionID)
+  const goal = input.goal.trim()
+  const checkCmd = input.check?.trim() || undefined
+  const recordPath = input.record?.trim() || undefined
+  if (!goal) throw new Error("Goal description cannot be empty.")
+  if (!checkCmd && !recordPath) {
+    throw new Error("Give `check` (a command that exits 0 when done) or `record` (a portable state.json).")
+  }
+  const maxTurns = input.turns ?? GOAL_DEFAULTS.turns
+  const maxMinutes = input.minutes ?? GOAL_DEFAULTS.minutes
+  const timeoutSeconds = input.timeoutSeconds ?? GOAL_DEFAULTS.timeoutSeconds
+  if (
+    !Number.isInteger(maxTurns) ||
+    maxTurns <= 0 ||
+    !Number.isInteger(maxMinutes) ||
+    maxMinutes <= 0 ||
+    !Number.isInteger(timeoutSeconds) ||
+    timeoutSeconds <= 0
+  ) {
+    throw new Error("`turns`, `minutes`, and `timeoutSeconds` must be whole numbers above 0.")
+  }
+
+  return withSessionLock(input.sessionID, async () => {
+    const state: GoalState = {
+      version: 1,
+      sessionID: input.sessionID,
+      goal,
+      check: checkCmd,
+      record: recordPath,
+      turns: 0,
+      maxTurns,
+      maxMinutes,
+      timeoutSeconds,
+      startedAt: runtime.now(),
+      status: "active",
+      repeats: 0,
+    }
+    const baseline = await runStateCheck(state, runtime.directory, runtime.runCheck)
+    if (baseline?.code === 0) {
+      const stopped: GoalState = {
+        ...state,
+        status: "stopped",
+        reason: "GOAL_MET: the check already passed before any work",
+      }
+      await Filesystem.writeJson(file, stopped)
+      return {
+        started: false,
+        state: stopped,
+        message: `[goal-loop] The check \`${state.check}\` already passes, so no loop was started.\nTell the user this in one line. Do no other work.`,
+      }
+    }
+    const active: GoalState = {
+      ...state,
+      lastFailure: baseline ? stallKey(baseline.output) : undefined,
+    }
+    await Filesystem.writeJson(file, active)
+    return {
+      started: true,
+      state: active,
+      message: [
+        startPrompt(active),
+        ...(baseline
+          ? [
+              "",
+              `The check fails now (exit ${baseline.code}). Last output:`,
+              "```",
+              baseline.output.slice(-OUTPUT_TAIL).trim() || "(no output)",
+              "```",
+            ]
+          : []),
+      ].join("\n"),
+    }
+  })
+}
+
+export async function advanceGoalLoopTurn(input: {
+  sessionID: string
+  directory?: string
+  messages: { info: Message; parts: Part[] }[]
+  stateDir?: string
+  runCheck?: CheckRunner
+  now?: () => number
+  onNotify?: (state: GoalState, text: string, variant: "info" | "success" | "warning" | "error") => Promise<void>
+}): Promise<
+  | { kind: "inactive" }
+  | { kind: "stopped" | "paused"; state: GoalState; message: string }
+  | { kind: "continue"; state: GoalState; prompt: string }
+> {
+  const runtime = resolveRuntime(input.directory, {
+    stateDir: input.stateDir,
+    runCheck: input.runCheck,
+    now: input.now,
+  })
+  const file = goalFilePath(runtime.stateDir, input.sessionID)
+  const load = () => Filesystem.readJson<GoalState>(file).catch((): GoalState | undefined => undefined)
+  const save = (state: GoalState) => Filesystem.writeJson(file, state)
+
+  const started = await load()
+  if (!started || started.status !== "active") return { kind: "inactive" }
+
+  const turn = readLastTurn(input.messages)
+  if (turn.pause) {
+    const reason = turn.pause
+    return withSessionLock(input.sessionID, async () => {
+      const state = await load()
+      if (!state || state.status !== "active" || state.startedAt !== started.startedAt) return { kind: "inactive" }
+      const paused: GoalState = { ...state, status: "paused", reason }
+      await save(paused)
+      const message = `Paused: ${reason}. Type /goal resume to carry on, or /goal stop.`
+      await input.onNotify?.(state, message, "warning")
+      return { kind: "paused", state: paused, message }
+    })
+  }
+
+  if (turn.failed) {
+    const failed = turn.failed
+    const outcome = await withSessionLock(input.sessionID, async () => {
+      const state = await load()
+      if (!state || state.status !== "active" || state.startedAt !== started.startedAt) {
+        return { retry: false as const, result: { kind: "inactive" as const } }
+      }
+      const errors = (state.turnErrors ?? 0) + 1
+      if (errors > GOAL_DEFAULTS.turnRetries) {
+        const reason = `the turn failed (${failed}) ${errors} times in a row`
+        const paused: GoalState = { ...state, status: "paused", reason, turnErrors: errors }
+        await save(paused)
+        const message = `Paused: ${reason}. Type /goal resume to carry on, or /goal stop.`
+        await input.onNotify?.(state, message, "warning")
+        return { retry: false as const, result: { kind: "paused" as const, state: paused, message } }
+      }
+      const updated: GoalState = { ...state, turnErrors: errors }
+      await save(updated)
+      await input.onNotify?.(
+        state,
+        `The turn failed (${failed}); retrying (${errors} of ${GOAL_DEFAULTS.turnRetries}).`,
+        "warning",
+      )
+      return { retry: true as const }
+    })
+    if (!outcome.retry) return outcome.result
+  }
+
+  const [checked, recorded] = await Promise.all([
+    runStateCheck(started, runtime.directory, runtime.runCheck),
+    readPortableRecord(runtime.directory, started.record),
+  ])
+
+  return withSessionLock(input.sessionID, async () => {
+    const state = await load()
+    if (!state || state.status !== "active" || state.startedAt !== started.startedAt) return { kind: "inactive" }
+
+    const step = decideGoalStep(state, { now: runtime.now(), check: checked, record: recorded })
+    if (step.kind === "stop") {
+      const stopped: GoalState = { ...state, status: "stopped", reason: `${step.outcome}: ${step.detail}` }
+      await save(stopped)
+      const message = `${step.outcome}: ${step.detail} after ${state.turns} extra prompt(s).`
+      await input.onNotify?.(state, message, step.outcome === "GOAL_MET" ? "success" : "warning")
+      return { kind: "stopped", state: stopped, message }
+    }
+    if (step.kind === "pause") {
+      const paused: GoalState = { ...state, status: "paused", reason: step.reason }
+      await save(paused)
+      const message = `Paused: ${step.reason}. Type /goal resume to carry on, or /goal stop.`
+      await input.onNotify?.(state, message, "warning")
+      return { kind: "paused", state: paused, message }
+    }
+
+    const next: GoalState = {
+      ...state,
+      turns: state.turns + 1,
+      repeats: step.failure !== undefined && step.failure === state.lastFailure ? state.repeats + 1 : 0,
+      lastFailure: step.failure,
+      // #327: a reply that worked resets the run of failed ones.
+      turnErrors: turn.failed ? state.turnErrors : 0,
+    }
+    await save(next)
+    return {
+      kind: "continue",
+      state: next,
+      prompt: continuePrompt(next, { check: checked, record: recorded?.state }),
+    }
+  })
+}
 
 // `raw` is the token as typed, quotes included; `value` drops one pair of surrounding quotes.
 function tokens(text: string) {
@@ -248,77 +581,21 @@ export async function GoalLoopPlugin(
   let shell: string | undefined
   let owned = false
 
-  const file = (sessionID: string) => path.join(dir, `${sessionID.replace(/[^\w.-]/g, "_")}.json`)
+  const runCheck = options?.runCheck ?? createDefaultCheckRunner(() => shell)
+  const runtimeConfig: GoalRuntimeConfig = {
+    stateDir: dir,
+    directory: input.directory,
+    runCheck,
+    now,
+  }
+  runtimeByDirectory.set(input.directory, runtimeConfig)
+  latestRuntime = runtimeConfig
+
+  const file = (sessionID: string) => goalFilePath(dir, sessionID)
   const load = (sessionID: string) =>
     Filesystem.readJson<GoalState>(file(sessionID)).catch((): GoalState | undefined => undefined)
   const save = (state: GoalState) => Filesystem.writeJson(file(state.sessionID), state)
-  // Every read-decide-write of a session's loop runs one at a time, so `/goal stop` and a
-  // finishing check cannot interleave. The check itself runs outside the lock.
-  const locks = new Map<string, Promise<unknown>>()
-  const exclusive = <T>(sessionID: string, fn: () => Promise<T>) => {
-    const run = (locks.get(sessionID) ?? Promise.resolve()).then(fn, fn)
-    locks.set(
-      sessionID,
-      run.catch(() => undefined),
-    )
-    return run
-  }
-
-  const runCheck =
-    options?.runCheck ??
-    (async ({ command, cwd, timeoutSeconds }) => {
-      // Same launch rules as the shell tool: PowerShell takes -Command, and other shells get
-      // their own process group so a timeout can stop the whole tree, not just the shell.
-      const sh = Shell.preferred(shell)
-      const proc =
-        process.platform === "win32" && Shell.ps(sh)
-          ? spawn(sh, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], {
-              cwd,
-              stdio: ["ignore", "pipe", "pipe"],
-              windowsHide: true,
-            })
-          : spawn(command, [], {
-              cwd,
-              shell: sh,
-              stdio: ["ignore", "pipe", "pipe"],
-              detached: process.platform !== "win32",
-              windowsHide: true,
-            })
-      const exited = new Promise<number>((resolve, reject) => {
-        proc.once("exit", (code, signal) => resolve(code ?? (signal ? 1 : 0)))
-        proc.once("error", reject)
-      })
-      let timedOut = false
-      const timer = setTimeout(() => {
-        timedOut = true
-        void Shell.killTree(proc, { exited: () => proc.exitCode !== null || proc.signalCode !== null })
-      }, timeoutSeconds * 1000)
-      const [code, stdout, stderr] = await Promise.all([exited, buffer(proc.stdout), buffer(proc.stderr)]).finally(() =>
-        clearTimeout(timer),
-      )
-      const output = `${stdout.toString()}${stderr.toString()}`
-      if (!timedOut) return { code, output }
-      return { code: code || 124, output: `${output}\n(the check was stopped after ${timeoutSeconds} seconds)` }
-    })
-
-  const check = (state: GoalState) =>
-    state.check
-      ? runCheck({ command: state.check, cwd: input.directory, timeoutSeconds: state.timeoutSeconds }).catch(
-          (error): CheckResult => ({
-            code: 1,
-            output: `The check could not run: ${error instanceof Error ? error.message : String(error)}`,
-          }),
-        )
-      : Promise.resolve(undefined)
-
-  const record = async (state: GoalState): Promise<{ state?: string; error?: string } | undefined> => {
-    if (!state.record) return undefined
-    const target = path.resolve(input.directory, state.record)
-    if (!(await Filesystem.exists(target))) return {}
-    return Filesystem.readJson<{ state?: unknown }>(target)
-      .then((data) => ({ state: typeof data.state === "string" ? data.state : undefined }))
-      .catch((error) => ({ error: error instanceof Error ? error.message : String(error) }))
-  }
+  const exclusive = <T>(sessionID: string, fn: () => Promise<T>) => withSessionLock(sessionID, fn)
 
   const notify = async (state: GoalState, text: string, variant: "info" | "success" | "warning" | "error") => {
     await input.client.tui.showToast({ body: { title: "Goal loop", message: text, variant } }).catch(() => undefined)
@@ -335,80 +612,70 @@ export async function GoalLoopPlugin(
     if (!started || started.status !== "active") return
 
     const messages = await input.client.session.messages({ path: { id: sessionID } })
-    const turn = readLastTurn(messages.data ?? [])
-    if (turn.pause) {
-      const reason = turn.pause
-      await exclusive(sessionID, async () => {
-        const state = await load(sessionID)
-        if (!state || state.status !== "active" || state.startedAt !== started.startedAt) return
-        await save({ ...state, status: "paused", reason })
-        await notify(state, `Paused: ${reason}. Type /goal resume to carry on, or /goal stop.`, "warning")
-      })
-      return
-    }
-    // #327: a failed model reply (a transient provider or GPU error) is retried up to
-    // GOAL_DEFAULTS.turnRetries times in a row through the normal continue path, so the turn and
-    // time budgets still bound it. Past that the loop pauses and names the error.
-    if (turn.failed) {
-      const failed = turn.failed
-      const retry = await exclusive(sessionID, async () => {
-        const state = await load(sessionID)
-        if (!state || state.status !== "active" || state.startedAt !== started.startedAt) return false
-        const errors = (state.turnErrors ?? 0) + 1
-        if (errors > GOAL_DEFAULTS.turnRetries) {
-          const reason = `the turn failed (${failed}) ${errors} times in a row`
-          await save({ ...state, status: "paused", reason, turnErrors: errors })
-          await notify(state, `Paused: ${reason}. Type /goal resume to carry on, or /goal stop.`, "warning")
-          return false
-        }
-        await save({ ...state, turnErrors: errors })
-        await notify(state, `The turn failed (${failed}); retrying (${errors} of ${GOAL_DEFAULTS.turnRetries}).`, "warning")
-        return true
-      })
-      if (!retry) return
-    }
-
-    const [checked, recorded] = await Promise.all([check(started), record(started)])
-    // Decide and save from the state as it is now: the person may have stopped, paused,
-    // resumed or restarted the loop while the check ran.
-    await exclusive(sessionID, async () => {
-      const state = await load(sessionID)
-      if (!state || state.status !== "active" || state.startedAt !== started.startedAt) return
-
-      const step = decideGoalStep(state, { now: now(), check: checked, record: recorded })
-      if (step.kind === "stop") {
-        await save({ ...state, status: "stopped", reason: `${step.outcome}: ${step.detail}` })
-        await notify(
-          state,
-          `${step.outcome}: ${step.detail} after ${state.turns} extra prompt(s).`,
-          step.outcome === "GOAL_MET" ? "success" : "warning",
-        )
-        return
-      }
-      if (step.kind === "pause") {
-        await save({ ...state, status: "paused", reason: step.reason })
-        await notify(state, `Paused: ${step.reason}. Type /goal resume to carry on, or /goal stop.`, "warning")
-        return
-      }
-
-      const next: GoalState = {
-        ...state,
-        turns: state.turns + 1,
-        repeats: step.failure !== undefined && step.failure === state.lastFailure ? state.repeats + 1 : 0,
-        lastFailure: step.failure,
-        // #327: a reply that worked resets the run of failed ones.
-        turnErrors: turn.failed ? state.turnErrors : 0,
-      }
-      await save(next)
-      const user = messages.data?.findLast((m) => m.info.role === "user")?.info
-      await input.client.session.promptAsync({
-        path: { id: sessionID },
-        body: {
-          ...(user?.role === "user" ? { agent: user.agent, model: user.model } : {}),
-          parts: [{ type: "text", text: continuePrompt(next, { check: checked, record: recorded?.state }) }],
-        },
-      })
+    const outcome = await advanceGoalLoopTurn({
+      sessionID,
+      directory: input.directory,
+      messages: messages.data ?? [],
+      stateDir: dir,
+      runCheck,
+      now,
+      onNotify: notify,
     })
+    if (outcome.kind !== "continue") return
+
+    const user = messages.data?.findLast((m) => m.info.role === "user")?.info
+    await input.client.session.promptAsync({
+      path: { id: sessionID },
+      body: {
+        ...(user?.role === "user" ? { agent: user.agent, model: user.model } : {}),
+        parts: [{ type: "text", text: outcome.prompt }],
+      },
+    })
+  }
+
+  const runGoalCommand = async (sessionID: string, args: GoalArgs) => {
+    if (args.action === "error") {
+      return `[goal-loop] The goal loop did not start: ${args.message}\nUsage: ${GOAL_USAGE}\nTell the user this in one or two lines. Do no other work.`
+    }
+    if (args.action === "status") {
+      const current = await exclusive(sessionID, () => load(sessionID))
+      return `[goal-loop] ${describeGoal(current)}\nTell the user this status in plain words. Do no other work.`
+    }
+    if (args.action === "stop") {
+      return exclusive(sessionID, async () => {
+        const current = await load(sessionID)
+        if (current && current.status !== "stopped") {
+          await save({ ...current, status: "stopped", reason: "CANCELLED: stopped by the user" })
+        }
+        return `[goal-loop] ${current ? "The goal loop is stopped." : describeGoal(current)}\nTell the user this in one line. Do no other work.`
+      })
+    }
+    if (args.action !== "start") {
+      return exclusive(sessionID, async () => {
+        const current = await load(sessionID)
+        if (!current || current.status !== "paused") {
+          return `[goal-loop] Nothing to resume. ${describeGoal(current)}\nTell the user this in one line. Do no other work.`
+        }
+        const resumed: GoalState = { ...current, status: "active", reason: undefined, repeats: 0, turnErrors: 0 }
+        await save(resumed)
+        return continuePrompt(resumed, {})
+      })
+    }
+
+    const started = await startGoalLoop({
+      sessionID,
+      directory: input.directory,
+      goal: args.goal,
+      check: args.check,
+      record: args.record,
+      turns: args.turns,
+      minutes: args.minutes,
+      timeoutSeconds: args.timeoutSeconds,
+      stateDir: dir,
+      runCheck,
+      now,
+    })
+    return started.message
   }
 
   return {
@@ -429,63 +696,122 @@ export async function GoalLoopPlugin(
     },
     "command.execute.before": async (hook, output) => {
       if (!owned || hook.command !== GOAL_COMMAND) return
-      const reply = await exclusive(hook.sessionID, async () => {
-        const args = parseGoalArgs(hook.arguments)
-        const current = await load(hook.sessionID)
-        if (args.action === "error")
-          return `[goal-loop] The goal loop did not start: ${args.message}\nUsage: ${GOAL_USAGE}\nTell the user this in one or two lines. Do no other work.`
-        if (args.action === "status")
-          return `[goal-loop] ${describeGoal(current)}\nTell the user this status in plain words. Do no other work.`
-        if (args.action === "stop") {
-          if (current && current.status !== "stopped")
-            await save({ ...current, status: "stopped", reason: "CANCELLED: stopped by the user" })
-          return `[goal-loop] ${current ? "The goal loop is stopped." : describeGoal(current)}\nTell the user this in one line. Do no other work.`
-        }
-        if (args.action !== "start") {
-          if (!current || current.status !== "paused")
-            return `[goal-loop] Nothing to resume. ${describeGoal(current)}\nTell the user this in one line. Do no other work.`
-          const resumed: GoalState = { ...current, status: "active", reason: undefined, repeats: 0, turnErrors: 0 }
-          await save(resumed)
-          return continuePrompt(resumed, {})
-        }
-
-        const state: GoalState = {
-          version: 1,
-          sessionID: hook.sessionID,
-          goal: args.goal,
-          check: args.check,
-          record: args.record,
-          turns: 0,
-          maxTurns: args.turns,
-          maxMinutes: args.minutes,
-          timeoutSeconds: args.timeoutSeconds,
-          startedAt: now(),
-          status: "active",
-          repeats: 0,
-        }
-        // Baseline: a check that already passes cannot measure progress (AIMETH-018).
-        const baseline = await check(state)
-        if (baseline?.code === 0) {
-          await save({ ...state, status: "stopped", reason: "GOAL_MET: the check already passed before any work" })
-          return `[goal-loop] The check \`${state.check}\` already passes, so no loop was started.\nTell the user this in one line. Do no other work.`
-        }
-        await save({ ...state, lastFailure: baseline ? stallKey(baseline.output) : undefined })
-        return [
-          startPrompt(state),
-          ...(baseline
-            ? [
-                "",
-                `The check fails now (exit ${baseline.code}). Last output:`,
-                "```",
-                baseline.output.slice(-OUTPUT_TAIL).trim() || "(no output)",
-                "```",
-              ]
-            : []),
-        ].join("\n")
-      })
+      const args = parseGoalArgs(hook.arguments)
+      const reply = await runGoalCommand(hook.sessionID, args)
       // The caller keeps its own reference to `parts`, so change the part in place.
       const text = output.parts.find((part) => part.type === "text")
       if (text?.type === "text") text.text = reply
+    },
+    tool: {
+      goal_loop: tool({
+        description:
+          "Start, inspect, resume, or stop a goal loop in the current session (or a target session). When active, the loop runs the `check` command (or inspects the `record` file) after every turn and keeps prompting the session until the check exits 0, the record reaches a terminal state, or the turn/time budget is exhausted.",
+        args: {
+          action: tool.schema
+            .enum(["start", "status", "stop", "resume"])
+            .describe("Goal loop action: start, status, stop, or resume"),
+          goal: tool.schema
+            .string()
+            .optional()
+            .describe("What done looks like (required when action is 'start')"),
+          check: tool.schema
+            .string()
+            .optional()
+            .describe("Shell command that exits 0 when the goal is met"),
+          record: tool.schema
+            .string()
+            .optional()
+            .describe("Path to a portable state.json record"),
+          turns: tool.schema
+            .number()
+            .int()
+            .positive()
+            .optional()
+            .describe("Maximum extra turns (default: 20)"),
+          minutes: tool.schema
+            .number()
+            .int()
+            .positive()
+            .optional()
+            .describe("Maximum duration in minutes (default: 120)"),
+          timeout: tool.schema
+            .number()
+            .int()
+            .positive()
+            .optional()
+            .describe("Check command timeout in seconds (default: 600)"),
+          session_id: tool.schema
+            .string()
+            .optional()
+            .describe("Optional session ID to manage (defaults to the current session)"),
+        },
+        async execute(args, context) {
+          const targetSession = args.session_id?.trim() || context.sessionID
+          if (args.action === "status") {
+            const current = await exclusive(targetSession, () => load(targetSession))
+            context.metadata({
+              title: "Goal loop status",
+              metadata: { sessionID: targetSession, status: current?.status ?? "none" },
+            })
+            return describeGoal(current)
+          }
+          if (args.action === "stop") {
+            const stopped = await stopGoalLoop(targetSession, "CANCELLED: stopped by the agent", {
+              directory: input.directory,
+              stateDir: dir,
+            })
+            context.metadata({
+              title: "Stopped goal loop",
+              metadata: { sessionID: targetSession, status: stopped?.status ?? "none" },
+            })
+            return stopped ? "The goal loop is stopped." : describeGoal(undefined)
+          }
+          if (args.action === "resume") {
+            return exclusive(targetSession, async () => {
+              const current = await load(targetSession)
+              if (!current || current.status !== "paused") {
+                return `Nothing to resume. ${describeGoal(current)}`
+              }
+              const resumed: GoalState = {
+                ...current,
+                status: "active",
+                reason: undefined,
+                repeats: 0,
+                turnErrors: 0,
+              }
+              await save(resumed)
+              context.metadata({
+                title: "Resumed goal loop",
+                metadata: { sessionID: targetSession, status: resumed.status },
+              })
+              return continuePrompt(resumed, {})
+            })
+          }
+
+          const started = await startGoalLoop({
+            sessionID: targetSession,
+            directory: input.directory,
+            goal: args.goal ?? "",
+            check: args.check,
+            record: args.record,
+            turns: args.turns,
+            minutes: args.minutes,
+            timeoutSeconds: args.timeout,
+            stateDir: dir,
+            runCheck,
+            now,
+          })
+          context.metadata({
+            title: started.started ? "Started goal loop" : "Goal loop check already passed",
+            metadata: {
+              sessionID: targetSession,
+              status: started.state.status,
+              started: started.started,
+            },
+          })
+          return started.message
+        },
+      }),
     },
     event: async ({ event }) => {
       if (event.type === "session.deleted") {
@@ -494,7 +820,7 @@ export async function GoalLoopPlugin(
       }
       if (event.type !== "session.idle") return
       const sessionID = event.properties.sessionID
-      if (busy.has(sessionID)) return
+      if (claimedSessions.has(sessionID) || busy.has(sessionID)) return
       busy.add(sessionID)
       await onIdle(sessionID)
         .catch((error) =>

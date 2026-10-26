@@ -17,6 +17,7 @@ import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
 
 import { TaskTool, type TaskPromptOps } from "../../src/tool/task"
+import { GoalLoopPlugin, startGoalLoop } from "../../src/plugin/goal-loop"
 import { Truncate } from "@/tool/truncate"
 import { ToolRegistry } from "@/tool/registry"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -1096,6 +1097,122 @@ describe("tool.task", () => {
 
       expect((yield* jobs.get(child.id))?.status).toBe("cancelled")
       expect((yield* jobs.get(grandchild.id))?.status).toBe("cancelled")
+    }),
+  )
+
+  it.instance("execute loops a subagent until the goal check passes", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      let checkRuns = 0
+      yield* Effect.promise(() =>
+        GoalLoopPlugin({ client: {} as never, directory: process.cwd() } as never, {
+          runCheck: async () => {
+            checkRuns += 1
+            // Baseline (1) fails, after Turn 1 (2) fails, after Turn 2 (3) passes
+            if (checkRuns < 3) return { code: 1, output: `failure #${checkRuns}` }
+            return { code: 0, output: "all green" }
+          },
+        }),
+      )
+
+      const prompts: string[] = []
+      const ops: TaskPromptOps = {
+        cancel: () => Effect.void,
+        resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
+        prompt: (input) =>
+          Effect.sync(() => {
+            const text = input.parts.find((p) => p.type === "text")
+            prompts.push(text && "text" in text ? text.text : "")
+            return reply(input, `turn ${prompts.length} output`)
+          }),
+      }
+
+      const result = yield* def.execute(
+        {
+          description: "fix failing tests",
+          prompt: '/goal unit tests exit 0 --check "bun test" --turns 5\nmake the unit tests pass',
+          subagent_type: "general",
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps: ops },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      expect(prompts).toHaveLength(2)
+      expect(prompts[0]).toContain("[goal-loop] A goal loop has started for this session.")
+      expect(prompts[0]).toContain("make the unit tests pass")
+      expect(prompts[1]).toContain("[goal-loop] Turn 1/5. The goal is not met yet.")
+      expect(result.output).toContain("turn 2 output")
+      expect(result.output).toContain("[goal-loop] GOAL_MET")
+    }),
+  )
+
+  it.instance("execute continues when a subagent starts a goal_loop during its first turn", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      let checkRuns = 0
+      yield* Effect.promise(() =>
+        GoalLoopPlugin({ client: {} as never, directory: process.cwd() } as never, {
+          runCheck: async () => {
+            checkRuns += 1
+            // Baseline (1) fails, after Turn 1 (2) fails, after Turn 2 (3) passes
+            if (checkRuns < 3) return { code: 1, output: "not ready" }
+            return { code: 0, output: "ready" }
+          },
+        }),
+      )
+
+      let turns = 0
+      const ops: TaskPromptOps = {
+        cancel: () => Effect.void,
+        resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
+        prompt: (input) =>
+          Effect.promise(async () => {
+            turns += 1
+            if (turns === 1) {
+              await startGoalLoop({
+                sessionID: input.sessionID,
+                goal: "self-started loop",
+                check: "bun test",
+                turns: 3,
+              })
+            }
+            return reply(input, `subagent turn ${turns}`)
+          }),
+      }
+
+      const result = yield* def.execute(
+        {
+          description: "run self-looping subagent",
+          prompt: "start a goal loop and finish it",
+          subagent_type: "general",
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps: ops },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      expect(turns).toBe(2)
+      expect(result.output).toContain("subagent turn 2")
+      expect(result.output).toContain("[goal-loop] GOAL_MET")
     }),
   )
 })

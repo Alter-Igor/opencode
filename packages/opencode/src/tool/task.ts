@@ -9,6 +9,14 @@ import { MessageV2 } from "../session/message-v2"
 import { Agent } from "../agent/agent"
 import { deriveSubagentSessionPermission } from "../agent/subagent-permissions"
 import type { SessionPrompt } from "../session/prompt"
+import {
+  advanceGoalLoopTurn,
+  claimGoalLoopSession,
+  loadGoalState,
+  parseGoalArgs,
+  startGoalLoop,
+  stopGoalLoop,
+} from "../plugin/goal-loop"
 import { Config } from "@/config/config"
 import { Effect, Exit, Schema, Scope } from "effect"
 import { EffectBridge } from "@/effect/bridge"
@@ -60,6 +68,14 @@ export const Parameters = Schema.Struct({
       "Run the agent in the background. You will be notified when it completes. DO NOT sleep, poll, or proactively check on its progress",
   }),
 })
+
+function extractLeadingGoal(prompt: string, command?: string) {
+  const trimmed = prompt.trim()
+  if (command === "goal") return { goalArgs: trimmed, body: "" }
+  const match = trimmed.match(/^\/goal\s+([^\r\n]+)(?:\r?\n([\s\S]*))?$/)
+  if (!match) return undefined
+  return { goalArgs: match[1].trim(), body: (match[2] ?? "").trim() }
+}
 
 function renderOutput(input: {
   sessionID: SessionID
@@ -198,30 +214,106 @@ export const TaskTool = Tool.define(
       if (!ops) return yield* Effect.fail(new Error("TaskTool requires promptOps in ctx.extra"))
 
       const runTask = Effect.fn("TaskTool.runTask")(function* () {
-        const parts = yield* ops.resolvePromptParts(params.prompt)
-        const result = yield* ops.prompt({
-          messageID: MessageID.ascending(),
-          sessionID: nextSession.id,
-          model: {
-            modelID: model.modelID,
-            providerID: model.providerID,
-          },
-          variant: next.model ? undefined : variant,
-          agent: next.name,
-          parts,
-        })
-        if (result.info.role === "assistant" && result.info.error) {
-          const message =
-            "message" in result.info.error.data && typeof result.info.error.data.message === "string"
-              ? result.info.error.data.message
-              : result.info.error.name
-          return yield* Effect.fail(new Error(`Subagent failed (task_id: ${nextSession.id}): ${message}`))
-        }
-        const failed = result.parts.findLast((item) => item.type === "tool" && item.state.status === "error")
-        if (failed?.type === "tool" && failed.state.status === "error") {
-          return yield* Effect.fail(new Error(`Subagent failed (task_id: ${nextSession.id}): ${failed.state.error}`))
-        }
-        return result.parts.findLast((item) => item.type === "text")?.text ?? ""
+        const releaseGoal = claimGoalLoopSession(nextSession.id)
+        return yield* Effect.gen(function* () {
+          const leadingGoal = extractLeadingGoal(params.prompt, params.command)
+          const initialPrompt = leadingGoal
+            ? yield* Effect.tryPromise({
+                try: async () => {
+                  const parsed = parseGoalArgs(leadingGoal.goalArgs)
+                  if (parsed.action !== "start") {
+                    throw new Error(parsed.action === "error" ? parsed.message : "Expected /goal start arguments.")
+                  }
+                  const started = await startGoalLoop({
+                    sessionID: nextSession.id,
+                    directory: nextSession.directory,
+                    goal: parsed.goal,
+                    check: parsed.check,
+                    record: parsed.record,
+                    turns: parsed.turns,
+                    minutes: parsed.minutes,
+                    timeoutSeconds: parsed.timeoutSeconds,
+                  })
+                  return leadingGoal.body ? `${started.message}\n\n${leadingGoal.body}` : started.message
+                },
+                catch: (error) => (error instanceof Error ? error : new Error(String(error))),
+              })
+            : params.prompt
+
+          const parts = yield* ops.resolvePromptParts(initialPrompt)
+          let result = yield* ops.prompt({
+            messageID: MessageID.ascending(),
+            sessionID: nextSession.id,
+            model: {
+              modelID: model.modelID,
+              providerID: model.providerID,
+            },
+            variant: next.model ? undefined : variant,
+            agent: next.name,
+            parts,
+          })
+
+          const stopGoalOnError = (error: Error) =>
+            Effect.promise(() =>
+              stopGoalLoop(nextSession.id, `ERROR: ${error.message}`, {
+                directory: nextSession.directory,
+              }),
+            )
+
+          let goalSummary: string | undefined
+          while (true) {
+            const activeGoal = yield* Effect.tryPromise({
+              try: () => loadGoalState(nextSession.id, { directory: nextSession.directory }),
+              catch: (error) => (error instanceof Error ? error : new Error(String(error))),
+            }).pipe(Effect.tapError(stopGoalOnError))
+            if (!activeGoal || activeGoal.status !== "active") break
+
+            const step = yield* Effect.tryPromise({
+              try: () =>
+                advanceGoalLoopTurn({
+                  sessionID: nextSession.id,
+                  directory: nextSession.directory,
+                  messages: [{ info: result.info as never, parts: result.parts as never }],
+                }),
+              catch: (error) => (error instanceof Error ? error : new Error(String(error))),
+            }).pipe(Effect.tapError(stopGoalOnError))
+            if (step.kind === "inactive") break
+            if (step.kind !== "continue") {
+              goalSummary = `[goal-loop] ${step.message}`
+              break
+            }
+            result = yield* ops.prompt({
+              messageID: MessageID.ascending(),
+              sessionID: nextSession.id,
+              model: {
+                modelID: model.modelID,
+                providerID: model.providerID,
+              },
+              variant: next.model ? undefined : variant,
+              agent: next.name,
+              parts: [{ type: "text", text: step.prompt }],
+            })
+          }
+
+          if (result.info.role === "assistant" && result.info.error) {
+            const message =
+              "message" in result.info.error.data && typeof result.info.error.data.message === "string"
+                ? result.info.error.data.message
+                : result.info.error.name
+            return yield* Effect.fail(
+              new Error(
+                `Subagent failed (task_id: ${nextSession.id}): ${message}${goalSummary ? `\n${goalSummary}` : ""}`,
+              ),
+            )
+          }
+          const failed = result.parts.findLast((item) => item.type === "tool" && item.state.status === "error")
+          if (failed?.type === "tool" && failed.state.status === "error") {
+            return yield* Effect.fail(new Error(`Subagent failed (task_id: ${nextSession.id}): ${failed.state.error}`))
+          }
+          const finalText = result.parts.findLast((item) => item.type === "text")?.text ?? ""
+          if (!goalSummary) return finalText
+          return finalText ? `${finalText}\n\n${goalSummary}` : goalSummary
+        }).pipe(Effect.ensuring(Effect.sync(releaseGoal)))
       })
 
       const inject = Effect.fn("TaskTool.injectBackgroundResult")(function* (
@@ -281,6 +373,12 @@ export const TaskTool = Tool.define(
         }
       }
 
+      const stopChildGoal = Effect.promise(() =>
+        stopGoalLoop(nextSession.id, "CANCELLED: subagent task interrupted", {
+          directory: nextSession.directory,
+        }),
+      )
+
       const info = yield* background.start({
         id: nextSession.id,
         type: id,
@@ -293,7 +391,7 @@ export const TaskTool = Tool.define(
           }),
           notify(nextSession.id),
         ]),
-        run: runTask().pipe(Effect.onInterrupt(() => ops.cancel(nextSession.id))),
+        run: runTask().pipe(Effect.onInterrupt(() => Effect.all([ops.cancel(nextSession.id), stopChildGoal], { discard: true }))),
       })
 
       function backgroundResult() {
@@ -319,7 +417,7 @@ export const TaskTool = Tool.define(
       }
 
       const runCancel = yield* EffectBridge.make()
-      const cancel = ops.cancel(nextSession.id)
+      const cancel = Effect.all([ops.cancel(nextSession.id), stopChildGoal], { discard: true })
 
       function onAbort() {
         runCancel.fork(cancel)
