@@ -64,10 +64,10 @@ flowchart LR
 
 Added in [#243](https://github.com/Alter-Igor/opencode/issues/243) (`packages/opencode/src/plugin/schedule.ts`):
 
-- Slash command: `/schedule <30s|15m|2h|1d> [--once] [--max-runs N] <prompt>`, `/schedule status`, `/schedule off [id|all]`.
-- Agent and sub-agent tools: `schedule_create`, `schedule_list`, `schedule_cancel`.
+- Slash command: `/schedule <30s|15m|2h|1d> <prompt>`, `/schedule status`, `/schedule off`.
+- Agent and sub-agent tools: `schedule_create` (`prompt`, optional `every`, `at`, `session_id`), `schedule_list` (optional `session_id`), `schedule_cancel` (`id` or `"all"`, optional `session_id`).
 - State lives in `~/.local/state/opencode/schedule/<schedule id>.json`, scoped to the project `directory` so one project's process only arms its own schedules.
-- Failed one-shot (`--once`) dispatches stay active and retry after 5 seconds instead of being marked completed.
+- Failed one-shot (`at` without `every`) dispatches stay active and retry after 30 seconds instead of being marked completed.
 
 ## Live check (2026-10-03)
 
@@ -96,5 +96,5 @@ Verified on `dev` at `6b00140634` via `opencode web` (`http://127.0.0.1:4098/`):
 
 | Scenario | Session | Result |
 |---|---|---|
-| Sub-agent schedule lifecycle | `ses_e8ab6e1b2ffef8knP20y5zRG16` | `general` sub-agent called `schedule_create` (`interval: "30m"`, `once: true`), `schedule_list`, and `schedule_cancel`, returning `Created and cancelled sch_mvofjbew_0001.` |
+| Sub-agent schedule lifecycle | `ses_e8ab6e1b2ffef8knP20y5zRG16` | `general` sub-agent called `schedule_create` (`every: "30m"`, `prompt: "Check CI"`), `schedule_list`, and `schedule_cancel`, returning `Created and cancelled sch_mvofjbew_0001.` |
 | Sub-agent `goal_loop` tool lifecycle | `ses_e8ab47320ffeXnpSIa0IkeRfZK` | `general` sub-agent called `goal_loop` (`start` with failing baseline check `bun -e 'process.exit(1)'`, `turns: 3`), `status` (`active`, `0/3`), and `stop` (`CANCELLED`). |
