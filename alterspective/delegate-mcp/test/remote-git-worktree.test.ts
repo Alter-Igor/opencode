@@ -11,7 +11,7 @@ afterEach(() => {
 })
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
-  const result = await defaultGitRunner(["git", "-C", cwd, "-c", "user.name=Test", "-c", "user.email=test@example.com", ...args])
+  const result = await defaultGitRunner(["git", "-C", cwd, "-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgSign=false", ...args])
   if (result.code !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`)
   return result.stdout.trim()
 }
@@ -25,6 +25,7 @@ async function repoWithWorktree(): Promise<{ main: string; worktree: string; bas
   // applyRemotePatch runs commit-tree without -c overrides, so the repo itself needs an identity (CI has none).
   await git(main, "config", "user.name", "Test")
   await git(main, "config", "user.email", "test@example.com")
+  await git(main, "config", "commit.gpgSign", "false")
   writeFileSync(path.join(main, "a.txt"), "one\n")
   await git(main, "add", "a.txt")
   await git(main, "commit", "-q", "-m", "init")

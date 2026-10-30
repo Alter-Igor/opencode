@@ -1,5 +1,5 @@
 // Host git helpers for remote delegation.
-import { writeFileSync } from "node:fs"
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { DelegateError } from "../shared/errors.ts"
@@ -62,14 +62,14 @@ export async function applyRemotePatch(
     return { branch, filesChanged: [] }
   }
 
-  const nonce = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
   // In a git worktree `.git` is a file, not a directory, so ask git for the real one and keep
-  // the temp index and patch outside the repository entirely.
+  // the temp index and patch outside the repository, in a private (0700) folder: in the shared
+  // temp folder another local user could pre-create the index path as a symlink.
   const gitDir = await resolveGitDir(hostRepo, run)
-  const tempIndex = path.join(os.tmpdir(), `delegate-index-${nonce}`)
-  const tempPatch = path.join(os.tmpdir(), `delegate-${nonce}.patch`)
+  const tempDir = mkdtempSync(path.join(os.tmpdir(), "delegate-"))
+  const tempIndex = path.join(tempDir, "index")
+  const tempPatch = path.join(tempDir, "remote.patch")
 
-  // The shared temp folder is readable by other users on Linux; the patch is source code.
   writeFileSync(tempPatch, patch, { mode: 0o600 })
   const indexEnv = { ...cleanEnv(), GIT_INDEX_FILE: tempIndex }
 
@@ -115,13 +115,7 @@ export async function applyRemotePatch(
 
     return { branch, filesChanged }
   } finally {
-    try {
-      const { unlinkSync } = await import("node:fs")
-      try { unlinkSync(tempPatch) } catch {}
-      try { unlinkSync(tempIndex) } catch {}
-    } catch {
-      // Ignore cleanup error
-    }
+    rmSync(tempDir, { recursive: true, force: true })
   }
 }
 
