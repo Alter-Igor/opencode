@@ -115,7 +115,8 @@ export async function applyRemotePatch(
 
     return { branch, filesChanged }
   } finally {
-    rmSync(tempDir, { recursive: true, force: true })
+    // Best effort: a locked temp file must not turn a finished collect (or an earlier git error) into a new failure.
+    try { rmSync(tempDir, { recursive: true, force: true }) } catch {}
   }
 }
 
