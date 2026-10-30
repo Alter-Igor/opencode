@@ -1,4 +1,5 @@
 // Host git helpers for remote delegation.
+import { writeFileSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { DelegateError } from "../shared/errors.ts"
@@ -68,7 +69,8 @@ export async function applyRemotePatch(
   const tempIndex = path.join(os.tmpdir(), `delegate-index-${nonce}`)
   const tempPatch = path.join(os.tmpdir(), `delegate-${nonce}.patch`)
 
-  await Bun.write(tempPatch, patch)
+  // The shared temp folder is readable by other users on Linux; the patch is source code.
+  writeFileSync(tempPatch, patch, { mode: 0o600 })
   const indexEnv = { ...cleanEnv(), GIT_INDEX_FILE: tempIndex }
 
   try {

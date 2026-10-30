@@ -22,6 +22,9 @@ async function repoWithWorktree(): Promise<{ main: string; worktree: string; bas
   const main = path.join(root, "main")
   const worktree = path.join(root, "wt")
   await defaultGitRunner(["git", "init", "-q", "-b", "dev", main])
+  // applyRemotePatch runs commit-tree without -c overrides, so the repo itself needs an identity (CI has none).
+  await git(main, "config", "user.name", "Test")
+  await git(main, "config", "user.email", "test@example.com")
   writeFileSync(path.join(main, "a.txt"), "one\n")
   await git(main, "add", "a.txt")
   await git(main, "commit", "-q", "-m", "init")
