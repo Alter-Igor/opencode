@@ -1,4 +1,5 @@
 // Host git helpers for remote delegation.
+import os from "node:os"
 import path from "node:path"
 import { DelegateError } from "../shared/errors.ts"
 import { cleanEnv, runCommand, type ExecResult } from "../supervisor/workspaces-exec.ts"
@@ -61,9 +62,11 @@ export async function applyRemotePatch(
   }
 
   const nonce = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-  const gitDir = path.join(hostRepo, ".git")
-  const tempIndex = path.join(gitDir, `delegate-index-${nonce}`)
-  const tempPatch = path.join(gitDir, `delegate-${nonce}.patch`)
+  // In a git worktree `.git` is a file, not a directory, so ask git for the real one and keep
+  // the temp index and patch outside the repository entirely.
+  const gitDir = await resolveGitDir(hostRepo, run)
+  const tempIndex = path.join(os.tmpdir(), `delegate-index-${nonce}`)
+  const tempPatch = path.join(os.tmpdir(), `delegate-${nonce}.patch`)
 
   await Bun.write(tempPatch, patch)
   const indexEnv = { ...cleanEnv(), GIT_INDEX_FILE: tempIndex }
@@ -118,4 +121,12 @@ export async function applyRemotePatch(
       // Ignore cleanup error
     }
   }
+}
+
+async function resolveGitDir(hostRepo: string, run: GitRunner): Promise<string> {
+  const result = await run(["git", "-C", hostRepo, "rev-parse", "--absolute-git-dir"])
+  if (result.code !== 0 || !result.stdout.trim()) {
+    throw new DelegateError("upstream_error", "Failed to locate the git directory of the local repository.", "Ensure directory is a valid git repository.", result.stderr)
+  }
+  return result.stdout.trim()
 }

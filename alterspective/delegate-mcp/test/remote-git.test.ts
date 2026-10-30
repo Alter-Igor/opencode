@@ -55,6 +55,9 @@ describe("remote git helpers", () => {
     const executed: string[][] = []
     const mockRunner: GitRunner = async (argv) => {
       executed.push(argv)
+      if (argv.includes("--absolute-git-dir")) {
+        return { code: 0, stdout: "/test/repo/.git\n", stderr: "" }
+      }
       if (argv.includes("write-tree")) {
         return { code: 0, stdout: "tree-sha-123\n", stderr: "" }
       }
@@ -70,5 +73,6 @@ describe("remote git helpers", () => {
     const res = await applyRemotePatch("/test/repo", "delegate/test-branch", "base-sha", "diff --git a/src/file.ts b/src/file.ts", mockRunner)
     expect(res.branch).toBe("delegate/test-branch")
     expect(res.filesChanged).toEqual(["src/file.ts"])
+    expect(executed.find((argv) => argv.includes("read-tree"))).toContain("/test/repo/.git")
   })
 })
