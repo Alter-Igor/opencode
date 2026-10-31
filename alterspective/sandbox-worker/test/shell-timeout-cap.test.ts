@@ -51,7 +51,12 @@ describe("shell timeout cap (#249)", () => {
     expect((await run(hooks, "webfetch", { timeout: 999_999 })).timeout).toBe(999_999)
   })
 
-  test.each([undefined, "", " ", "abc", "0", "-5", "1.5", "NaN", "Infinity"])("cap %p means off: no hooks", async (value) => {
+  test("surrounding spaces are allowed", async () => {
+    const hooks = await load(" 120000 ")
+    expect((await run(hooks, "bash", { timeout: 999_999 })).timeout).toBe(120000)
+  })
+
+  test.each([undefined, "", " ", "abc", "0", "000", "-5", "+120000", "1.5", "NaN", "Infinity", "0x10", "0b11", "1e5", "120000abc", "9".repeat(400)])("cap %p means off: no hooks", async (value) => {
     const hooks = await load(value)
     expect(hooks).toEqual({})
   })

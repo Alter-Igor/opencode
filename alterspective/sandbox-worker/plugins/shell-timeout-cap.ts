@@ -1,13 +1,14 @@
 // Caps the time-out the model asks for on the shell tool (#249, svc-coding-agent#539).
 // The tool takes any positive `timeout` the model sends (packages/opencode/src/tool/shell.ts), so a
 // model could hold one turn for 25 minutes. svc-coding-agent sets SBXW_SHELL_MAX_TIMEOUT_MS per
-// task. A whole number above 0 turns the cap on; anything else leaves the tool unchanged.
+// task. Plain decimal digits above 0 turn the cap on; anything else leaves the tool unchanged.
 // Imports nothing: the config dir is read-only (supervisor/main.ts, #127). Export only this
 // factory: OpenCode loads every function export of a plugin file as a plugin.
 export const ShellTimeoutCap = async () => {
-  const raw = process.env.SBXW_SHELL_MAX_TIMEOUT_MS ?? ""
+  // Plain decimal digits only: Number() would also read "0x10" as 16 and "1e5" as 100000.
+  const raw = (process.env.SBXW_SHELL_MAX_TIMEOUT_MS ?? "").trim()
   const value = Number(raw)
-  const cap = raw.trim() !== "" && Number.isInteger(value) && value > 0 ? value : undefined
+  const cap = /^[0-9]+$/.test(raw) && Number.isSafeInteger(value) && value > 0 ? value : undefined
   console.log(`[sbxw] shell timeout cap: ${cap === undefined ? "off" : `${cap} ms`}`)
   if (cap === undefined) return {}
   return {
