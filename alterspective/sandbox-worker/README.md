@@ -23,6 +23,7 @@ two do not share files, image names, container names or ports.
 | `supervisor/harness.ts`, `supervisor/harness-run.ts` | The harness check (#121): root runs hidden acceptance tests after the agent claims GOAL_MET, and reports the result apart from the claim. |
 | `test/` | Unit tests: `bun test` from this folder. `bun run test:fast` at the repo root runs a changed test file here; it does not map a changed `supervisor/` file to its tests, so run `bun test` here after a supervisor change. |
 | `plugins/env-scrub.ts` | Blanks the server password and model key in every shell the agent runs. |
+| `plugins/shell-timeout-cap.ts` | Lowers a shell tool `timeout` above `SBXW_SHELL_MAX_TIMEOUT_MS` to that cap, and says so in the tool description (#249). Unset or not a whole number above 0 means off: nothing changes. |
 | `driver/run-task.ts` | Stands in for CAS. Runs one task end to end and writes `runs/<taskId>/result.json` and `change.patch`. |
 
 ## Build and run
