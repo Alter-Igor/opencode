@@ -80,6 +80,11 @@ export class FakeHub implements DelegateHub {
   track(sessionID: string, directory: string) {
     this.tracked.push([sessionID, directory])
   }
+  /** #252: index into `order` at each sendStarting call (kept out of `order` itself). */
+  readonly starting: Array<{ sessionID: string; at: number }> = []
+  sendStarting(sessionID: string) {
+    this.starting.push({ sessionID, at: this.order.length })
+  }
   markSent(sessionID: string) {
     this.order.push("markSent")
     this.sent.push(sessionID)

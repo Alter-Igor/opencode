@@ -56,8 +56,10 @@ type Entry = {
   awaitingStart: boolean
   sentAt?: number
   lastActiveAt?: number
-  /** Last session.error; `armed` until a busy shows the run carried on. */
-  lastError?: { label: string; aborted: boolean; armed: boolean }
+  /** Last session.error; `armed` until a busy shows the run carried on. `order` is when it arrived. */
+  lastError?: { label: string; aborted: boolean; armed: boolean; order: number }
+  /** #252: when the latest send began (before its POST), on the table's event order. */
+  sendStartedOrder?: number
   /** Per-entry gap (disposed directory, failed rebuild read). */
   gap?: string
   state: Derived
@@ -68,6 +70,8 @@ type Entry = {
 export class SessionTable {
   private readonly entries = new Map<string, Entry>()
   private link: Link = { kind: "gap", detail: "not connected yet" }
+  /** #252: a counter, not a clock, so a send and an error in the same millisecond still have an order. */
+  private order = 0
 
   constructor(
     private readonly now: () => number,
@@ -133,6 +137,16 @@ export class SessionTable {
     return this.link
   }
 
+  /**
+   * #252: a send is about to POST prompt_async. Record when, so `markSent` can tell an error that
+   * came before this send (an earlier prompt's) from one that came after it (this prompt's, e.g. a
+   * fast "Agent not found" that beats the 204).
+   */
+  sendStarting(sessionID: string): void {
+    const e = this.entries.get(sessionID)
+    if (e) e.sendStartedOrder = ++this.order
+  }
+
   /** prompt_async was accepted: expect busy within the window, unless it is already running. */
   markSent(sessionID: string): Change[] {
     const e = this.entries.get(sessionID)
@@ -143,9 +157,12 @@ export class SessionTable {
     e.detail = undefined
     e.awaitingStart = true
     e.sentAt = this.now()
-    // #252: an error armed before this send belongs to the earlier prompt. Only an error that
-    // arrives after this send may be reported as "the prompt never ran".
-    if (e.lastError) e.lastError.armed = false
+    // #252: an error armed before this send began belongs to the earlier prompt, so it is not this
+    // prompt's outcome. An error after the send began (it can beat the 204) stays armed. With no
+    // recorded start (a caller that never called sendStarting) nothing is disarmed.
+    const started = e.sendStartedOrder
+    if (e.lastError && started !== undefined && e.lastError.order < started) e.lastError.armed = false
+    e.sendStartedOrder = undefined
     return this.refresh(e)
   }
 
@@ -201,7 +218,7 @@ export class SessionTable {
     // watchdog armed. A refused prompt (unknown agent) never goes busy or idle, so clearing the
     // wait here left the session `starting` forever. A busy that follows still clears it (running()).
     if (aborted || e.base !== "starting") e.awaitingStart = false
-    e.lastError = { label, aborted, armed: true }
+    e.lastError = { label, aborted, armed: true, order: ++this.order }
     if (!aborted) return []
     e.pending.clear()
     return this.refresh(e)

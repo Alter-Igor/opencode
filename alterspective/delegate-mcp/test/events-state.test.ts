@@ -303,10 +303,24 @@ describe("wave 2 review fixes (state)", () => {
     table.status("ses_1", "idle")
     table.error("ses_1", "APIError", false) // a stray error with no idle after it
     tick(60_000)
+    table.sendStarting("ses_1") // the new send begins after that error
     table.markSent("ses_1")
     tick(10_000)
     const [change] = table.startTimeout("ses_1")
     expect(change?.state).toBe("not_started")
+  })
+
+  test("#252: an error that beats the 204 (after the send began, before markSent) is the new prompt's outcome", () => {
+    const { table, tick } = upTable()
+    tick(60_000)
+    table.status("ses_1", "idle")
+    table.sendStarting("ses_1") // before the POST
+    table.error("ses_1", "UnknownError", false) // "Agent not found" in 21 ms, before prompt_async returns
+    table.markSent("ses_1") // after the 204
+    tick(10_000)
+    const [change] = table.startTimeout("ses_1")
+    expect(change?.state).toBe("error")
+    expect(table.get("ses_1")?.detail).toBe("UnknownError; the prompt never ran")
   })
 
   test("#252: an early error followed by busy carries on as before (recoverable errors are not final)", () => {

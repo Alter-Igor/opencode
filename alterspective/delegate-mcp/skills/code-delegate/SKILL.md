@@ -62,7 +62,7 @@ The `engine` argument never names an agent (#252). The sandbox runs its default 
 
 | Engine | What happens |
 |---|---|
-| `'auto'` *(Default)* | Runs the sandbox's default OpenCode agent. Pick the model with `model` (default `synapse/auto`, Synapse routes it). |
+| `'auto'` *(Default)* | Runs the sandbox's default OpenCode agent. Pick the model with `model`. Left out, the sandbox's owner-picked default model is used; `synapse/auto` (Synapse routes it) only when no default is set. |
 | `'opencode'` | The same as `'auto'`. |
 | `'deepseek'` | Refused with `invalid_input` before any session or branch is made. There is no DeepSeek harness. To use a DeepSeek model, leave `engine` unset and pass it as `model` (see `code_list_models`). |
 

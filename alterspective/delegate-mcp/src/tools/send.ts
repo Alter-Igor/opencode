@@ -78,6 +78,8 @@ export async function sendPrompt(ctx: ToolContext, box: Box, record: SessionReco
   // #73: the run's start for the task record, taken before the POST (a fast run can settle during it).
   const sendStartedAt = new Date().toISOString()
   const live = liveSessionID(record)
+  // #252: the send boundary, recorded before the POST so an error that beats the 204 is this prompt's.
+  box.hub.sendStarting?.(live)
   const res = await box.api.call({ method: "POST", path: `/session/${encodeURIComponent(live)}/prompt_async`, directory: record.boxPath, body, correlationId: prompt.correlationId })
   if (res.status === 404) throw sessionGone(record.sessionID)
   if (res.status < 200 || res.status >= 300) throw new DelegateError("upstream_error", "The delegate server did not accept the message.", "Check oc_status, then retry.", `HTTP ${res.status}`)
