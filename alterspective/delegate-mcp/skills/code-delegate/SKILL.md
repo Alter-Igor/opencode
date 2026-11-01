@@ -1,6 +1,6 @@
 ---
 name: code-delegate
-description: "Delegates coding work to autonomous coding agents (local sandboxes or remote svc-coding-agent cloud microVMs) using the code-delegate MCP server. Recommends the 1-step autonomous delegate_task tool, explains when to delegate vs do it locally, engine selection ('auto' | 'deepseek' | 'opencode'), reviewing the resulting branch delegate/<key>, merging, and closing the feedback loop with coder lessons (TRN-KC-04 / coder_teach)."
+description: "Delegates coding work to autonomous coding agents (local sandboxes or remote svc-coding-agent cloud microVMs) using the code-delegate MCP server. Recommends the 1-step autonomous delegate_task tool, explains when to delegate vs do it locally, engine selection ('auto' or 'opencode'; 'deepseek' is refused) and model choice, reviewing the resulting branch delegate/<key>, merging, and closing the feedback loop with coder lessons (TRN-KC-04 / coder_teach)."
 argument-hint: "[repo directory] [task prompt]"
 disable-model-invocation: true
 ---
@@ -58,13 +58,13 @@ Do **NOT** delegate:
 
 ## 3. Engine Selection
 
-The `engine` argument controls which execution harness runs the task:
+The `engine` argument never names an agent (#252). The sandbox runs its default OpenCode agent either way:
 
-| Engine | Description | Best For |
-|---|---|---|
-| `'auto'` *(Default)* | Dynamic routing via Synapse model router and task classifier. | General coding, bugfixes, and standard feature additions. |
-| `'deepseek'` | Direct prompt loop with Synapse DeepSeek runner, unprivileged execution, and strict 400-code-line standards enforcement. | Fast refactors, clean algorithmic tasks, and strict standards-compliant code. |
-| `'opencode'` | Full OpenCode multi-tool harness inside the E2B sandbox. | Complex sessions requiring deep sub-tool orchestration or multi-step repairs. |
+| Engine | What happens |
+|---|---|
+| `'auto'` *(Default)* | Runs the sandbox's default OpenCode agent. Pick the model with `model`. Left out, the sandbox's owner-picked default model is used; `synapse/auto` (Synapse routes it) only when no default is set. |
+| `'opencode'` | The same as `'auto'`. |
+| `'deepseek'` | Refused with `invalid_input` before any session or branch is made. There is no DeepSeek harness. To use a DeepSeek model, leave `engine` unset and pass it as `model` (see `code_list_models`). |
 
 ---
 
