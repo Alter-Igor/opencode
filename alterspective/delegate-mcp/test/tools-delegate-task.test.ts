@@ -67,23 +67,35 @@ describe("delegate_task (FEAT-CD-001)", () => {
     expect(String(d.advice)).toContain("code_close_session")
   })
 
-  test("engine parameter resolves correctly for deepseek and opencode", async () => {
+  // #252: this test used to assert agent "deepseek" was sent. The box has no such agent (build,
+  // explore, general, plan), so every such task failed with "Agent not found".
+  test("#252: engine opencode sends no agent (the box default), and deepseek is refused before a session", async () => {
     const f = fakeContext()
     setupWorkingSession(f, "idle")
 
-    await invoke(
-      delegateTaskTool,
-      {
-        directory: "C:\\GitHub\\demo",
-        prompt: "DeepSeek task",
-        engine: "deepseek",
-      },
-      f.ctx,
-    )
+    await invoke(delegateTaskTool, { directory: "C:\GitHub\demo", prompt: "OpenCode task", engine: "opencode" }, f.ctx)
+    expect(f.ctx.sessions.get(SID)?.agent).toBeUndefined()
+    const send = f.api.find("POST", `/session/${SID}/prompt_async`)
+    expect((send?.body as { agent?: unknown } | undefined)?.agent).toBeUndefined()
 
-    const createCall = f.api.find("POST", "/session")
-    expect(createCall).toBeDefined()
-    expect(f.ctx.sessions.get(SID)?.agent).toBe("deepseek")
+    const g = fakeContext()
+    setupWorkingSession(g, "idle")
+    const refused = await invoke(delegateTaskTool, { directory: "C:\GitHub\demo", prompt: "DeepSeek task", engine: "deepseek" }, g.ctx)
+    expect(refused.isError).toBe(true)
+    expect(JSON.stringify(refused)).toContain("invalid_input")
+    expect(g.api.find("POST", "/session")).toBeUndefined()
+  })
+
+  test("#252: a session that settles not_started is reported failed, not timed out", async () => {
+    const f = fakeContext()
+    setupWorkingSession(f, "idle")
+    const view = { sessionID: SID, directory: "/sessions/s-001", state: "not_started" as const, detail: "prompt accepted but no busy within 10 s", since: "2026-10-19T00:00:00Z" }
+    f.hub.views.set(SID, view)
+    f.hub.waitResult = { events: [], next: { epoch: "ep1", seq: 10 }, timedOut: false, views: [view] }
+
+    const d = data(await invoke(delegateTaskTool, { directory: "C:\GitHub\demo", prompt: "x", timeoutMs: 5000 }, f.ctx))
+    expect(d.status).toBe("failed")
+    expect(d.stillRunning).toBeUndefined()
   })
 
   test("handles needs_input state gracefully with advice to use code_pending", async () => {

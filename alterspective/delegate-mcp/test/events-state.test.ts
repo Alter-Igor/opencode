@@ -270,6 +270,43 @@ describe("wave 2 review fixes (state)", () => {
     expect(table.get("ses_1")?.state).toBe("error")
   })
 
+  test("#252: an error before the prompt ever ran becomes error when the watchdog fires (never stuck in starting)", () => {
+    const { table, tick } = upTable()
+    tick(60_000)
+    table.markSent("ses_1")
+    expect(table.error("ses_1", "UnknownError", false)).toEqual([])
+    expect(table.get("ses_1")?.state).toBe("starting")
+    expect(table.awaitingStart("ses_1")).toBe(true)
+    tick(10_000)
+    const [change] = table.startTimeout("ses_1")
+    expect(change?.state).toBe("error")
+    expect(table.get("ses_1")?.detail).toBe("UnknownError; the prompt never ran")
+  })
+
+  test("#252: an early error followed by busy carries on as before (recoverable errors are not final)", () => {
+    const { table, tick } = upTable()
+    tick(60_000)
+    table.markSent("ses_1")
+    table.error("ses_1", "UnknownError", false)
+    table.status("ses_1", "busy")
+    tick(10_000)
+    expect(table.startTimeout("ses_1")).toEqual([])
+    table.status("ses_1", "idle")
+    expect(table.get("ses_1")?.state).toBe("idle")
+  })
+
+  test("#252: an early error followed by idle is error, and the watchdog does not overwrite it", () => {
+    const { table, tick } = upTable()
+    tick(60_000)
+    table.markSent("ses_1")
+    table.error("ses_1", "UnknownError", false)
+    table.status("ses_1", "idle")
+    expect(table.get("ses_1")?.state).toBe("error")
+    tick(10_000)
+    expect(table.startTimeout("ses_1")).toEqual([])
+    expect(table.get("ses_1")?.state).toBe("error")
+  })
+
   test("W2A-25: only busy/retry count as activity (an error does not swallow the next send)", () => {
     const { table } = upTable()
     table.error("ses_1", "APIError", false)

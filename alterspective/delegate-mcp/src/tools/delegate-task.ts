@@ -2,6 +2,7 @@
 // Orchestrates start -> send -> wait (long poll) -> collect -> result in a single call.
 // Works across both local Docker and remote svc-coding-agent cloud microVM backends.
 import { z } from "zod"
+import { DelegateError } from "../shared/errors.ts"
 import { defineTool } from "./define.ts"
 import { ok, untrusted } from "./shape.ts"
 import { startSessionTool } from "./sessions.ts"
@@ -9,6 +10,9 @@ import { sendTool, MAX_MESSAGE_CHARS } from "./send.ts"
 import { waitTool } from "./wait.ts"
 import { collectTool } from "./collect.ts"
 import { resultTool } from "./result.ts"
+
+/** #252: settled states that mean the task did not complete (never "timed out, still running"). */
+const FAILED_STATES = new Set(["error", "aborted", "not_started", "not_found"])
 
 export const delegateTaskInput = {
   directory: z
@@ -24,7 +28,7 @@ export const delegateTaskInput = {
   engine: z
     .enum(["auto", "deepseek", "opencode"])
     .optional()
-    .describe("Execution engine: 'auto' (default model router), 'deepseek' (DeepSeek harness), or 'opencode' (OpenCode agent). Default: 'auto'."),
+    .describe("Execution engine: 'auto' (default) or 'opencode' both run the sandbox's default OpenCode agent. 'deepseek' is refused: there is no DeepSeek harness; pass a DeepSeek model as `model` instead."),
   model: z
     .string()
     .optional()
@@ -51,20 +55,22 @@ export const delegateTaskTool = defineTool({
     const startedAt = Date.now()
     const timeoutMs = args.timeoutMs ?? 300_000
 
-    // Resolve engine to agent/model parameters
-    let agent: string | undefined
-    if (args.engine === "deepseek") {
-      agent = "deepseek"
-    } else if (args.engine === "opencode") {
-      agent = "opencode"
-    }
+    // #252: `engine` never names an agent. The box's agents are build/explore/general/plan;
+    // sending "opencode" or "deepseek" made the prompt fail with "Agent not found". `auto` and
+    // `opencode` run the box's default agent. There is no DeepSeek harness, so `deepseek` is
+    // refused before a session (and a host branch) is created; pick a deepseek model with `model`.
+    if (args.engine === "deepseek")
+      throw new DelegateError(
+        "invalid_input",
+        "There is no DeepSeek engine in this sandbox.",
+        "Leave engine unset (or 'auto') and pass a DeepSeek model as `model`, e.g. one from code_list_models.",
+      )
 
     // 1. Start Session (allowShared: true to avoid blocking on concurrent runs)
     const startRes = await startSessionTool.run(
       {
         directory: args.directory,
         allowShared: true,
-        agent,
         model: args.model,
       },
       ctx,
@@ -81,7 +87,6 @@ export const delegateTaskTool = defineTool({
       {
         sessionID,
         message: args.prompt,
-        agent,
         model: args.model,
       },
       ctx,
@@ -126,7 +131,7 @@ export const delegateTaskTool = defineTool({
         }
       }
 
-      if (finalState === "idle" || finalState === "needs_input" || finalState === "error" || finalState === "aborted") {
+      if (finalState === "idle" || finalState === "needs_input" || FAILED_STATES.has(finalState)) {
         break
       }
 
@@ -149,7 +154,7 @@ export const delegateTaskTool = defineTool({
       )
     }
 
-    if (finalState === "error" || finalState === "aborted") {
+    if (FAILED_STATES.has(finalState)) {
       const matched = lastViews.find((v) => v.sessionID === sessionID)
       const detail = matched?.lastError ?? matched?.detail ?? "Task failed"
       return ok(`Task ended in state '${finalState}': ${detail}`, {

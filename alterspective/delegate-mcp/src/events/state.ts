@@ -156,6 +156,14 @@ export class SessionTable {
     if (!e?.awaitingStart || this.link.kind !== "up" || e.gap) return []
     if (this.now() - (e.sentAt ?? 0) < this.notStartedMs) return []
     e.awaitingStart = false
+    const err = e.lastError
+    if (err?.armed) {
+      // #252: the prompt failed before it ran; the error is the outcome, not silence.
+      e.base = "error"
+      e.detail = `${err.label}; the prompt never ran`
+      err.armed = false
+      return this.refresh(e)
+    }
     e.base = "not_started"
     e.detail = `prompt accepted but no busy within ${this.notStartedMs / 1000} s`
     return this.refresh(e)
@@ -186,7 +194,10 @@ export class SessionTable {
   error(sessionID: string, label: string, aborted: boolean): Change[] {
     const e = this.entries.get(sessionID)
     if (!e) return []
-    e.awaitingStart = false
+    // #252: an error before the prompt was seen running (still `starting`) keeps the not-started
+    // watchdog armed. A refused prompt (unknown agent) never goes busy or idle, so clearing the
+    // wait here left the session `starting` forever. A busy that follows still clears it (running()).
+    if (aborted || e.base !== "starting") e.awaitingStart = false
     e.lastError = { label, aborted, armed: true }
     if (!aborted) return []
     e.pending.clear()
@@ -272,6 +283,7 @@ export class SessionTable {
     e.gap = undefined
     const err = e.lastError
     if (err?.armed) {
+      e.awaitingStart = false // #252: the error is the outcome; the watchdog must not replace it
       e.base = err.aborted ? "aborted" : "error"
       e.detail = err.label
       err.armed = false
