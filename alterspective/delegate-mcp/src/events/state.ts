@@ -262,6 +262,15 @@ export class SessionTable {
       // Finished during the gap, or never started: unknowable, so keep the conservative claim.
       if (this.now() - (e.sentAt ?? 0) < this.notStartedMs) return
       e.awaitingStart = false
+      const early = e.lastError
+      if (early?.armed) {
+        // #252: the prompt failed before it ran and the watchdog fired during the gap; the error
+        // is the outcome, not not_started.
+        e.base = "error"
+        e.detail = `${early.label}; the prompt never ran; ${GAP_CAVEAT}`
+        early.armed = false
+        return
+      }
       e.base = "not_started"
       e.detail = "idle after a stream gap; the prompt was never seen running"
       return

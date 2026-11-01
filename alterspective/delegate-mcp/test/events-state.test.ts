@@ -283,6 +283,20 @@ describe("wave 2 review fixes (state)", () => {
     expect(table.get("ses_1")?.detail).toBe("UnknownError; the prompt never ran")
   })
 
+  test("#252: an early error, then a stream gap past the start window, then an idle rebuild is error (not not_started)", () => {
+    const { table, tick } = upTable()
+    tick(60_000)
+    table.markSent("ses_1")
+    table.error("ses_1", "UnknownError", false)
+    table.setLink({ kind: "gap", detail: "closed" })
+    tick(10_000)
+    expect(table.startTimeout("ses_1")).toEqual([]) // fired during the gap: claims nothing
+    table.rebuild(snap({ ses_1: { base: "idle", pending: [] } }))
+    expect(table.get("ses_1")?.state).toBe("error")
+    expect(table.get("ses_1")?.detail).toContain("UnknownError; the prompt never ran")
+    expect(table.awaitingStart("ses_1")).toBe(false)
+  })
+
   test("#252: an early error followed by busy carries on as before (recoverable errors are not final)", () => {
     const { table, tick } = upTable()
     tick(60_000)

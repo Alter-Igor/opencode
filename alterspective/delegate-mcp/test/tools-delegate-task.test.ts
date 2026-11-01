@@ -73,14 +73,14 @@ describe("delegate_task (FEAT-CD-001)", () => {
     const f = fakeContext()
     setupWorkingSession(f, "idle")
 
-    await invoke(delegateTaskTool, { directory: "C:\GitHub\demo", prompt: "OpenCode task", engine: "opencode" }, f.ctx)
+    await invoke(delegateTaskTool, { directory: "C:\\GitHub\\demo", prompt: "OpenCode task", engine: "opencode" }, f.ctx)
     expect(f.ctx.sessions.get(SID)?.agent).toBeUndefined()
     const send = f.api.find("POST", `/session/${SID}/prompt_async`)
     expect((send?.body as { agent?: unknown } | undefined)?.agent).toBeUndefined()
 
     const g = fakeContext()
     setupWorkingSession(g, "idle")
-    const refused = await invoke(delegateTaskTool, { directory: "C:\GitHub\demo", prompt: "DeepSeek task", engine: "deepseek" }, g.ctx)
+    const refused = await invoke(delegateTaskTool, { directory: "C:\\GitHub\\demo", prompt: "DeepSeek task", engine: "deepseek" }, g.ctx)
     expect(refused.isError).toBe(true)
     expect(JSON.stringify(refused)).toContain("invalid_input")
     expect(g.api.find("POST", "/session")).toBeUndefined()
@@ -93,9 +93,24 @@ describe("delegate_task (FEAT-CD-001)", () => {
     f.hub.views.set(SID, view)
     f.hub.waitResult = { events: [], next: { epoch: "ep1", seq: 10 }, timedOut: false, views: [view] }
 
-    const d = data(await invoke(delegateTaskTool, { directory: "C:\GitHub\demo", prompt: "x", timeoutMs: 5000 }, f.ctx))
+    const d = data(await invoke(delegateTaskTool, { directory: "C:\\GitHub\\demo", prompt: "x", timeoutMs: 5000 }, f.ctx))
     expect(d.status).toBe("failed")
     expect(d.stillRunning).toBeUndefined()
+  })
+
+  test("#252: a failure seen only as a state event keeps that event's detail, not a stale view's", async () => {
+    const f = fakeContext()
+    setupWorkingSession(f, "idle")
+    f.hub.waitResult = {
+      events: [{ cursor: { epoch: "ep1", seq: 11 }, at: "2026-10-19T00:00:01Z", type: "status", sessionID: SID, state: "error", summary: "session s is error (UnknownError; the prompt never ran)" }],
+      next: { epoch: "ep1", seq: 11 },
+      timedOut: false,
+      views: [],
+    }
+
+    const d = data(await invoke(delegateTaskTool, { directory: "C:\\GitHub\\demo", prompt: "x", timeoutMs: 5000 }, f.ctx))
+    expect(d.status).toBe("failed")
+    expect(String(d.error)).toContain("the prompt never ran")
   })
 
   test("handles needs_input state gracefully with advice to use code_pending", async () => {

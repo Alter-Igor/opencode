@@ -47,8 +47,8 @@ export const delegateTaskTool = defineTool({
   title: "Delegate a complete coding task in one step",
   description:
     "Autonomous 1-step delegation: starts a session on your repository, sends the task prompt, waits for completion, " +
-    "and collects the finished work into local branch delegate/<key>. Supports 'auto', 'deepseek', or 'opencode' engines " +
-    "across local Docker and cloud backends.",
+    "and collects the finished work into local branch delegate/<key>. Engine 'auto' or 'opencode' runs the sandbox's default " +
+    "agent across local Docker and cloud backends; 'deepseek' is refused (pass a DeepSeek model as `model`).",
   input: delegateTaskInput,
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   async run(args, ctx, correlationId) {
@@ -98,6 +98,8 @@ export const delegateTaskTool = defineTool({
     // 3. Polling Wait Loop with chunked timeouts
     let finalState = "busy"
     let lastViews: Array<{ sessionID: string; state: string; lastError?: string; detail?: string }> = []
+    // The state event that set finalState when the wait returned no view (its summary is bridge words only).
+    let stateFromEvent: { summary?: string; code?: string } | undefined
 
     while (Date.now() - startedAt < timeoutMs) {
       const elapsed = Date.now() - startedAt
@@ -118,16 +120,18 @@ export const delegateTaskTool = defineTool({
       }
 
       const views = (waitRes.structuredContent?.views ?? []) as typeof lastViews
-      const events = (waitRes.structuredContent?.events ?? []) as Array<{ sessionID?: string; state?: string }>
+      const events = (waitRes.structuredContent?.events ?? []) as Array<{ sessionID?: string; state?: string; summary?: string; code?: string }>
 
       if (views.length > 0 && views[0]) {
         lastViews = views
+        stateFromEvent = undefined
         const matched = views.find((v) => v.sessionID === sessionID) ?? views[0]
         finalState = matched.state
       } else {
         const stateEvent = [...events].reverse().find((e) => e.sessionID === sessionID && e.state)
         if (stateEvent?.state) {
           finalState = stateEvent.state
+          stateFromEvent = stateEvent
         }
       }
 
@@ -155,8 +159,10 @@ export const delegateTaskTool = defineTool({
     }
 
     if (FAILED_STATES.has(finalState)) {
-      const matched = lastViews.find((v) => v.sessionID === sessionID)
-      const detail = matched?.lastError ?? matched?.detail ?? "Task failed"
+      // #252: a view older than the state event that ended the wait describes an earlier state.
+      const matched = stateFromEvent ? undefined : lastViews.find((v) => v.sessionID === sessionID)
+      const fromEvent = stateFromEvent?.code ?? stateFromEvent?.summary
+      const detail = matched?.lastError ?? matched?.detail ?? (fromEvent || "Task failed")
       return ok(`Task ended in state '${finalState}': ${detail}`, {
         status: "failed",
         sessionID,
