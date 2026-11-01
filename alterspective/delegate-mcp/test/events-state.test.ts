@@ -293,7 +293,7 @@ describe("wave 2 review fixes (state)", () => {
     expect(table.startTimeout("ses_1")).toEqual([]) // fired during the gap: claims nothing
     table.rebuild(snap({ ses_1: { base: "idle", pending: [] } }))
     expect(table.get("ses_1")?.state).toBe("error")
-    expect(table.get("ses_1")?.detail).toContain("UnknownError; the prompt never ran")
+    expect(table.get("ses_1")?.detail).toContain("UnknownError; the prompt was not seen running")
     expect(table.awaitingStart("ses_1")).toBe(false)
   })
 

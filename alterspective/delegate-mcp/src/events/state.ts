@@ -267,10 +267,11 @@ export class SessionTable {
       e.awaitingStart = false
       const early = e.lastError
       if (early?.armed) {
-        // #252: the prompt failed before it ran and the watchdog fired during the gap; the error
-        // is the outcome, not not_started.
+        // #252: an error arrived before the prompt was seen running, and the watchdog fired during
+        // the gap. The error is the outcome, not not_started. The gap means a run cannot be ruled out,
+        // so the detail says "not seen running", never "never ran".
         e.base = "error"
-        e.detail = `${early.label}; the prompt never ran; ${GAP_CAVEAT}`
+        e.detail = `${early.label}; the prompt was not seen running; ${GAP_CAVEAT}`
         early.armed = false
         return
       }
