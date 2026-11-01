@@ -143,6 +143,9 @@ export class SessionTable {
     e.detail = undefined
     e.awaitingStart = true
     e.sentAt = this.now()
+    // #252: an error armed before this send belongs to the earlier prompt. Only an error that
+    // arrives after this send may be reported as "the prompt never ran".
+    if (e.lastError) e.lastError.armed = false
     return this.refresh(e)
   }
 

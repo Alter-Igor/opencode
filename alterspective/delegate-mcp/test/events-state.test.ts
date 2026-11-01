@@ -297,6 +297,18 @@ describe("wave 2 review fixes (state)", () => {
     expect(table.awaitingStart("ses_1")).toBe(false)
   })
 
+  test("#252: an error from an earlier prompt is not reported as the new prompt's outcome", () => {
+    const { table, tick } = upTable()
+    tick(60_000)
+    table.status("ses_1", "idle")
+    table.error("ses_1", "APIError", false) // a stray error with no idle after it
+    tick(60_000)
+    table.markSent("ses_1")
+    tick(10_000)
+    const [change] = table.startTimeout("ses_1")
+    expect(change?.state).toBe("not_started")
+  })
+
   test("#252: an early error followed by busy carries on as before (recoverable errors are not final)", () => {
     const { table, tick } = upTable()
     tick(60_000)
