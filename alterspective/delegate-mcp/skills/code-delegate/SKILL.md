@@ -25,14 +25,17 @@ skills from this folder never fall back to the stale pre-2026-11 content that us
 The previous version of this file was wrong. If you still see those claims anywhere, treat them
 as false:
 
-1. **Remote backend is a stub.** `OPENCODE_DELEGATE_BACKEND=remote` / `SVC_CODING_AGENT_URL`
-   is not implemented (opencode #242, #254). Do not route work to a remote `svc-coding-agent`
-   engine. For repo-scale cloud coding use `svc-coding-agent` via Keystone dynamic MCP
-   (KB-AI-016 § Coding agent via Keystone dynamic MCP) — that is a different path from this MCP
-   server.
-2. **No engine selection.** There is no `engine: 'auto' | 'deepseek' | 'opencode'` argument in
-   the current tool contract. Models are Synapse-only: leave `model` unset (`synapse/auto`) or
-   pick from `code_list_models` / `oc_list_models`.
+1. **Remote backend is implemented.** `OPENCODE_DELEGATE_BACKEND=remote` / `SVC_CODING_AGENT_URL`
+   builds a real remote bridge (`createRemoteClient` / `createRemoteHub` / `createRemoteWorkspaces`
+   in `src/runtime.ts`) on svc-coding-agent; `delegate_task` works across local Docker and remote
+   backends. A remote `delegate_task` starts with a generated session title when none is given
+   (`title: args.title ?? "delegate <sessionKey>"` in `src/tools/sessions.ts`). Repo-scale cloud
+   coding can also go via `svc-coding-agent` through Keystone dynamic MCP (KB-AI-016 § Coding
+   agent via Keystone dynamic MCP) — that is a separate path from this MCP server.
+2. **Engine field exists.** `delegate_task` takes an optional
+   `engine: 'auto' | 'deepseek' | 'opencode'`. `auto` (default) and `opencode` both run the
+   sandbox's default OpenCode agent; `deepseek` is refused before any session is created —
+   pass a DeepSeek model as `model` instead (pick from `code_list_models` / `oc_list_models`).
 3. **The granular path is real.** Besides the fast path `delegate_task` (`code_delegate_task`),
    the granular path is `code_start_session` → `code_send` → `code_wait` → `code_pending` /
    `code_answer` → `code_result` → `code_collect` → `oc_close_session` → `oc_cleanup`
@@ -41,8 +44,8 @@ as false:
 4. **Approvals and safety model.** Pending approvals are answered `once` or `reject` — never
    `always`. Every approval's tool and arguments are read before answering. `code_collect`
    returns `hostExecutableChanges`; review every flagged file. The caller (you) runs the tests,
-   typecheck and lint, merges through a reviewed PR, then closes the session and runs
-   `code_cleanup`. Never leave sessions open.
+    typecheck and lint, merges through a reviewed PR, then closes the session and runs
+    `oc_cleanup`. Never leave sessions open.
 5. **Check the bridge first.** Run `code_doctor` / `oc_doctor` once per session before the
    first start; `verified: true` means go, anything else is fixed per OPS-008-00 § 9 first.
 
