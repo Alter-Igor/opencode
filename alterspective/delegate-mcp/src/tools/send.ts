@@ -10,7 +10,7 @@ import { DelegateError } from "../shared/errors.ts"
 import type { Box, SessionRecord, ToolContext } from "./context.ts"
 import { readInstructions, type Instructions } from "./core-box.ts"
 import { closingError, isClosing } from "./closing.ts"
-import { CORRELATION_RE, agentSchema, formatCursor, liveSessionID, modelSchema, ownSession, parseModel, requireSynapseModel, sameRules, sessionGone, sessionIdSchema } from "./core-session.ts"
+import { CORRELATION_RE, agentSchema, applyTaskProfile, formatCursor, liveSessionID, modelSchema, ownSession, parseModel, requireSynapseModel, sameRules, sessionGone, sessionIdSchema } from "./core-session.ts"
 import { DEFAULT_MODEL, SYNAPSE_PROVIDER } from "../supervisor/profile.ts"
 import { defineTool } from "./define.ts"
 import { boxDefault, fetchModels, pickRoleModel, requireModel } from "./models.ts"
@@ -61,6 +61,8 @@ async function savedModel(box: Box, saved: string | undefined, correlationId: st
 export async function sendPrompt(ctx: ToolContext, box: Box, record: SessionRecord, prompt: Prompt): Promise<Sent> {
   // #71: an explicit model was checked by the caller (requireModel); this is the last guard.
   if (prompt.model) requireSynapseModel(prompt.model)
+  // #124: apply (or clear) this session's per-task delegation profile on the gate before sending.
+  await applyTaskProfile(ctx, record.delegationProfile)
   const saved = prompt.model ? {} : await savedModel(box, record.model, prompt.correlationId)
   const model = prompt.model ?? saved.model
   const agent = prompt.agent ?? record.agent

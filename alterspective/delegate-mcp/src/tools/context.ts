@@ -1,5 +1,6 @@
 // MOD-04 tool context: the services every tool can use, created lazily so the MCP server starts
 // instantly and the box is only started by the first tool that needs it (technical-design §5).
+import type { Profile } from "../../mcp-gate/src/policy.ts"
 import type { BridgeConfig } from "../shared/config.ts"
 import type { Guard } from "../shared/contracts.ts"
 import type { Logger } from "../shared/log.ts"
@@ -30,6 +31,8 @@ export type SessionRecord = {
   agent?: string
   /** Additive (R4-01): the Keystone connections this session was narrowed to (convenience, not a wall); undefined = the whole box-wide set. */
   keystone?: string[]
+  /** #124: per-task delegation profile narrowing Keystone /mcp/dynamic tool reach; never widens the owner's profile. */
+  delegationProfile?: Profile
   /** #146: which caller started the session (callerName). */
   caller?: string
   /** #148: allowed file path patterns (globs) for this session's tasks. */

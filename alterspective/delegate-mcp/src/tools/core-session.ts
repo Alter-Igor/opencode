@@ -7,6 +7,7 @@
 // upgrade a readonly profile.
 import { randomBytes } from "node:crypto"
 import { z } from "zod"
+import { parseProfile, type Profile } from "../../mcp-gate/src/policy.ts"
 import type { Cursor } from "../shared/contracts.ts"
 import { DelegateError, isDelegateError } from "../shared/errors.ts"
 import type { ApiTarget } from "../shared/opencode-api.ts"
@@ -14,7 +15,7 @@ import { AGENT_RE, MODEL_RE, SESSION_ID_RE, SESSION_KEY, type HostSessionState, 
 import type { Box, SessionRecord, ToolContext } from "./context.ts"
 import { closingError, isClosing } from "./closing.ts"
 
-export { AGENT_RE, MODEL_RE, SESSION_ID_RE, type SessionProfile }
+export { AGENT_RE, MODEL_RE, SESSION_ID_RE, type Profile, type SessionProfile }
 export const CORRELATION_RE = /^[A-Za-z0-9_.:-]{1,64}$/
 const CURSOR_RE = /^([A-Za-z0-9-]{1,64})\.(\d{1,15})$/
 
@@ -22,6 +23,48 @@ export const sessionIdSchema = z.string().regex(SESSION_ID_RE, "a session id suc
 export const modelSchema = z.string().regex(MODEL_RE, "provider/model, for example synapse/auto")
 export const agentSchema = z.string().regex(AGENT_RE, "an agent name such as build or plan")
 export const cursorSchema = z.string().regex(CURSOR_RE, "a cursor returned by oc_send, oc_wait or oc_events")
+
+/** #124: per-task delegation profile narrowing Keystone /mcp/dynamic tool reach. */
+export const delegationProfileSchema = z
+  .object({
+    allowedToolPatterns: z.array(z.string()).optional().describe("Tool patterns this task may use (e.g. ['github__*', 'rag__*']). Empty array allows no tools."),
+    deniedToolPatterns: z.array(z.string()).optional().describe("Tool patterns this task may never use, even when allowed above."),
+    approvalRequiredToolPatterns: z.array(z.string()).optional().describe("Tool patterns that always require human approval."),
+    approvals: z.enum(["risky", "listed"]).optional().describe("'risky' (default): risky tools also wait for approval. 'listed': only approvalRequiredToolPatterns (never downgrades the owner's base profile)."),
+  })
+  .strict()
+
+export function parseDelegationProfile(value: unknown): Profile | undefined {
+  if (value === undefined) return undefined
+  try {
+    return parseProfile(JSON.stringify(value))
+  } catch (error) {
+    throw new DelegateError(
+      "invalid_input",
+      error instanceof Error ? `Invalid delegationProfile: ${error.message}.` : "Invalid delegationProfile.",
+      "Pass a valid delegationProfile with allowedToolPatterns, deniedToolPatterns, approvalRequiredToolPatterns, and/or approvals ('risky' | 'listed').",
+    )
+  }
+}
+
+export async function applyTaskProfile(ctx: ToolContext, delegationProfile: Profile | undefined): Promise<void> {
+  if (ctx.config.backend === "remote") return
+  if (delegationProfile !== undefined) {
+    if (!ctx.gate?.setTaskProfile) {
+      throw new DelegateError(
+        "sandbox_unavailable",
+        "The delegation gate is not available to enforce this session's delegationProfile.",
+        "Run oc_doctor or restart the sandbox with oc_server_restart.",
+        "gate.setTaskProfile unavailable",
+      )
+    }
+    await ctx.gate.setTaskProfile(delegationProfile)
+    return
+  }
+  if (ctx.gate?.setTaskProfile) {
+    await ctx.gate.setTaskProfile(null).catch(() => undefined)
+  }
+}
 
 /** Session metadata the bridge writes on POST /session: a lookup key for the host record, nothing more. */
 export type SessionMetadata = { supervisor: string; sessionKey: string }
@@ -163,6 +206,7 @@ export async function recordFromState(ctx: ToolContext, state: OwnedStateRecord)
     ...(state.model ? { model: state.model } : {}),
     ...(state.agent ? { agent: state.agent } : {}),
     ...(state.keystone ? { keystone: state.keystone } : {}),
+    ...(state.delegationProfile ? { delegationProfile: state.delegationProfile } : {}),
     ...(state.caller ? { caller: state.caller } : {}),
     ...(state.allowedPaths ? { allowedPaths: state.allowedPaths } : {}),
     ...(state.boxSessionID ? { boxSessionID: state.boxSessionID } : {}),

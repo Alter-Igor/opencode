@@ -4,13 +4,14 @@
 // `docker inspect <project>-mcp-gate` together with the host port label. The token never appears in
 // errors or logs. A failed read is an error, never "no approvals".
 import { type ApprovalView } from "../../mcp-gate/src/approvals.ts"
+import type { Profile } from "../../mcp-gate/src/policy.ts"
 import type { BridgeConfig } from "../shared/config.ts"
 import { DelegateError, isDelegateError } from "../shared/errors.ts"
 import { GATE_ADMIN_PORT_LABEL, GATE_ADMIN_TOKEN_ENV, containerName } from "../supervisor/compose-env.ts"
 import { inspectBox, type BoxInspect, type Exec } from "../supervisor/docker.ts"
 
 export type GateTarget = { baseUrl: string; token: string }
-export type { ApprovalView }
+export type { ApprovalView, Profile }
 
 /** Approval ids as the gate makes them (mcp-gate/src/approvals.ts). */
 export const APPROVAL_ID_RE = /^apr_[a-z0-9]{1,40}$/
@@ -42,6 +43,8 @@ export type GateApprovals = {
   pending(): Promise<ApprovalView[]>
   /** Approve (`once`) or refuse (`reject`) one pending approval. */
   decide(id: string, decision: "approve" | "deny"): Promise<ApprovalView>
+  /** #124: set or clear the active per-task delegation profile on the gate (narrows only, never widens). */
+  setTaskProfile?(profile: Profile | null): Promise<void>
 }
 
 export type GateOptions = { target: () => Promise<GateTarget>; invalidate?: () => void; fetch?: typeof fetch; timeoutMs?: number }
@@ -79,6 +82,14 @@ export function createGateApprovals(options: GateOptions): GateApprovals {
       const approval = (data as { approval?: ApprovalView } | undefined)?.approval
       if (status !== 200 || approval === undefined) throw unavailable("The delegation gate did not take the decision.", `HTTP ${status}`)
       return approval
+    },
+    async setTaskProfile(profile) {
+      const { status, data } = await call("/v1/profile", { method: "POST", body: JSON.stringify({ profile }) })
+      if (status === 400) {
+        const msg = (data as { error?: unknown } | undefined)?.error
+        throw new DelegateError("invalid_input", typeof msg === "string" ? msg : "Invalid delegation profile.", "Pass a valid delegationProfile (allowedToolPatterns, deniedToolPatterns, approvalRequiredToolPatterns, approvals).")
+      }
+      if (status !== 200) throw unavailable("The delegation gate did not accept the task profile.", `HTTP ${status}`)
     },
   }
 }

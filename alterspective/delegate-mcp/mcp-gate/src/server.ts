@@ -13,11 +13,13 @@
 import { timingSafeEqual } from "node:crypto"
 import { ApprovalStore } from "./approvals.ts"
 import { filterResult, MAX_FILTER_BYTES, planMessage, rewriteSse, toolError, type Message, type Plan } from "./mcp.ts"
-import type { Profile } from "./policy.ts"
+import { parseProfile, type Profile } from "./policy.ts"
 
 export type GateConfig = {
   upstream: string
   profile: Profile
+  /** #124: optional per-task narrowing profile set via the admin API (never widens `profile`). */
+  taskProfile?: Profile
   adminToken: string
   approvals: ApprovalStore
   fetch?: typeof fetch
@@ -64,6 +66,17 @@ export function frontHandler(config: GateConfig) {
     if (url.pathname !== upstreamUrl.pathname || url.search !== "") return json(403, { error: "forbidden" })
     if (!["GET", "POST", "DELETE"].includes(request.method)) return json(405, { error: "method not allowed" })
 
+    const rawHeaderProfile = request.headers.get("x-opencode-delegate-profile")
+    let headerProfile: Profile | undefined
+    if (rawHeaderProfile !== null && rawHeaderProfile.trim() !== "") {
+      try {
+        headerProfile = parseProfile(rawHeaderProfile)
+      } catch {
+        log({ event: "invalid_task_profile" })
+        return json(400, { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid x-opencode-delegate-profile header" } })
+      }
+    }
+
     const headers = pick(request.headers, PASS_REQUEST)
     if (request.method !== "POST") {
       const upstream = await fetchFn(upstreamUrl, { method: request.method, headers, redirect: "error" })
@@ -81,7 +94,11 @@ export function frontHandler(config: GateConfig) {
     // A batch could hide a gated call among others; the MCP client never sends one, so refuse it.
     if (Array.isArray(parsed)) return json(400, { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Batches are not accepted by the delegation gate." } })
     const message = parsed as Message
-    const plan = planMessage(config.profile, message)
+    const taskProfile =
+      config.taskProfile && headerProfile
+        ? [config.taskProfile, headerProfile]
+        : (headerProfile ?? config.taskProfile)
+    const plan = planMessage(config.profile, message, taskProfile)
 
     if (plan.kind === "decide") {
       const { decision } = plan
@@ -109,7 +126,7 @@ export function frontHandler(config: GateConfig) {
 
     const text = await upstream.text()
     if (text.length > MAX_FILTER_BYTES) return json(200, toolError(plan.id, "The tool list was too large for the delegation gate to check, so it was withheld."))
-    const edit = (m: Message): Message => (m.id === plan.id && m.result !== undefined ? filterResult(config.profile, m, plan.what) : m)
+    const edit = (m: Message): Message => (m.id === plan.id && m.result !== undefined ? filterResult(config.profile, m, plan.what, taskProfile) : m)
     const contentType = upstream.headers.get("content-type") ?? ""
     if (contentType.includes("text/event-stream")) return new Response(rewriteSse(text, edit), { status: upstream.status, headers: responseHeaders })
     try {
@@ -127,12 +144,47 @@ function sameToken(given: string | null, expected: string): boolean {
   return a.length === b.length && timingSafeEqual(a, b)
 }
 
-/** The admin listener's handler: GET /v1/approvals[?state=], POST /v1/approvals/<id> {decision}. */
+/** The admin listener's handler: GET /v1/approvals[?state=], POST /v1/approvals/<id> {decision}, GET/POST /v1/profile. */
 export function adminHandler(config: GateConfig) {
   return async (request: Request): Promise<Response> => {
     if (!sameToken(request.headers.get("authorization"), config.adminToken)) return json(401, { error: "unauthorized" })
     const url = new URL(request.url)
     if (request.method === "GET" && url.pathname === "/v1/health") return json(200, { ok: true })
+    if (request.method === "GET" && url.pathname === "/v1/profile") {
+      return json(200, { profile: config.taskProfile ?? null })
+    }
+    if (request.method === "POST" && url.pathname === "/v1/profile") {
+      let body: unknown
+      try {
+        body = await request.json()
+      } catch {
+        return json(400, { error: "body must be JSON" })
+      }
+      if (body === null || typeof body !== "object" || Array.isArray(body)) {
+        return json(400, { error: "body must be a JSON object" })
+      }
+      const rawProfile = (body as { profile?: unknown }).profile
+      if (rawProfile === null || rawProfile === undefined) {
+        config.taskProfile = undefined
+        config.log?.({ event: "task_profile_cleared" })
+        return json(200, { profile: null })
+      }
+      if (typeof rawProfile !== "string" && (typeof rawProfile !== "object" || Array.isArray(rawProfile))) {
+        return json(400, { error: "profile must be a JSON object, string, or null" })
+      }
+      let parsed: Profile
+      try {
+        if (typeof rawProfile === "string" && rawProfile.trim() === "") {
+          throw new Error("delegation profile is not JSON")
+        }
+        parsed = parseProfile(typeof rawProfile === "string" ? rawProfile : JSON.stringify(rawProfile))
+      } catch (error) {
+        return json(400, { error: error instanceof Error ? error.message : "invalid delegation profile" })
+      }
+      config.taskProfile = parsed
+      config.log?.({ event: "task_profile_set" })
+      return json(200, { profile: parsed })
+    }
     if (request.method === "GET" && url.pathname === "/v1/approvals") {
       const state = url.searchParams.get("state") ?? undefined
       const allowed = ["pending", "approved", "denied", "used", "expired"]

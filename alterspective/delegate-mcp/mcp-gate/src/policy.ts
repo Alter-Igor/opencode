@@ -14,7 +14,7 @@
 const VALID_PATTERN = /^[a-zA-Z0-9_.*-]{1,200}$/
 
 export type Profile = {
-  /** Tools the delegated task may use. Missing or empty means every tool. */
+  /** Tools the delegated task may use. Missing means every tool; an empty array allows no tools. */
   allowedToolPatterns?: string[]
   /** Tools the task may never use, even when allowed above. */
   deniedToolPatterns?: string[]
@@ -58,10 +58,13 @@ export function parseProfile(raw: string | undefined): Profile {
   }
   const approvals = input.approvals
   if (approvals !== undefined && approvals !== "risky" && approvals !== "listed") throw new Error('delegation profile approvals must be "risky" or "listed"')
+  const allowed = list("allowedToolPatterns")
+  const denied = list("deniedToolPatterns")
+  const approvalRequired = list("approvalRequiredToolPatterns")
   return {
-    ...(list("allowedToolPatterns") ? { allowedToolPatterns: list("allowedToolPatterns") } : {}),
-    ...(list("deniedToolPatterns") ? { deniedToolPatterns: list("deniedToolPatterns") } : {}),
-    ...(list("approvalRequiredToolPatterns") ? { approvalRequiredToolPatterns: list("approvalRequiredToolPatterns") } : {}),
+    ...(allowed !== undefined ? { allowedToolPatterns: allowed } : {}),
+    ...(denied !== undefined ? { deniedToolPatterns: denied } : {}),
+    ...(approvalRequired !== undefined ? { approvalRequiredToolPatterns: approvalRequired } : {}),
     ...(approvals ? { approvals } : {}),
   }
 }
@@ -69,8 +72,19 @@ export function parseProfile(raw: string | undefined): Profile {
 /** Whether the profile lets the task see and use this tool at all (no approval question). */
 export function isVisible(profile: Profile, toolName: string): boolean {
   if (matchesAnyPattern(toolName, profile.deniedToolPatterns ?? [])) return false
-  const allowed = profile.allowedToolPatterns ?? []
-  return allowed.length === 0 || matchesAnyPattern(toolName, allowed)
+  if (profile.allowedToolPatterns === undefined) return true
+  return profile.allowedToolPatterns.length > 0 && matchesAnyPattern(toolName, profile.allowedToolPatterns)
+}
+
+/**
+ * #124: strict monotonic visibility narrowing. A task profile can only hide tools that `base`
+ * allows; it can never expose a tool that `base` hides.
+ */
+export function isVisibleWithNarrowing(base: Profile, narrower: Profile | readonly (Profile | undefined)[] | undefined, toolName: string): boolean {
+  if (!isVisible(base, toolName)) return false
+  if (narrower === undefined) return true
+  const list = Array.isArray(narrower) ? narrower : [narrower]
+  return list.every((p) => p === undefined || isVisible(p, toolName))
 }
 
 /** The decision for one call of `toolName` (a Keystone dynamic tool name, `<namespace>__<tool>`). */
@@ -82,6 +96,26 @@ export function decide(profile: Profile, toolName: string): Decision {
     if (risk !== undefined) return { effect: "approve", reason: risk }
   }
   return { effect: "allow" }
+}
+
+/**
+ * #124: strict monotonic decision narrowing (`deny` > `approve` > `allow`).
+ * - A task profile can never make a tool visible that `base` hid.
+ * - A task profile with `approvals: "listed"` can never downgrade an approval required by `base`.
+ * - A task profile can add new denials or new approval requirements on top of `base`.
+ */
+export function decideWithNarrowing(base: Profile, narrower: Profile | readonly (Profile | undefined)[] | undefined, toolName: string): Decision {
+  const dBase = decide(base, toolName)
+  if (dBase.effect === "deny" || narrower === undefined) return dBase
+  const list = Array.isArray(narrower) ? narrower : [narrower]
+  let approval: Extract<Decision, { effect: "approve" }> | undefined = dBase.effect === "approve" ? dBase : undefined
+  for (const p of list) {
+    if (p === undefined) continue
+    const dNarrow = decide(p, toolName)
+    if (dNarrow.effect === "deny") return dNarrow
+    if (dNarrow.effect === "approve" && approval === undefined) approval = dNarrow
+  }
+  return approval ?? { effect: "allow" }
 }
 
 // ---- Risk words, copied from CAS src/core/domain/tool-risk.ts and coding-delegate-reach.ts ----
