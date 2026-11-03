@@ -334,7 +334,7 @@ export async function createRuntime(options: RuntimeOptions = {}): Promise<Runti
     log,
     guard: createGuard(config),
     supervisorService,
-    workspaces: createWorkspaces({ config, container: containerName(config), logger: log }),
+    workspaces: createWorkspaces({ config, container: () => containerName(config), logger: log }),
     inbox: createInbox({ supervisor: `supervisor:${name}`, target: inboxTarget.target, invalidate: inboxTarget.invalidate }),
     gate: createGateApprovals({ target: gateTarget.target, invalidate: gateTarget.invalidate }),
     servedModels: (sessionID, sinceIso) => servedModelsFromFront(bunExec, config, sessionID, sinceIso),

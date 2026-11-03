@@ -23,7 +23,7 @@ import { boxFailure, canonicalPath, invalidFolder, isUnder, outsideRoots, runCom
 import { copyOutBundle, dockerTarSource, type TarSource } from "./workspaces-copyout.ts"
 import { assertRegularFile, DEFAULT_MAX_BUNDLE_BYTES, planOutBundle, randomNonce, removeQuietly, reserveInBundle } from "./workspaces-handoff.ts"
 import { bindHostState, COMMIT_ID, listHostStates, readHostState, removeHostState, SESSION_KEY, updateHostState, writeHostState, type HostSessionState, type SessionBinding } from "./workspaces-state.ts"
-import { createSessionPruner, type MissingSession } from "./workspaces-prune.ts"
+import { createSessionPruner, pruneDeletedBoxSessions, type MissingSession, type PruneOptions } from "./workspaces-prune.ts"
 import { closeCandidates, closeSession, inspectClose, type CandidateOptions, type CloseCandidates, type CloseDeps, type CloseHooks, type CloseOptions, type CloseOutcome, type CloseOwner, type ClosePlan } from "./workspaces-close.ts"
 
 export { canonicalPath, cleanEnv, isUnder, parseSubst, runCommand, TIMEOUT_CODE, type Exec, type ExecOptions, type ExecResult } from "./workspaces-exec.ts"
@@ -32,6 +32,7 @@ export { DEFAULT_MAX_BUNDLE_BYTES, HANDOFF_IN, HANDOFF_OUT } from "./workspaces-
 export { TAR_SLACK_BYTES, type TarSource, type TarStream } from "./workspaces-copyout.ts"
 
 export type { CandidateOptions, CloseCandidates, CloseHooks, CloseOptions, CloseOutcome, CloseOwner, ClosePlan, SessionRemoval } from "./workspaces-close.ts"
+export { createSessionPruner, pruneDeletedBoxSessions, type BoundHostState, type MissingSession, type PruneOptions } from "./workspaces-prune.ts"
 export { AGENT_RE, COMMIT_ID, MODEL_RE, SESSION_ID_RE, SESSION_KEY, SUPERVISOR_RE, type HostSessionState, type SessionBinding, type SessionProfile } from "./workspaces-state.ts"
 /** bundle, clone and fetch: whole repositories. */
 export const LONG_TIMEOUT_MS = 10 * 60_000
@@ -40,8 +41,8 @@ export const SHORT_TIMEOUT_MS = 60_000
 
 export type WorkspacesOptions = {
   config: BridgeConfig
-  /** Box container name; used by the default box exec (`docker exec <container> ...`). */
-  container: string
+  /** Box container name or dynamic resolver; defaults to `containerName(options.config)` resolved dynamically. */
+  container?: string | (() => string)
   /** Host hand-off folder: `<handoffDir>/in` is mounted read-only at `<boxHandoff>/in`. `<boxHandoff>/out` is box-only. Default `<home>/handoff`. */
   handoffDir?: string
   /** Host-only state (base commit per session, quarantined bundles). Never mounted. Default `<home>/workspaces`. */
@@ -437,10 +438,10 @@ export type DelegateWorkspaces = Omit<Workspaces, "open" | "collect"> & {
   /** Every readable host record, newest first. */
   listSessionStates(): Promise<HostSessionState[]>
   /**
-   * #53: bounded cleanup of confirmed missing sessions whose clones are also proved absent. Only
-   * records this box made (same `boxProject`) and sessions not `tracked` in memory. Returns removed keys.
+   * #53: bounded cleanup of confirmed missing sessions whose clones are also proved absent.
+   * Returns removed keys.
    */
-  pruneSessionStates(supervisor: string, missing: MissingSession, tracked?: (sessionID: string) => boolean): Promise<string[]>
+  pruneSessionStates(supervisor: string, missing: MissingSession, tracked?: (sessionID: string) => boolean, options?: PruneOptions): Promise<string[]>
   /** Best effort (W3A-14): remove the box clone and the host record of a session that never started. Never throws. */
   discard(sessionKey: string): Promise<void>
   /** #72: what closing this bridge's session would remove and lose. Reads only. */
@@ -475,11 +476,17 @@ async function traced<T>(logger: Logger, op: string, call: CallOptions | undefin
 }
 
 export function createWorkspaces(options: WorkspacesOptions): DelegateWorkspaces {
+  const initialProject = options.config.project
+  const currentContainer = (): string => {
+    if (typeof options.container === "function") return options.container()
+    if (options.config.project !== initialProject) return containerName(options.config)
+    return options.container ?? containerName(options.config)
+  }
   const ctx: Ctx = {
     roots: options.config.roots,
     host: options.hostExec ?? ((argv, o) => runCommand(argv, undefined, o?.timeoutMs)),
-    box: options.boxExec ?? ((argv, o) => runCommand(["docker", "exec", containerName(options.config), ...argv], undefined, o?.timeoutMs)),
-    tar: options.boxTar ?? ((boxPath, timeoutMs) => dockerTarSource(containerName(options.config))(boxPath, timeoutMs)),
+    box: options.boxExec ?? ((argv, o) => runCommand(["docker", "exec", currentContainer(), ...argv], undefined, o?.timeoutMs)),
+    tar: options.boxTar ?? ((boxPath, timeoutMs) => dockerTarSource(currentContainer())(boxPath, timeoutMs)),
     get handoffDir() {
       return options.handoffDir ?? paths(options.config).handoff
     },
@@ -499,6 +506,7 @@ export function createWorkspaces(options: WorkspacesOptions): DelegateWorkspaces
     boxSessions: ctx.boxSessions,
     box: ctx.box,
     host: ctx.host,
+    home: options.config.home,
     timeoutMs: ctx.timeouts.short,
     excludes: WORKSPACE_EXCLUDES,
     resolveRepo: (hostRepo: string) => resolveRepo(ctx, hostRepo),

@@ -451,3 +451,228 @@ describe("closeCandidates", () => {
     T,
   )
 })
+
+describe("#174 & #53 dynamic container resolution, cross-bridge orphan reclaim, and not_tracked cleanup", () => {
+  test(
+    "dynamic container resolution: mutating config.project after createWorkspaces updates boxProject dynamically",
+    async () => {
+      const dir = path.join(fx.tmp, "dyn-state")
+      const cfg = { ...defaultConfig({}), home: path.join(fx.tmp, "dyn-home"), roots: [fx.root], project: "opencode-delegate" }
+      const ws = fx.workspaces({ config: cfg, container: undefined, stateDir: dir })
+
+      // Simulate place() mutating config.project to a generation after createWorkspaces was wired
+      cfg.project = "opencode-delegate-g2"
+
+      await ws.open(fx.hostRepo, "dyn-001")
+      const bound = await ws.bindSession("dyn-001", {
+        sessionID: "ses_111111111111111111",
+        profile: "standard",
+        supervisor: SUPERVISOR,
+      })
+      expect(bound.boxProject).toBe("opencode-delegate-g2")
+
+      const out = await ws.closeSession(
+        "dyn-001",
+        { supervisor: SUPERVISOR, sessionID: "ses_111111111111111111" },
+        KEEP,
+        { stop: async () => {}, deleteSession: async () => "deleted" },
+      )
+      expect(out.closed).toBe(true)
+    },
+    T,
+  )
+
+  test(
+    "#174 closeCandidates and closeSession reclaim dead-bridge, legacy, retired-box, and not_tracked records while protecting live bridges",
+    async () => {
+      const dir = path.join(fx.tmp, "cand-reclaim")
+      const base = (await git(fx.hostRepo, ["rev-parse", "HEAD"])).trim()
+      const project = defaultConfig({}).project
+      const oldIso = new Date(Date.UTC(2026, 0, 1, 0, 0, 1)).toISOString()
+      const missingWorktree = path.join(fx.tmp, "missing-wt-dir")
+
+      // 1. Dead bridge record
+      writeHostState(dir, {
+        sessionKey: "rec-dead-bridge",
+        hostRepo: fx.hostRepo,
+        base,
+        createdAt: oldIso,
+        sessionID: "ses_000000000000000001",
+        supervisor: "supervisor:dead-bridge",
+        boxProject: project,
+      })
+      // 2. Live other bridge record -> must be protected
+      writeHostState(dir, {
+        sessionKey: "rec-live-bridge",
+        hostRepo: fx.hostRepo,
+        base,
+        createdAt: oldIso,
+        sessionID: "ses_000000000000000002",
+        supervisor: "supervisor:live-bridge",
+        boxProject: project,
+      })
+      // 3. Legacy record (boxProject: undefined)
+      writeHostState(dir, {
+        sessionKey: "rec-legacy",
+        hostRepo: fx.hostRepo,
+        base,
+        createdAt: oldIso,
+        sessionID: "ses_000000000000000003",
+        supervisor: "supervisor:dead-bridge",
+      })
+      // 4. Retired generation box with missing worktree (not_tracked)
+      writeHostState(dir, {
+        sessionKey: "rec-retired-box",
+        hostRepo: missingWorktree,
+        base,
+        createdAt: oldIso,
+        sessionID: "ses_000000000000000004",
+        supervisor: "supervisor:dead-bridge",
+        boxProject: "opencode-delegate-g2",
+      })
+      // 5. Unbound not_tracked record (no sessionID)
+      writeHostState(dir, {
+        sessionKey: "rec-unbound",
+        hostRepo: missingWorktree,
+        base,
+        createdAt: oldIso,
+        supervisor: SUPERVISOR,
+        boxProject: project,
+      })
+
+      const activeSupervisors = new Set<string>([SUPERVISOR, "supervisor:live-bridge"])
+      const inactiveBoxes = new Set<string>(["opencode-delegate-g2"])
+      const ws = fx.workspaces({ stateDir: dir })
+
+      const cands = await ws.closeCandidates(SUPERVISOR, new Date(Date.UTC(2026, 0, 10)), 20, {
+        activeSupervisors,
+        inactiveBoxes,
+        includeLegacy: true,
+        includeNotTracked: true,
+      })
+      expect(cands.states.map((s) => s.sessionKey)).toEqual([
+        "rec-dead-bridge",
+        "rec-legacy",
+        "rec-retired-box",
+        "rec-unbound",
+      ])
+      expect(cands.otherBridge).toBe(1)
+
+      // Live bridge record is still refused
+      expect(
+        await codeOf(
+          ws.closeSession(
+            "rec-live-bridge",
+            { supervisor: SUPERVISOR, sessionID: "ses_000000000000000002", activeSupervisors, inactiveBoxes, allowLegacyBox: true, allowNotTracked: true },
+            KEEP,
+            { stop: async () => {}, deleteSession: async () => "already_gone" },
+          ),
+        ),
+      ).toBe("not_found")
+
+      // Dead-bridge, legacy, retired-box, and not_tracked records are closed and removed cleanly
+      for (const st of cands.states) {
+        const res = await ws.closeSession(
+          st.sessionKey,
+          { supervisor: SUPERVISOR, sessionID: st.sessionID ?? "", activeSupervisors, inactiveBoxes, allowLegacyBox: true, allowNotTracked: true },
+          KEEP,
+          { stop: async () => {}, deleteSession: async () => "already_gone" },
+        )
+        expect(res.closed).toBe(true)
+        expect(existsSync(path.join(dir, `${st.sessionKey}.json`))).toBe(false)
+      }
+      expect(existsSync(path.join(dir, "rec-live-bridge.json"))).toBe(true)
+    },
+    T,
+  )
+
+  test(
+    "#53 pruneSessionStates prunes dead-bridge, legacy, and retired-generation records while respecting safety invariants",
+    async () => {
+      const dir = path.join(fx.tmp, "prune-reclaim")
+      const base = (await git(fx.hostRepo, ["rev-parse", "HEAD"])).trim()
+      const project = defaultConfig({}).project
+      const oldIso = new Date(Date.UTC(2026, 0, 1, 0, 0, 1)).toISOString()
+      const missingWorktree = path.join(fx.tmp, "missing-prune-wt")
+
+      // Eligible: dead supervisor, clone absent
+      writeHostState(dir, {
+        sessionKey: "p-dead-sup",
+        hostRepo: fx.hostRepo,
+        base,
+        createdAt: oldIso,
+        sessionID: "ses_000000000000000011",
+        supervisor: "supervisor:dead-bridge",
+        boxProject: project,
+      })
+      // Eligible: legacy record (boxProject undefined), clone absent
+      writeHostState(dir, {
+        sessionKey: "p-legacy",
+        hostRepo: fx.hostRepo,
+        base,
+        createdAt: oldIso,
+        sessionID: "ses_000000000000000012",
+        supervisor: SUPERVISOR,
+      })
+      // Eligible: retired generation box + missing host worktree
+      writeHostState(dir, {
+        sessionKey: "p-retired-gen",
+        hostRepo: missingWorktree,
+        base,
+        createdAt: oldIso,
+        sessionID: "ses_000000000000000013",
+        supervisor: "supervisor:dead-bridge",
+        boxProject: "opencode-delegate-g2",
+      })
+      // Ineligible: live foreign supervisor
+      writeHostState(dir, {
+        sessionKey: "p-live-sup",
+        hostRepo: fx.hostRepo,
+        base,
+        createdAt: oldIso,
+        sessionID: "ses_000000000000000014",
+        supervisor: "supervisor:live-other",
+        boxProject: project,
+      })
+      // Ineligible: hasActiveTurn = true
+      writeHostState(dir, {
+        sessionKey: "p-active-turn",
+        hostRepo: fx.hostRepo,
+        base,
+        createdAt: oldIso,
+        sessionID: "ses_000000000000000015",
+        supervisor: SUPERVISOR,
+        boxProject: project,
+      })
+      // Ineligible: in liveSessionIds
+      writeHostState(dir, {
+        sessionKey: "p-live-sid",
+        hostRepo: fx.hostRepo,
+        base,
+        createdAt: oldIso,
+        sessionID: "ses_000000000000000016",
+        supervisor: SUPERVISOR,
+        boxProject: project,
+      })
+
+      const ws = fx.workspaces({ stateDir: dir })
+      const pruned = await ws.pruneSessionStates(
+        SUPERVISOR,
+        async () => true,
+        () => false,
+        {
+          activeSupervisors: new Set<string>([SUPERVISOR, "supervisor:live-other"]),
+          hasActiveTurn: (sid) => sid === "ses_000000000000000015",
+          liveSessionIds: new Set<string>(["ses_000000000000000016"]),
+          isBoxRunning: async (boxProj) => boxProj !== "opencode-delegate-g2",
+        },
+      )
+
+      expect(pruned.sort()).toEqual(["p-dead-sup", "p-legacy", "p-retired-gen"])
+      expect(existsSync(path.join(dir, "p-live-sup.json"))).toBe(true)
+      expect(existsSync(path.join(dir, "p-active-turn.json"))).toBe(true)
+      expect(existsSync(path.join(dir, "p-live-sid.json"))).toBe(true)
+    },
+    T,
+  )
+})

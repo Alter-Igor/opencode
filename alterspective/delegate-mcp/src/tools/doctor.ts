@@ -2,11 +2,12 @@
 // starts the box (and never takes a lease) unless called with start:true; a box another bridge
 // started is read through its status() target. Names and errors the box reports are box data.
 import { z } from "zod"
-import { readdir, readFile, stat } from "node:fs/promises"
+import { readdir } from "node:fs/promises"
 import path from "node:path"
 import type { LiveChecks } from "../supervisor/live.ts"
 import type { SupervisorStatus } from "../supervisor/status.ts"
-import { processAlive } from "../supervisor/process.ts"
+import { sweepAllLeases } from "../supervisor/leases.ts"
+import { SESSION_KEY } from "../supervisor/workspaces-state.ts"
 import type { Verdict } from "../shared/contracts.ts"
 import type { McpStatus, OpencodeApi } from "../shared/opencode-api.ts"
 import { KS_NAME } from "../guard/entries.ts"
@@ -238,36 +239,30 @@ async function gateReport(ctx: ToolContext, connections: readonly string[], runn
 }
 
 /**
- * Bridge leases in this home (<home>/leases, one file per bridge): which bridges hold or held the
- * box, with PID, last heartbeat and liveness. An old lease of a dead or idle bridge explains log
- * spam and stale event streams (live finding 2026-10-10: two zombie bridges spammed "event stream
- * dropped" for days). Read-only; at most 20, newest heartbeat first; never throws.
+ * #265: Bridge leases across `<home>/leases` and `<home>/generations/<gen>/leases`.
+ * Sweeps dead-PID leases older than `LEASE_STALE_MS` (unless diagnostics-read-only due to ceiling mismatch),
+ * returning `{ count, pruned, items, leases }` capped at 20 newest heartbeats first.
  */
-async function leaseReport(home: string, nowMs: number = Date.now()): Promise<Record<string, unknown>> {
-  const dir = path.join(home, "leases")
+async function leaseReport(home: string, readOnly = false): Promise<Record<string, unknown>> {
   try {
-    const files = (await readdir(dir)).filter((name) => /^[A-Za-z0-9_-]{1,64}$/.test(name))
-    const items = await Promise.all(
-      files.map(async (name) => {
-        const file = path.join(dir, name)
-        const [text, st] = await Promise.all([readFile(file, "utf8").catch(() => undefined), stat(file).catch(() => undefined)])
-        const record = (text === undefined ? undefined : (JSON.parse(text) as { pid?: unknown; bridgeId?: unknown })) ?? {}
-        const pid = typeof record.pid === "number" ? record.pid : undefined
-        const heartbeatMs = st?.mtimeMs
-        return {
-          bridgeId: typeof record.bridgeId === "string" ? record.bridgeId : name,
-          ...(pid === undefined ? {} : { pid, alive: processAlive(pid) }),
-          heartbeat: heartbeatMs === undefined ? "unknown" : new Date(heartbeatMs).toISOString(),
-          idleSec: heartbeatMs === undefined ? undefined : Math.max(0, Math.floor((nowMs - heartbeatMs) / 1000)),
-        }
-      }),
-    )
-    const newestFirst = items.sort((a, b) => (a.idleSec ?? Number.MAX_SAFE_INTEGER) - (b.idleSec ?? Number.MAX_SAFE_INTEGER)).slice(0, 20)
-    return { count: items.length, leases: newestFirst }
-  } catch (error) {
-    // A home with no leases folder yet (never started a box) is empty, not unreadable.
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { count: 0, leases: [] }
+    const swept = await sweepAllLeases(home, { readOnly })
+    const items = swept.leases.slice(0, 20)
+    return { count: swept.leases.length, pruned: swept.pruned, items, leases: items }
+  } catch {
     return { unavailable: "the lease folder could not be read" }
+  }
+}
+
+async function sessionReport(ctx: ToolContext): Promise<{ trackedInProcess: number; hostRecordsTotal: number }> {
+  const dir = path.join(ctx.config.home, "workspaces")
+  const [diskNames, listed] = await Promise.all([
+    readdir(dir).catch(() => [] as string[]),
+    ctx.workspaces.listSessionStates().catch(() => []),
+  ])
+  const diskCount = diskNames.filter((name) => name.endsWith(".json") && SESSION_KEY.test(name.slice(0, -5))).length
+  return {
+    trackedInProcess: ctx.sessions.size,
+    hostRecordsTotal: Math.max(diskCount, listed.length),
   }
 }
 
@@ -295,11 +290,16 @@ export const doctorTool = defineTool({
     const synapse = await ctx.synapse.status()
     const keystoneAuth = await keystoneAuthReport(ctx, keystone, live)
     const gate = await gateReport(ctx, "connections" in keystone ? keystone.connections : [], status.state === "running")
-    const leases = await leaseReport(ctx.config.home)
+    const readOnlyLeases = status.state === "running" && (status.ceilingMismatch?.length ?? 0) > 0
+    const [leases, sessions] = await Promise.all([
+      leaseReport(ctx.config.home, readOnlyLeases),
+      sessionReport(ctx),
+    ])
     const verified = isVerified(status, mcp, verdict) && egress.ok && keystoneEntriesOk(keystone) && live?.ok === true && synapse.ok && (!keystoneAuth.enabled || keystoneAuth.ok) && gate.ok
     return ok(`${summaryOf(status, mcp, verdict, verified)} ${keystoneLine(keystone)}.${keystoneEntriesHint(keystone, ctx.keystone !== undefined)}${egressSummary(egress)}${liveSummary(live, keystoneAuth.enabled)}${synapseLine(synapse)}${keystoneAuthLine(keystoneAuth)}${gate.line}`, {
       verified,
       leases,
+      sessions,
       synapse,
       keystoneAuth,
       gate: gate.report,

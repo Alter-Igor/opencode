@@ -37,6 +37,9 @@ export type RemoteSession = {
   time?: { created?: number; updated?: number }
 }
 
+export type OwnedStateRecord = HostSessionState & { sessionID: string }
+export type PreloadedOwnedStates = ReadonlyArray<OwnedStateRecord> | ReadonlyMap<string, OwnedStateRecord>
+
 export function newSessionKey(): string {
   return `s-${randomBytes(5).toString("hex")}`
 }
@@ -123,13 +126,31 @@ export async function hostState(ctx: ToolContext, key: string): Promise<HostSess
 }
 
 /** Host records that name a session of THIS bridge. */
-export async function ownedStates(ctx: ToolContext): Promise<Array<HostSessionState & { sessionID: string }>> {
+export async function ownedStates(ctx: ToolContext): Promise<Array<OwnedStateRecord>> {
   const states: HostSessionState[] = await ctx.workspaces.listSessionStates().catch(() => [])
-  return states.filter((s): s is HostSessionState & { sessionID: string } => s.sessionID !== undefined && s.supervisor === ctx.supervisor)
+  return states.filter((s): s is OwnedStateRecord => s.sessionID !== undefined && s.supervisor === ctx.supervisor)
+}
+
+/** Build an O(1) lookup map indexed by `sessionID`, `boxSessionID`, and `sessionKey`. */
+export function indexOwnedStates(states: ReadonlyArray<OwnedStateRecord>): Map<string, OwnedStateRecord> {
+  const map = new Map<string, OwnedStateRecord>()
+  for (const state of states) {
+    if (!map.has(state.sessionID)) map.set(state.sessionID, state)
+    if (state.boxSessionID && !map.has(state.boxSessionID)) map.set(state.boxSessionID, state)
+    if (!map.has(state.sessionKey)) map.set(state.sessionKey, state)
+  }
+  return map
+}
+
+function lookupPreloaded(preloaded: PreloadedOwnedStates, idOrKey: string): OwnedStateRecord | undefined {
+  if (preloaded instanceof Map || "get" in preloaded) {
+    return (preloaded as ReadonlyMap<string, OwnedStateRecord>).get(idOrKey)
+  }
+  return (preloaded as ReadonlyArray<OwnedStateRecord>).find((item) => item.sessionID === idOrKey || item.boxSessionID === idOrKey || item.sessionKey === idOrKey)
 }
 
 /** A SessionRecord built only from the host record (the repo is re-checked against the roots). */
-export async function recordFromState(ctx: ToolContext, state: HostSessionState & { sessionID: string }): Promise<SessionRecord> {
+export async function recordFromState(ctx: ToolContext, state: OwnedStateRecord): Promise<SessionRecord> {
   return {
     sessionID: state.sessionID,
     sessionKey: state.sessionKey,
@@ -149,9 +170,10 @@ export async function recordFromState(ctx: ToolContext, state: HostSessionState 
 }
 
 /** Adopt a session the box has: the host record's caller id is `callerID`; the box id may be `boxSessionID`. */
-async function adopt(ctx: ToolContext, remote: RemoteSession, callerID: string): Promise<SessionRecord> {
+async function adopt(ctx: ToolContext, remote: RemoteSession, callerID: string, preloaded?: PreloadedOwnedStates): Promise<SessionRecord> {
   const key = typeof remote.metadata?.sessionKey === "string" ? remote.metadata.sessionKey : ""
-  const state = await hostState(ctx, key)
+  const fromPreloaded = preloaded && key ? lookupPreloaded(preloaded, key) : undefined
+  const state = fromPreloaded ?? (await hostState(ctx, key))
   const live = state?.boxSessionID ?? state?.sessionID
   if (!state || state.sessionID !== callerID || live !== remote.id || state.supervisor !== ctx.supervisor) throw notOurs(callerID, "no host record of this bridge names it", remote.parentID)
   if (remote.directory !== boxPathOf(state.sessionKey)) throw notOurs(callerID, "directory does not match its host record")
@@ -163,14 +185,23 @@ export type OwnedSession = { record: SessionRecord; remote?: RemoteSession }
 /**
  * The record for one of our sessions. Known sessions are returned as they are (with the remote
  * read when `read` is set); unknown ones are adopted only through the host record (see adopt).
+ * Pass `preloaded` (from `ownedStates(ctx)` / `indexOwnedStates(...)`) to perform an O(1) lookup
+ * without re-scanning `<home>/workspaces/*.json` on each session (#264).
  */
-export async function ownSession(ctx: ToolContext, box: Box, sessionID: string, correlationId: string, read = false): Promise<OwnedSession> {
+export async function ownSession(
+  ctx: ToolContext,
+  box: Box,
+  sessionID: string,
+  correlationId: string,
+  read = false,
+  preloaded?: PreloadedOwnedStates,
+): Promise<OwnedSession> {
   checkSessionId(sessionID)
   // #72: a session being closed is not handed to send, collect or any other tool meanwhile.
   if (isClosing(ctx, sessionID)) throw closingError(sessionID)
   const known = ctx.sessions.get(sessionID)
   if (known && !read) return { record: known }
-  const state = known ? undefined : (await ownedStates(ctx)).find((item) => item.sessionID === sessionID)
+  const state = known ? undefined : preloaded ? lookupPreloaded(preloaded, sessionID) : (await ownedStates(ctx)).find((item) => item.sessionID === sessionID)
   const live = known?.boxSessionID ?? state?.boxSessionID ?? sessionID
   const directory = known?.boxPath ?? (state ? boxPathOf(state.sessionKey) : undefined)
   const ours = known !== undefined || state !== undefined
@@ -182,7 +213,7 @@ export async function ownSession(ctx: ToolContext, box: Box, sessionID: string, 
     throw error
   }
   if (known) return { record: known, remote }
-  const record = await adopt(ctx, remote, sessionID)
+  const record = await adopt(ctx, remote, sessionID, preloaded)
   ctx.sessions.set(sessionID, record)
   box.hub.track(live, record.boxPath)
   ctx.log.log("info", "tools", "adopted session from its host record", { sessionID, sessionKey: record.sessionKey, correlationId })
