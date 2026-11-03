@@ -7,21 +7,140 @@
 // upgrade a readonly profile.
 import { randomBytes } from "node:crypto"
 import { z } from "zod"
+import { parseProfile, type Profile } from "../../mcp-gate/src/policy.ts"
 import type { Cursor } from "../shared/contracts.ts"
 import { DelegateError, isDelegateError } from "../shared/errors.ts"
+import { DYNAMIC_ID, readKeystoneSet } from "../shared/keystone.ts"
 import type { ApiTarget } from "../shared/opencode-api.ts"
 import { AGENT_RE, MODEL_RE, SESSION_ID_RE, SESSION_KEY, type HostSessionState, type SessionProfile } from "../supervisor/workspaces-state.ts"
 import type { Box, SessionRecord, ToolContext } from "./context.ts"
 import { closingError, isClosing } from "./closing.ts"
 
-export { AGENT_RE, MODEL_RE, SESSION_ID_RE, type SessionProfile }
+export { AGENT_RE, MODEL_RE, SESSION_ID_RE, type Profile, type SessionProfile }
 export const CORRELATION_RE = /^[A-Za-z0-9_.:-]{1,64}$/
 const CURSOR_RE = /^([A-Za-z0-9-]{1,64})\.(\d{1,15})$/
+const BUSY_STATES = new Set(["starting", "busy", "retry", "needs_input", "unknown"])
+const gateProfileLocks = new Map<string, Promise<unknown>>()
 
 export const sessionIdSchema = z.string().regex(SESSION_ID_RE, "a session id such as ses_0123456789abcdef")
 export const modelSchema = z.string().regex(MODEL_RE, "provider/model, for example synapse/auto")
 export const agentSchema = z.string().regex(AGENT_RE, "an agent name such as build or plan")
 export const cursorSchema = z.string().regex(CURSOR_RE, "a cursor returned by oc_send, oc_wait or oc_events")
+
+/** #124: per-task delegation profile narrowing Keystone /mcp/dynamic tool reach. */
+export const delegationProfileSchema = z
+  .object({
+    allowedToolPatterns: z.array(z.string()).optional().describe("Tool patterns this task may use (e.g. ['github__*', 'rag__*']). Empty array allows no tools."),
+    deniedToolPatterns: z.array(z.string()).optional().describe("Tool patterns this task may never use, even when allowed above."),
+    approvalRequiredToolPatterns: z.array(z.string()).optional().describe("Tool patterns that always require human approval."),
+    approvals: z.enum(["risky", "listed"]).optional().describe("'risky' (default): risky tools also wait for approval. 'listed': only approvalRequiredToolPatterns (never downgrades the owner's base profile)."),
+  })
+  .strict()
+
+export function parseDelegationProfile(value: unknown): Profile | undefined {
+  if (value === undefined) return undefined
+  try {
+    return parseProfile(JSON.stringify(value))
+  } catch (error) {
+    throw new DelegateError(
+      "invalid_input",
+      error instanceof Error ? `Invalid delegationProfile: ${error.message}.` : "Invalid delegationProfile.",
+      "Pass a valid delegationProfile with allowedToolPatterns, deniedToolPatterns, approvalRequiredToolPatterns, and/or approvals ('risky' | 'listed').",
+    )
+  }
+}
+
+/**
+ * #124: serialize `[applyTaskProfile -> request acceptance]` across the shared gate identity
+ * (`ctx.config.project`) so two concurrent starts or sends cannot both pass the idle check before
+ * either marks its session active or updates the gate profile.
+ */
+export async function withGateProfileLock<T>(ctx: ToolContext, work: () => Promise<T>): Promise<T> {
+  const key = ctx.config.project || "opencode-delegate"
+  const prev = gateProfileLocks.get(key) ?? Promise.resolve()
+  let release!: () => void
+  const current = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const tail = prev.then(
+    () => current,
+    () => current,
+  )
+  gateProfileLocks.set(key, tail)
+  await prev.catch(() => undefined)
+  try {
+    return await work()
+  } finally {
+    release()
+    if (gateProfileLocks.get(key) === tail) {
+      gateProfileLocks.delete(key)
+    }
+  }
+}
+
+export async function applyTaskProfile(
+  ctx: ToolContext,
+  box: Box,
+  delegationProfile: Profile | undefined,
+  currentSessionID?: string,
+): Promise<void> {
+  if (ctx.config.backend === "remote") {
+    if (delegationProfile !== undefined) {
+      throw new DelegateError(
+        "invalid_input",
+        "Per-task delegationProfile is not supported on the remote backend.",
+        "Omit delegationProfile when running against the remote backend, or use the local Docker sandbox.",
+      )
+    }
+    return
+  }
+  const states = typeof ctx.config.home === "string" ? await ctx.workspaces.listSessionStates(Number.MAX_SAFE_INTEGER, { strict: true }) : []
+  const known = new Map<string, { sessionID: string; boxSessionID?: string; delegationProfile?: Profile }>()
+  for (const s of states) {
+    if (!s.sessionID) continue
+    if (s.boxProject && s.boxProject !== ctx.config.project) continue
+    known.set(s.sessionID, {
+      sessionID: s.sessionID,
+      ...(s.boxSessionID ? { boxSessionID: s.boxSessionID } : {}),
+      ...(s.delegationProfile ? { delegationProfile: s.delegationProfile } : {}),
+    })
+  }
+  for (const rec of ctx.sessions.values()) {
+    const prev = known.get(rec.sessionID)
+    known.set(rec.sessionID, {
+      sessionID: rec.sessionID,
+      ...(rec.boxSessionID ?? prev?.boxSessionID ? { boxSessionID: rec.boxSessionID ?? prev?.boxSessionID } : {}),
+      ...(rec.delegationProfile ?? prev?.delegationProfile ? { delegationProfile: rec.delegationProfile ?? prev?.delegationProfile } : {}),
+    })
+  }
+  let anyProfiledSession = delegationProfile !== undefined
+  for (const existing of known.values()) {
+    if (existing.delegationProfile !== undefined) anyProfiledSession = true
+    if (existing.sessionID === currentSessionID) continue
+    if (delegationProfile === undefined && existing.delegationProfile === undefined) continue
+    const view = await box.hub.view(existing.boxSessionID ?? existing.sessionID)
+    if (!BUSY_STATES.has(view.state)) continue
+    throw new DelegateError(
+      "directory_busy",
+      `Session ${existing.sessionID} is still active (${view.state}) while a per-task delegationProfile is in use.`,
+      "Wait for the active session with oc_wait or stop it with oc_abort before starting or sending to another session.",
+      `profiled overlap with ${existing.sessionID} (${view.state})`,
+    )
+  }
+  const dynamicEnabled =
+    typeof ctx.config.home === "string" &&
+    readKeystoneSet(ctx.config.home, ctx.config.keystoneConnections).connections.includes(DYNAMIC_ID)
+  if (!anyProfiledSession && !dynamicEnabled) return
+  if (!ctx.gate?.setTaskProfile) {
+    throw new DelegateError(
+      "sandbox_unavailable",
+      "The delegation gate is not available to enforce this session's delegationProfile.",
+      "Run oc_doctor or restart the sandbox with oc_server_restart.",
+      "gate.setTaskProfile unavailable",
+    )
+  }
+  await ctx.gate.setTaskProfile(delegationProfile ?? null)
+}
 
 /** Session metadata the bridge writes on POST /session: a lookup key for the host record, nothing more. */
 export type SessionMetadata = { supervisor: string; sessionKey: string }
@@ -163,6 +282,7 @@ export async function recordFromState(ctx: ToolContext, state: OwnedStateRecord)
     ...(state.model ? { model: state.model } : {}),
     ...(state.agent ? { agent: state.agent } : {}),
     ...(state.keystone ? { keystone: state.keystone } : {}),
+    ...(state.delegationProfile ? { delegationProfile: state.delegationProfile } : {}),
     ...(state.caller ? { caller: state.caller } : {}),
     ...(state.allowedPaths ? { allowedPaths: state.allowedPaths } : {}),
     ...(state.boxSessionID ? { boxSessionID: state.boxSessionID } : {}),

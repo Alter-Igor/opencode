@@ -10,7 +10,21 @@ import { DelegateError } from "../shared/errors.ts"
 import type { Box, SessionRecord, ToolContext } from "./context.ts"
 import { readInstructions, type Instructions } from "./core-box.ts"
 import { closingError, isClosing } from "./closing.ts"
-import { CORRELATION_RE, agentSchema, formatCursor, liveSessionID, modelSchema, ownSession, parseModel, requireSynapseModel, sameRules, sessionGone, sessionIdSchema } from "./core-session.ts"
+import {
+  CORRELATION_RE,
+  agentSchema,
+  applyTaskProfile,
+  formatCursor,
+  liveSessionID,
+  modelSchema,
+  ownSession,
+  parseModel,
+  requireSynapseModel,
+  sameRules,
+  sessionGone,
+  sessionIdSchema,
+  withGateProfileLock,
+} from "./core-session.ts"
 import { DEFAULT_MODEL, SYNAPSE_PROVIDER } from "../supervisor/profile.ts"
 import { defineTool } from "./define.ts"
 import { boxDefault, fetchModels, pickRoleModel, requireModel } from "./models.ts"
@@ -71,23 +85,29 @@ export async function sendPrompt(ctx: ToolContext, box: Box, record: SessionReco
     ...(agent ? { agent } : {}),
     ...(instructions.system ? { system: instructions.system } : {}),
   }
-  // Combined review: a close may have started while this send waited (the default-model read, the
-  // instructions read). Checked again with no await before the POST, so it reaches no closing session.
-  if (isClosing(ctx, record.sessionID)) throw closingError(record.sessionID)
-  const cursor = box.hub.cursor()
-  // #73: the run's start for the task record, taken before the POST (a fast run can settle during it).
-  const sendStartedAt = new Date().toISOString()
-  const live = liveSessionID(record)
-  // #252: the send boundary, recorded before the POST so an error that beats the 204 is this prompt's.
-  box.hub.sendStarting?.(live)
-  const res = await box.api.call({ method: "POST", path: `/session/${encodeURIComponent(live)}/prompt_async`, directory: record.boxPath, body, correlationId: prompt.correlationId })
-  if (res.status === 404) throw sessionGone(record.sessionID)
-  if (res.status < 200 || res.status >= 300) throw new DelegateError("upstream_error", "The delegate server did not accept the message.", "Check oc_status, then retry.", `HTTP ${res.status}`)
-  box.hub.markSent(live)
-  // #73: metadata only (the model and agent sent); the prompt text never reaches the record.
-  recordSend(ctx, record, { model, agent, at: sendStartedAt })
-  ctx.log.log("info", "tools", "prompt sent", { sessionID: record.sessionID, correlationId: prompt.correlationId, instructions: instructions.files.join(","), instructionsTruncated: instructions.truncated, instructionsFailed: (instructions.failed ?? []).join(","), savedModelFallback: saved.fallback !== undefined })
-  return { cursor: formatCursor(cursor), instructions, ...(saved.fallback ? { modelFallback: saved.fallback } : {}) }
+  return withGateProfileLock(ctx, async () => {
+    // #124: apply (or clear) this session's per-task delegation profile on the gate inside the
+    // per-project serialization lock right before prompt_async + markSent so concurrent sends
+    // cannot pass the idle check together and overwrite each other's gate profile.
+    await applyTaskProfile(ctx, box, record.delegationProfile, record.sessionID)
+    // Combined review: a close may have started while this send waited (the default-model read, the
+    // instructions read). Checked again with no await before the POST, so it reaches no closing session.
+    if (isClosing(ctx, record.sessionID)) throw closingError(record.sessionID)
+    const cursor = box.hub.cursor()
+    // #73: the run's start for the task record, taken before the POST (a fast run can settle during it).
+    const sendStartedAt = new Date().toISOString()
+    const live = liveSessionID(record)
+    // #252: the send boundary, recorded before the POST so an error that beats the 204 is this prompt's.
+    box.hub.sendStarting?.(live)
+    const res = await box.api.call({ method: "POST", path: `/session/${encodeURIComponent(live)}/prompt_async`, directory: record.boxPath, body, correlationId: prompt.correlationId })
+    if (res.status === 404) throw sessionGone(record.sessionID)
+    if (res.status < 200 || res.status >= 300) throw new DelegateError("upstream_error", "The delegate server did not accept the message.", "Check oc_status, then retry.", `HTTP ${res.status}`)
+    box.hub.markSent(live)
+    // #73: metadata only (the model and agent sent); the prompt text never reaches the record.
+    recordSend(ctx, record, { model, agent, at: sendStartedAt })
+    ctx.log.log("info", "tools", "prompt sent", { sessionID: record.sessionID, correlationId: prompt.correlationId, instructions: instructions.files.join(","), instructionsTruncated: instructions.truncated, instructionsFailed: (instructions.failed ?? []).join(","), savedModelFallback: saved.fallback !== undefined })
+    return { cursor: formatCursor(cursor), instructions, ...(saved.fallback ? { modelFallback: saved.fallback } : {}) }
+  })
 }
 
 function instructionReport(i: Instructions): Record<string, unknown> {

@@ -8,7 +8,7 @@
 // So the gate decides on `arguments.toolName` of execute-tool and get-tool-schema, and removes
 // tools the profile hides from search-tools results. Any other tools/call name is decided as a tool
 // name itself (fail closed if Keystone ever serves real tools directly).
-import { decide, isVisible, type Decision, type Profile } from "./policy.ts"
+import { decideWithNarrowing, isVisibleWithNarrowing, type Decision, type Profile } from "./policy.ts"
 
 export const META_TOOLS = new Set(["search-tools", "get-tool-schema", "execute-tool"])
 /** Responses the gate rewrites are buffered; anything bigger is refused rather than passed unchecked. */
@@ -16,6 +16,7 @@ export const MAX_FILTER_BYTES = 4 * 1024 * 1024
 
 export type JsonRpcId = string | number | null
 export type Message = { jsonrpc?: string; id?: JsonRpcId; method?: string; params?: unknown; result?: unknown; error?: unknown }
+export type TaskProfile = Profile | readonly (Profile | undefined)[] | undefined
 
 /** What the gate must do with one POSTed message. */
 export type Plan =
@@ -28,7 +29,7 @@ const record = (value: unknown): Record<string, unknown> | undefined =>
   value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined
 
 /** The plan for one parsed JSON-RPC message. */
-export function planMessage(profile: Profile, message: Message): Plan {
+export function planMessage(profile: Profile, message: Message, taskProfile?: TaskProfile): Plan {
   if (message.method === "tools/list" && message.id !== undefined) return { kind: "filter", id: message.id, what: "list" }
   if (message.method !== "tools/call") return { kind: "forward" }
   const params = record(message.params) ?? {}
@@ -41,10 +42,14 @@ export function planMessage(profile: Profile, message: Message): Plan {
     const schemaOnly = name === "get-tool-schema"
     if (toolName === "") return { kind: "decide", id, toolName: "(none)", args: {}, decision: { effect: "deny", reason: "no toolName given" }, schemaOnly }
     // Reading a schema changes nothing, so it only needs the tool to be visible.
-    const decision = schemaOnly ? (isVisible(profile, toolName) ? ({ effect: "allow" } as const) : decide(profile, toolName)) : decide(profile, toolName)
+    const decision = schemaOnly
+      ? isVisibleWithNarrowing(profile, taskProfile, toolName)
+        ? ({ effect: "allow" } as const)
+        : decideWithNarrowing(profile, taskProfile, toolName)
+      : decideWithNarrowing(profile, taskProfile, toolName)
     return { kind: "decide", id, toolName, args: args.arguments ?? {}, decision, schemaOnly }
   }
-  return { kind: "decide", id, toolName: name, args: params.arguments ?? {}, decision: decide(profile, name), schemaOnly: false }
+  return { kind: "decide", id, toolName: name, args: params.arguments ?? {}, decision: decideWithNarrowing(profile, taskProfile, name), schemaOnly: false }
 }
 
 /** A tool result that tells the model the call did not run, and why. */
@@ -53,7 +58,7 @@ export function toolError(id: JsonRpcId, text: string): Message {
 }
 
 /** search-tools text content with hidden tools removed. Unreadable text is replaced, never passed. */
-function filterSearchText(profile: Profile, text: string): string {
+export function filterSearchText(profile: Profile, text: string, taskProfile?: TaskProfile): string {
   let parsed: unknown
   try {
     parsed = JSON.parse(text)
@@ -64,7 +69,7 @@ function filterSearchText(profile: Profile, text: string): string {
   if (body === undefined || !Array.isArray(body.tools)) return JSON.stringify({ tools: [], note: "The delegation gate could not read this search result, so it was withheld." })
   const tools = body.tools.filter((tool) => {
     const name = record(tool)?.name
-    return typeof name === "string" && isVisible(profile, name)
+    return typeof name === "string" && isVisibleWithNarrowing(profile, taskProfile, name)
   })
   const hidden = body.tools.length - tools.length
   const services = Array.isArray(body.services)
@@ -72,7 +77,7 @@ function filterSearchText(profile: Profile, text: string): string {
         .map((service) => {
           const s = record(service)
           if (s === undefined) return undefined
-          const names = Array.isArray(s.tools) ? s.tools.filter((n) => typeof n === "string" && isVisible(profile, n)) : []
+          const names = Array.isArray(s.tools) ? s.tools.filter((n) => typeof n === "string" && isVisibleWithNarrowing(profile, taskProfile, n)) : []
           return names.length === 0 ? undefined : { ...s, tools: names, toolCount: names.length }
         })
         .filter((s) => s !== undefined)
@@ -86,20 +91,20 @@ function filterSearchText(profile: Profile, text: string): string {
 }
 
 /** The response message with hidden tools removed (search-tools text, or tools/list tools). */
-export function filterResult(profile: Profile, message: Message, what: "search" | "list"): Message {
+export function filterResult(profile: Profile, message: Message, what: "search" | "list", taskProfile?: TaskProfile): Message {
   const result = record(message.result)
   if (result === undefined) return message
   if (what === "list") {
     const tools = Array.isArray(result.tools) ? result.tools.filter((t) => {
       const name = record(t)?.name
-      return typeof name === "string" && (META_TOOLS.has(name) || isVisible(profile, name))
+      return typeof name === "string" && (META_TOOLS.has(name) || isVisibleWithNarrowing(profile, taskProfile, name))
     }) : result.tools
     return { ...message, result: { ...result, tools } }
   }
   const content = Array.isArray(result.content)
     ? result.content.map((part) => {
         const p = record(part)
-        return p?.type === "text" && typeof p.text === "string" ? { ...p, text: filterSearchText(profile, p.text) } : part
+        return p?.type === "text" && typeof p.text === "string" ? { ...p, text: filterSearchText(profile, p.text, taskProfile) } : part
       })
     : result.content
   return { ...message, result: { ...result, content } }

@@ -6,12 +6,13 @@
 // metadata is only a lookup key. Files are written whole (temp file + rename) and validated on read.
 import { mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs"
 import path from "node:path"
+import { parseProfile, type Profile } from "../../mcp-gate/src/policy.ts"
 import { PROJECT_RE } from "../shared/config.ts"
 import { SESSION_ID_RE } from "../shared/contracts.ts"
 import { DelegateError } from "../shared/errors.ts"
 import { CONNECTION_ID, MAX_CONNECTIONS } from "../shared/keystone.ts"
 
-export { SESSION_ID_RE }
+export { SESSION_ID_RE, type Profile }
 
 export const SESSION_KEY = /^[a-z0-9-]{4,64}$/
 /** A full commit id: SHA-1 (40 hex) or, for sha256 repositories, 64 hex. */
@@ -39,6 +40,8 @@ export type HostSessionState = {
   agent?: string
   /** R4-01: the Keystone connections the session was narrowed to; absent = the whole box-wide set. */
   keystone?: string[]
+  /** #124: per-task delegation profile narrowing Keystone /mcp/dynamic tool reach; never widens the owner's profile. */
+  delegationProfile?: Profile
   /** #146: which caller started the session (callerName); for filtering and caller isolation. */
   caller?: string
   /** #148: allowed file path globs; oc_result flags files touched outside these patterns. */
@@ -56,12 +59,33 @@ export type HostSessionState = {
 }
 
 /** Written by oc_start_session right after POST /session; the workspaces layer adds `boxProject`. */
-export type SessionBinding = { sessionID: string; profile: SessionProfile; supervisor: string; model?: string; agent?: string; keystone?: string[]; boxProject?: string; caller?: string; allowedPaths?: string[] }
+export type SessionBinding = {
+  sessionID: string
+  profile: SessionProfile
+  supervisor: string
+  model?: string
+  agent?: string
+  keystone?: string[]
+  delegationProfile?: Profile
+  boxProject?: string
+  caller?: string
+  allowedPaths?: string[]
+}
 
 /** A valid narrowing list (each a connection id, bounded), or undefined. */
 function keystoneList(value: unknown): string[] | undefined {
   if (!Array.isArray(value) || value.length > MAX_CONNECTIONS) return undefined
   return value.every((id) => typeof id === "string" && CONNECTION_ID.test(id)) ? (value as string[]) : undefined
+}
+
+/** Validate a per-task delegation profile object via parseProfile; undefined when malformed. */
+function validDelegationProfile(value: unknown): Profile | undefined {
+  if (value === undefined || value === null || typeof value !== "object" || Array.isArray(value)) return undefined
+  try {
+    return parseProfile(JSON.stringify(value))
+  } catch {
+    return undefined
+  }
 }
 
 const errno = (error: unknown) => (error as NodeJS.ErrnoException | undefined)?.code ?? "unknown"
@@ -86,6 +110,9 @@ export function parseHostState(raw: string, key: string): HostSessionState | und
   const hostRepo = str(p.hostRepo)
   const base = optional(p.base, COMMIT_ID)
   if (!hostRepo || !base) return undefined
+  // #124: if a narrowing delegationProfile is present on disk and damaged, fail closed so it never widens access.
+  const delegationProfile = p.delegationProfile !== undefined ? validDelegationProfile(p.delegationProfile) : undefined
+  if (p.delegationProfile !== undefined && delegationProfile === undefined) return undefined
   const createdAt = optional(p.createdAt, ISO_RE) ?? new Date(0).toISOString()
   const state: HostSessionState = { sessionKey: key, hostRepo, base, createdAt }
   const sessionID = optional(p.sessionID, SESSION_ID_RE)
@@ -101,7 +128,17 @@ export function parseHostState(raw: string, key: string): HostSessionState | und
   const boxSessionID = optional(p.boxSessionID, SESSION_ID_RE)
   const caller = str(p.caller)?.slice(0, 128)
   const allowedPaths = Array.isArray(p.allowedPaths) ? p.allowedPaths.filter((s): s is string => typeof s === "string") : undefined
-  return { ...state, ...(model ? { model } : {}), ...(agent ? { agent } : {}), ...(keystone ? { keystone } : {}), ...(boxProject ? { boxProject } : {}), ...(boxSessionID ? { boxSessionID } : {}), ...(caller ? { caller } : {}), ...(allowedPaths ? { allowedPaths } : {}) }
+  return {
+    ...state,
+    ...(model ? { model } : {}),
+    ...(agent ? { agent } : {}),
+    ...(keystone ? { keystone } : {}),
+    ...(delegationProfile ? { delegationProfile } : {}),
+    ...(boxProject ? { boxProject } : {}),
+    ...(boxSessionID ? { boxSessionID } : {}),
+    ...(caller ? { caller } : {}),
+    ...(allowedPaths ? { allowedPaths } : {}),
+  }
 }
 
 function checkState(state: HostSessionState): void {
@@ -113,6 +150,7 @@ function checkState(state: HostSessionState): void {
     (state.model !== undefined && !MODEL_RE.test(state.model)) ||
     (state.agent !== undefined && !AGENT_RE.test(state.agent)) ||
     (state.keystone !== undefined && keystoneList(state.keystone) === undefined) ||
+    (state.delegationProfile !== undefined && validDelegationProfile(state.delegationProfile) === undefined) ||
     (state.boxProject !== undefined && !PROJECT_RE.test(state.boxProject)) ||
     (state.boxSessionID !== undefined && !SESSION_ID_RE.test(state.boxSessionID)) ||
     (state.caller !== undefined && typeof state.caller !== "string") ||
@@ -156,8 +194,8 @@ export function readHostState(dir: string, key: string): HostSessionState | unde
   )
 }
 
-/** Every readable record (damaged ones are skipped), newest first. The default cap is the display list. */
-export function listHostStates(dir: string, limit = MAX_LISTED_STATES): HostSessionState[] {
+/** Every readable record (damaged ones are skipped unless options.strict is true), newest first. The default cap is the display list. */
+export function listHostStates(dir: string, limit = MAX_LISTED_STATES, options?: { strict?: boolean }): HostSessionState[] {
   let names: string[]
   try {
     names = readdirSync(dir).filter((n) => n.endsWith(".json"))
@@ -170,7 +208,8 @@ export function listHostStates(dir: string, limit = MAX_LISTED_STATES): HostSess
     try {
       const state = readHostState(dir, name.slice(0, -".json".length))
       if (state) states.push(state)
-    } catch {
+    } catch (error) {
+      if (options?.strict) throw error
       // damaged or unreadable: not listed (readHostState reports it when the key is asked for)
     }
   }

@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test"
 import type { Config, PluginInput } from "@opencode-ai/plugin"
-import { DOCS_COMMAND, DOCS_SYSTEM_LINE, DOCS_TEMPLATE, OpencodealtDocsPlugin } from "../../src/plugin/opencodealt-docs"
+import {
+  DOCS_COMMAND,
+  DOCS_SYSTEM_LINE,
+  DOCS_TEMPLATE,
+  HEADLESS_WATCHER_GUIDANCE,
+  OpencodealtDocsPlugin,
+} from "../../src/plugin/opencodealt-docs"
 import { OPENCODEALT_DOCS_URL } from "../../src/installation/opencodealt"
 
 const plugin = () => OpencodealtDocsPlugin({} as PluginInput)
@@ -35,5 +41,14 @@ describe("opencodealt docs plugin (#90)", () => {
     const output = { system: ["generate an agent"] }
     await hooks["experimental.chat.system.transform"]?.({ model: {} as never }, output)
     expect(output.system).toEqual(["generate an agent"])
+  })
+
+  test("includes headless execution and launcher PID watcher guidance (#261)", () => {
+    expect(HEADLESS_WATCHER_GUIDANCE).toContain("opencodealt run")
+    expect(HEADLESS_WATCHER_GUIDANCE).toContain("-p")
+    expect(HEADLESS_WATCHER_GUIDANCE).toContain("opencodealt.bat")
+    expect(HEADLESS_WATCHER_GUIDANCE).toContain("oc_status")
+    expect(DOCS_SYSTEM_LINE).toContain(HEADLESS_WATCHER_GUIDANCE)
+    expect(DOCS_TEMPLATE).toContain(HEADLESS_WATCHER_GUIDANCE)
   })
 })

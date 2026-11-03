@@ -4,6 +4,7 @@
 import { z } from "zod"
 import { DelegateError } from "../shared/errors.ts"
 import type { ToolContext } from "./context.ts"
+import { delegationProfileSchema } from "./core-session.ts"
 import { defineTool } from "./define.ts"
 import { ok, untrusted } from "./shape.ts"
 import { startSessionTool } from "./sessions.ts"
@@ -42,6 +43,9 @@ export const delegateTaskInput = {
     .max(1_800_000)
     .optional()
     .describe("Maximum execution timeout in milliseconds (default: 300,000 = 5m, max: 1,800,000 = 30m)."),
+  delegationProfile: delegationProfileSchema
+    .optional()
+    .describe("Optional per-task delegation profile (#124) narrowing Keystone /mcp/dynamic tool reach for this task. Can only narrow the owner's profile, never widen it."),
 }
 
 export const delegateTaskTool = defineTool({
@@ -68,12 +72,13 @@ export const delegateTaskTool = defineTool({
         "Leave engine unset (or 'auto') and pass a DeepSeek model as `model`, e.g. one from code_list_models.",
       )
 
-    // 1. Start Session (allowShared: true to avoid blocking on concurrent runs)
+    // 1. Start Session (allowShared is disabled when a per-task delegationProfile is set)
     const startRes = await startSessionTool.run(
       {
         directory: args.directory,
-        allowShared: true,
+        allowShared: args.delegationProfile === undefined,
         model: args.model,
+        ...(args.delegationProfile ? { delegationProfile: args.delegationProfile } : {}),
       },
       ctx,
       correlationId,

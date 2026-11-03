@@ -17,14 +17,37 @@ import type { OpenedWorkspace } from "../supervisor/workspaces.ts"
 import { samePath } from "../supervisor/workspaces-exec.ts"
 import type { Box, SessionRecord, ToolContext } from "./context.ts"
 import { refuseBusy } from "./core-box.ts"
-import { SESSION_ID_RE, agentSchema, modelSchema, newSessionKey, ownSession, sessionIdSchema, webUrl, type SessionMetadata } from "./core-session.ts"
+import {
+  SESSION_ID_RE,
+  agentSchema,
+  applyTaskProfile,
+  delegationProfileSchema,
+  modelSchema,
+  newSessionKey,
+  ownSession,
+  parseDelegationProfile,
+  sessionIdSchema,
+  webUrl,
+  withGateProfileLock,
+  type Profile,
+  type SessionMetadata,
+} from "./core-session.ts"
 import { defineTool } from "./define.ts"
 import { fetchModels, pickRoleModel, requireModel } from "./models.ts"
 import { ok } from "./shape.ts"
 
 export { listSessionsTool, statusTool } from "./sessions-list.ts"
 
-type StartArgs = { directory: string; title?: string; agent?: string; model?: string; profile?: "standard" | "readonly"; allowShared?: boolean; keystone?: string[] }
+type StartArgs = {
+  directory: string
+  title?: string
+  agent?: string
+  model?: string
+  profile?: "standard" | "readonly"
+  allowShared?: boolean
+  keystone?: string[]
+  delegationProfile?: Profile
+}
 
 /** The narrowing list, checked to be a subset of the box-wide set in force now; undefined = no narrowing. */
 export function sessionKeystone(ctx: ToolContext, requested: readonly string[] | undefined): string[] | undefined {
@@ -80,16 +103,24 @@ async function startIn(ctx: ToolContext, box: Box, args: StartArgs, ws: OpenedWo
   const profile = args.profile ?? "standard"
   let sessionID: string | undefined
   try {
-    sessionID = await createSession(ctx, box, args, ws, correlationId)
-    const extra = {
-      ...(args.model ? { model: args.model } : {}),
-      ...(args.agent ? { agent: args.agent } : {}),
-      ...(args.keystone ? { keystone: args.keystone } : {}),
-      ...(ctx.caller ? { caller: ctx.caller } : {}),
-    }
-    const state = await ctx.workspaces.bindSession(ws.sessionKey, { sessionID, profile, supervisor: ctx.supervisor, ...extra })
-    return { sessionID, sessionKey: ws.sessionKey, hostRepo: ws.hostRepo, boxPath: ws.boxPath, branch: ws.branch, profile, createdAt: state.createdAt, base: ws.base, ...extra }
+    return await withGateProfileLock(ctx, async () => {
+      await applyTaskProfile(ctx, box, args.delegationProfile)
+      sessionID = await createSession(ctx, box, args, ws, correlationId)
+      const extra = {
+        ...(args.model ? { model: args.model } : {}),
+        ...(args.agent ? { agent: args.agent } : {}),
+        ...(args.keystone ? { keystone: args.keystone } : {}),
+        ...(args.delegationProfile ? { delegationProfile: args.delegationProfile } : {}),
+        ...(ctx.caller ? { caller: ctx.caller } : {}),
+      }
+      const state = await ctx.workspaces.bindSession(ws.sessionKey, { sessionID, profile, supervisor: ctx.supervisor, ...extra })
+      const record: SessionRecord = { sessionID, sessionKey: ws.sessionKey, hostRepo: ws.hostRepo, boxPath: ws.boxPath, branch: ws.branch, profile, createdAt: state.createdAt, base: ws.base, ...extra }
+      ctx.sessions.set(record.sessionID, record)
+      box.hub.track(record.sessionID, ws.boxPath)
+      return record
+    })
   } catch (error) {
+    if (sessionID) ctx.sessions.delete(sessionID)
     await abandon(ctx, box, ws, sessionID, correlationId)
     throw error
   }
@@ -114,9 +145,27 @@ export const startSessionTool = defineTool({
       .max(MAX_CONNECTIONS)
       .optional()
       .describe("Only these Keystone connections' tools for this session (a subset of the sandbox's set; see oc_list_models). A convenience, not a security boundary. Default: all of the sandbox's set."),
+    delegationProfile: delegationProfileSchema
+      .optional()
+      .describe("Optional per-task delegation profile (#124) narrowing Keystone /mcp/dynamic tool reach for this session. Can only narrow the owner's profile, never widen it."),
   },
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   async run(args, ctx, correlationId) {
+    const delegationProfile = parseDelegationProfile(args.delegationProfile)
+    if (delegationProfile !== undefined && ctx.config.backend === "remote") {
+      throw new DelegateError(
+        "invalid_input",
+        "Per-task delegationProfile is not supported on the remote backend.",
+        "Omit delegationProfile when running against the remote backend, or use the local Docker sandbox.",
+      )
+    }
+    if (delegationProfile !== undefined && args.allowShared === true) {
+      throw new DelegateError(
+        "invalid_input",
+        "allowShared cannot be used with delegationProfile because the delegation gate enforces one task profile across the sandbox at a time.",
+        "Omit allowShared (or set allowShared: false) when passing delegationProfile.",
+      )
+    }
     const hostRepo = await ctx.workspaces.resolveRepo(args.directory)
     const keystone = ctx.config.backend === "remote" ? undefined : sessionKeystone(ctx, args.keystone)
     if (!args.allowShared) await refuseBusy(ctx, hostRepo, samePath)
@@ -139,13 +188,12 @@ export const startSessionTool = defineTool({
       }
     }
     const ws = await ctx.workspaces.open(hostRepo, newSessionKey())
-    const record = await startIn(ctx, box, { ...args, model, keystone }, ws, correlationId)
-    ctx.sessions.set(record.sessionID, record)
-    box.hub.track(record.sessionID, ws.boxPath)
+    const record = await startIn(ctx, box, { ...args, model, keystone, delegationProfile }, ws, correlationId)
     recordStart(ctx, record)
     return ok(`Session ${record.sessionID} started on ${ws.branch}. Next: oc_send, then oc_wait.${taskPick && "model" in taskPick ? ` Model for role "${taskPick.role}": ${taskPick.model} (Synapse fit ${taskPick.score.toFixed(2)}).` : ""}`, {
       sessionID: record.sessionID, sessionKey: ws.sessionKey, branch: ws.branch, boxPath: ws.boxPath, hostRepo: ws.hostRepo, profile: record.profile, base: ws.base,
       ...(keystone ? { keystone } : {}),
+      ...(delegationProfile ? { delegationProfile } : {}),
       ...(taskPick ? { taskPick } : {}),
       webUrl: webUrl(box.target, ws.boxPath, record.sessionID),
     })
