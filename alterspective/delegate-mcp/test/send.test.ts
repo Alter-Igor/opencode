@@ -49,6 +49,8 @@ describe("#263: preflight and failed-send cleanup", () => {
     expect(outside.code).toBe("directory_invalid")
     expect(outside.action).toContain("C:\\GitHub")
     expect(outside.action).toContain("OPENCODE_DELEGATE_ROOTS")
+    expect(outside.action).toContain("C:\\GitHub;X:\\")
+    expect(outside.action).toContain("restart the MCP client")
 
     const invalid = invalidFolder(["C:\\GitHub"], "The folder is not a git work tree.", "C:\\GitHub\\not-git")
     expect(invalid.code).toBe("directory_invalid")
