@@ -18,6 +18,7 @@ import {
   stopGoalLoop,
 } from "../plugin/goal-loop"
 import { Config } from "@/config/config"
+import { runningPromotedTask } from "./task-check-in"
 import { Effect, Exit, Schema, Scope } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -461,7 +462,7 @@ export const TaskTool = Tool.define(
               background.wait({ id: nextSession.id }).pipe(Effect.map((waited) => waited.info)),
               background.waitForPromotion(nextSession.id),
             )
-            if (result?.metadata?.background === true && result.status === "running") return promotedResult(result.status)
+            if (runningPromotedTask(result)) return promotedResult(result?.status)
             if (result?.status === "error") return yield* Effect.fail(new Error(result.error ?? "Task failed"))
             if (result?.status === "cancelled") return yield* Effect.fail(new Error("Task cancelled"))
             return {

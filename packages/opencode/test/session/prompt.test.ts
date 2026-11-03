@@ -1609,6 +1609,47 @@ it.instance("user text promotes a foreground task and synthetic text does not", 
   20_000,
 )
 
+it.instance("a file-only user message promotes a foreground task", () =>
+  Effect.gen(function* () {
+    const { directory: dir } = yield* TestInstance
+    const note = path.join(dir, "note.txt")
+    yield* writeText(note, "hello")
+    const jobs = yield* BackgroundJob.Service
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const child = "file-child"
+    yield* jobs.start({
+      id: child,
+      type: "task",
+      metadata: { parentSessionId: chat.id, sessionId: child },
+      run: Effect.never,
+    })
+
+    yield* llm.text("saw the file")
+    const result = yield* prompt
+      .prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "file", mime: "text/plain", filename: "note.txt", url: `file://${note}` }],
+      })
+      .pipe(
+        Effect.timeoutOrElse({
+          duration: "12 seconds",
+          orElse: () => Effect.fail(new Error("parent prompt joined the foreground task and did not return")),
+        }),
+      )
+    expect(result.info.role).toBe("assistant")
+    const job = yield* jobs.get(child)
+    expect(job?.status).toBe("running")
+    expect(job?.metadata?.background).toBe(true)
+    yield* jobs.cancel(child)
+  }),
+  20_000,
+)
+
 it.instance(
   "user text promotes the running foreground task tool and the prompt returns",
   () =>
