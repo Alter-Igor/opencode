@@ -63,10 +63,23 @@ export function boxFailure(what: string, stderr: string, timedOut: boolean | und
   return new DelegateError(down ? "sandbox_unavailable" : "upstream_error", `The delegate box failed to ${what}.`, action, stderr.trim())
 }
 
-/** directory_invalid with an action that names the configured roots (review A-22). */
+function rootsText(roots: readonly string[]): string {
+  return roots.length > 0 ? roots.join("; ") : "(none configured: set OPENCODE_DELEGATE_ROOTS)"
+}
+
+/** directory_invalid for a malformed, missing, or non-git folder (review A-22). */
 export function invalidFolder(roots: readonly string[], message: string, detail?: string): DelegateError {
-  const where = roots.length > 0 ? roots.join("; ") : "(none configured: set OPENCODE_DELEGATE_ROOTS)"
-  return new DelegateError("directory_invalid", message, `Pass a git repository folder under an allowed root: ${where}.`, detail)
+  return new DelegateError("directory_invalid", message, `Pass a git repository folder under an allowed root: ${rootsText(roots)}.`, detail)
+}
+
+/** directory_invalid for a folder outside the allowed roots (review A-22, #263). */
+export function outsideRoots(roots: readonly string[], message: string, detail?: string): DelegateError {
+  return new DelegateError(
+    "directory_invalid",
+    message,
+    `Pass a git repository folder under an allowed root: ${rootsText(roots)}. To allow a secondary drive or worktree root, set OPENCODE_DELEGATE_ROOTS to a ';'-separated list including both C:\\GitHub and the secondary root (e.g. C:\\GitHub;X:\\) because setting OPENCODE_DELEGATE_ROOTS replaces the default C:\\GitHub root, then restart the MCP client.`,
+    detail,
+  )
 }
 
 function applySubst(p: string, subst: Record<string, string>): string {

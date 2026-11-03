@@ -18,7 +18,7 @@ type Running = Extract<BoxState, { state: "running" }>
 
 /** BoxState plus supervisor detail. Assignable to BoxState; the hub may widen contracts.ts to match. */
 export type SupervisorStatus =
-  | Exclude<BoxState, { state: "running" }>
+  | (Exclude<BoxState, { state: "running" }> & { action?: string })
   | (Running & {
       health: BoxInspect["health"]
       /** OPENCODE_MCP_ALLOW in the box equals mcpAllowPolicy for the Keystone set in force now. */
@@ -121,6 +121,6 @@ export async function statusOf(run: Run): Promise<SupervisorStatus> {
   } catch (error) {
     const failure = toDelegateError(error)
     run.note("warn", "status unavailable", { code: failure.code, detail: failure.detail })
-    return { state: "unavailable", reason: failure.message }
+    return { state: "unavailable", reason: failure.message, ...(failure.action ? { action: failure.action } : {}) }
   }
 }
