@@ -141,15 +141,10 @@ export function createRemoteHub(options: RemoteHubOptions): DelegateHub {
     },
 
     track(sessionID: string, directory: string) {
-      const existing = tracked.get(sessionID)
-      if (existing?.timer) return
-      const timer = setInterval(() => void pollSession(sessionID), pollIntervalMs)
-      if (existing) {
-        existing.directory = directory
-        existing.timer = timer
-      } else {
-        tracked.set(sessionID, { directory, timer })
-      }
+      const info = ensureTracked(sessionID, directory)
+      if (directory !== undefined) info.directory = directory
+      if (info.timer) return
+      info.timer = setInterval(() => void pollSession(sessionID), pollIntervalMs)
       void pollSession(sessionID)
     },
 
