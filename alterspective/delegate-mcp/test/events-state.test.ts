@@ -361,6 +361,16 @@ describe("wave 2 review fixes (state)", () => {
     tick(10_000)
     expect(table.startTimeout("ses_1")).toEqual([])
     expect(table.get("ses_1")).toMatchObject({ state: "error", detail: "APIError", lastError: "APIError" })
+    // Also preserves error when settled through idleAfterGap during a rebuild before markSent:
+    table.status("ses_1", "busy")
+    table.status("ses_1", "idle")
+    table.sendStarting("ses_1")
+    table.error("ses_1", "UnknownError", false)
+    table.setLink({ kind: "gap", detail: "closed" })
+    table.rebuild(snap({ ses_1: { base: "idle", pending: [] } }))
+    expect(table.get("ses_1")?.state).toBe("error")
+    expect(table.markSent("ses_1")).toEqual([])
+    expect(table.get("ses_1")?.state).toBe("error")
   })
 
   test("#255: a second turn sent within 2 s of the prior turn's busy still transitions to starting and arms the start watchdog", () => {

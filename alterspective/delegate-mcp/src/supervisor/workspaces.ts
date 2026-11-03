@@ -19,7 +19,7 @@ import { DelegateError, isDelegateError } from "../shared/errors.ts"
 import { safeLog, silentLogger, type Logger } from "../shared/log.ts"
 import { containerName, paths } from "./compose-env.ts"
 import { flagChanges, parseRawDiff } from "./workspaces-detect.ts"
-import { boxFailure, canonicalPath, invalidFolder, isUnder, runCommand, samePath, systemSubst, type Exec } from "./workspaces-exec.ts"
+import { boxFailure, canonicalPath, invalidFolder, isUnder, outsideRoots, runCommand, samePath, systemSubst, type Exec } from "./workspaces-exec.ts"
 import { copyOutBundle, dockerTarSource, type TarSource } from "./workspaces-copyout.ts"
 import { assertRegularFile, DEFAULT_MAX_BUNDLE_BYTES, planOutBundle, randomNonce, removeQuietly, reserveInBundle } from "./workspaces-handoff.ts"
 import { bindHostState, COMMIT_ID, listHostStates, readHostState, removeHostState, SESSION_KEY, updateHostState, writeHostState, type HostSessionState, type SessionBinding } from "./workspaces-state.ts"
@@ -112,12 +112,12 @@ async function resolveRepo(ctx: Ctx, hostRepo: string): Promise<string> {
     }
   })
   const candidate = canonicalPath(hostRepo, subst, ctx.roots)
-  if (!roots.some((root) => isUnder(candidate, root))) throw invalidFolder(ctx.roots, "The folder is outside the allowed roots.", candidate)
+  if (!roots.some((root) => isUnder(candidate, root))) throw outsideRoots(ctx.roots, "The folder is outside the allowed roots.", candidate)
   const probe = await ctx.host(["git", "-C", candidate, "rev-parse", "--is-inside-work-tree", "--show-toplevel"], { timeoutMs: ctx.timeouts.short })
   const [inside, top] = probe.stdout.trim().split(/\r?\n/)
   if (probe.code !== 0 || inside !== "true" || !top) throw invalidFolder(ctx.roots, "The folder is not a git work tree.", candidate)
   const toplevel = canonicalPath(top, subst, ctx.roots)
-  if (!roots.some((root) => isUnder(toplevel, root))) throw invalidFolder(ctx.roots, "The repository is outside the allowed roots.", toplevel)
+  if (!roots.some((root) => isUnder(toplevel, root))) throw outsideRoots(ctx.roots, "The repository is outside the allowed roots.", toplevel)
   return toplevel
 }
 

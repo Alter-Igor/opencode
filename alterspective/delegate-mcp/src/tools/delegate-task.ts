@@ -3,6 +3,7 @@
 // Works across both local Docker and remote svc-coding-agent cloud microVM backends.
 import { z } from "zod"
 import { DelegateError } from "../shared/errors.ts"
+import type { ToolContext } from "./context.ts"
 import { defineTool } from "./define.ts"
 import { ok, untrusted } from "./shape.ts"
 import { startSessionTool } from "./sessions.ts"
@@ -83,7 +84,7 @@ export const delegateTaskTool = defineTool({
     const base = startRes.structuredContent?.base as string
     const hostRepo = startRes.structuredContent?.hostRepo as string
 
-    // 2. Send Prompt (#263: clean up the newly created session if send fails before running)
+    // 2. Send Prompt (#263: clean up on confirmed rejection; retain session on ambiguous transport failure)
     let sendRes: Awaited<ReturnType<typeof sendTool.run>>
     try {
       sendRes = await sendTool.run(
@@ -96,12 +97,7 @@ export const delegateTaskTool = defineTool({
         correlationId,
       )
     } catch (error) {
-      if (sessionID) {
-        await closeSessionTool
-          .run({ sessionID, abort: true, discardWork: true, deleteBranch: true }, ctx, correlationId)
-          .catch(() => undefined)
-      }
-      throw error
+      return await handleFailedSend(error, sessionID, ctx, correlationId)
     }
 
     let cursor = sendRes.structuredContent?.cursor as string | undefined
@@ -239,3 +235,51 @@ export const delegateTaskTool = defineTool({
     })
   },
 })
+
+/** True only when `sendTool.run` failed before the prompt was sent or with an explicit HTTP non-2xx rejection. */
+function isConfirmedSendRejection(error: unknown): error is DelegateError {
+  if (!(error instanceof DelegateError)) return false
+  if (error.code === "server_down") return false
+  if (error.code === "upstream_error") return /^HTTP \d+$/.test(error.detail ?? "")
+  return true
+}
+
+/**
+ * #263: On confirmed send rejection, close and discard the newly created session (reporting any
+ * incomplete cleanup alongside `sessionID` and `oc_list_sessions`). On ambiguous transport or
+ * response-reading errors, retain the session and surface `sessionID` for recovery.
+ */
+async function handleFailedSend(error: unknown, sessionID: string | undefined, ctx: ToolContext, correlationId: string): Promise<never> {
+  if (!sessionID) throw error
+  if (!isConfirmedSendRejection(error)) {
+    const baseErr =
+      error instanceof DelegateError
+        ? error
+        : new DelegateError("upstream_error", "The prompt request failed while reading the response.", "Check oc_status, then retry.", error instanceof Error ? error.message : String(error))
+    throw new DelegateError(
+      baseErr.code,
+      `${baseErr.message} Session ${sessionID} was retained because prompt acceptance is uncertain.`,
+      `${baseErr.action} Inspect or recover session ${sessionID} with oc_status or oc_list_sessions.`,
+      baseErr.detail ? `${baseErr.detail} (sessionID=${sessionID} retained)` : `sessionID=${sessionID} retained`,
+    )
+  }
+
+  let cleanupStatus: string | undefined
+  try {
+    const closeRes = await closeSessionTool.run({ sessionID, abort: true, discardWork: true, deleteBranch: true }, ctx, correlationId)
+    const sc = closeRes.structuredContent ?? {}
+    if (sc.closed !== true) {
+      cleanupStatus = `closed=false (session=${String(sc.session ?? "unknown")}, clone=${String(sc.clone ?? "unknown")}, branch=${String(sc.branch ?? "unknown")}, record=${String(sc.record ?? "unknown")})`
+    }
+  } catch (cleanupErr) {
+    cleanupStatus = cleanupErr instanceof DelegateError ? `${cleanupErr.code}: ${cleanupErr.message}` : cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr)
+  }
+
+  if (!cleanupStatus) throw error
+  throw new DelegateError(
+    error.code,
+    `${error.message} Cleanup of session ${sessionID} was incomplete (${cleanupStatus}).`,
+    `${error.action} Inspect session ${sessionID} with oc_list_sessions and retry oc_close_session { sessionID: "${sessionID}", abort: true, discardWork: true, deleteBranch: true }.`,
+    error.detail ? `${error.detail}; cleanup: ${cleanupStatus}` : `cleanup: ${cleanupStatus}`,
+  )
+}

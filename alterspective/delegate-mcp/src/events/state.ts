@@ -58,8 +58,6 @@ type Entry = {
   lastActiveAt?: number
   /** #255: table event order when the session last went busy/retry. */
   lastActiveOrder?: number
-  /** #256: table event order when a turn settled on idle (including error/abort + idle). */
-  lastSettledOrder?: number
   /** Last session.error; `armed` until a busy shows the run carried on. `order` is when it arrived. */
   lastError?: { label: string; aborted: boolean; armed: boolean; order: number }
   /** #252: when the latest send began (before its POST), on the table's event order. */
@@ -158,9 +156,9 @@ export class SessionTable {
     const started = e.sendStartedOrder
     e.sendStartedOrder = undefined
     if (e.base === "busy" || e.base === "retry" || e.pending.size > 0) return []
-    // #256: if the prompt sent after sendStartedOrder already errored/aborted and went idle before
-    // HTTP 204 returned, preserve the settled error/aborted state instead of overwriting with `starting`.
-    if (started !== undefined && e.lastSettledOrder !== undefined && e.lastSettledOrder > started && (e.base === "error" || e.base === "aborted")) {
+    // #256: if the prompt sent after sendStartedOrder already errored/aborted and settled (via idle
+    // or idleAfterGap rebuild) before HTTP 204 returned, preserve the settled error/aborted state.
+    if (started !== undefined && e.lastError !== undefined && e.lastError.order > started && (e.base === "error" || e.base === "aborted")) {
       e.awaitingStart = false
       return this.refresh(e)
     }
@@ -334,12 +332,10 @@ export class SessionTable {
       e.base = err.aborted ? "aborted" : "error"
       e.detail = err.label
       err.armed = false
-      e.lastSettledOrder = ++this.order
     } else if (e.base !== "error" && e.base !== "aborted") {
       // error/aborted stay visible through repeated idles; only a new run (busy) clears them.
       e.base = "idle"
       e.detail = undefined
-      e.lastSettledOrder = ++this.order
     }
     return this.refresh(e)
   }
