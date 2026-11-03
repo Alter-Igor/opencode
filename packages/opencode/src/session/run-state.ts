@@ -4,6 +4,7 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Runner } from "@/effect/runner"
 import { BackgroundJob } from "@/background/job"
 import { Effect, Latch, Layer, Scope, Context } from "effect"
+import { isSessionDeleting } from "./cancel-tree"
 import { Session } from "./session"
 import { SessionID } from "./schema"
 import { SessionStatus } from "./status"
@@ -90,6 +91,8 @@ const layer = Layer.effect(
       onInterrupt: Effect.Effect<SessionV1.WithParts>,
       work: Effect.Effect<SessionV1.WithParts>,
     ) {
+      // Fork (#214): refuse to start a new run for a session that is currently being deleted.
+      if (isSessionDeleting(sessionID)) return yield* onInterrupt
       return yield* (yield* runner(sessionID, onInterrupt)).ensureRunning(work)
     })
 
@@ -99,6 +102,8 @@ const layer = Layer.effect(
       work: Effect.Effect<SessionV1.WithParts>,
       ready?: Latch.Latch,
     ) {
+      // Fork (#214): refuse to start a shell for a session that is currently being deleted.
+      if (isSessionDeleting(sessionID)) return yield* Effect.fail(busyError(sessionID))
       return yield* (yield* runner(sessionID, onInterrupt))
         .startShell(work, ready)
         .pipe(Effect.catchTag("RunnerBusy", () => Effect.fail(busyError(sessionID))))

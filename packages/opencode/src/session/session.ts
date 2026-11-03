@@ -35,6 +35,7 @@ import { InstanceState } from "@/effect/instance-state"
 import { Snapshot } from "@/snapshot"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { WorkspaceV2 } from "@opencode-ai/core/workspace"
+import { isSessionDeleting, markSessionDeleting, unmarkSessionDeleting } from "./cancel-tree"
 import { SessionID, MessageID, PartID } from "./schema"
 
 import type { Provider } from "@/provider/provider"
@@ -531,6 +532,7 @@ const layer: Layer.Layer<
           updated: Date.now(),
         },
       }
+      unmarkSessionDeleting(result.id)
       yield* Effect.logInfo("created", result)
 
       yield* events.publish(SessionV1.Event.Created, { sessionID: result.id, info: result })
@@ -605,6 +607,7 @@ const layer: Layer.Layer<
     })
 
     const remove: Interface["remove"] = Effect.fnUntraced(function* (sessionID: SessionID) {
+      markSessionDeleting(sessionID)
       const session = yield* get(sessionID)
       try {
         // `remove` needs to work in all cases, such as broken sessions that
@@ -629,12 +632,16 @@ const layer: Layer.Layer<
 
     const updateMessage = <T extends SessionV1.Info>(msg: T): Effect.Effect<T> =>
       Effect.gen(function* () {
+        // Fork (#214): drop late writes from detached background fibers for a session being deleted.
+        if (isSessionDeleting(msg.sessionID)) return msg
         yield* events.publish(SessionV1.Event.MessageUpdated, { sessionID: msg.sessionID, info: msg })
         return msg
       }).pipe(Effect.withSpan("Session.updateMessage"))
 
     const updatePart = <T extends SessionV1.Part>(part: T): Effect.Effect<T> =>
       Effect.gen(function* () {
+        // Fork (#214): drop late writes from detached background fibers for a session being deleted.
+        if (isSessionDeleting(part.sessionID)) return part
         const stored = structuredClone(part)
         // Fork (#26): no credentials in any stored copy of a tool part (running, completed or
         // failed). The published event is durable, so streamed shell output counts too.
@@ -738,6 +745,8 @@ const layer: Layer.Layer<
 
     const patch = (sessionID: SessionID, info: Patch) =>
       Effect.gen(function* () {
+        // Fork (#214): drop late title/summary/metadata patches for a session being deleted.
+        if (isSessionDeleting(sessionID)) return
         const current = yield* get(sessionID)
         const next = {
           ...current,
@@ -886,6 +895,7 @@ const layer: Layer.Layer<
       field: string
       delta: string
     }) {
+      if (isSessionDeleting(input.sessionID)) return
       yield* events.publish(MessageV2.Event.PartDelta, input)
     })
 
