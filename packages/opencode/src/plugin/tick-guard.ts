@@ -14,15 +14,11 @@ export type TickMessage = {
     role: string
     synthetic?: boolean
   }
-  // SDK parts are a wide union. A weak `{ synthetic?: boolean }` rejects that union.
-  parts?: ReadonlyArray<object>
+  // Optional `type` overlaps real message parts, so Part[] assigns here.
+  parts?: { type?: string; synthetic?: boolean }[]
 }
 
 export type TickDecision = { send: true } | { send: false; reason: "busy" | "unanswered" }
-
-function partIsSynthetic(part: object): boolean {
-  return "synthetic" in part && (part as { synthetic?: unknown }).synthetic === true
-}
 
 // A user row is synthetic when it says so, or when every part is. No parts means a real user row.
 function isRealUser(message: TickMessage) {
@@ -30,7 +26,7 @@ function isRealUser(message: TickMessage) {
   if (message.info.synthetic === true) return false
   const parts = message.parts ?? []
   if (parts.length === 0) return true
-  return parts.some((part) => !partIsSynthetic(part))
+  return parts.some((part) => part.synthetic !== true)
 }
 
 export function shouldSendTick(input: { status: TickStatus; messages: TickMessage[] }): TickDecision {
