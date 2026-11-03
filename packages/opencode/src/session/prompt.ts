@@ -46,6 +46,8 @@ import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Type
 import { InstanceState } from "@/effect/instance-state"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
 import { SessionRunState } from "./run-state"
+import { BackgroundJob } from "@/background/job"
+import { promoteForegroundTask } from "./prompt-foreground-task"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
@@ -140,6 +142,7 @@ const layer = Layer.effect(
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
+    const background = yield* BackgroundJob.Service
     const { db } = database
     const ops = Effect.fn("SessionPrompt.ops")(function* () {
       return {
@@ -1067,6 +1070,7 @@ const layer = Layer.effect(
       }
 
       if (input.noReply === true) return message
+      yield* promoteForegroundTask(background, input.sessionID, message.parts)
       return yield* loop({ sessionID: input.sessionID })
     })
 
@@ -1618,6 +1622,7 @@ export const node = LayerNode.make({
     CrossSpawnSpawner.node,
     Instruction.node,
     SessionRunState.node,
+    BackgroundJob.node,
     SessionRevert.node,
     SessionSummary.node,
     SystemPrompt.node,

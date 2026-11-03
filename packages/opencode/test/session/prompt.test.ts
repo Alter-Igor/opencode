@@ -35,6 +35,7 @@ import { SessionSummary } from "../../src/session/summary"
 import { Instruction } from "../../src/session/instruction"
 import { SessionProcessor } from "../../src/session/processor"
 import { SessionPrompt } from "../../src/session/prompt"
+import { TaskTool, type TaskPromptOps } from "../../src/tool/task"
 import { SessionRevert } from "../../src/session/revert"
 import { SessionRunState } from "../../src/session/run-state"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
@@ -416,6 +417,36 @@ const seed = Effect.fn("test.seed")(function* (sessionID: SessionID, opts?: { fi
   })
   return { user: msg, assistant }
 })
+
+function taskReply(input: SessionPrompt.PromptInput, text: string): SessionV1.WithParts {
+  const id = MessageID.ascending()
+  return {
+    info: {
+      id,
+      role: "assistant",
+      parentID: input.messageID ?? MessageID.ascending(),
+      sessionID: input.sessionID,
+      mode: input.agent ?? "general",
+      agent: input.agent ?? "general",
+      cost: 0,
+      path: { cwd: "/tmp", root: "/tmp" },
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: input.model?.modelID ?? ref.modelID,
+      providerID: input.model?.providerID ?? ref.providerID,
+      time: { created: Date.now() },
+      finish: "stop",
+    },
+    parts: [
+      {
+        id: PartID.ascending(),
+        messageID: id,
+        sessionID: input.sessionID,
+        type: "text",
+        text,
+      },
+    ],
+  }
+}
 
 const addSubtask = (sessionID: SessionID, messageID: MessageID, model = ref) =>
   Effect.gen(function* () {
@@ -1494,6 +1525,190 @@ it.instance("prompt submitted during an active run is included in the next LLM i
     if (!Array.isArray(messages)) throw new Error("expected LLM messages")
     expect(messages.at(-1)).toEqual({ role: "user", content: "second" })
   }),
+)
+
+it.instance("user text promotes a foreground task and synthetic text does not", () =>
+  Effect.gen(function* () {
+    const flags = yield* RuntimeFlags.Service
+    expect(flags.experimentalBackgroundSubagents).toBe(false)
+    const jobs = yield* BackgroundJob.Service
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    const other = yield* sessions.create({ title: "Pinned" })
+    const child = "child-session"
+    yield* jobs.start({
+      id: child,
+      type: "task",
+      metadata: { parentSessionId: chat.id, sessionId: child },
+      run: Effect.never,
+    })
+    yield* jobs.start({
+      id: "other-child",
+      type: "task",
+      metadata: { parentSessionId: other.id, sessionId: "other-child" },
+      run: Effect.never,
+    })
+    yield* jobs.start({
+      id: "not-a-task",
+      type: "shell",
+      metadata: { parentSessionId: chat.id },
+      run: Effect.never,
+    })
+
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      model: ref,
+      noReply: true,
+      parts: [{ type: "text", text: "are you there?" }],
+    })
+    expect((yield* jobs.get(child))?.status).toBe("running")
+    expect((yield* jobs.get(child))?.metadata?.background).not.toBe(true)
+
+    yield* llm.text("synthetic turn")
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      model: ref,
+      parts: [{ type: "text", text: "system note", synthetic: true }],
+    })
+    expect((yield* jobs.get(child))?.metadata?.background).not.toBe(true)
+
+    yield* llm.text("status answer")
+    const result = yield* prompt
+      .prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "what is the status?" }],
+      })
+      .pipe(
+        Effect.timeoutOrElse({
+          duration: "12 seconds",
+          orElse: () => Effect.fail(new Error("parent prompt joined the foreground task and did not return")),
+        }),
+      )
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role === "assistant") {
+      expect(result.parts.some((part) => part.type === "text" && part.text === "status answer")).toBe(true)
+    }
+    const job = yield* jobs.get(child)
+    expect(job?.status).toBe("running")
+    expect(job?.metadata?.background).toBe(true)
+    expect((yield* jobs.get("other-child"))?.metadata?.background).not.toBe(true)
+    expect((yield* jobs.get("other-child"))?.status).toBe("running")
+    expect((yield* jobs.get("not-a-task"))?.metadata?.background).not.toBe(true)
+    expect((yield* jobs.get("not-a-task"))?.status).toBe("running")
+
+    yield* jobs.cancel(child)
+    yield* jobs.cancel("other-child")
+    yield* jobs.cancel("not-a-task")
+  }),
+  20_000,
+)
+
+it.instance(
+  "user text promotes the running foreground task tool and the prompt returns",
+  () =>
+    Effect.gen(function* () {
+      const flags = yield* RuntimeFlags.Service
+      expect(flags.experimentalBackgroundSubagents).toBe(false)
+      const jobs = yield* BackgroundJob.Service
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const { assistant } = yield* seed(chat.id)
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const ready = yield* Deferred.make<void>()
+      const done = yield* Deferred.make<void>()
+      let runs = 0
+      let cancels = 0
+      const promptOps: TaskPromptOps = {
+        cancel: () =>
+          Effect.sync(() => {
+            cancels += 1
+          }),
+        resolvePromptParts: (template) => Effect.succeed([{ type: "text", text: template }]),
+        prompt: (input) => {
+          if (input.sessionID === chat.id) return Effect.succeed(taskReply(input, "injected"))
+          return Effect.gen(function* () {
+            runs += 1
+            yield* Deferred.succeed(ready, undefined)
+            yield* Deferred.await(done)
+            return taskReply(input, "background done")
+          })
+        },
+      }
+
+      const fiber = yield* def
+        .execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.forkChild)
+
+      yield* Deferred.await(ready).pipe(
+        Effect.timeoutOrElse({
+          duration: "8 seconds",
+          orElse: () => Effect.fail(new Error("foreground task did not start")),
+        }),
+      )
+      const job = (yield* jobs.list()).find((item) => item.metadata?.parentSessionId === chat.id)
+      if (!job) throw new Error("foreground task job not found")
+      expect(job.metadata?.background).not.toBe(true)
+
+      yield* llm.text("ok")
+      const answered = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "what is the status?" }],
+        })
+        .pipe(
+          Effect.timeoutOrElse({
+            duration: "12 seconds",
+            orElse: () => Effect.fail(new Error("parent prompt joined the foreground task and did not return")),
+          }),
+        )
+      const result = yield* Fiber.join(fiber).pipe(
+        Effect.timeoutOrElse({
+          duration: "8 seconds",
+          orElse: () => Effect.fail(new Error("foreground task tool did not return after promote")),
+        }),
+      )
+
+      const childID = String(result.metadata.sessionId)
+      expect(answered.info.role).toBe("assistant")
+      expect(result.metadata.background).toBe(true)
+      expect(result.output).toContain(`Child session ${childID} is running.`)
+      expect(result.output).toContain("The user is waiting. Answer them. Do not start the same task again.")
+      expect(result.output.toLowerCase()).not.toContain("poll")
+      expect((yield* jobs.get(childID))?.status).toBe("running")
+      expect(cancels).toBe(0)
+      expect(runs).toBe(1)
+
+      yield* jobs.cancel(childID)
+      yield* Deferred.succeed(done, undefined).pipe(Effect.ignore)
+    }),
+  30_000,
 )
 
 it.instance("assertNotBusy fails with BusyError when loop running", () =>
