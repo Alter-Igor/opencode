@@ -89,7 +89,9 @@ export async function applyTaskProfile(
       `profiled overlap with ${existing.sessionID} (${view.state})`,
     )
   }
-  const dynamicEnabled = readKeystoneSet(ctx.config.home, ctx.config.keystoneConnections).connections.includes(DYNAMIC_ID)
+  const dynamicEnabled =
+    typeof ctx.config.home === "string" &&
+    readKeystoneSet(ctx.config.home, ctx.config.keystoneConnections).connections.includes(DYNAMIC_ID)
   if (!anyProfiledSession && !dynamicEnabled) return
   if (!ctx.gate?.setTaskProfile) {
     throw new DelegateError(
