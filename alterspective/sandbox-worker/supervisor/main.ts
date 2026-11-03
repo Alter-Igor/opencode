@@ -3,9 +3,17 @@
 // bundle, and runs `opencode serve`. Phase 2 adds the outbound control link to the gateway.
 import { $ } from "bun"
 import path from "path"
-import { PRIVACY_TIER_ENV, resolvePrivacyTier, renderConfig, serveEnv, type Manifest } from "./config"
+import {
+  DEFAULT_SERVED_MODELS_FILE,
+  PRIVACY_TIER_ENV,
+  SERVED_MODELS_FILE_ENV,
+  resolvePrivacyTier,
+  renderConfig,
+  serveEnv,
+  type Manifest,
+} from "./config"
 import { checkBundleFile, checkDependenciesDir, checkTree } from "./bundle"
-import { checkUnreachable } from "./egress-guard"
+import { checkEgress } from "./egress-guard"
 import { parseResolveBody } from "./policy"
 
 const fail = (message: string): never => {
@@ -19,9 +27,9 @@ if (!manifest.model?.baseURL) fail("manifest.model.baseURL is required")
 // Never run the server unauthenticated, even bound to loopback.
 const password = process.env.SBXW_SERVER_PASSWORD ?? fail("SBXW_SERVER_PASSWORD is not set")
 
-// #118: refuse to run if the cloud metadata endpoint is reachable (egress not locked down).
-const metadata = await checkUnreachable()
-if (!metadata.ok) fail(`refusing to start: ${metadata.detail} (run egress/lockdown.ts as root first)`)
+// #118, #123: refuse to run if the lockdown marker is missing/invalid (when required) or the cloud metadata endpoint is reachable.
+const egress = await checkEgress()
+if (!egress.ok) fail(`refusing to start: ${egress.detail} (run egress/lockdown.ts as root first)`)
 
 // #108: the fork commit this image was built from (Dockerfile `GIT_SHA` build argument).
 const buildSha = process.env.SBXW_BUILD_SHA || "unknown"
@@ -105,6 +113,7 @@ await Bun.write(exclude, `${await Bun.file(exclude).text().catch(() => "")}\n.sy
 await $`git -C ${repoDir} config user.name "OpenCode sandbox worker"`
 await $`git -C ${repoDir} config user.email "sandbox-worker@noreply.alterspective.com.au"`
 const baseSha = (await $`git -C ${repoDir} rev-parse --verify --quiet HEAD`.nothrow().text()).trim()
+const servedModelsFile = process.env[SERVED_MODELS_FILE_ENV] || DEFAULT_SERVED_MODELS_FILE
 
 await Bun.write(
   "/run/sbxw/state.json",
@@ -118,6 +127,8 @@ await Bun.write(
     // #102: which policy this task ran under (ADR-042: effectivePolicyVersion frozen at task start).
     modelPolicy: policy,
     privacyTier: tier,
+    // #257: where the Synapse plugin records actual x-synapse-served-model headers per session.
+    servedModelsFile,
     // #121: recorded only; the harness never reads this file (the agent can write it).
     harnessRequired: manifest.harness?.required === true,
   }),
@@ -127,7 +138,7 @@ const hostname = manifest.listen?.hostname ?? "127.0.0.1"
 const port = manifest.listen?.port ?? 4096
 // #161: serveEnv strips the secret manifest vars, spreads the rest, and sets the tier AFTER the
 // spread so an inherited SYNAPSE_PRIVACY_TIER cannot override the manifest-resolved tier.
-const env = serveEnv(process.env, tier)
+const env = serveEnv(process.env, tier, servedModelsFile)
 console.log(
   `[sbxw] task ${manifest.taskId}: build ${buildSha}, base ${baseSha || "(empty repo)"}, ` +
     `bundle sha256 ${verified.sha256 ? "verified" : "not checked"}, tree ${verified.tree ? "verified" : "not checked"}, ` +
@@ -147,6 +158,7 @@ const child = Bun.spawn(["opencode", "serve", "--hostname", hostname, "--port", 
     // #161: the Synapse plugin adds the tier to every Synapse call, not only the chat route. The
     // tier comes from the manifest, local-only by default.
     [PRIVACY_TIER_ENV]: tier,
+    [SERVED_MODELS_FILE_ENV]: servedModelsFile,
     OPENCODE_AUTH_CONTENT: JSON.stringify(auth),
   },
   stdio: ["ignore", "inherit", "inherit"],

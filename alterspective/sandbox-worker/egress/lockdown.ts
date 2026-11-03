@@ -7,32 +7,53 @@ import { $ } from "bun"
 import { pidsOwnedBy } from "./preflight"
 import { TABLE, parseAllow, renderRuleset } from "./rules"
 
+export const LOCKDOWN_MARKER_ENV = "SBXW_LOCKDOWN_MARKER"
+export const DEFAULT_LOCKDOWN_MARKER = "/run/sbxw-egress.locked"
+
+export async function writeLockdownMarker(
+  allowHosts: string[],
+  markerPath = process.env[LOCKDOWN_MARKER_ENV] || DEFAULT_LOCKDOWN_MARKER,
+): Promise<void> {
+  await Bun.write(
+    markerPath,
+    JSON.stringify({
+      lockedAt: new Date().toISOString(),
+      allowHosts,
+    }),
+  )
+}
+
 /** Print the reason and exit 1: the caller must then not start the supervisor. */
 const fail = (message: string): never => {
   console.error(`[sbxw-egress] ${message}`)
   process.exit(1)
 }
 
-if (process.getuid?.() !== 0) fail("must run as root")
-const agentUser = process.env.SBXW_AGENT_USER || "agent"
-const agentUid = await $`id -u ${agentUser}`.nothrow().quiet()
-// Fail closed: a wrong user name would skip the check and let a running agent's flows survive.
-const uid = Number(agentUid.text().trim())
-if (agentUid.exitCode !== 0 || !Number.isInteger(uid)) fail(`agent user ${agentUser} not found; set SBXW_AGENT_USER`)
-const running = pidsOwnedBy(uid)
-if (running.length > 0) fail(`${agentUser} already has ${running.length} process(es); lock down before the agent starts`)
-let ruleset: string
-try {
-  ruleset = renderRuleset({ allow: parseAllow(process.env.SBXW_EGRESS_ALLOW), dns: process.env.SBXW_EGRESS_DNS || undefined })
-} catch (error) {
-  fail(`bad configuration: ${error instanceof Error ? error.message : String(error)}`)
+if (import.meta.main) {
+  if (process.getuid?.() !== 0) fail("must run as root")
+  const agentUser = process.env.SBXW_AGENT_USER || "agent"
+  const agentUid = await $`id -u ${agentUser}`.nothrow().quiet()
+  // Fail closed: a wrong user name would skip the check and let a running agent's flows survive.
+  const uid = Number(agentUid.text().trim())
+  if (agentUid.exitCode !== 0 || !Number.isInteger(uid)) fail(`agent user ${agentUser} not found; set SBXW_AGENT_USER`)
+  const running = pidsOwnedBy(uid)
+  if (running.length > 0) fail(`${agentUser} already has ${running.length} process(es); lock down before the agent starts`)
+  let allow: ReturnType<typeof parseAllow> = []
+  let ruleset = ""
+  try {
+    allow = parseAllow(process.env.SBXW_EGRESS_ALLOW)
+    ruleset = renderRuleset({ allow, dns: process.env.SBXW_EGRESS_DNS || undefined })
+  } catch (error) {
+    fail(`bad configuration: ${error instanceof Error ? error.message : String(error)}`)
+  }
+  const file = "/run/sbxw-egress.nft"
+  await Bun.write(file, ruleset)
+  const applied = await $`nft -f ${file}`.nothrow().quiet()
+  if (applied.exitCode !== 0) fail(`nft -f failed: ${applied.stderr.toString().trim()}`)
+  const v4 = (await $`nft list table ip ${TABLE}`.nothrow().quiet().text()).trim()
+  const v6 = (await $`nft list table ip6 ${TABLE}`.nothrow().quiet().text()).trim()
+  if (!/policy drop/.test(v4) || !/comment "metadata"/.test(v4)) fail("the ip table did not load as expected")
+  if (!/policy drop/.test(v6) || !/comment "ipv6"/.test(v6) || !/comment "ipv6-link-local"/.test(v6)) fail("the ip6 table did not load as expected")
+  await writeLockdownMarker(allow.map((entry) => `${entry.cidr}:${entry.port}`))
+  console.log(`[sbxw-egress] locked down: tables ip and ip6 ${TABLE}, policy drop`)
 }
-const file = "/run/sbxw-egress.nft"
-await Bun.write(file, ruleset!)
-const applied = await $`nft -f ${file}`.nothrow().quiet()
-if (applied.exitCode !== 0) fail(`nft -f failed: ${applied.stderr.toString().trim()}`)
-const v4 = (await $`nft list table ip ${TABLE}`.nothrow().quiet().text()).trim()
-const v6 = (await $`nft list table ip6 ${TABLE}`.nothrow().quiet().text()).trim()
-if (!/policy drop/.test(v4) || !/comment "metadata"/.test(v4)) fail("the ip table did not load as expected")
-if (!/policy drop/.test(v6) || !/comment "ipv6"/.test(v6) || !/comment "ipv6-link-local"/.test(v6)) fail("the ip6 table did not load as expected")
-console.log(`[sbxw-egress] locked down: tables ip and ip6 ${TABLE}, policy drop`)

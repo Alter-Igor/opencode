@@ -1,7 +1,7 @@
 import { tool, type Hooks, type PluginInput } from "@opencode-ai/plugin"
 import { createServer } from "http"
-import * as path from "path"
-import * as fs from "fs/promises"
+import path from "path"
+import fs from "fs/promises"
 import open from "open"
 import { OauthCallbackPage } from "@opencode-ai/core/oauth/page"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
@@ -27,7 +27,11 @@ import {
   type StreamError,
 } from "./synapse-fallback"
 import {
+  SYNAPSE_AUTO_MODEL,
   createSynapseModelsFailureLogger,
+  defaultAutoModel,
+  ensureSynapseProviderConfig,
+  fileSynapseModelsCache,
   loadSynapseModels,
   readStoredSynapseCredential,
   synapseModelsTarget,
@@ -52,7 +56,81 @@ export const SYNAPSE_RESOURCE = "https://synapse-mcp.alterspective.com.au/mcp"
 export const SYNAPSE_MCP_FALLBACK_MODEL = SYNAPSE_AUTO_ROUTE
 /** #101: when set, every Synapse call this plugin makes carries `x-privacy-tier` with the resolved tier. */
 export const SYNAPSE_PRIVACY_TIER_ENV = "SYNAPSE_PRIVACY_TIER"
+/** #257: sideband file path where `x-synapse-served-model` headers are recorded per session. */
+export const SERVED_MODELS_FILE_ENV = "SBXW_SERVED_MODELS_FILE"
 export type SynapsePrivacyTier = "local-only" | "cloud-ok"
+
+export interface SynapseServedModelsSideband {
+  bySession: Record<string, Record<string, number>>
+  totals: Record<string, number>
+  lastServedModel: string
+  updatedAt: string
+}
+
+let servedModelsWriteChain: Promise<void> = Promise.resolve()
+
+/**
+ * #257: atomically update the JSON sideband file at `SBXW_SERVED_MODELS_FILE` with the served model
+ * count per session and overall totals. Never throws if the sideband write fails.
+ */
+export async function recordServedModelSideband(
+  servedModel: string | null | undefined,
+  sessionId?: string,
+  filePath: string | undefined = process.env[SERVED_MODELS_FILE_ENV],
+): Promise<void> {
+  const model = servedModel?.trim()
+  const targetFile = filePath?.trim()
+  if (!model || !targetFile) return
+  const sessionKey = sessionId?.trim() || "global"
+
+  const next = servedModelsWriteChain.then(async () => {
+    try {
+      let current: SynapseServedModelsSideband = {
+        bySession: {},
+        totals: {},
+        lastServedModel: model,
+        updatedAt: new Date().toISOString(),
+      }
+      try {
+        const raw = await fs.readFile(targetFile, "utf8")
+        const parsed = JSON.parse(raw)
+        if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+          const bySession =
+            typeof parsed.bySession === "object" && parsed.bySession !== null && !Array.isArray(parsed.bySession)
+              ? (parsed.bySession as Record<string, Record<string, number>>)
+              : {}
+          const totals =
+            typeof parsed.totals === "object" && parsed.totals !== null && !Array.isArray(parsed.totals)
+              ? (parsed.totals as Record<string, number>)
+              : {}
+          current = {
+            bySession,
+            totals,
+            lastServedModel: model,
+            updatedAt: new Date().toISOString(),
+          }
+        }
+      } catch {}
+
+      const sessionCounts =
+        typeof current.bySession[sessionKey] === "object" && current.bySession[sessionKey] !== null
+          ? { ...current.bySession[sessionKey] }
+          : {}
+      sessionCounts[model] = (Number(sessionCounts[model]) || 0) + 1
+      current.bySession[sessionKey] = sessionCounts
+      current.totals[model] = (Number(current.totals[model]) || 0) + 1
+      current.lastServedModel = model
+      current.updatedAt = new Date().toISOString()
+
+      await fs.mkdir(path.dirname(targetFile), { recursive: true })
+      const tmpFile = `${targetFile}.${process.pid}.${crypto.randomUUID().slice(0, 8)}.tmp`
+      await fs.writeFile(tmpFile, JSON.stringify(current, null, 2), "utf8")
+      await fs.rename(tmpFile, targetFile)
+    } catch {}
+  })
+  servedModelsWriteChain = next.catch(() => undefined)
+  await servedModelsWriteChain
+}
 
 /**
  * #101: the privacy tier forced on every Synapse call, or undefined when the variable is unset or
@@ -96,6 +174,11 @@ export const OAUTH_PORT = 1459
 export const OAUTH_REDIRECT_PATH = "/auth/callback"
 export const ACCESS_TOKEN_REFRESH_SKEW_MS = 120_000
 
+/** #248: resolve the optional broker key from the environment (trimmed). Empty means use PKCE fallback. */
+export function resolveBrokerKey(env: Record<string, string | undefined> = process.env): string {
+  return (env[BROKER_KEY_ENV] ?? "").trim()
+}
+
 export const CORRELATION_ID_HEADER = "X-Correlation-Id"
 export const CORRELATION_CLIENT_PREFIX = "opencode"
 export const CORRELATION_ID_MAX_LENGTH = 128
@@ -127,6 +210,85 @@ let latestSynapseServing: SynapseServingTelemetry | undefined
 // AIESC-001: observer-owned escalation state (session-keyed; directory fallback).
 const escalations = new EscalationTracker()
 const countedMalformedParts = new Set<string>()
+const countedMarkupMessages = new Set<string>()
+const sessionsWithActiveToolCalls = new Set<string>()
+
+export const TOOL_CALL_MARKUP_REPAIR_PROMPT =
+  "Your previous reply emitted raw tool-call markup as plain text instead of invoking a native tool call. Invoke the tool using native function calling now, or provide a plain-text answer without tool-call markup."
+
+// #20: built by concatenation so this source file stays free of raw marker sequences.
+const TOOL_CALL_MARKUP_RE = new RegExp(
+  [
+    "<" + "tool_call(?![a-z0-9_])",
+    "<" + "/tool_call>",
+    "<" + "function=[^\\s>]+>",
+    "<" + "\\|DSML\\|(?:tool_calls|invoke|function_calls)",
+    "<" + "\\|\\s*tool_calls?(?:_section_begin)?\\s*\\|>",
+    "```tool_call\\b",
+  ].join("|"),
+  "i",
+)
+
+/**
+ * #20: true when assistant text output contains raw tool-call markup of any known model family
+ * (`<tool_call>`, `<function=...>`, `<|DSML|tool_calls>`, `<|tool_call|>`, ```tool_call).
+ * Excludes longer prose tag names like `<tool_calls>` or `<tool_calling>`.
+ */
+export function containsToolCallMarkup(text: string): boolean {
+  if (!text) return false
+  const stripped = text.replace(/```[\s\S]*?```/g, "").replace(/`[^`\n]+`/g, "")
+  return TOOL_CALL_MARKUP_RE.test(stripped)
+}
+
+interface MarkupRepairState {
+  messageID: string
+  armed: boolean
+  injectSystem: boolean
+  repairedInTurn: boolean
+}
+
+const pendingMarkupRepairs = new Map<string, MarkupRepairState>()
+
+function setMarkupRepairState(sessionID: string, state: MarkupRepairState): void {
+  if (!pendingMarkupRepairs.has(sessionID) && pendingMarkupRepairs.size >= 100) {
+    const oldest = pendingMarkupRepairs.keys().next().value
+    if (oldest !== undefined) pendingMarkupRepairs.delete(oldest)
+  }
+  pendingMarkupRepairs.set(sessionID, state)
+}
+
+export function hasPendingMarkupRepair(sessionID: string, messageID?: string): boolean {
+  const entry = pendingMarkupRepairs.get(sessionID)
+  if (!entry || !entry.armed) return false
+  if (messageID && entry.messageID !== messageID) return false
+  return true
+}
+
+/**
+ * #20: consume the bounded 1-shot repair flag for `sessionID` (at most 1 retry per user turn).
+ */
+export function takePendingMarkupRepair(sessionID: string, messageID?: string): boolean {
+  const entry = pendingMarkupRepairs.get(sessionID)
+  if (!entry || !entry.armed) return false
+  if (messageID && entry.messageID !== messageID) return false
+  entry.armed = false
+  return true
+}
+
+export function resetMarkupRepairState(sessionID?: string): void {
+  if (sessionID) {
+    pendingMarkupRepairs.delete(sessionID)
+    sessionsWithActiveToolCalls.delete(sessionID)
+    return
+  }
+  pendingMarkupRepairs.clear()
+  sessionsWithActiveToolCalls.clear()
+  countedMarkupMessages.clear()
+}
+
+export function getEscalationSnapshot(sessionID: string) {
+  return escalations.snapshot(sessionID)
+}
 
 export function getLatestSynapseServing(): SynapseServingTelemetry | undefined {
   return latestSynapseServing
@@ -207,7 +369,6 @@ export async function registerKeystoneClient(
   registerUrl = KEYSTONE_REGISTER,
 ): Promise<{ clientId: string }> {
   const loopbackHosts = ["127.0.0.1", "localhost"]
-  const url = new URL(redirect)
   const redirectUris = loopbackHosts.map((host) => {
     const next = new URL(redirect)
     next.hostname = host
@@ -535,7 +696,7 @@ export interface ParsedToolCall {
 }
 
 export function normalizeToolName(name: string): string {
-  let clean = String(name).trim().replace(/^(mcp__|tools\/|functions\.)/, "")
+  const clean = String(name).trim().replace(/^(mcp__|tools\/|functions\.)/, "")
 
   // Map RAG tools: e.g. rag_ask -> alterspective-rag_rag_ask
   if (clean.startsWith("rag_") || clean.startsWith("rag-")) {
@@ -843,6 +1004,12 @@ interface SynapsePluginOptions {
   registerUrl?: string
   inferenceUrl?: string
   audience?: string
+  /** Optional fetch implementation for OAuth registration/token exchange (injectable for tests). */
+  fetch?: typeof fetch
+  /** Optional loopback port for OAuth callback server (default OAUTH_PORT). */
+  oauthPort?: number
+  /** Optional browser launcher override (default `open`). */
+  openBrowser?: (url: string) => Promise<unknown>
   /** How long a chat request waits for a token refresh. Default SYNAPSE_CHAT_REFRESH_WAIT_MS. */
   refreshWaitMs?: number
   /** #75: the cross-process lock around a refresh. Default synapseRefreshFileLock. */
@@ -886,6 +1053,34 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
       const toast = input.client?.tui?.showToast?.({ body: { title: "Synapse", message, variant: "warning" } })
       void Promise.resolve(toast).catch(() => undefined)
     } catch {}
+  }
+
+  // #248: log concrete OAuth / sign-in failures and show a TUI toast before returning { type: "failed" }.
+  function reportAuthFailure(error: unknown): string {
+    const detail = error instanceof Error ? error.message : String(error)
+    sessionObserver.logDiagnostic(
+      {
+        timestamp: new Date().toISOString(),
+        type: "AUTH_EVENT",
+        error: `Keystone sign-in failed: ${detail}`,
+        details: { event: "synapse-auth-failed", error: detail },
+      },
+      input.directory,
+    )
+    try {
+      const appLog = input.client?.app?.log?.({
+        body: { service: "synapse", level: "error", message: `Keystone sign-in failed: ${detail}` },
+      })
+      void Promise.resolve(appLog).catch(() => undefined)
+    } catch {}
+    try {
+      if (options?.notify) options.notify(`Keystone sign-in failed: ${detail}`)
+      const toast = input.client?.tui?.showToast?.({
+        body: { title: "Keystone Sign-In Failed", message: detail, variant: "error" },
+      })
+      void Promise.resolve(toast).catch(() => undefined)
+    } catch {}
+    return detail
   }
 
   async function saveSynapseCredential(cred: NonNullable<SynapseCredentialState["latest"]>): Promise<void> {
@@ -1016,18 +1211,43 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
   }
 
   return {
-    // Fork-only (#74): the live Synapse model list is merged into the configured one
-    // (svc#366: a configured model is never dropped).
+    // Fork-only (#74, #248): ensure provider.synapse.models is always seeded with `auto`, then merge
+    // the live Synapse model list into the configured one (svc#366: a configured model is never dropped).
     // Core reads cfg.provider after this hook resolves (provider/provider.ts).
     config: async (cfg) => {
+      const hadConfiguredSynapse = Boolean(cfg.provider?.synapse)
+      const storedCred = await readStoredSynapseCredential().catch(() => undefined)
+      const staticKey =
+        (typeof cfg.provider?.synapse?.options?.apiKey === "string" && cfg.provider.synapse.options.apiKey.trim()) ||
+        process.env.SYNAPSE_API_KEY?.trim() ||
+        process.env.GPAAS_API_KEY?.trim() ||
+        ""
+      const isModelsCli = process.argv.includes("models")
+      if (!hadConfiguredSynapse && !storedCred && !staticKey && !isModelsCli) {
+        return
+      }
+      const seeded = ensureSynapseProviderConfig(cfg, inferenceUrl)
+      if (!seeded) return
       // #101: before the model list is read, so that call carries the tier too.
       if (privacyTier) applyPrivacyTierHeader(cfg, privacyTier)
       modelsTarget = synapseModelsTarget(cfg, inferenceUrl)
+      if (!hadConfiguredSynapse && !storedCred && !staticKey && !options?.inferenceUrl && !process.env.SYNAPSE_BASE_URL) {
+        const cached = await fileSynapseModelsCache().read(modelsTarget?.baseURL ?? inferenceUrl)
+        if (cached) {
+          const current = seeded.models ?? {}
+          seeded.models = {
+            ...current,
+            ...cached,
+            [SYNAPSE_AUTO_MODEL]: current[SYNAPSE_AUTO_MODEL] ?? defaultAutoModel(),
+          }
+        }
+        return
+      }
       await loadSynapseModels(cfg, {
         defaultBaseURL: inferenceUrl,
         userAgent,
         resolveToken: async () => {
-          const stored = await readStoredSynapseCredential()
+          const stored = storedCred ?? (await readStoredSynapseCredential())
           return synapseModelsToken(stored && currentSynapseCredential(stored))
         },
         log: createSynapseModelsFailureLogger((event) => {
@@ -1061,7 +1281,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
           async fetch(requestInput: RequestInfo | URL, init?: RequestInit) {
             // An earlier refresh may still be saving its rotated token.
             await synapseCredentialState.save
-            let currentAuth = await getAuth()
+            const currentAuth = await getAuth()
             const storedToken =
               currentAuth.type === "api"
                 ? currentAuth.key
@@ -1101,7 +1321,9 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
             let sanitizedBody = init?.body
             // AIESC-02: escalation is observer-owned; key by session when known.
             const incomingHeaders = new Headers(init?.headers as HeadersInit)
-            const sessionKey = incomingHeaders.get("x-opencode-session") || input.directory
+            const reqHeaders = requestInput instanceof Request ? requestInput.headers : undefined
+            const explicitSessionId = incomingHeaders.get("x-opencode-session") || reqHeaders?.get("x-opencode-session")
+            const sessionKey = explicitSessionId || input.directory
             const correlationId = incomingHeaders.get("x-correlation-id") || createCorrelationId(sessionKey)
             // #80: resend a failed pinned-model request once with `auto` (opt out: OPENCODE_SYNAPSE_PINNED_FALLBACK=0).
             const pinnedFallbackOn = options?.pinnedFallback ?? pinnedFallbackEnabled()
@@ -1137,6 +1359,12 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                 )
               } catch {}
             }
+
+            const sidebandSessionKey =
+              explicitSessionId ||
+              (typeof requestBodyJson?.sessionID === "string" && requestBodyJson.sessionID) ||
+              (typeof requestBodyJson?.session_id === "string" && requestBodyJson.session_id) ||
+              "global"
 
             // If authenticating via Keystone JWT token, execute through Synapse MCP bridge
             const rawMessages = requestBodyJson?.messages || (requestBodyJson?.prompt ? [{ role: "user", content: requestBodyJson.prompt }] : [])
@@ -1349,6 +1577,11 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                     timestamp: Date.now(),
                     correlationId: mcpCorrelationId,
                   }
+                  await recordServedModelSideband(
+                    mcpRes.headers.get("x-synapse-served-model") ||
+                      (servedModel !== "synapse-auto" ? servedModel : undefined),
+                    sidebandSessionKey,
+                  )
 
                   const extracted = extractToolCallsFromModelOutput(parsedContent)
                   let toolCalls = extracted.toolCalls
@@ -1636,13 +1869,16 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
               if (contentType.includes("application/json")) {
                 const wire = await response.clone().json().catch(() => undefined)
                 const message = wire?.choices?.[0]?.message
-                const meaningful =
-                  (message?.tool_calls?.length ?? 0) > 0 ||
-                  (typeof message?.content === "string" && message.content.trim().length > 0)
-                if (meaningful) escalations.recordSuccess(sessionKey)
-                else escalations.recordFailure(sessionKey, "empty-content")
-              } else {
-                escalations.recordSuccess(sessionKey)
+                const hasNativeTools = (message?.tool_calls?.length ?? 0) > 0
+                const contentText = typeof message?.content === "string" ? message.content : ""
+                const meaningful = hasNativeTools || contentText.trim().length > 0
+                if (!meaningful) {
+                  escalations.recordFailure(sessionKey, "empty-content")
+                } else if (!hasNativeTools && containsToolCallMarkup(contentText)) {
+                  escalations.recordFailure(sessionKey, "malformed-output")
+                } else {
+                  escalations.recordSuccess(sessionKey)
+                }
               }
             }
 
@@ -1693,7 +1929,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
               escalations.recordFailure(sessionKey, classifyFailure(response.status, errorBody))
             }
 
-            const servedModel = response.headers.get("x-synapse-served-model")
+            const servedModel = response.headers.get("x-synapse-served-model")?.trim()
             const costUsd = response.headers.get("x-synapse-cost-usd")
             const routedProvider = response.headers.get("x-synapse-routed-provider")
             const latencyMs = response.headers.get("x-synapse-latency-ms")
@@ -1708,6 +1944,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                 timestamp: Date.now(),
                 correlationId: echoedCorrelationId,
               }
+              await recordServedModelSideband(servedModel, sidebandSessionKey)
             }
 
             return response
@@ -1719,14 +1956,144 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
           type: "oauth",
           label: "Sign in with Keystone (Alterspective SSO)",
           async authorize() {
+            const port = options?.oauthPort ?? OAUTH_PORT
+            const redirect = redirectUri(port)
+            const fetcher = options?.fetch ?? fetch
+            const openUrl = options?.openBrowser ?? ((targetUrl: string) => open(targetUrl))
+            const brokerKey = resolveBrokerKey()
+
+            // #248: when OPENCODE_KEYSTONE_BROKER_KEY is unset, do NOT fail silently; fall back
+            // automatically to the public-client OAuth PKCE flow (`registerKeystoneClient` ->
+            // `buildAuthorizeUrl` -> callback -> `exchangeCodeForTokens`).
+            if (!brokerKey) {
+              let clientId = ""
+              try {
+                const registered = await registerKeystoneClient(redirect, fetcher, options?.registerUrl)
+                clientId = registered.clientId
+              } catch (error) {
+                const detail = reportAuthFailure(error)
+                return {
+                  url: "",
+                  instructions: `Keystone sign-in failed: ${detail}`,
+                  method: "auto" as const,
+                  async callback() {
+                    return { type: "failed" as const }
+                  },
+                }
+              }
+
+              const pkce = await generatePKCE()
+              const state = generateState()
+              const url = buildAuthorizeUrl({
+                clientId,
+                redirectUri: redirect,
+                pkce,
+                state,
+                authorizeUrl: options?.authorizeUrl,
+                audience,
+              })
+
+              let server: ReturnType<typeof createServer> | undefined
+              const callbackPromise = new Promise<{ code: string }>((resolve, reject) => {
+                server = createServer((req, res) => {
+                  const reqUrl = new URL(req.url || "/", `http://127.0.0.1:${port}`)
+                  if (reqUrl.pathname !== OAUTH_REDIRECT_PATH) return
+
+                  const queryError = reqUrl.searchParams.get("error")
+                  const queryErrorDescription = reqUrl.searchParams.get("error_description")
+                  if (queryError) {
+                    res.writeHead(200, { "Content-Type": "text/html" })
+                    res.end(
+                      OauthCallbackPage.error(queryErrorDescription || queryError, { provider: "Keystone (Synapse)" }),
+                    )
+                    reject(new Error(queryErrorDescription || queryError))
+                    return
+                  }
+
+                  const returnedState = reqUrl.searchParams.get("state")
+                  if (returnedState !== state) {
+                    res.writeHead(400, { "Content-Type": "text/html" })
+                    res.end(
+                      OauthCallbackPage.error("OAuth state mismatch. Please try again.", { provider: "Keystone (Synapse)" }),
+                    )
+                    reject(new Error("OAuth state mismatch"))
+                    return
+                  }
+
+                  const code = reqUrl.searchParams.get("code")
+                  if (!code) {
+                    res.writeHead(400, { "Content-Type": "text/html" })
+                    res.end(OauthCallbackPage.error("Missing authorization code.", { provider: "Keystone (Synapse)" }))
+                    reject(new Error("Missing authorization code"))
+                    return
+                  }
+
+                  res.writeHead(200, { "Content-Type": "text/html" })
+                  res.end(OauthCallbackPage.success({ provider: "Keystone (Synapse)" }))
+                  resolve({ code })
+                })
+
+                server.on("error", (err) => reject(err))
+                server.listen(port, "127.0.0.1")
+              })
+              callbackPromise.catch(() => undefined)
+
+              await openUrl(url).catch(() => undefined)
+
+              return {
+                url,
+                instructions: "Sign in with your Alterspective account in the browser.",
+                method: "auto" as const,
+                async callback() {
+                  try {
+                    const { code } = await callbackPromise
+                    const tokens = await exchangeCodeForTokens(
+                      {
+                        clientId,
+                        code,
+                        redirectUri: redirect,
+                        verifier: pkce.verifier,
+                        tokenUrl: options?.tokenUrl,
+                        audience,
+                      },
+                      fetcher,
+                    )
+                    const expiresAt = Date.now() + (tokens.expires_in ?? 3600) * 1000
+                    await saveSynapseCredential({
+                      token: tokens.access_token,
+                      refreshToken: tokens.refresh_token || "",
+                      expiresAt,
+                      clientId,
+                    })
+                    return {
+                      type: "success" as const,
+                      provider: "synapse",
+                      key: tokens.access_token,
+                      metadata: {
+                        clientId,
+                        clientSecret: "",
+                        refreshToken: tokens.refresh_token || "",
+                        expiresAt: String(expiresAt),
+                      },
+                    }
+                  } catch (error) {
+                    reportAuthFailure(error)
+                    return { type: "failed" as const }
+                  } finally {
+                    const listener = server
+                    setTimeout(() => listener?.close(), 5000)
+                  }
+                },
+              }
+            }
+
             const nonce = generateState()
-            const redirect = redirectUri(OAUTH_PORT)
             const url = buildHandoffLoginUrl({ redirectUri: redirect, nonce, loginUrl: options?.loginUrl })
 
             let server: ReturnType<typeof createServer> | undefined
             const callbackPromise = new Promise<{ handoff: string }>((resolve, reject) => {
               server = createServer((req, res) => {
-                const reqUrl = new URL(req.url || "/", `http://127.0.0.1:${OAUTH_PORT}`)
+                const reqUrl = new URL(req.url || "/", `http://127.0.0.1:${port}`)
                 if (reqUrl.pathname !== OAUTH_REDIRECT_PATH) return
 
                 const queryError = reqUrl.searchParams.get("error")
@@ -1765,10 +2132,12 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                 resolve({ handoff })
               })
 
-              server.listen(OAUTH_PORT, "127.0.0.1")
+              server.on("error", (err) => reject(err))
+              server.listen(port, "127.0.0.1")
             })
+            callbackPromise.catch(() => undefined)
 
-            await open(url).catch(() => undefined)
+            await openUrl(url).catch(() => undefined)
 
             return {
               url,
@@ -1776,16 +2145,17 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
               method: "auto" as const,
               async callback() {
                 try {
-                  const brokerKey = process.env[BROKER_KEY_ENV] || ""
-                  if (!brokerKey) throw new Error(`${BROKER_KEY_ENV} is not set`)
                   const { handoff } = await callbackPromise
-                  const tokens = await exchangeHandoffForSynapseToken({
-                    handoff,
-                    brokerKey,
-                    tokenUrl: options?.tokenUrl,
-                    audience,
-                    offline: true,
-                  })
+                  const tokens = await exchangeHandoffForSynapseToken(
+                    {
+                      handoff,
+                      brokerKey,
+                      tokenUrl: options?.tokenUrl,
+                      audience,
+                      offline: true,
+                    },
+                    fetcher,
+                  )
                   return {
                     type: "success" as const,
                     provider: "synapse",
@@ -1797,7 +2167,8 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                       expiresAt: String(Date.now() + (tokens.expires_in ?? 3600) * 1000),
                     },
                   }
-                } catch {
+                } catch (error) {
+                  reportAuthFailure(error)
                   return { type: "failed" as const }
                 } finally {
                   // The browser needs a moment to finish rendering the callback
@@ -1826,7 +2197,10 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
         await sessionObserver.finalizeSessionRetrospective(sessionID, input.directory)
       }
       // AIESC follow-up (#15): completed sessions free their tracker slot.
-      if (sessionID && event.type === "session.deleted") escalations.release(sessionID)
+      if (sessionID && event.type === "session.deleted") {
+        escalations.release(sessionID)
+        resetMarkupRepairState(sessionID)
+      }
       // #18: a failed tool call skips tool.execute.after; its stored part carries the error.
       const failed = failedToolFromEvent(event as { type: string; properties?: any })
       if (failed) sessionObserver.onToolFailed(failed.sessionID, failed.callID, failed.tool, failed.error)
@@ -1838,11 +2212,56 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
           if (countedMalformedParts.has(hit.partID)) return
           countedMalformedParts.add(hit.partID)
           if (countedMalformedParts.size > 500) {
-          const oldestCounted = countedMalformedParts.values().next().value
-          if (oldestCounted !== undefined) countedMalformedParts.delete(oldestCounted)
-        }
+            const oldestCounted = countedMalformedParts.values().next().value
+            if (oldestCounted !== undefined) countedMalformedParts.delete(oldestCounted)
+          }
         }
         escalations.recordFailure(hit.sessionID, "malformed-output")
+      }
+    },
+    // #20: detect raw tool-call markup emitted as assistant text on the REST streaming path,
+    // charge it as a malformed-output failure, and arm a bounded 1-shot repair (at most 1 retry per turn).
+    "experimental.text.complete": async (textInput, textOutput) => {
+      const { sessionID, messageID, partID } = textInput
+      const hasMarkup = containsToolCallMarkup(textOutput.text)
+      const hadNativeTools = sessionsWithActiveToolCalls.has(`${sessionID}:${messageID}`)
+      if (hasMarkup && !hadNativeTools) {
+        if (!countedMarkupMessages.has(messageID)) {
+          countedMarkupMessages.add(messageID)
+          if (countedMarkupMessages.size > 500) {
+            const oldest = countedMarkupMessages.values().next().value
+            if (oldest !== undefined) countedMarkupMessages.delete(oldest)
+          }
+          escalations.recordFailure(sessionID, "malformed-output")
+        }
+        const existing = pendingMarkupRepairs.get(sessionID)
+        const alreadyRepaired = existing?.repairedInTurn === true
+        setMarkupRepairState(sessionID, {
+          messageID,
+          armed: !alreadyRepaired,
+          injectSystem: !alreadyRepaired,
+          repairedInTurn: true,
+        })
+        sessionObserver.logDiagnostic(
+          {
+            timestamp: new Date().toISOString(),
+            type: "ESCALATION",
+            sessionId: sessionID,
+            details: {
+              kind: "rest-tool-markup-drift",
+              messageID,
+              partID,
+              armedRepair: !alreadyRepaired,
+              ...escalations.snapshot(sessionID),
+            },
+          },
+          input.directory,
+        )
+        return
+      }
+      if (!hasMarkup && textOutput.text.trim().length > 0) {
+        escalations.recordSuccess(sessionID)
+        pendingMarkupRepairs.delete(sessionID)
       }
     },
     // #18: every native and plugin tool is announced here; MCP tools never are, which is how the
@@ -1851,6 +2270,8 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
       sessionObserver.markNativeTool(definitionInput.toolID)
     },
     "tool.execute.before": async (toolInput, output) => {
+      sessionsWithActiveToolCalls.add(`${toolInput.sessionID}:${(toolInput as any).messageID ?? ""}`)
+      pendingMarkupRepairs.delete(toolInput.sessionID)
       // 1. Policy Enforcement: Block raw browser scraping of corporate email / M365
       if (toolInput.tool.includes("playwright") || toolInput.tool.includes("browser")) {
         const rawUrl = String(output.args?.url || output.args?.Url || "")
@@ -1919,11 +2340,17 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
       // protocol). The plugin is registered for every session, so without this guard they were
       // pasted into OpenAI, Anthropic and other providers' prompts too.
       if (_input.model?.providerID !== "synapse") return
+      const sessionKey = _input.sessionID ?? input.directory
       const recentLearnings = await sessionObserver.getRecentLearnings(INJECTED_LEARNINGS_LIMIT, input.directory)
-      if (escalations.atCap(_input.sessionID ?? input.directory)) {
+      if (escalations.atCap(sessionKey)) {
         output.system.push(
           "AIESC-03: automatic escalation budget is exhausted for this session. Do NOT retry the same request shape. Present the failure evidence to the user and ask how to proceed.",
         )
+      }
+      const repairEntry = pendingMarkupRepairs.get(sessionKey)
+      if (repairEntry?.injectSystem) {
+        repairEntry.injectSystem = false
+        output.system.push(TOOL_CALL_MARKUP_REPAIR_PROMPT)
       }
       const learningsBlock =
         recentLearnings.length > 0
@@ -2069,7 +2496,8 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
             ? 'Removed ' + result.forgotten + ' rule(s) matching "' + needle + '". They will not be applied in future sessions.'
             : 'No rule matched "' + needle + '". Use synapse_list_rules to see the recorded rules.'
         },
-      }),      synapse_buddy_review: tool({
+      }),
+      synapse_buddy_review: tool({
         description:
           "Run an instant, $0-cost on-premises code review using the Synapse Coder specialist. Checks code snippets or files for syntax errors, SQL injection, broken imports, and security defects.",
         args: {
@@ -2288,7 +2716,8 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
         },
       }),
       synapse_probe: tool({
-        description: "Check the last Synapse AI model routing, provider destination, and inference cost telemetry.",
+        description:
+          "Built-in Synapse provider telemetry probe (tool id: synapse_probe; distinct from the workspace .opencode synapse-probe CAS/env-key tool). Uses stored Keystone sign-in / provider auth to report the last served Synapse model, routed provider destination, latency, and inference cost telemetry.",
         args: {},
         async execute() {
           if (!latestSynapseServing) {
@@ -2325,6 +2754,3 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
     },
   }
 }
-
-
-

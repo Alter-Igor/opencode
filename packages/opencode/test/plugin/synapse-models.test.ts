@@ -6,6 +6,8 @@ import {
   SYNAPSE_DEFAULT_OUTPUT,
   SYNAPSE_MODELS_TIMEOUT_MS,
   createSynapseModelsFailureLogger,
+  defaultAutoModel,
+  ensureSynapseProviderConfig,
   fileSynapseModelsCache,
   loadSynapseModels,
   parseSynapseModelList,
@@ -747,6 +749,50 @@ describe("Synapse credential refresh (chat only; startup never refreshes)", () =
       expect(h.chatAuth).toEqual([`Bearer ${h.old}`])
     } finally {
       h.restore()
+    }
+  })
+})
+
+describe("#248: ensureSynapseProviderConfig pre-auth seeding", () => {
+  test("seeds cfg.provider.synapse.models with auto when provider block is absent", () => {
+    const cfg: Config = {}
+    const synapse = ensureSynapseProviderConfig(cfg, BASE)
+    expect(synapse?.npm).toBe("@ai-sdk/openai-compatible")
+    expect(synapse?.options?.baseURL).toBe(BASE)
+    expect(synapse?.models?.[SYNAPSE_AUTO_MODEL]).toEqual(defaultAutoModel())
+    expect(() => Object.entries(cfg.provider!.synapse!.models!)).not.toThrow()
+  })
+
+  test("SynapseAuthPlugin.config seeds provider.synapse.models.auto when running opencode models before sign-in, without hijacking unauthenticated non-models runs", async () => {
+    const hooks = await SynapseAuthPlugin({
+      client: {} as never,
+      project: {} as never,
+      directory: "",
+      worktree: "",
+      experimental_workspace: { register() {} },
+      serverUrl: new URL("https://example.com"),
+      $: {} as never,
+    })
+    // 1) When provider.synapse exists with no models block, ensureSynapseProviderConfig seeds auto
+    const configuredEmpty: Config = { provider: { synapse: { options: { baseURL: BASE } } } }
+    const origFetch = globalThis.fetch
+    globalThis.fetch = (async () => new Response(JSON.stringify(LIVE_REPLY), { status: 200 })) as unknown as typeof fetch
+    try {
+      await hooks.config?.(configuredEmpty)
+      expect(configuredEmpty.provider?.synapse?.models?.[SYNAPSE_AUTO_MODEL]).toBeDefined()
+      expect(Object.entries(configuredEmpty.provider!.synapse!.models!).length).toBeGreaterThanOrEqual(1)
+
+      // 2) When running "opencode models" before sign-in with an empty config, provider.synapse.models.auto is seeded
+      const modelsCliCfg: Config = {}
+      process.argv.push("models")
+      try {
+        await hooks.config?.(modelsCliCfg)
+      } finally {
+        process.argv.pop()
+      }
+      expect(modelsCliCfg.provider?.synapse?.models?.[SYNAPSE_AUTO_MODEL]).toBeDefined()
+    } finally {
+      globalThis.fetch = origFetch
     }
   })
 })

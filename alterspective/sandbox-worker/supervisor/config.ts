@@ -54,6 +54,22 @@ export type Manifest = {
 export const PRIVACY_TIER = "local-only"
 /** The fork's Synapse plugin reads this and puts the tier on every Synapse call it makes. */
 export const PRIVACY_TIER_ENV = "SYNAPSE_PRIVACY_TIER"
+/** #257: sideband file path where the Synapse plugin records `x-synapse-served-model` counts. */
+export const SERVED_MODELS_FILE_ENV = "SBXW_SERVED_MODELS_FILE"
+export const DEFAULT_SERVED_MODELS_FILE = "/run/sbxw/served-models.json"
+
+export type ServedModelsSideband = {
+  bySession: Record<string, Record<string, number>>
+  totals: Record<string, number>
+  lastServedModel: string
+  updatedAt: string
+}
+
+export type ServedModelsSummary = {
+  servedModel: string | null
+  servedModels: Record<string, number>
+  bySession: Record<string, Record<string, number>>
+}
 
 /**
  * #161: resolves the task's privacy tier from the manifest's top-level `privacyTier` field, which
@@ -107,11 +123,85 @@ export function renderConfig(manifest: Manifest, modelIds: string[]) {
 }
 
 /**
- * The environment for the `opencode serve` child (#161). The resolved tier is set after the spread
- * of `base`, so an inherited `SYNAPSE_PRIVACY_TIER` (e.g. `cloud-ok` from the host) can never
+ * The environment for the `opencode serve` child (#161, #257). The resolved tier is set after the
+ * spread of `base`, so an inherited `SYNAPSE_PRIVACY_TIER` (e.g. `cloud-ok` from the host) can never
  * override what the manifest resolves to.
  */
-export function serveEnv(base: Record<string, string | undefined>, tier: "local-only" | "cloud-ok") {
+export function serveEnv(
+  base: Record<string, string | undefined>,
+  tier: "local-only" | "cloud-ok",
+  servedModelsFile: string = base[SERVED_MODELS_FILE_ENV] || DEFAULT_SERVED_MODELS_FILE,
+) {
   const { SBXW_SERVER_PASSWORD: _drop, SBXW_MANIFEST: _manifest, ...env } = base
-  return { ...env, [PRIVACY_TIER_ENV]: tier }
+  return { ...env, [PRIVACY_TIER_ENV]: tier, [SERVED_MODELS_FILE_ENV]: servedModelsFile }
+}
+
+function sanitizeCountMap(input: unknown): Record<string, number> {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) return {}
+  const out: Record<string, number> = {}
+  for (const [model, count] of Object.entries(input as Record<string, unknown>)) {
+    const trimmed = model.trim()
+    if (!trimmed) continue
+    if (typeof count === "number" && Number.isFinite(count) && count > 0) {
+      out[trimmed] = Math.floor(count)
+    }
+  }
+  return out
+}
+
+/**
+ * #257: parses the served-models sideband JSON written by the Synapse plugin and resolves the
+ * dominant/last served model and per-model call counts for `sessionId` (or the whole run).
+ */
+export function parseServedModelsSideband(raw: unknown, sessionId?: string): ServedModelsSummary {
+  let data: unknown = raw
+  if (typeof raw === "string") {
+    try {
+      data = JSON.parse(raw)
+    } catch {
+      return { servedModel: null, servedModels: {}, bySession: {} }
+    }
+  }
+  if (typeof data !== "object" || data === null || Array.isArray(data)) {
+    return { servedModel: null, servedModels: {}, bySession: {} }
+  }
+  const record = data as Record<string, unknown>
+  const bySession: Record<string, Record<string, number>> = {}
+  if (typeof record.bySession === "object" && record.bySession !== null && !Array.isArray(record.bySession)) {
+    for (const [sid, counts] of Object.entries(record.bySession as Record<string, unknown>)) {
+      const cleaned = sanitizeCountMap(counts)
+      if (Object.keys(cleaned).length > 0) bySession[sid] = cleaned
+    }
+  }
+  const totals = sanitizeCountMap(record.totals)
+  const sessionCounts = sessionId && bySession[sessionId] ? bySession[sessionId] : undefined
+  const servedModels = sessionCounts && Object.keys(sessionCounts).length > 0 ? { ...sessionCounts } : { ...totals }
+  const lastServedModel =
+    typeof record.lastServedModel === "string" && record.lastServedModel.trim() ? record.lastServedModel.trim() : null
+
+  let dominant: string | null = null
+  let bestCount = 0
+  for (const [model, count] of Object.entries(servedModels)) {
+    if (count > bestCount || (count === bestCount && model === lastServedModel)) {
+      dominant = model
+      bestCount = count
+    }
+  }
+  return {
+    servedModel: dominant ?? lastServedModel,
+    servedModels,
+    bySession,
+  }
+}
+
+export async function readServedModelsSideband(
+  filePath = process.env[SERVED_MODELS_FILE_ENV] || DEFAULT_SERVED_MODELS_FILE,
+  sessionId?: string,
+): Promise<ServedModelsSummary> {
+  try {
+    const text = await Bun.file(filePath).text()
+    return parseServedModelsSideband(text, sessionId)
+  } catch {
+    return { servedModel: null, servedModels: {}, bySession: {} }
+  }
 }

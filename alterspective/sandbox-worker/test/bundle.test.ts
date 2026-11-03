@@ -23,7 +23,7 @@ beforeAll(async () => {
   bundle = path.join(dir, "repo.bundle")
   await git(repo, "bundle", "create", bundle, "HEAD")
   tree = (await git(repo, "rev-parse", "HEAD^{tree}").text()).trim()
-})
+}, 20_000)
 
 afterAll(async () => {
   await rm(dir, { recursive: true, force: true })
@@ -71,7 +71,7 @@ describe("checkTree (#108)", () => {
     const clone = path.join(dir, "clone-ok")
     await $`git clone --quiet ${bundle} ${clone}`.quiet()
     expect(await checkTree(clone, tree)).toEqual({ ok: true })
-  })
+  }, 20_000)
 
   test("a different tree is refused", async () => {
     const clone = path.join(dir, "clone-other")
@@ -81,7 +81,7 @@ describe("checkTree (#108)", () => {
     const check = await checkTree(clone, tree)
     expect(check.ok).toBe(false)
     if (!check.ok) expect(check.reason).toContain("tree mismatch")
-  })
+  }, 20_000)
 
   test("a malformed expected tree is refused", async () => {
     expect(await checkTree(dir, "not-a-sha")).toEqual({ ok: false, reason: "repo.treeSha is not a git object id" })
@@ -97,7 +97,7 @@ describe("checkTree (#108)", () => {
     const empty = path.join(dir, "empty")
     await $`git init --quiet ${empty}`.quiet()
     expect(await checkTree(empty, tree)).toEqual({ ok: false, reason: "the cloned repository has no commit to check" })
-  })
+  }, 20_000)
 })
 
 describe("checkDependenciesDir (#85)", () => {

@@ -28,8 +28,8 @@
 // This runs from the Synapse plugin's `config` hook. OPENCODE_DISABLE_DEFAULT_PLUGINS
 // turns all internal plugins off, so with it set nothing here runs: no live list and
 // no `auto`, only what the config file lists.
-import * as fs from "fs/promises"
-import * as path from "path"
+import fs from "fs/promises"
+import path from "path"
 import type { Config } from "@opencode-ai/plugin"
 import { Global } from "@opencode-ai/core/global"
 
@@ -128,12 +128,16 @@ export function parseSynapseModelList(body: unknown): Record<string, SynapseMode
   return models
 }
 
-function defaultAutoModel(): SynapseModelEntry {
+export function defaultAutoModel(): SynapseModelEntry {
   return {
     name: "Synapse Auto",
     tool_call: true,
     limit: { context: SYNAPSE_DEFAULT_CONTEXT, output: SYNAPSE_DEFAULT_OUTPUT },
   }
+}
+
+export const SYNAPSE_FALLBACK_MODELS: Record<string, SynapseModelEntry> = {
+  [SYNAPSE_AUTO_MODEL]: defaultAutoModel(),
 }
 
 function optionalString(value: unknown): string | undefined {
@@ -241,6 +245,33 @@ export function synapseAllowed(cfg: Config): boolean {
   if (cfg.disabled_providers?.includes(SYNAPSE_PROVIDER_ID)) return false
   if (cfg.enabled_providers && !cfg.enabled_providers.includes(SYNAPSE_PROVIDER_ID)) return false
   return true
+}
+
+/**
+ * #248: ensure `cfg.provider.synapse` exists and `cfg.provider.synapse.models` is always seeded
+ * with at least `{ auto: defaultAutoModel() }` so `opencode models` and `opencode models synapse`
+ * never crash on an unconfigured or pre-sign-in `provider.synapse`.
+ */
+export function ensureSynapseProviderConfig(cfg: Config, defaultBaseURL: string): ProviderEntry | undefined {
+  if (!synapseAllowed(cfg)) return undefined
+  cfg.provider ??= {}
+  const existing = cfg.provider[SYNAPSE_PROVIDER_ID]
+  const options = isRecord(existing?.options) ? existing.options : {}
+  const baseURL = typeof options.baseURL === "string" && options.baseURL ? options.baseURL : defaultBaseURL
+  const configuredModels = isRecord(existing?.models) ? (existing.models as Record<string, SynapseModelEntry>) : {}
+  const auto = configuredModels[SYNAPSE_AUTO_MODEL] ?? defaultAutoModel()
+  const seeded: ProviderEntry = {
+    npm: existing?.npm ?? "@ai-sdk/openai-compatible",
+    name: existing?.name ?? "Alterspective Synapse",
+    ...existing,
+    options: { ...options, baseURL },
+    models: {
+      ...configuredModels,
+      [SYNAPSE_AUTO_MODEL]: auto,
+    },
+  }
+  cfg.provider[SYNAPSE_PROVIDER_ID] = seeded
+  return seeded
 }
 
 async function defaultResolveToken(): Promise<{ token?: string; expired: boolean }> {
@@ -363,3 +394,5 @@ export async function loadSynapseModels(cfg: Config, deps: SynapseModelsDeps): P
     return await useFallback()
   }
 }
+
+export const loadSynapseModelsIntoConfig = loadSynapseModels

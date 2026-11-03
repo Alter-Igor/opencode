@@ -1,5 +1,19 @@
 import { describe, expect, test } from "bun:test"
-import { PRIVACY_TIER, PRIVACY_TIER_ENV, resolvePrivacyTier, renderConfig, serveEnv, type Manifest } from "../supervisor/config"
+import { mkdtemp, rm, writeFile } from "fs/promises"
+import { tmpdir } from "os"
+import path from "path"
+import {
+  DEFAULT_SERVED_MODELS_FILE,
+  PRIVACY_TIER,
+  PRIVACY_TIER_ENV,
+  SERVED_MODELS_FILE_ENV,
+  parseServedModelsSideband,
+  readServedModelsSideband,
+  resolvePrivacyTier,
+  renderConfig,
+  serveEnv,
+  type Manifest,
+} from "../supervisor/config"
 
 const manifest = (headers?: Record<string, string>): Manifest => ({
   taskId: "sbxw-test",
@@ -68,10 +82,11 @@ describe("renderConfig privacy tier (#161)", () => {
   })
 })
 
-describe("serveEnv (#161)", () => {
+describe("serveEnv (#161, #257)", () => {
   test("an inherited SYNAPSE_PRIVACY_TIER cannot override a local tier", () => {
     const env = serveEnv({ PATH: "/usr/bin", SYNAPSE_PRIVACY_TIER: "cloud-ok", SBXW_MANIFEST: "{}", SBXW_SERVER_PASSWORD: "p" }, "local-only")
     expect(env[PRIVACY_TIER_ENV]).toBe("local-only")
+    expect(env[SERVED_MODELS_FILE_ENV]).toBe(DEFAULT_SERVED_MODELS_FILE)
     expect(env.SBXW_MANIFEST).toBeUndefined()
     expect(env.SBXW_SERVER_PASSWORD).toBeUndefined()
     expect(env.PATH).toBe("/usr/bin")
@@ -79,6 +94,49 @@ describe("serveEnv (#161)", () => {
 
   test("the tier is set exactly once from the manifest resolution", () => {
     expect(serveEnv({ SYNAPSE_PRIVACY_TIER: "local-only", OTHER: "x" }, "cloud-ok")[PRIVACY_TIER_ENV]).toBe("cloud-ok")
+  })
+})
+
+describe("parseServedModelsSideband / readServedModelsSideband (#257)", () => {
+  test("extracts per-session or total counts and dominant servedModel", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "sbxw-served-"))
+    try {
+      const file = path.join(dir, "served-models.json")
+      await writeFile(
+        file,
+        JSON.stringify({
+          bySession: {
+            ses_1: { "qwen/qwen3.8-27b-dflash2": 3, "qwen/qwen3.8-flash": 1 },
+            ses_2: { "anthropic/claude-opus-5": 2 },
+          },
+          totals: {
+            "qwen/qwen3.8-27b-dflash2": 3,
+            "qwen/qwen3.8-flash": 1,
+            "anthropic/claude-opus-5": 2,
+          },
+          lastServedModel: "anthropic/claude-opus-5",
+          updatedAt: "2026-11-03T10:00:00.000Z",
+        }),
+      )
+
+      const ses1 = await readServedModelsSideband(file, "ses_1")
+      expect(ses1.servedModel).toBe("qwen/qwen3.8-27b-dflash2")
+      expect(ses1.servedModels).toEqual({ "qwen/qwen3.8-27b-dflash2": 3, "qwen/qwen3.8-flash": 1 })
+
+      const overall = await readServedModelsSideband(file)
+      expect(overall.servedModel).toBe("qwen/qwen3.8-27b-dflash2")
+      expect(overall.servedModels).toEqual({
+        "qwen/qwen3.8-27b-dflash2": 3,
+        "qwen/qwen3.8-flash": 1,
+        "anthropic/claude-opus-5": 2,
+      })
+
+      const missing = await readServedModelsSideband(path.join(dir, "nonexistent.json"))
+      expect(missing).toEqual({ servedModel: null, servedModels: {}, bySession: {} })
+      expect(parseServedModelsSideband("{corrupt")).toEqual({ servedModel: null, servedModels: {}, bySession: {} })
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 })
 
