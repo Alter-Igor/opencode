@@ -194,8 +194,8 @@ export function readHostState(dir: string, key: string): HostSessionState | unde
   )
 }
 
-/** Every readable record (damaged ones are skipped), newest first. The default cap is the display list. */
-export function listHostStates(dir: string, limit = MAX_LISTED_STATES): HostSessionState[] {
+/** Every readable record (damaged ones are skipped unless options.strict is true), newest first. The default cap is the display list. */
+export function listHostStates(dir: string, limit = MAX_LISTED_STATES, options?: { strict?: boolean }): HostSessionState[] {
   let names: string[]
   try {
     names = readdirSync(dir).filter((n) => n.endsWith(".json"))
@@ -208,7 +208,8 @@ export function listHostStates(dir: string, limit = MAX_LISTED_STATES): HostSess
     try {
       const state = readHostState(dir, name.slice(0, -".json".length))
       if (state) states.push(state)
-    } catch {
+    } catch (error) {
+      if (options?.strict) throw error
       // damaged or unreadable: not listed (readHostState reports it when the key is asked for)
     }
   }

@@ -84,8 +84,17 @@ export async function applyTaskProfile(
   delegationProfile: Profile | undefined,
   currentSessionID?: string,
 ): Promise<void> {
-  if (ctx.config.backend === "remote") return
-  const states = typeof ctx.config.home === "string" ? await ctx.workspaces.listSessionStates(Number.MAX_SAFE_INTEGER) : []
+  if (ctx.config.backend === "remote") {
+    if (delegationProfile !== undefined) {
+      throw new DelegateError(
+        "invalid_input",
+        "Per-task delegationProfile is not supported on the remote backend.",
+        "Omit delegationProfile when running against the remote backend, or use the local Docker sandbox.",
+      )
+    }
+    return
+  }
+  const states = typeof ctx.config.home === "string" ? await ctx.workspaces.listSessionStates(Number.MAX_SAFE_INTEGER, { strict: true }) : []
   const known = new Map<string, { sessionID: string; boxSessionID?: string; delegationProfile?: Profile }>()
   for (const s of states) {
     if (!s.sessionID) continue

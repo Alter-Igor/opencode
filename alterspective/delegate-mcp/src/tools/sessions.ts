@@ -152,6 +152,13 @@ export const startSessionTool = defineTool({
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   async run(args, ctx, correlationId) {
     const delegationProfile = parseDelegationProfile(args.delegationProfile)
+    if (delegationProfile !== undefined && ctx.config.backend === "remote") {
+      throw new DelegateError(
+        "invalid_input",
+        "Per-task delegationProfile is not supported on the remote backend.",
+        "Omit delegationProfile when running against the remote backend, or use the local Docker sandbox.",
+      )
+    }
     if (delegationProfile !== undefined && args.allowShared === true) {
       throw new DelegateError(
         "invalid_input",

@@ -435,8 +435,8 @@ export type DelegateWorkspaces = Omit<Workspaces, "open" | "collect"> & {
   updateSessionState(sessionKey: string, patch: Partial<HostSessionState>): Promise<HostSessionState>
   /** The host record for a session key; undefined when there is none (throws when damaged). */
   sessionState(sessionKey: string): Promise<HostSessionState | undefined>
-  /** Every readable host record, newest first (pass limit to override the default display cap). */
-  listSessionStates(limit?: number): Promise<HostSessionState[]>
+  /** Every readable host record, newest first (pass limit to override the default display cap; strict propagates corrupt record errors). */
+  listSessionStates(limit?: number, options?: { strict?: boolean }): Promise<HostSessionState[]>
   /**
    * #53: bounded cleanup of confirmed missing sessions whose clones are also proved absent.
    * Returns removed keys.
@@ -528,7 +528,7 @@ export function createWorkspaces(options: WorkspacesOptions): DelegateWorkspaces
     bindSession: async (key, binding) => bindHostState(ctx.stateDir, key, { ...binding, boxProject: options.config.project }),
     updateSessionState: async (key, patch) => updateHostState(ctx.stateDir, key, patch),
     sessionState: async (key) => readHostState(ctx.stateDir, key),
-    listSessionStates: async (limit?: number) => listHostStates(ctx.stateDir, limit),
+    listSessionStates: async (limit?: number, stateOptions?: { strict?: boolean }) => listHostStates(ctx.stateDir, limit, stateOptions),
     pruneSessionStates,
     discard: (key) => discard(ctx, key),
     inspectClose: (key, owner, options) => traced(logger, "inspectClose", undefined, { sessionKey: key }, () => inspectClose(closeDeps, key, owner, options), (p) => ({ safe: p.safe, uncollectedCommits: p.uncollectedCommits })),
