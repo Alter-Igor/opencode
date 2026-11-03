@@ -1645,6 +1645,95 @@ describe("session.llm.stream", () => {
   )
 
   it.instance(
+    "swaps unsupported images before native runtime stream (#235)",
+    () =>
+      Effect.gen(function* () {
+        const model = loadFixture("openai", "gpt-5.2").model
+        const chunks = [
+          {
+            type: "response.completed",
+            response: { incomplete_details: null, usage: { input_tokens: 1, output_tokens: 1 } },
+          },
+        ]
+        let captured: Record<string, unknown> | undefined
+        const executor = Layer.succeed(
+          RequestExecutor.Service,
+          RequestExecutor.Service.of({
+            execute: (request) =>
+              Effect.gen(function* () {
+                const web = yield* HttpClientRequest.toWeb(request).pipe(Effect.orDie)
+                captured = (yield* Effect.promise(() => web.json())) as Record<string, unknown>
+                return HttpClientResponse.fromWeb(request, createEventResponse(chunks, true))
+              }),
+          }),
+        )
+
+        const resolved = yield* Provider.use.getModel(ProviderV2.ID.openai, ModelV2.ID.make(model.id))
+        const sessionID = SessionID.make("session-test-native-vision-swap")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+
+        yield* drainWith(llmLayerWithExecutor({ executor, flags: { experimentalNativeLlm: true } }), {
+          user: {
+            id: MessageID.make("msg_user-native-vision-swap"),
+            sessionID,
+            role: "user",
+            time: { created: Date.now() },
+            agent: agent.name,
+            model: { providerID: ProviderV2.ID.make("openai"), modelID: resolved.id },
+          } satisfies SessionV1.User,
+          sessionID,
+          model: { ...resolved, capabilities: { ...resolved.capabilities, input: { ...resolved.capabilities.input, image: false } } },
+          agent,
+          system: [],
+          messages: [
+            {
+              role: "user",
+              content: [
+                { type: "text", text: "What is on this screen?" },
+                {
+                  type: "file",
+                  mediaType: "image/png",
+                  filename: "shot.png",
+                  data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=",
+                },
+              ],
+            },
+          ] as ModelMessage[],
+          tools: {
+            synapse_vision: tool({
+              description: "Ask Synapse vision",
+              inputSchema: z.object({ image: z.string(), question: z.string() }),
+              execute: async () => ({ output: "ok" }),
+            }),
+          },
+        })
+
+        const serialized = JSON.stringify(captured?.input)
+        expect(serialized).toContain("shot.png")
+        expect(serialized).toContain("available at:")
+        expect(serialized).toContain("synapse_vision")
+      }),
+    {
+      config: () => {
+        const base = openAIConfig(loadFixture("openai", "gpt-5.2").model, "https://injected-openai.test/v1")
+        return {
+          ...base,
+          enabled_providers: ["openai", "synapse"],
+          provider: {
+            ...base.provider,
+            synapse: { name: "Synapse", npm: "@ai-sdk/openai-compatible", env: [], models: {} },
+          },
+        }
+      },
+    },
+  )
+
+  it.instance(
     "executes OpenAI tool calls through native runtime",
     () =>
       Effect.gen(function* () {
