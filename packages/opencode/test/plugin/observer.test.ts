@@ -5,17 +5,29 @@ import { tmpdir } from "../fixture/fixture"
 import * as fs from "fs/promises"
 import * as path from "path"
 
-// The observer has a fixed remote endpoint; intercept fetch so no test sends session data there.
+// Intercept fetch so no test sends session data over the network.
 let telemetry: ReturnType<typeof spyOn<typeof globalThis, "fetch">>
 beforeEach(() => {
   telemetry = spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }))
 })
 afterEach(() => telemetry.mockRestore())
 
+// #83: the learning store follows OPENCODE_TEST_HOME (set by test/preload.ts), so these tests
+// redirect that, not USERPROFILE.
+function restoreTestHome(value: string | undefined) {
+  if (value === undefined) delete process.env.OPENCODE_TEST_HOME
+  else process.env.OPENCODE_TEST_HOME = value
+}
+
 describe("session retrospective profile", () => {
-  test.each([undefined, "0"])("keeps retrospective behavior when the flag is %s", async (value) => {
+  test.each([undefined, "0"])("keeps retrospective behavior when the flag is %s and writes outside workspaceDir (#50, #233)", async (value) => {
+    await using home = await tmpdir()
     await using ws = await tmpdir()
+    const prevHome = process.env.OPENCODE_TEST_HOME
     const previous = process.env.OPENCODE_DISABLE_SESSION_RETROSPECTIVES
+    const prevAudit = process.env.OPENCODE_RETROSPECTIVE_AUDIT_URL
+    process.env.OPENCODE_TEST_HOME = home.path
+    delete process.env.OPENCODE_RETROSPECTIVE_AUDIT_URL
     if (value === undefined) delete process.env.OPENCODE_DISABLE_SESSION_RETROSPECTIVES
     if (value !== undefined) process.env.OPENCODE_DISABLE_SESSION_RETROSPECTIVES = value
     try {
@@ -24,19 +36,53 @@ describe("session retrospective profile", () => {
       const retro = await sessionObserver.finalizeSessionRetrospective(sessionId, ws.path)
       if (!retro) throw new Error("no retrospective found")
       expect(retro.totalToolCalls).toBe(1)
+      expect(retro.workspaceDirectory).toBe(ws.path)
       expect(sessionObserver.getLatestRetrospectives()).toContain(retro)
-      const files = await fs.readdir(path.join(ws.path, ".system_generated", "retrospectives"))
+      const retroDir = path.join(home.path, ".local", "share", "opencode", "retrospectives")
+      const files = await fs.readdir(retroDir)
       expect(files).toHaveLength(1)
-      expect(await Bun.file(path.join(ws.path, ".system_generated", "retrospectives", files[0]!)).json()).toEqual(retro)
-      expect(telemetry).toHaveBeenCalledTimes(1)
-      expect(telemetry).toHaveBeenCalledWith("https://identity.alterspective.com.au/api/audit/session-retrospective", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(retro),
-      })
+      expect(await Bun.file(path.join(retroDir, files[0]!)).json()).toEqual(retro)
+      expect(await fs.readdir(ws.path)).not.toContain(".system_generated")
+      // #233: no network POST when OPENCODE_RETROSPECTIVE_AUDIT_URL is unset
+      expect(telemetry).not.toHaveBeenCalled()
     } finally {
+      restoreTestHome(prevHome)
       if (previous === undefined) delete process.env.OPENCODE_DISABLE_SESSION_RETROSPECTIVES
       if (previous !== undefined) process.env.OPENCODE_DISABLE_SESSION_RETROSPECTIVES = previous
+      if (prevAudit === undefined) delete process.env.OPENCODE_RETROSPECTIVE_AUDIT_URL
+      if (prevAudit !== undefined) process.env.OPENCODE_RETROSPECTIVE_AUDIT_URL = prevAudit
+    }
+  })
+
+  test("posts audit telemetry only when OPENCODE_RETROSPECTIVE_AUDIT_URL is set to https or loopback (#233)", async () => {
+    await using home = await tmpdir()
+    await using ws = await tmpdir()
+    const prevHome = process.env.OPENCODE_TEST_HOME
+    const prevAudit = process.env.OPENCODE_RETROSPECTIVE_AUDIT_URL
+    process.env.OPENCODE_TEST_HOME = home.path
+    try {
+      process.env.OPENCODE_RETROSPECTIVE_AUDIT_URL = "https://identity.alterspective.com.au/api/audit/session-retrospective"
+      sessionObserver.onToolBefore("obs-audit-https", "read-1", "read", {})
+      const retro = await sessionObserver.finalizeSessionRetrospective("obs-audit-https", ws.path)
+      expect(telemetry).toHaveBeenCalledTimes(1)
+      expect(telemetry).toHaveBeenCalledWith(
+        "https://identity.alterspective.com.au/api/audit/session-retrospective",
+        expect.objectContaining({
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(retro),
+        }),
+      )
+
+      telemetry.mockClear()
+      process.env.OPENCODE_RETROSPECTIVE_AUDIT_URL = "http://example.com/insecure-audit"
+      sessionObserver.onToolBefore("obs-audit-insecure", "read-1", "read", {})
+      await sessionObserver.finalizeSessionRetrospective("obs-audit-insecure", ws.path)
+      expect(telemetry).not.toHaveBeenCalled()
+    } finally {
+      restoreTestHome(prevHome)
+      if (prevAudit === undefined) delete process.env.OPENCODE_RETROSPECTIVE_AUDIT_URL
+      if (prevAudit !== undefined) process.env.OPENCODE_RETROSPECTIVE_AUDIT_URL = prevAudit
     }
   })
 
@@ -63,13 +109,6 @@ describe("session retrospective profile", () => {
     }
   })
 })
-
-// #83: the learning store follows OPENCODE_TEST_HOME (set by test/preload.ts), so these tests
-// redirect that, not USERPROFILE.
-function restoreTestHome(value: string | undefined) {
-  if (value === undefined) delete process.env.OPENCODE_TEST_HOME
-  else process.env.OPENCODE_TEST_HOME = value
-}
 
 describe("SessionObserverManager.onToolAfter", () => {
   test("records a tool call with string output", async () => {
@@ -144,7 +183,7 @@ describe("SessionObserverManager.onToolAfter", () => {
   })
 })
 describe("rule visibility", () => {
-  test("injects a rule that exists only in the project store", async () => {
+  test("injects a rule that exists only in the legacy project store when new store does not exist yet (#50)", async () => {
     await using home = await tmpdir()
     await using ws = await tmpdir()
     const prev = process.env.OPENCODE_TEST_HOME
@@ -274,7 +313,7 @@ describe("rule visibility", () => {
     }
   })
 
-  test("records the scope of each rule", async () => {
+  test("records the scope of each rule outside workspaceDir (#50)", async () => {
     await using home = await tmpdir()
     await using ws = await tmpdir()
     const prev = process.env.OPENCODE_TEST_HOME
@@ -283,14 +322,46 @@ describe("rule visibility", () => {
       await sessionObserver.recordLearning({ lesson: "global rule", source: "user_feedback" })
       await sessionObserver.recordLearning({ lesson: "project rule", source: "user_feedback" }, ws.path)
 
-      const global = JSON.parse(
-        await fs.readFile(path.join(home.path, ".local", "share", "opencode", "learnings.json"), "utf8"),
-      )
-      const project = JSON.parse(
-        await fs.readFile(path.join(ws.path, ".system_generated", "logs", "learnings.json"), "utf8"),
-      )
+      const paths = learningStorePaths(ws.path)
+      expect(paths.project).toStartWith(path.join(home.path, ".local", "share", "opencode", "project-learnings"))
+      const global = JSON.parse(await fs.readFile(paths.global!, "utf8"))
+      const project = JSON.parse(await fs.readFile(paths.project!, "utf8"))
       expect(global.find((r: { lesson: string }) => r.lesson === "global rule").scope).toBe("global")
       expect(project.find((r: { lesson: string }) => r.lesson === "project rule").scope).toBe("project")
+      expect(await fs.readdir(ws.path)).not.toContain(".system_generated")
+    } finally {
+      restoreTestHome(prev)
+    }
+  })
+
+  test("buddy_review and auto_correction learnings stay project-scoped and do not leak to global store (#211)", async () => {
+    await using home = await tmpdir()
+    await using wsA = await tmpdir()
+    await using wsB = await tmpdir()
+    const prev = process.env.OPENCODE_TEST_HOME
+    process.env.OPENCODE_TEST_HOME = home.path
+    try {
+      const buddy = await sessionObserver.recordLearning(
+        { lesson: "Buddy Review finding in auth.ts: SQL injection", source: "buddy_review" },
+        wsA.path,
+      )
+      expect(buddy.savedTo).toEqual(["project"])
+
+      const auto = await sessionObserver.recordLearning(
+        { lesson: "Auto correction in repo A", source: "auto_correction" },
+        wsA.path,
+      )
+      expect(auto.savedTo).toEqual(["project"])
+
+      // Workspace A sees its project rules
+      const listA = await sessionObserver.listLearnings(wsA.path)
+      expect(listA.map((r) => r.lesson)).toContain("Buddy Review finding in auth.ts: SQL injection")
+      expect(listA.map((r) => r.lesson)).toContain("Auto correction in repo A")
+
+      // Workspace B and the global store do NOT receive Workspace A's automatic rules
+      const listB = await sessionObserver.listLearnings(wsB.path)
+      expect(listB).toEqual([])
+      await expect(fs.readFile(learningStorePaths().global!, "utf8")).rejects.toThrow()
     } finally {
       restoreTestHome(prev)
     }
@@ -345,7 +416,7 @@ describe("rule visibility", () => {
     try {
       await sessionObserver.recordLearning({ lesson: "only global", source: "user_feedback" }, ws.path)
       // Remove the project store so only the global copy remains.
-      await fs.rm(path.join(ws.path, ".system_generated", "logs", "learnings.json"), { force: true })
+      await fs.rm(learningStorePaths(ws.path).project!, { force: true })
 
       expect(await sessionObserver.forgetLearning("only global", ws.path)).toBe(1)
     } finally {
@@ -361,7 +432,7 @@ describe("rule visibility", () => {
     try {
       await sessionObserver.recordLearning({ lesson: "fragile", source: "user_feedback" })
       // The project store exists but holds valid JSON that is not the expected array.
-      const wsFile = path.join(ws.path, ".system_generated", "logs", "learnings.json")
+      const wsFile = learningStorePaths(ws.path).project!
       await fs.mkdir(path.dirname(wsFile), { recursive: true })
       await fs.writeFile(wsFile, JSON.stringify("not a rules array"), "utf8")
 
@@ -647,15 +718,17 @@ describe("rule visibility", () => {
     const prev = process.env.OPENCODE_TEST_HOME
     process.env.OPENCODE_TEST_HOME = home.path
     try {
-      // A file where the global store's folder should be: the lock folder cannot be made there.
-      const folder = path.dirname(learningStorePaths(ws.path).global!)
-      await fs.mkdir(path.dirname(folder), { recursive: true })
-      await fs.writeFile(folder, "not a folder", "utf8")
+      // A file where the lock folder should be, and an unreadable global store so only project can be written.
+      const globalFile = learningStorePaths(ws.path).global!
+      const locks = path.join(path.dirname(globalFile), "locks")
+      await fs.mkdir(path.dirname(locks), { recursive: true })
+      await fs.writeFile(locks, "not a folder", "utf8")
+      await fs.writeFile(globalFile, "{ broken", "utf8")
       const recorded = await sessionObserver.recordLearning({ lesson: "saved without the lock", source: "user_feedback" }, ws.path)
       expect(recorded.savedTo).toEqual(["project"])
       const failed = sessionObserver
         .getDiagnosticLogs()
-        .filter((e) => e.type === "LEARNING_STORE" && e.details.event === "lock_failed" && e.details.file === learningStorePaths(ws.path).global)
+        .filter((e) => e.type === "LEARNING_STORE" && e.details.event === "lock_failed" && e.details.file === globalFile)
       expect(failed.length).toBeGreaterThan(0)
     } finally {
       restoreTestHome(prev)
@@ -718,7 +791,7 @@ describe("rule visibility", () => {
   })
 })
 
-describe("observer paths (#83)", () => {
+describe("observer paths (#83, #50)", () => {
   const saved = { home: process.env.OPENCODE_TEST_HOME, diag: process.env.OPENCODE_DIAGNOSTICS_DIR }
   afterEach(() => {
     if (saved.home === undefined) delete process.env.OPENCODE_TEST_HOME
@@ -733,14 +806,18 @@ describe("observer paths (#83)", () => {
     expect(learningStorePaths().global).toBe(path.join(tmp.path, ".local", "share", "opencode", "learnings.json"))
   })
 
-  test("a broken OPENCODE_DIAGNOSTICS_DIR falls back to the default log folder", async () => {
+  test("a broken OPENCODE_DIAGNOSTICS_DIR falls back to the default log folder and never pollutes workspaceDir (#50)", async () => {
     await using tmp = await tmpdir()
+    await using ws = await tmpdir()
     process.env.OPENCODE_TEST_HOME = tmp.path
     // A file where the folder should be: mkdir and append both fail there.
     const notADir = path.join(tmp.path, "not-a-dir")
     await fs.writeFile(notADir, "x")
     process.env.OPENCODE_DIAGNOSTICS_DIR = notADir
-    sessionObserver.logDiagnostic({ timestamp: new Date().toISOString(), type: "AUTH_EVENT", details: { marker: "obs-83-fallback" } })
+    sessionObserver.logDiagnostic(
+      { timestamp: new Date().toISOString(), type: "AUTH_EVENT", details: { marker: "obs-83-fallback" } },
+      ws.path,
+    )
     const log = path.join(defaultDiagnosticsLogDir()!, "diagnostics.log")
     let text = ""
     for (let i = 0; i < 50 && !text.includes("obs-83-fallback"); i++) {
@@ -748,6 +825,7 @@ describe("observer paths (#83)", () => {
       text = await fs.readFile(log, "utf8").catch(() => "")
     }
     expect(text).toContain("obs-83-fallback")
+    expect(await fs.readdir(ws.path)).not.toContain(".system_generated")
   })
 })
 
@@ -808,16 +886,28 @@ describe("MCP tool failures with real remote tool names (#18)", () => {
   })
 
   test("a turn with no tool calls writes and sends no retrospective (#209)", async () => {
+    await using home = await tmpdir()
     await using ws = await tmpdir()
-    const sessionId = "obs-209-empty"
-    expect(await sessionObserver.finalizeSessionRetrospective(sessionId, ws.path)).toBeNull()
-    // A session.deleted right after an idle: the idle took the records, the delete finds none.
-    sessionObserver.onToolBefore(sessionId, "c1", "read", {})
-    sessionObserver.onToolAfter(sessionId, "c1", "read", "ok")
-    expect((await sessionObserver.finalizeSessionRetrospective(sessionId, ws.path))?.totalToolCalls).toBe(1)
-    expect(await sessionObserver.finalizeSessionRetrospective(sessionId, ws.path)).toBeNull()
-    expect(await fs.readdir(path.join(ws.path, ".system_generated", "retrospectives"))).toHaveLength(1)
-    expect(telemetry).toHaveBeenCalledTimes(1)
+    const prevHome = process.env.OPENCODE_TEST_HOME
+    const prevAudit = process.env.OPENCODE_RETROSPECTIVE_AUDIT_URL
+    process.env.OPENCODE_TEST_HOME = home.path
+    process.env.OPENCODE_RETROSPECTIVE_AUDIT_URL = "https://identity.alterspective.com.au/api/audit/session-retrospective"
+    try {
+      const sessionId = "obs-209-empty"
+      expect(await sessionObserver.finalizeSessionRetrospective(sessionId, ws.path)).toBeNull()
+      // A session.deleted right after an idle: the idle took the records, the delete finds none.
+      sessionObserver.onToolBefore(sessionId, "c1", "read", {})
+      sessionObserver.onToolAfter(sessionId, "c1", "read", "ok")
+      expect((await sessionObserver.finalizeSessionRetrospective(sessionId, ws.path))?.totalToolCalls).toBe(1)
+      expect(await sessionObserver.finalizeSessionRetrospective(sessionId, ws.path)).toBeNull()
+      expect(await fs.readdir(path.join(home.path, ".local", "share", "opencode", "retrospectives"))).toHaveLength(1)
+      expect(await fs.readdir(ws.path)).not.toContain(".system_generated")
+      expect(telemetry).toHaveBeenCalledTimes(1)
+    } finally {
+      restoreTestHome(prevHome)
+      if (prevAudit === undefined) delete process.env.OPENCODE_RETROSPECTIVE_AUDIT_URL
+      if (prevAudit !== undefined) process.env.OPENCODE_RETROSPECTIVE_AUDIT_URL = prevAudit
+    }
   })
 
   test("a real MCP timeout still counts as a failure (#209)", async () => {
@@ -851,6 +941,24 @@ describe("MCP tool failures with real remote tool names (#18)", () => {
       isError: true,
     })
     expect((await mcpAnomalies(sessionId)).map((a) => a.tool)).toEqual(["alterspective-rag_rag_search"])
+  })
+
+  test("child MCP tool failure shapes passed to onToolAfter record MCP_TOOL_FAILURE unless aborted (#209)", async () => {
+    const sessionId = "obs-209-child-mcp"
+    sessionObserver.onToolBefore(sessionId, "call_code_mode/1", "keystone_search", {})
+    sessionObserver.onToolAfter(sessionId, "call_code_mode/1", "keystone_search", {
+      content: [{ type: "text", text: "MCP error -32001: Request timed out" }],
+      isError: true,
+    })
+    sessionObserver.onToolBefore(sessionId, "call_code_mode/2", "keystone_search", {})
+    sessionObserver.onToolAfter(sessionId, "call_code_mode/2", "keystone_search", {
+      content: [{ type: "text", text: "MCP error -32001: AbortError: The operation was aborted." }],
+      isError: true,
+    })
+    const anomalies = await mcpAnomalies(sessionId)
+    expect(anomalies).toHaveLength(1)
+    expect(anomalies[0]?.tool).toBe("keystone_search")
+    expect(anomalies[0]?.detail).toContain("Request timed out")
   })
 
   test("a failed call is flagged from its stored part when the tool was never announced as native", async () => {

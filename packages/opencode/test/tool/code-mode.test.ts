@@ -426,6 +426,37 @@ describe("code mode execute", () => {
     expect(after!.output).toEqual({ content: [{ type: "text", text: "one" }] })
   })
 
+  test("failing child MCP calls fire tool.execute.after with isError so observer captures failures (#209)", async () => {
+    const events: { name: string; input: any; output: any }[] = []
+    const trigger = ((name: unknown, input: unknown, output: unknown) =>
+      Effect.sync(() => {
+        events.push({ name: name as string, input, output })
+        return output
+      })) as Plugin.Interface["trigger"]
+    const tool = await build(
+      {
+        bad_tool: mcpTool("tool", () => ({ isError: true, content: [{ type: "text", text: "server exploded" }] })),
+      },
+      undefined,
+      undefined,
+      trigger,
+    )
+
+    const out = await Effect.runPromise(
+      tool.execute({ code: "try { await tools.bad.tool({ q: 'x' }) } catch (e) { return 'caught: ' + e.message }" }, ctx),
+    )
+
+    expect(out.output).toBe("caught: server exploded")
+    expect(events.map((e) => [e.name, e.input.tool, e.input.callID])).toEqual([
+      ["tool.execute.before", "bad_tool", "call_code_mode/1"],
+      ["tool.execute.after", "bad_tool", "call_code_mode/1"],
+    ])
+    expect(events[1]!.output).toEqual({
+      content: [{ type: "text", text: "server exploded" }],
+      isError: true,
+    })
+  })
+
   test("a failing before hook fails only that child call as a catchable in-program error", async () => {
     const trigger = ((name: unknown, input: any, output: unknown) => {
       if (name === "tool.execute.before" && input.tool === "a_tool") return Effect.die(new Error("hook exploded"))

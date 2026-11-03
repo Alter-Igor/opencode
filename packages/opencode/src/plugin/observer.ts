@@ -1,5 +1,6 @@
 import * as fs from "node:fs/promises"
 import * as path from "node:path"
+import { createHash } from "node:crypto"
 import { truthy } from "@opencode-ai/core/flag/flag"
 import { getLatestSynapseServing } from "./synapse"
 import { redactSecrets } from "./secret-redaction"
@@ -179,7 +180,7 @@ class SessionObserverManager {
   private diagnosticLogs: DiagnosticLogEntry[] = []
   private nativeTools = new Set<string>()
 
-  public logDiagnostic(entry: DiagnosticLogEntry, workspaceDir?: string) {
+  public logDiagnostic(entry: DiagnosticLogEntry, _workspaceDir?: string) {
     const safeEntry: DiagnosticLogEntry = {
       ...entry,
       details: redactSensitiveData(entry.details || {}),
@@ -188,19 +189,11 @@ class SessionObserverManager {
     if (this.diagnosticLogs.length > 200) {
       this.diagnosticLogs.pop()
     }
-    void this.persistDiagnosticLog(safeEntry, workspaceDir)
+    void this.persistDiagnosticLog(safeEntry)
   }
 
-  private async persistDiagnosticLog(entry: DiagnosticLogEntry, workspaceDir?: string) {
+  private async persistDiagnosticLog(entry: DiagnosticLogEntry) {
     const logLine = JSON.stringify(entry) + "\n"
-    if (workspaceDir) {
-      try {
-        const logDir = path.join(workspaceDir, ".system_generated", "logs")
-        await fs.mkdir(logDir, { recursive: true })
-        const filePath = path.join(logDir, "diagnostics.log")
-        await fs.appendFile(filePath, logLine, "utf8")
-      } catch {}
-    }
     // #83: a broken OPENCODE_DIAGNOSTICS_DIR (a file, no permission) used to drop the line
     // silently; fall back to the default log folder instead.
     const configured = diagnosticsLogDir()
@@ -263,15 +256,27 @@ class SessionObserverManager {
 
   public onToolAfter(sessionId: string, callId: string, tool: string, output: unknown) {
     // #18: an MCP result carries its text in `content` items, not in `output`.
-    const mcp = isMcpResult(output)
-    const text = typeof output === "string" ? output : mcp ? mcpText(output) : output == null ? "" : JSON.stringify(output) ?? ""
+    const raw =
+      !isMcpResult(output) &&
+      !!output &&
+      typeof output === "object" &&
+      isMcpResult((output as { metadata?: unknown }).metadata)
+        ? (output as { metadata: { content: unknown[]; isError?: unknown } }).metadata
+        : output
+    const mcp = isMcpResult(raw)
+    const text = typeof raw === "string" ? raw : mcp ? mcpText(raw) : raw == null ? "" : JSON.stringify(raw) ?? ""
     const records = this.trajectories.get(sessionId) ?? []
     const record = records.find((r) => r.callId === callId)
     if (record && mcp) record.mcp = true
+    if (mcp && raw.isError === true) {
+      if (record) record.outputSnippet = text.slice(0, 300)
+      this.onToolFailed(sessionId, callId, tool, text)
+      return
+    }
     // A real MCP error result is thrown by core and arrives through onToolFailed; the words in a
     // successful MCP result (a log or search tool's text) are data, not a failure (QA on #18).
     const isError = mcp
-      ? output.isError === true
+      ? false
       : text.includes("Error:") ||
       text.includes("error:") ||
       text.includes("Failed to") ||
@@ -378,10 +383,12 @@ class SessionObserverManager {
       this.latestRetrospectives.pop()
     }
 
-    // Save locally
+    // Save locally (#50: store under ~/.local/share/opencode/retrospectives instead of <workspaceDir>/.system_generated)
     if (workspaceDir) {
       try {
-        const retroDir = path.join(workspaceDir, ".system_generated", "retrospectives")
+        const retroDir =
+          process.env.OPENCODE_RETROSPECTIVES_DIR?.trim() ||
+          path.join(observerHome(), ".local", "share", "opencode", "retrospectives")
         await fs.mkdir(retroDir, { recursive: true })
         const filePath = path.join(retroDir, `retro-${sessionId}-${Date.now()}.json`)
         await fs.writeFile(filePath, JSON.stringify(retro, null, 2), "utf8")
@@ -395,25 +402,32 @@ class SessionObserverManager {
   }
 
   private async dispatchAuditTelemetry(retro: SessionRetrospective) {
-    try {
-      await fetch("https://identity.alterspective.com.au/api/audit/session-retrospective", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(retro),
-      })
-    } catch {}
+    const auditUrl = process.env.OPENCODE_RETROSPECTIVE_AUDIT_URL?.trim()
+    if (!auditUrl) return
+    if (
+      !auditUrl.startsWith("https://") &&
+      !auditUrl.startsWith("http://127.0.0.1") &&
+      !auditUrl.startsWith("http://localhost")
+    ) {
+      return
+    }
+    await fetch(auditUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(retro),
+      signal: AbortSignal.timeout(5000),
+    }).catch(() => {})
   }
 
   /**
-   * Store a rule. With a `workspaceDir` it is written to BOTH stores, by design (#38): the global
-   * copy is what makes `synapse_record_learning` keep its promise that the rule guides "all
-   * future sessions", in any project; the project copy (`.system_generated/logs`, not committed)
-   * keeps it with that workspace. So a rule recorded in a project is live machine-wide, and a
-   * `forgetLearning` from the same workspace removes both copies. Without a `workspaceDir` only
-   * the global store is written. Automatic rules (buddy review findings) are mirrored too, which
-   * can carry one project's text into every project's prompt: an owner decision, #211. A store
-   * that cannot be read is left alone, never overwritten. `savedTo` names the stores actually
-   * written, so a caller never reports a rule as saved when it was not.
+   * Store a rule. With a `workspaceDir`, explicit `user_feedback` rules are written to BOTH stores
+   * (#38): the global copy makes `synapse_record_learning` keep its promise that the rule guides
+   * "all future sessions", in any project; the project copy (`project-learnings/<hash>.json` under
+   * home, #50) keeps it with that workspace. Automatic rules (`buddy_review`, `auto_correction`,
+   * `session_retro`) with a `workspaceDir` are written to the project store only, so one repo's
+   * findings never leak into another repo's prompt (#211). Without a `workspaceDir` only the global
+   * store is written. A store that cannot be read is left alone, never overwritten. `savedTo` names
+   * the stores actually written, so a caller never reports a rule as saved when it was not.
    */
   public async recordLearning(
     learning: Omit<SessionLearning, "id" | "timestamp">,
@@ -421,7 +435,8 @@ class SessionObserverManager {
   ): Promise<SessionLearning & { savedTo: Array<"global" | "project"> }> {
     const normalizedText = learning.lesson.trim().toLowerCase()
     const paths = learningStorePaths(workspaceDir)
-    const files = [paths.global, paths.project].filter((file): file is string => Boolean(file))
+    const mirrorGlobal = !paths.project || learning.source === "user_feedback"
+    const files = [mirrorGlobal ? paths.global : undefined, paths.project].filter((file): file is string => Boolean(file))
     const entry: SessionLearning = {
       id: `learn_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
       timestamp: new Date().toISOString(),
@@ -436,7 +451,7 @@ class SessionObserverManager {
           await fs.mkdir(path.dirname(file), { recursive: true })
           // #38: a store we cannot read is left alone. Writing one row over it would drop its
           // other rules and the tombstones that keep forgotten rules forgotten.
-          const read = await readRuleStore(file)
+          const read = await (scope === "project" ? readRuleStoreWithLegacy(file, workspaceDir) : readRuleStore(file))
           if (read === "unreadable") continue
           const existing: SessionLearning[] = read ?? []
           const found = existing.find((e) => e.lesson.trim().toLowerCase() === normalizedText)
@@ -473,7 +488,9 @@ class SessionObserverManager {
       const paths = learningStorePaths(workspaceDir)
       // #212: the same row check as a forget, so a malformed row cannot throw in isLive.
       const read = async (file?: string): Promise<SessionLearning[]> => {
-        const rows = file ? await readRuleStore(file) : undefined
+        const rows = file
+          ? await (file === paths.project ? readRuleStoreWithLegacy(file, workspaceDir) : readRuleStore(file))
+          : undefined
         if (file) this.noteSkippedStore(file, file === paths.project ? "project" : "global", rows === "unreadable", workspaceDir)
         return Array.isArray(rows) ? rows : []
       }
@@ -545,7 +562,7 @@ class SessionObserverManager {
       let lease: Flock.Lease | undefined
       try {
         lease = await Flock.acquire(`learning-store:${anchor}`, {
-          dir: path.dirname(anchor),
+          dir: path.join(path.dirname(anchor), "locks"),
           timeoutMs: LEARNING_STORE_LOCK_TIMEOUT_MS,
         })
       } catch (error) {
@@ -577,11 +594,13 @@ class SessionObserverManager {
     workspaceDir?: string,
   ): Promise<Array<SessionLearning & { origin: "global" | "project"; injected: boolean }>> {
     // #212: the same row check as a forget, so a malformed row cannot throw in isLive.
+    const paths = learningStorePaths(workspaceDir)
     const read = async (file?: string): Promise<SessionLearning[]> => {
-      const rows = file ? await readRuleStore(file) : undefined
+      const rows = file
+        ? await (file === paths.project ? readRuleStoreWithLegacy(file, workspaceDir) : readRuleStore(file))
+        : undefined
       return Array.isArray(rows) ? rows : []
     }
-    const paths = learningStorePaths(workspaceDir)
     const global = (await read(paths.global)).filter(isLive)
     const project = (await read(paths.project)).filter(isLive)
     const globalKeys = new Set(global.map(learningKey))
@@ -602,7 +621,7 @@ class SessionObserverManager {
   public async unreadableRuleStores(workspaceDir?: string): Promise<Array<"global" | "project">> {
     const paths = learningStorePaths(workspaceDir)
     const out: Array<"global" | "project"> = []
-    if (paths.project && (await readRuleStore(paths.project)) === "unreadable") out.push("project")
+    if (paths.project && (await readRuleStoreWithLegacy(paths.project, workspaceDir)) === "unreadable") out.push("project")
     if (paths.global && (await readRuleStore(paths.global)) === "unreadable") out.push("global")
     return out
   }
@@ -640,31 +659,38 @@ class SessionObserverManager {
       // #38: read and check every store before writing any. If a store cannot be read, we
       // cannot claim its copy is gone, so we report nothing AND change nothing: a refused
       // forget used to tombstone the global copy before it found the project store unreadable.
-      const stores: Array<{ file: string; rows: SessionLearning[] }> = []
+      const stores: Array<{ file: string; rows: SessionLearning[]; existed: boolean }> = []
       for (const file of files) {
-        const read = await readRuleStore(file)
+        const isProject = file === paths.project
+        const read = await (isProject ? readRuleStoreWithLegacy(file, workspaceDir) : readRuleStore(file))
         if (read === "unreadable") return { forgotten: 0, refused: "unreadable" as const }
-        if (read) stores.push({ file, rows: read })
+        if (read) {
+          const existed = !isProject || (await readRuleStore(file)) !== undefined
+          stores.push({ file, rows: read, existed })
+        }
       }
       const forgotten = new Set<string>()
-      const written: Array<{ file: string; before: SessionLearning[] }> = []
+      const written: Array<{ file: string; before: SessionLearning[]; existed: boolean }> = []
       for (const store of stores) {
         const before = structuredClone(store.rows)
         const keys = markForgotten(store.rows, matches)
         if (keys.size === 0) continue
         try {
+          await fs.mkdir(path.dirname(store.file), { recursive: true })
           await writeJsonAtomic(store.file, trimRules(store.rows))
         } catch {
           // #212: one store written and the next not would leave a rule half forgotten; put the
           // written stores back (best effort) so a refused forget changes nothing here either.
           let restored = true
-          for (const done of written)
-            await writeJsonAtomic(done.file, done.before).catch(() => {
+          for (const done of written) {
+            const op = done.existed ? writeJsonAtomic(done.file, done.before) : fs.rm(done.file, { force: true })
+            await op.catch(() => {
               restored = false
             })
+          }
           return { forgotten: 0, refused: "write_failed" as const, restored }
         }
-        written.push({ file: store.file, before })
+        written.push({ file: store.file, before, existed: store.existed })
         for (const key of keys) forgotten.add(key)
       }
       return { forgotten: forgotten.size }
@@ -709,13 +735,34 @@ function observerHome(): string {
 /**
  * The two on-disk rule stores: global (whole machine) and this project. #83: the global store
  * honours OPENCODE_TEST_HOME too, so a test never writes to the person's real learnings.json.
+ * #50: the project store lives under <home>/.local/share/opencode/project-learnings/<hash>.json
+ * rather than inside the git working tree.
  */
 export function learningStorePaths(workspaceDir?: string): { global?: string; project?: string } {
   const homeDir = observerHome()
+  if (!homeDir) return { global: undefined, project: undefined }
+  const hash = workspaceDir
+    ? createHash("sha256").update(path.resolve(workspaceDir)).digest("hex").slice(0, 32)
+    : undefined
   return {
-    global: homeDir ? path.join(homeDir, ".local", "share", "opencode", "learnings.json") : undefined,
-    project: workspaceDir ? path.join(workspaceDir, ".system_generated", "logs", "learnings.json") : undefined,
+    global: path.join(homeDir, ".local", "share", "opencode", "learnings.json"),
+    project: hash ? path.join(homeDir, ".local", "share", "opencode", "project-learnings", `${hash}.json`) : undefined,
   }
+}
+
+function legacyProjectLearningStorePath(workspaceDir?: string): string | undefined {
+  return workspaceDir ? path.join(workspaceDir, ".system_generated", "logs", "learnings.json") : undefined
+}
+
+async function readRuleStoreWithLegacy(
+  file: string,
+  workspaceDir?: string,
+): Promise<SessionLearning[] | undefined | "unreadable"> {
+  const primary = await readRuleStore(file)
+  if (primary !== undefined) return primary
+  const legacy = legacyProjectLearningStorePath(workspaceDir)
+  if (!legacy || legacy === file) return undefined
+  return readRuleStore(legacy)
 }
 
 const learningKey = (l: SessionLearning) => String(l.lesson ?? "").trim().toLowerCase()
@@ -826,5 +873,3 @@ export interface SessionLearning {
 }
 
 export const sessionObserver = new SessionObserverManager()
-
-
