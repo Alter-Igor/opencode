@@ -67,9 +67,19 @@ export function containerName(config: Pick<BridgeConfig, "project">): string {
  * running set built from another checkout is caught on reuse.
  */
 export const SIBLING_SERVICES = ["front", "npm-cache", "pypi-cache", "inbox", "mcp-gate"] as const
+/**
+ * #240: the socat loopback forwarders that publish the box API, inbox admin API and gate admin API
+ * on 127.0.0.1. They carry no image/config label (fixed alpine/socat digest), but must be running
+ * for the host bridge to reach the sandbox.
+ */
+export const FORWARDER_SIBLING_SERVICES = ["gate-box", "gate-admin", "gate-mcp-admin"] as const
 
 export function siblingContainers(config: Pick<BridgeConfig, "project">): Array<{ service: string; container: string }> {
   return SIBLING_SERVICES.map((service) => ({ service, container: `${containerName(config)}-${service}` }))
+}
+
+export function forwarderSiblingContainers(config: Pick<BridgeConfig, "project">): Array<{ service: string; container: string }> {
+  return FORWARDER_SIBLING_SERVICES.map((service) => ({ service, container: `${containerName(config)}-${service}` }))
 }
 
 /**
@@ -109,11 +119,16 @@ export type ComposeInputs = {
   opencodeVersion: string
 }
 
-/** front's upstream DNS resolver (compose.yaml front), passed on only when the owner set it; not a secret. */
+/** front's upstream DNS resolver (compose.yaml front) and the box memory limit (#160), passed on only when the owner set them; not secrets. */
 export const FRONT_RESOLVER_ENV = "OCD_FRONT_RESOLVER"
+export const BOX_MEM_LIMIT_ENV = "OCD_BOX_MEM_LIMIT"
 function frontEnv(hostEnv: NodeJS.ProcessEnv): Record<string, string> {
+  const out: Record<string, string> = {}
   const value = hostEnv[FRONT_RESOLVER_ENV]
-  return value ? { [FRONT_RESOLVER_ENV]: value } : {}
+  if (value) out[FRONT_RESOLVER_ENV] = value
+  const mem = hostEnv[BOX_MEM_LIMIT_ENV]
+  if (mem) out[BOX_MEM_LIMIT_ENV] = mem
+  return out
 }
 
 /** Values of the approved box env vars present on the host (for the child env and for redaction). */

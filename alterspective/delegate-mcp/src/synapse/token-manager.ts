@@ -55,6 +55,8 @@ export type TokenState = {
    * are retried on the timer, with backoff; other results wait for a new token or a sandbox start.
    */
   lastReload?: { result: Reload; at: number; failures?: number }
+  /** #180 item 2: other running fronts whose last reload failed transiently, keyed by container name. */
+  lastReloadFailedContainers?: Record<string, { result: Reload; at: number; failures: number }>
 }
 
 /** A pending marker older than this is from a bridge that went away (it retries every tick). */
@@ -171,19 +173,58 @@ export async function publishAuthConf(deps: Pick<SynapseDeps, "targets" | "front
 }
 
 /**
- * #178: reload this bridge's front (recorded and returned, as reloadFront), then every other box's
- * front (logged only). Lock hold time: one more bounded reload (about 50 s worst case) per other
- * box folder this home remembers, not only running ones.
+ * #178 / #180 items 2 & 4: reload this bridge's front (recorded and returned, as reloadFront), then
+ * every other RUNNING box's front. Stopped other fronts are skipped so they neither log a false
+ * "front NOT reloaded" warning nor add to the lock hold time. Any other running front whose reload
+ * fails transiently is recorded in `lastReloadFailedContainers` so `reloadRetryDue` retries it.
  */
 export async function reloadFronts(deps: Pick<SynapseDeps, "targets" | "frontDir" | "exec" | "frontContainer" | "home" | "now" | "log">, options: { record?: boolean; component?: string } = {}): Promise<Reload> {
   const own = await reloadFront(deps, options)
-  for (const other of await otherFronts(deps)) await reloadFront({ ...deps, frontContainer: other.frontContainer }, { ...options, record: false })
+  const others = await otherFronts(deps)
+  if (others.length === 0) return own
+  const state = options.record === false ? undefined : await readState(deps.home)
+  const failed: Record<string, { result: Reload; at: number; failures: number }> = { ...(state?.lastReloadFailedContainers ?? {}) }
+  delete failed[deps.frontContainer]
+  let changed = state?.lastReloadFailedContainers?.[deps.frontContainer] !== undefined
+  for (const other of others) {
+    if (!(await isFrontRunning(deps.exec, other.frontContainer))) {
+      if (failed[other.frontContainer] !== undefined) {
+        delete failed[other.frontContainer]
+        changed = true
+      }
+      continue
+    }
+    const run = await deps.exec(["docker", "exec", other.frontContainer, FRONT_RELOAD], { timeoutMs: 30_000 })
+    const result: Reload = run.code === 0 ? "reloaded" : run.code === FILES_CHANGED ? "config_changed" : await notReloaded({ exec: deps.exec, frontContainer: other.frontContainer }, run.code)
+    const reason = run.stderr.trim().split("\n").at(-1)?.slice(0, 300)
+    safeLog(deps.log, result === "reloaded" ? "info" : "warn", options.component ?? "synapse", result === "reloaded" ? "front reloaded" : "front NOT reloaded", { front: other.frontContainer, result, ...(result === "reloaded" ? {} : { exit: run.code, reason }) })
+    const transient = result !== "front_not_running" && TRANSIENT_EXITS.has(run.code)
+    if (transient) {
+      const prev = failed[other.frontContainer]?.failures ?? 0
+      failed[other.frontContainer] = { result, at: deps.now(), failures: prev + 1 }
+      changed = true
+      continue
+    }
+    if (failed[other.frontContainer] !== undefined) {
+      delete failed[other.frontContainer]
+      changed = true
+    }
+  }
+  if (state && changed) {
+    const { lastReloadFailedContainers: _old, ...rest } = state
+    const hasFailed = Object.keys(failed).length > 0
+    await writeState(deps.home, { ...rest, ...(hasFailed ? { lastReloadFailedContainers: failed } : {}) })
+  }
   return own
 }
 
+export async function isFrontRunning(exec: Exec, container: string): Promise<boolean> {
+  const running = await exec(["docker", "inspect", "--type", "container", "--format", "{{.State.Running}}", container], { timeoutMs: 20_000 })
+  return running.code === 0 && running.stdout.trim() === "true"
+}
+
 async function notReloaded(deps: Pick<SynapseDeps, "exec" | "frontContainer">, code: number): Promise<Reload> {
-  const running = await deps.exec(["docker", "inspect", "--type", "container", "--format", "{{.State.Running}}", deps.frontContainer], { timeoutMs: 20_000 })
-  if (running.code !== 0 || running.stdout.trim() !== "true") return "front_not_running"
+  if (!(await isFrontRunning(deps.exec, deps.frontContainer))) return "front_not_running"
   return EXIT_RESULTS[code] ?? "config_invalid"
 }
 
