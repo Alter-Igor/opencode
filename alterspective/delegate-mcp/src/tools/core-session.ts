@@ -10,6 +10,7 @@ import { z } from "zod"
 import { parseProfile, type Profile } from "../../mcp-gate/src/policy.ts"
 import type { Cursor } from "../shared/contracts.ts"
 import { DelegateError, isDelegateError } from "../shared/errors.ts"
+import { DYNAMIC_ID, readKeystoneSet } from "../shared/keystone.ts"
 import type { ApiTarget } from "../shared/opencode-api.ts"
 import { AGENT_RE, MODEL_RE, SESSION_ID_RE, SESSION_KEY, type HostSessionState, type SessionProfile } from "../supervisor/workspaces-state.ts"
 import type { Box, SessionRecord, ToolContext } from "./context.ts"
@@ -18,6 +19,7 @@ import { closingError, isClosing } from "./closing.ts"
 export { AGENT_RE, MODEL_RE, SESSION_ID_RE, type Profile, type SessionProfile }
 export const CORRELATION_RE = /^[A-Za-z0-9_.:-]{1,64}$/
 const CURSOR_RE = /^([A-Za-z0-9-]{1,64})\.(\d{1,15})$/
+const BUSY_STATES = new Set(["starting", "busy", "retry", "needs_input", "unknown"])
 
 export const sessionIdSchema = z.string().regex(SESSION_ID_RE, "a session id such as ses_0123456789abcdef")
 export const modelSchema = z.string().regex(MODEL_RE, "provider/model, for example synapse/auto")
@@ -47,23 +49,57 @@ export function parseDelegationProfile(value: unknown): Profile | undefined {
   }
 }
 
-export async function applyTaskProfile(ctx: ToolContext, delegationProfile: Profile | undefined): Promise<void> {
+export async function applyTaskProfile(
+  ctx: ToolContext,
+  box: Box,
+  delegationProfile: Profile | undefined,
+  currentSessionID?: string,
+): Promise<void> {
   if (ctx.config.backend === "remote") return
-  if (delegationProfile !== undefined) {
-    if (!ctx.gate?.setTaskProfile) {
-      throw new DelegateError(
-        "sandbox_unavailable",
-        "The delegation gate is not available to enforce this session's delegationProfile.",
-        "Run oc_doctor or restart the sandbox with oc_server_restart.",
-        "gate.setTaskProfile unavailable",
-      )
-    }
-    await ctx.gate.setTaskProfile(delegationProfile)
-    return
+  const states = await ctx.workspaces.listSessionStates().catch(() => [])
+  const known = new Map<string, { sessionID: string; boxSessionID?: string; delegationProfile?: Profile }>()
+  for (const s of states) {
+    if (!s.sessionID) continue
+    if (s.boxProject && s.boxProject !== ctx.config.project) continue
+    known.set(s.sessionID, {
+      sessionID: s.sessionID,
+      ...(s.boxSessionID ? { boxSessionID: s.boxSessionID } : {}),
+      ...(s.delegationProfile ? { delegationProfile: s.delegationProfile } : {}),
+    })
   }
-  if (ctx.gate?.setTaskProfile) {
-    await ctx.gate.setTaskProfile(null).catch(() => undefined)
+  for (const rec of ctx.sessions.values()) {
+    const prev = known.get(rec.sessionID)
+    known.set(rec.sessionID, {
+      sessionID: rec.sessionID,
+      ...(rec.boxSessionID ?? prev?.boxSessionID ? { boxSessionID: rec.boxSessionID ?? prev?.boxSessionID } : {}),
+      ...(rec.delegationProfile ?? prev?.delegationProfile ? { delegationProfile: rec.delegationProfile ?? prev?.delegationProfile } : {}),
+    })
   }
+  let anyProfiledSession = delegationProfile !== undefined
+  for (const existing of known.values()) {
+    if (existing.delegationProfile !== undefined) anyProfiledSession = true
+    if (existing.sessionID === currentSessionID) continue
+    if (delegationProfile === undefined && existing.delegationProfile === undefined) continue
+    const view = await box.hub.view(existing.boxSessionID ?? existing.sessionID)
+    if (!BUSY_STATES.has(view.state)) continue
+    throw new DelegateError(
+      "directory_busy",
+      `Session ${existing.sessionID} is still active (${view.state}) while a per-task delegationProfile is in use.`,
+      "Wait for the active session with oc_wait or stop it with oc_abort before starting or sending to another session.",
+      `profiled overlap with ${existing.sessionID} (${view.state})`,
+    )
+  }
+  const dynamicEnabled = readKeystoneSet(ctx.config.home, ctx.config.keystoneConnections).connections.includes(DYNAMIC_ID)
+  if (!anyProfiledSession && !dynamicEnabled) return
+  if (!ctx.gate?.setTaskProfile) {
+    throw new DelegateError(
+      "sandbox_unavailable",
+      "The delegation gate is not available to enforce this session's delegationProfile.",
+      "Run oc_doctor or restart the sandbox with oc_server_restart.",
+      "gate.setTaskProfile unavailable",
+    )
+  }
+  await ctx.gate.setTaskProfile(delegationProfile ?? null)
 }
 
 /** Session metadata the bridge writes on POST /session: a lookup key for the host record, nothing more. */

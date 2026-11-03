@@ -62,7 +62,7 @@ export async function sendPrompt(ctx: ToolContext, box: Box, record: SessionReco
   // #71: an explicit model was checked by the caller (requireModel); this is the last guard.
   if (prompt.model) requireSynapseModel(prompt.model)
   // #124: apply (or clear) this session's per-task delegation profile on the gate before sending.
-  await applyTaskProfile(ctx, record.delegationProfile)
+  await applyTaskProfile(ctx, box, record.delegationProfile, record.sessionID)
   const saved = prompt.model ? {} : await savedModel(box, record.model, prompt.correlationId)
   const model = prompt.model ?? saved.model
   const agent = prompt.agent ?? record.agent

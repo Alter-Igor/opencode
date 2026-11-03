@@ -6,6 +6,9 @@ import { decide, decideWithNarrowing, isVisibleWithNarrowing, parseProfile, tool
 import { adminHandler, frontHandler, type GateConfig } from "../mcp-gate/src/server.ts"
 import { createGateApprovals } from "../src/gate/client.ts"
 import { parseHostState } from "../src/supervisor/workspaces-state.ts"
+import { applyTaskProfile } from "../src/tools/core-session.ts"
+import { startSessionTool } from "../src/tools/sessions.ts"
+import { OTHER_SID, SID, fakeContext, ours } from "./tools-core-fixture.ts"
 
 const UPSTREAM = "https://identity.example.test/mcp/dynamic"
 const ADMIN = "a".repeat(40)
@@ -356,5 +359,69 @@ describe("host session record delegationProfile persistence (#124)", () => {
       delegationProfile: { unknownField: ["github__*"] },
     })
     expect(parseHostState(damagedUnknown, "s-0123456789")).toBeUndefined()
+  })
+})
+
+describe("session-scoped task profile ownership and overlap rejection (#124)", () => {
+  test("oc_start_session rejects allowShared: true when delegationProfile is provided", async () => {
+    const f = fakeContext()
+    await expect(
+      startSessionTool.run(
+        {
+          directory: "C:\\GitHub\\demo",
+          allowShared: true,
+          delegationProfile: { allowedToolPatterns: ["github__*"] },
+        },
+        f.ctx,
+        "cid-test",
+      ),
+    ).rejects.toThrow(/allowShared cannot be used with delegationProfile/)
+  })
+
+  test("applyTaskProfile rejects overlapping runs while a profiled session is active and propagates clear failures", async () => {
+    const f = fakeContext()
+    const applied: Array<Profile | null> = []
+    f.ctx.gate = {
+      pending: async () => [],
+      decide: async () => {
+        throw new Error("not used")
+      },
+      setTaskProfile: async (profile) => {
+        applied.push(profile)
+      },
+    }
+
+    // Seed a profiled session SID that is currently busy
+    ours(f, { sessionID: SID, sessionKey: "s-0000000001", delegationProfile: { allowedToolPatterns: ["github__*"] } })
+    f.hub.views.set(SID, { sessionID: SID, directory: "/sessions/s-0000000001", state: "busy", since: "2026-10-01T00:00:00.000Z" })
+
+    // Starting or sending to an unprofiled session OTHER_SID while SID is busy is rejected
+    await expect(applyTaskProfile(f.ctx, f.box, undefined, OTHER_SID)).rejects.toThrow(/still active \(busy\) while a per-task delegationProfile is in use/)
+    expect(applied).toHaveLength(0)
+
+    // Once SID settles to idle, an unprofiled session OTHER_SID clears the gate task profile
+    f.hub.views.set(SID, { sessionID: SID, directory: "/sessions/s-0000000001", state: "idle", since: "2026-10-01T00:00:00.000Z" })
+    await applyTaskProfile(f.ctx, f.box, undefined, OTHER_SID)
+    expect(applied).toEqual([null])
+
+    // If OTHER_SID is now busy (unprofiled), starting/sending a profiled session SID is also rejected
+    ours(f, { sessionID: OTHER_SID, sessionKey: "s-0000000002" })
+    f.hub.views.set(OTHER_SID, { sessionID: OTHER_SID, directory: "/sessions/s-0000000002", state: "busy", since: "2026-10-01T00:00:00.000Z" })
+    await expect(applyTaskProfile(f.ctx, f.box, { allowedToolPatterns: ["github__*"] }, SID)).rejects.toThrow(
+      /still active \(busy\) while a per-task delegationProfile is in use/,
+    )
+
+    // When OTHER_SID is idle, clearing the profile propagates gate errors instead of swallowing them
+    f.hub.views.set(OTHER_SID, { sessionID: OTHER_SID, directory: "/sessions/s-0000000002", state: "idle", since: "2026-10-01T00:00:00.000Z" })
+    f.ctx.gate = {
+      pending: async () => [],
+      decide: async () => {
+        throw new Error("not used")
+      },
+      setTaskProfile: async () => {
+        throw new Error("gate unreachable on clear")
+      },
+    }
+    await expect(applyTaskProfile(f.ctx, f.box, undefined, OTHER_SID)).rejects.toThrow(/gate unreachable on clear/)
   })
 })

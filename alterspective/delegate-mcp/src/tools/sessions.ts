@@ -102,7 +102,7 @@ async function startIn(ctx: ToolContext, box: Box, args: StartArgs, ws: OpenedWo
   const profile = args.profile ?? "standard"
   let sessionID: string | undefined
   try {
-    await applyTaskProfile(ctx, args.delegationProfile)
+    await applyTaskProfile(ctx, box, args.delegationProfile)
     sessionID = await createSession(ctx, box, args, ws, correlationId)
     const extra = {
       ...(args.model ? { model: args.model } : {}),
@@ -145,6 +145,13 @@ export const startSessionTool = defineTool({
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   async run(args, ctx, correlationId) {
     const delegationProfile = parseDelegationProfile(args.delegationProfile)
+    if (delegationProfile !== undefined && args.allowShared === true) {
+      throw new DelegateError(
+        "invalid_input",
+        "allowShared cannot be used with delegationProfile because the delegation gate enforces one task profile across the sandbox at a time.",
+        "Omit allowShared (or set allowShared: false) when passing delegationProfile.",
+      )
+    }
     const hostRepo = await ctx.workspaces.resolveRepo(args.directory)
     const keystone = ctx.config.backend === "remote" ? undefined : sessionKeystone(ctx, args.keystone)
     if (!args.allowShared) await refuseBusy(ctx, hostRepo, samePath)

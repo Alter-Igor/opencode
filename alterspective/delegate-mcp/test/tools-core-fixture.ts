@@ -3,6 +3,7 @@
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
 import os from "node:os"
 import path from "node:path"
+import type { Profile } from "../mcp-gate/src/policy.ts"
 import { frontServersFor } from "../src/guard/egress.ts"
 import { createGuard } from "../src/guard/index.ts"
 import { defaultConfig } from "../src/shared/config.ts"
@@ -134,7 +135,7 @@ export type Fake = {
   setBox(fn: (argv: string[]) => CommandResult): void
   status: { value: SupervisorStatus }
   /** The delegation gate the context gets; doctor tests can make pending() answer or throw. */
-  gate: { pending(): Promise<never[]>; decide(): Promise<never> }
+  gate: { pending(): Promise<never[]>; decide(): Promise<never>; setTaskProfile?(profile: Profile | null): Promise<void> }
   /** What supervisor.verifyLive() reports (R5-01, R5-05); all checks pass by default. */
   live: { value: LiveChecks }
 }
@@ -221,7 +222,7 @@ export function fakeContext(options: { boxHeld?: boolean } = {}): Fake {
     setHost: (fn) => (host = fn),
     setBox: (fn) => (inBox = fn),
     status: { value: { state: "running", target: TARGET, imageTag: "img:1", startedBy: "other", health: "healthy", policyVerified: true, frontMatches: true, imageMatches: true } },
-    gate: { pending: async () => [], decide: async () => { throw new Error("not used") } },
+    gate: { pending: async () => [], decide: async () => { throw new Error("not used") }, setTaskProfile: async () => {} },
     live: { value: LIVE_OK },
     ctx: undefined as unknown as ToolContext,
   }
