@@ -48,6 +48,18 @@ const BACKGROUND_UPDATED = [
   "Work on non-overlapping tasks, or briefly tell the user what you sent and end your response.",
 ].join("\n")
 
+function childTaskStatus(status: string | undefined) {
+  if (status === "running") return "running"
+  return "idle"
+}
+
+function promotedTaskText(sessionID: string, status: "running" | "idle") {
+  return [
+    `Child session ${sessionID} is ${status}.`,
+    "The user is waiting. Answer them. Do not start the same task again.",
+  ].join("\n")
+}
+
 const BaseParameterFields = {
   description: Schema.String.annotate({ description: "A short (3-5 words) description of the task" }),
   prompt: Schema.String.annotate({ description: "The task for the agent to perform" }),
@@ -411,6 +423,22 @@ export const TaskTool = Tool.define(
         }
       }
 
+      function promotedResult(status: string | undefined) {
+        return {
+          title: params.description,
+          metadata: {
+            ...metadata,
+            background: true,
+            jobId: info.id,
+          },
+          output: renderOutput({
+            sessionID: nextSession.id,
+            state: "running",
+            text: promotedTaskText(nextSession.id, childTaskStatus(status)),
+          }),
+        }
+      }
+
       if (runInBackground) {
         yield* notify(info.id)
         return backgroundResult()
@@ -433,7 +461,7 @@ export const TaskTool = Tool.define(
               background.wait({ id: nextSession.id }).pipe(Effect.map((waited) => waited.info)),
               background.waitForPromotion(nextSession.id),
             )
-            if (result?.metadata?.background === true) return backgroundResult()
+            if (result && result.metadata?.background === true) return promotedResult(result.status)
             if (result?.status === "error") return yield* Effect.fail(new Error(result.error ?? "Task failed"))
             if (result?.status === "cancelled") return yield* Effect.fail(new Error("Task cancelled"))
             return {
