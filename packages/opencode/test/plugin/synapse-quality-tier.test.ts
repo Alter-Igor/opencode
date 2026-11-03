@@ -19,14 +19,16 @@ const pluginInput = {
 
 type Call = { href: string; headers: Headers }
 
-async function capture(model: string, headers?: Record<string, string>): Promise<Call[]> {
+async function capture(model: string, headers?: Record<string, string>, replies?: Response[]): Promise<Call[]> {
   const previousFetch = globalThis.fetch
   const calls: Call[] = []
+  const pending = [...(replies ?? [])]
+  const statuses = replies?.map((reply) => reply.status) ?? [200]
   const stub = async (url: RequestInfo | URL, init?: RequestInit) => {
     const href = typeof url === "string" ? url : url instanceof URL ? url.href : url.url
     if (!href.startsWith(BASE)) return previousFetch(url, init)
     calls.push({ href, headers: new Headers(init?.headers) })
-    return Response.json({ choices: [{ message: { role: "assistant", content: "ok" } }] })
+    return pending.shift() ?? Response.json({ choices: [{ message: { role: "assistant", content: "ok" } }] })
   }
   globalThis.fetch = Object.assign(stub, { preconnect: previousFetch.preconnect })
   try {
@@ -34,12 +36,14 @@ async function capture(model: string, headers?: Record<string, string>): Promise
     const stored = { type: "api", key: API_KEY }
     const loaded = await hooks.auth?.loader?.(async () => stored as never, {} as never)
     const chatFetch = loaded?.fetch as (u: string, i: RequestInit) => Promise<Response>
-    const response = await chatFetch(`${BASE}/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", ...headers },
-      body: JSON.stringify({ model, messages: [{ role: "user", content: "hi" }] }),
-    })
-    expect(response.status).toBe(200)
+    for (const status of statuses) {
+      const response = await chatFetch(`${BASE}/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...headers },
+        body: JSON.stringify({ model, messages: [{ role: "user", content: "hi" }] }),
+      })
+      expect(response.status).toBe(status)
+    }
     return calls
   } finally {
     setLatestSynapseServing(undefined)
@@ -76,5 +80,18 @@ describe("outgoing x-quality-tier (#258)", () => {
   test("a missing header uses the model's declared tier", async () => {
     const calls = await capture("z-ai/glm-5.3")
     expect(tier(calls)).toBe("economy")
+  })
+
+  test("a caller economy stays the base after failures, then bumps once", async () => {
+    const calls = await capture(
+      "anthropic/claude-opus-5",
+      { "x-quality-tier": "economy", "x-opencode-session": "ses-quality-tier" },
+      [
+        new Response("failure", { status: 503 }),
+        new Response("failure", { status: 503 }),
+        Response.json({ choices: [{ message: { role: "assistant", content: "ok" } }] }),
+      ],
+    )
+    expect(calls.map((call) => call.headers.get("x-quality-tier"))).toEqual(["economy", "economy", "balanced"])
   })
 })
