@@ -15,6 +15,7 @@ import { MessageV2 } from "./message-v2"
 import { isOverflow } from "./overflow"
 import { PartID } from "./schema"
 import type { SessionID } from "./schema"
+import { ParentAlert } from "./parent-alert"
 import { SessionRetry } from "./retry"
 import { SessionStatus } from "./status"
 import { SessionSummary } from "./summary"
@@ -114,6 +115,9 @@ const layer = Layer.effect(
         reasoningMap: {},
       }
       let aborted = false
+      // toolStarted stays set across retries so a saved tool call is not sent again.
+      // waits is the last retry sleep that was scheduled. The give-up sentence names all five.
+      const progress = { toolStarted: false, waits: 0 }
 
       const parse = (e: unknown) =>
         MessageV2.fromError(e, {
@@ -221,6 +225,7 @@ const layer = Layer.effect(
       }) {
         const existing = yield* readToolCall(input.id)
         if (existing) {
+          progress.toolStarted = true
           if (!input.providerExecuted || existing.part.metadata?.providerExecuted) return existing
           const part = yield* session.updatePart({
             ...existing.part,
@@ -244,6 +249,7 @@ const layer = Layer.effect(
           state: { status: "pending", input: {}, raw: "" },
           metadata: input.providerExecuted ? { providerExecuted: true } : undefined,
         } satisfies SessionV1.ToolPart)
+        progress.toolStarted = true
         ctx.toolcalls[input.id] = {
           done: yield* Deferred.make<void>(),
           partID: part.id,
@@ -620,20 +626,38 @@ const layer = Layer.effect(
           error: errorMessage(e),
           stack: e instanceof Error ? e.stack : undefined,
         })
-        const error = parse(e)
-        if (SessionV1.ContextOverflowError.isInstance(error)) {
+        const parsed = parse(e)
+        if (SessionV1.ContextOverflowError.isInstance(parsed)) {
           if ((yield* config.get()).compaction?.auto === false && !ctx.assistantMessage.summary) {
-            ctx.assistantMessage.error = error
+            ctx.assistantMessage.error = parsed
             ctx.assistantMessage.finish = "error"
-            yield* events.publish(Session.Event.Error, { sessionID: ctx.sessionID, error })
+            yield* events.publish(Session.Event.Error, { sessionID: ctx.sessionID, error: parsed })
             yield* status.set(ctx.sessionID, { type: "idle" })
             return
           }
           ctx.needsCompaction = true
-          yield* events.publish(Session.Event.Error, { sessionID: ctx.sessionID, error })
+          yield* events.publish(Session.Event.Error, { sessionID: ctx.sessionID, error: parsed })
           return
         }
+        const error = ParentAlert.haltError(parsed, progress.waits)
         ctx.assistantMessage.error = error
+        const row =
+          error === parsed
+            ? undefined
+            : yield* session.get(ctx.sessionID).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+        const parentSessionID = row?.parentID
+        if (parentSessionID) {
+          yield* ParentAlert.note({
+            parentID: parentSessionID,
+            agent: ctx.assistantMessage.agent,
+            providerID: ctx.assistantMessage.providerID,
+            modelID: ctx.assistantMessage.modelID,
+            variant: ctx.assistantMessage.variant,
+          }).pipe(
+            Effect.provideService(Session.Service, session),
+            Effect.catchCause(() => Effect.void),
+          )
+        }
         yield* events.publish(Session.Event.Error, {
           sessionID: ctx.assistantMessage.sessionID,
           error: ctx.assistantMessage.error,
@@ -681,7 +705,9 @@ const layer = Layer.effect(
               SessionRetry.policy({
                 provider: input.model.providerID,
                 parse,
+                progress,
                 set: (info) => {
+                  progress.waits = info.attempt
                   return status.set(ctx.sessionID, {
                     type: "retry",
                     attempt: info.attempt,
