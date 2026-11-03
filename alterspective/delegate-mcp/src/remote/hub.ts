@@ -104,6 +104,11 @@ export function createRemoteHub(options: RemoteHubOptions): DelegateHub {
           info.startedSinceSend = true
           cancelWatchdog(info)
         }
+        // While awaiting turn start (watchdog armed) and before any running poll was seen,
+        // a pre-run idle poll must not clear the starting state or emit a premature idle event.
+        if (info.watchdogCancel && !info.startedSinceSend && mapped === "idle") {
+          return
+        }
         info.cachedState = mapped
         info.cachedDetail = undefined
         info.since = new Date(timers.now()).toISOString()
@@ -170,10 +175,6 @@ export function createRemoteHub(options: RemoteHubOptions): DelegateHub {
         state: "starting",
         summary: `Remote task ${sessionID} is starting`,
       })
-      if (!info.timer) {
-        info.timer = setInterval(() => void pollSession(sessionID), pollIntervalMs)
-        void pollSession(sessionID)
-      }
       info.watchdogCancel = timers.setTimeout(() => {
         info.watchdogCancel = undefined
         if (info.startedSinceSend || (info.cachedState !== "starting" && info.cachedState !== "idle")) {
@@ -190,6 +191,10 @@ export function createRemoteHub(options: RemoteHubOptions): DelegateHub {
           summary: "Turn did not start within 10s",
         })
       }, startWatchdogMs)
+      if (!info.timer) {
+        info.timer = setInterval(() => void pollSession(sessionID), pollIntervalMs)
+        void pollSession(sessionID)
+      }
     },
 
     cursor(): Cursor {
