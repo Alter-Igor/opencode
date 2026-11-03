@@ -8,8 +8,10 @@ import { DelegateError, isDelegateError } from "../shared/errors.ts"
 import { readKeystoneSet } from "../shared/keystone.ts"
 import { ceilingOf } from "../shared/keystone-policy.ts"
 import type { ApiTarget } from "../shared/opencode-api.ts"
-import { INSPECT_ENV, MCP_ALLOW_ENV, PASSWORD_ENV } from "./compose-env.ts"
+import { INSPECT_ENV, MCP_ALLOW_ENV, PASSWORD_ENV, containerName, forwarderSiblingContainers, paths, siblingContainers } from "./compose-env.ts"
 import { LABEL, builtFrom, inspectBox, requireDocker, type BoxInspect } from "./docker.ts"
+import { generationProject, readGenerations } from "./generations.ts"
+import { createLeases } from "./leases.ts"
 import type { LiveChecks } from "./live.ts"
 import { frontFilesFor } from "./plan.ts"
 import { toDelegateError, type Run } from "./run.ts"
@@ -78,11 +80,80 @@ function savedOutsideCeiling(config: KeystoneConfig): string[] {
   }
 }
 
+/** Point this process at `project` (its own profile, front, hand-off and leases). The configured name stays in baseProject. */
+export function place(run: Run, project: string): void {
+  const ctx = run.root
+  if (ctx.deps.config.project === project && ctx.container === project && ctx.compose.project === project) {
+    run.dirs = ctx.dirs
+    run.compose = ctx.compose
+    run.container = ctx.container
+    run.leases = ctx.leases
+    return
+  }
+  ctx.deps.config.project = project
+  ctx.dirs = paths(ctx.deps.config)
+  ctx.compose = { project, files: [ctx.deps.composeFile, ctx.dirs.boxEnvOverride] }
+  ctx.container = containerName(ctx.deps.config)
+  ctx.leases = createLeases(ctx.deps.leaseFs, ctx.dirs.leases, { probe: ctx.deps.probe, now: ctx.deps.now })
+  run.dirs = ctx.dirs
+  run.compose = ctx.compose
+  run.container = ctx.container
+  run.leases = ctx.leases
+  ctx.deps.onBound?.(project)
+}
+
+/** Drop this bridge's lease file only. Do not stop the box: other sessions may still be on it. */
+export async function releaseOwnLease(run: Run): Promise<void> {
+  if (!run.state.leased) return
+  await run.stopHeartbeat()
+  await run.leases.release(run.deps.bridgeId)
+  run.state.leased = false
+}
+
+/**
+ * #187 / #206: when the bound project is not running, check whether the base project or a known
+ * generation IS running (preferring the generation that matches this bridge's image, then the base
+ * project) and re-bind to it so status() and Synapse point at the live box and its front.
+ */
+async function resolveRunningBox(run: Run): Promise<BoxInspect | undefined> {
+  const { deps } = run
+  const current = await inspectBox(deps.exec, INSPECT_ENV, run.container)
+  if (current?.running) return current
+  const next = generationProject(run.root.baseProject, deps.image)
+  const known = await readGenerations(deps.config.home)
+  const candidates = [...new Set([next, run.root.baseProject, ...known].filter((p): p is string => Boolean(p) && p !== run.container))]
+  for (const candidate of candidates) {
+    const box = await inspectBox(deps.exec, INSPECT_ENV, candidate)
+    if (box?.running) {
+      await releaseOwnLease(run)
+      place(run, candidate)
+      return box
+    }
+  }
+  return current
+}
+
+/** #240: every sibling and forwarder (`gate-box`, `gate-admin`, `gate-mcp-admin`) must be running. */
+async function checkRunningSiblings(run: Run): Promise<void> {
+  const { deps } = run
+  for (const { service, container } of [...siblingContainers(deps.config), ...forwarderSiblingContainers(deps.config)]) {
+    const sibling = await inspectBox(deps.exec, [], container)
+    if (sibling && !sibling.running) {
+      throw new DelegateError(
+        "sandbox_unavailable",
+        `The running sandbox's ${service} service is stopped.`,
+        "Restart the sandbox with oc_server_restart, or run oc_doctor.",
+        `${service} container not running`,
+      )
+    }
+  }
+}
+
 export async function statusOf(run: Run): Promise<SupervisorStatus> {
   const { deps } = run
   try {
     await requireDocker(deps.exec)
-    const box = await inspectBox(deps.exec, INSPECT_ENV, run.container)
+    const box = await resolveRunningBox(run)
     if (!box?.running) return { state: "stopped" }
     const image = box.labels[LABEL.image]
     const front = await inspectBox(deps.exec, [], `${run.container}-front`)
@@ -99,6 +170,7 @@ export async function statusOf(run: Run): Promise<SupervisorStatus> {
     try {
       config = effectiveConfig(deps.config)
       const target = targetOf(box, deps.config.project)
+      await checkRunningSiblings(run)
       return {
         ...base,
         target,
@@ -114,6 +186,7 @@ export async function statusOf(run: Run): Promise<SupervisorStatus> {
       if (isDelegateError(error) && error.code === "policy_violation") {
         const outside = savedOutsideCeiling(deps.config)
         const target = targetOf(box, deps.config.project)
+        await checkRunningSiblings(run)
         return { ...base, target, policyVerified: false, frontMatches: false, ...(outside.length > 0 ? { ceilingMismatch: outside } : {}) }
       }
       throw error

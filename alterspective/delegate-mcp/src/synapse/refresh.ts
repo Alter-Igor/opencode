@@ -27,10 +27,12 @@ async function anyIncludeHasToken(deps: SynapseDeps): Promise<boolean> {
   return false
 }
 const pastExpiry = (state: TokenState | undefined, now: number) => state !== undefined && now >= state.expiresAt
-/** Only a transient failure (it carries `failures`) is retried on the timer, once its backoff ends. */
-const reloadRetryDue = (state: TokenState | undefined, now: number) => {
+/** Only a transient failure (it carries `failures`) is retried on the timer, once its backoff ends (#180 item 2: on any target front). */
+export const reloadRetryDue = (state: TokenState | undefined, now: number) => {
   const last = state?.lastReload
-  return last?.failures !== undefined && now >= last.at + reloadBackoffMs(last.failures)
+  if (last?.failures !== undefined && now >= last.at + reloadBackoffMs(last.failures)) return true
+  const others = Object.values(state?.lastReloadFailedContainers ?? {})
+  return others.some((entry) => entry.failures > 0 && now >= entry.at + reloadBackoffMs(entry.failures))
 }
 
 /**

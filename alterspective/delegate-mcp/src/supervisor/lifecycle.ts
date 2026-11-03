@@ -16,11 +16,11 @@ import { DelegateError, isDelegateError } from "../shared/errors.ts"
 import type { Logger } from "../shared/log.ts"
 import type { ApiTarget } from "../shared/opencode-api.ts"
 import { FRONT_SERVERS_NAME } from "../guard/egress.ts"
-import { emptyUnchosenKsAuthConf, ensureAuthConf, ensureKsAuthConf } from "../synapse/auth-conf.ts"
+import { KS_AUTH_VAR, authConfHasToken, authConfPath, emptyUnchosenKsAuthConf, ensureAuthConf, ensureKsAuthConf, ksAuthConfPath, writeAuthConf, writeKsAuthConf } from "../synapse/auth-conf.ts"
 import { KEYSTONE_HOST_AUTH_ENV, keystoneHostAuth } from "../guard/egress-identity.ts"
 import { SYNAPSE_LOCK_WAIT_MS } from "../synapse/lock.ts"
 import type { RegisteredModels } from "../synapse/models.ts"
-import { INSPECT_ENV, MCP_ALLOW_ENV, PASSWORD_ENV, approvedValues, boxEnvOverride, composeDownEnv, composeEnv, containerName, dynamicProfileFor, paths, siblingContainers } from "./compose-env.ts"
+import { FORWARDER_SIBLING_SERVICES, INSPECT_ENV, MCP_ALLOW_ENV, PASSWORD_ENV, approvedValues, boxEnvOverride, composeDownEnv, composeEnv, containerName, dynamicProfileFor, forwarderSiblingContainers, paths, siblingContainers } from "./compose-env.ts"
 import { GENERATION_CAP, forgetGeneration, generationProject, readGenerations, rememberGeneration } from "./generations.ts"
 import { LABEL, dockerArgs, imageExists, inspectBox, redactAll, requireDocker, type BoxInspect, type Exec, type ExecResult } from "./docker.ts"
 import { boxAnswers, waitHealthy } from "./health.ts"
@@ -32,10 +32,10 @@ import { planFor, withSynapseModels, type Plan } from "./plan.ts"
 import { fsFailure, writeProfile, type PermissionRule, type ProfileFs } from "./profile.ts"
 import { createContext, lockOptions, traced, withLease, type Run } from "./run.ts"
 import { withStartLock, type Every } from "./start-lock.ts"
-import { statusOf, targetOf, type DelegateSupervisor, type ReplaceOptions, type ReplaceResult } from "./status.ts"
+import { place, releaseOwnLease, statusOf, targetOf, type DelegateSupervisor, type ReplaceOptions, type ReplaceResult } from "./status.ts"
 import { listHostStates } from "./workspaces-state.ts"
 
-export { PASSWORD_ENV, boxEnvOverride, composeDownEnv, composeEnv, paths, siblingContainers } from "./compose-env.ts"
+export { FORWARDER_SIBLING_SERVICES, PASSWORD_ENV, boxEnvOverride, composeDownEnv, composeEnv, forwarderSiblingContainers, paths, siblingContainers } from "./compose-env.ts"
 export { defaultSupervisorDeps } from "./deps.ts"
 export { targetOf, type DelegateSupervisor, type ReplaceOptions, type ReplaceResult, type SupervisorStatus } from "./status.ts"
 
@@ -136,6 +136,7 @@ function checkFrontConfig(service: string, sibling: BoxInspect | undefined, plan
  * front, the caches and the inbox must come from the same checkout as the box (review N-9) and
  * must be running (W2C-12): reusing a box whose inbox or proxy has stopped would give a sandbox
  * that half works. front must also carry this plan's generated config.
+ * #240: the forwarder services (`gate-box`, `gate-admin`, `gate-mcp-admin`) must also be running.
  */
 export async function checkSiblings(run: Run, plan: Pick<Plan, "front">, project = run.deps.config.project): Promise<void> {
   const { deps } = run
@@ -150,6 +151,16 @@ export async function checkSiblings(run: Run, plan: Pick<Plan, "front">, project
       )
     checkFrontConfig(service, sibling, plan)
     if (!sibling?.running)
+      throw new DelegateError(
+        "sandbox_unavailable",
+        `The running sandbox's ${service} service is stopped.`,
+        "Restart the sandbox with oc_server_restart, or run oc_doctor.",
+        `${service} container not running`,
+      )
+  }
+  for (const { service, container } of forwarderSiblingContainers(config)) {
+    const sibling = await inspectBox(deps.exec, [], container)
+    if (sibling && !sibling.running)
       throw new DelegateError(
         "sandbox_unavailable",
         `The running sandbox's ${service} service is stopped.`,
@@ -203,6 +214,10 @@ async function prepareFiles(run: Run, plan: Plan): Promise<void> {
       await writeFile(path.join(dirs.front, FRONT_SERVERS_NAME), plan.front.servers, "utf8")
       // WS2 (#48): servers.conf includes the Synapse auth file, so it must exist (empty = no credential).
       await ensureAuthConf(dirs.front)
+      // #180 item 3: when preparing a generation's front folder, seed synapse-auth.conf and chosen
+      // ks-auth-<id>.conf from the base <home>/front (or another known front folder) while holding
+      // the Synapse lock, so a new generation box never starts with an empty token window.
+      await seedFromSiblingFronts(run, dirs.front, plan.config.keystoneConnections)
       // #67 step 4: with host-held Keystone tokens servers.conf includes one ks-auth-<id>.conf per
       // chosen connection, so each must exist (empty = no credential until the host publishes one).
       if (keystoneHostAuth()) {
@@ -283,26 +298,45 @@ async function plan(run: Run, keystone?: readonly string[]): Promise<Plan> {
   return made
 }
 
-/** Point this process at `project` (its own profile, front, hand-off and leases). The configured name stays in baseProject. */
-function place(run: Run, project: string): void {
-  const ctx = run.root
-  if (ctx.deps.config.project === project && ctx.container === project && ctx.compose.project === project) {
-    run.dirs = ctx.dirs
-    run.compose = ctx.compose
-    run.container = ctx.container
-    run.leases = ctx.leases
-    return
+/**
+ * #180 item 3: seed a generation's front folder from `<home>/front` (and any other known generation
+ * front folder) while holding `synapseLock`, if the target include has no token yet and a sibling
+ * folder holds a valid bearer.
+ */
+async function seedFromSiblingFronts(run: Run, targetFrontDir: string, chosenConnections: readonly string[]): Promise<void> {
+  const home = run.deps.config.home
+  const baseFrontDir = path.join(home, "front")
+  if (targetFrontDir === baseFrontDir) return
+  const generations = await readGenerations(home).catch(() => [])
+  const donorDirs = [baseFrontDir, ...generations.map((project) => paths({ ...run.deps.config, project }).front)].filter((dir) => dir !== targetFrontDir)
+  const targetSynapse = await readFile(authConfPath(targetFrontDir), "utf8").catch(() => "")
+  if (!authConfHasToken(targetSynapse)) {
+    for (const donor of donorDirs) {
+      const text = await readFile(authConfPath(donor), "utf8").catch(() => "")
+      if (authConfHasToken(text)) {
+        const token = /"Bearer ([^"]+)"/.exec(text)?.[1]
+        if (token) {
+          await writeAuthConf(targetFrontDir, token)
+          break
+        }
+      }
+    }
   }
-  ctx.deps.config.project = project
-  ctx.dirs = paths(ctx.deps.config)
-  ctx.compose = { project, files: [ctx.deps.composeFile, ctx.dirs.boxEnvOverride] }
-  ctx.container = containerName(ctx.deps.config)
-  ctx.leases = createLeases(ctx.deps.leaseFs, ctx.dirs.leases, { probe: ctx.deps.probe, now: ctx.deps.now })
-  run.dirs = ctx.dirs
-  run.compose = ctx.compose
-  run.container = ctx.container
-  run.leases = ctx.leases
-  ctx.deps.onBound?.(project)
+  if (!keystoneHostAuth()) return
+  for (const id of chosenConnections) {
+    const targetKs = await readFile(ksAuthConfPath(targetFrontDir, id), "utf8").catch(() => "")
+    if (authConfHasToken(targetKs, KS_AUTH_VAR)) continue
+    for (const donor of donorDirs) {
+      const text = await readFile(ksAuthConfPath(donor, id), "utf8").catch(() => "")
+      if (authConfHasToken(text, KS_AUTH_VAR)) {
+        const token = /"Bearer ([^"]+)"/.exec(text)?.[1]
+        if (token) {
+          await writeKsAuthConf(targetFrontDir, id, token)
+          break
+        }
+      }
+    }
+  }
 }
 
 async function profileProblem(run: Run, box: BoxInspect, made: Plan, project = run.deps.config.project): Promise<DelegateError | undefined> {
@@ -370,7 +404,7 @@ async function downProject(run: Run, project: string): Promise<void> {
 async function anyProjectContainerRunning(run: Run, project: string): Promise<boolean> {
   const box = await inspectBox(run.deps.exec, [], project).catch(() => undefined)
   if (box?.running) return true
-  for (const { container } of siblingContainers({ project })) {
+  for (const { container } of [...siblingContainers({ project }), ...forwarderSiblingContainers({ project })]) {
     const sibling = await inspectBox(run.deps.exec, [], container).catch(() => undefined)
     if (sibling?.running) return true
   }
@@ -521,14 +555,6 @@ async function finishGeneration(run: Run): Promise<void> {
   await sweepOthers(run, known)
 }
 
-/** Drop this bridge's lease file only. Do not stop the box: other sessions may still be on it. */
-async function releaseOwnLease(run: Run): Promise<void> {
-  if (!run.state.leased) return
-  await run.stopHeartbeat()
-  await run.leases.release(run.deps.bridgeId)
-  run.state.leased = false
-}
-
 async function beside(run: Run, made: Plan, next: string): Promise<ApiTarget> {
   const known = [...new Set([run.root.baseProject, ...(await readGenerations(run.deps.config.home))])]
   const ours = await inspectBox(run.deps.exec, INSPECT_ENV, next)
@@ -546,6 +572,15 @@ async function beside(run: Run, made: Plan, next: string): Promise<ApiTarget> {
     await finishGeneration(run)
     return target
   }
+  if (ours) {
+    run.note("warn", "replacing stopped sandbox", {
+      container: run.container,
+      exitCode: ours.exitCode ?? undefined,
+      oomKilled: ours.oomKilled,
+      finishedAt: ours.finishedAt ?? undefined,
+      error: ours.error ?? undefined,
+    })
+  }
   const target = await start(run, made)
   await finishGeneration(run)
   return target
@@ -560,7 +595,17 @@ async function ensure(run: Run): Promise<ApiTarget> {
     await stopSilentBoxes(run).catch((error: unknown) =>
       run.note("warn", "silent sandbox check skipped", { detail: error instanceof Error ? error.message.slice(0, 200) : "unknown" }),
     )
-    const box = await inspectBox(run.deps.exec, INSPECT_ENV, run.container)
+    let box = await inspectBox(run.deps.exec, INSPECT_ENV, run.container)
+    // #206 / #187: if this bridge was earlier placed onto a generation that is no longer running,
+    // check whether the base project IS running and re-bind to it before inspecting or starting.
+    if (!box?.running && run.deps.config.project !== run.root.baseProject) {
+      const baseBox = await inspectBox(run.deps.exec, INSPECT_ENV, run.root.baseProject)
+      if (baseBox?.running) {
+        await releaseOwnLease(run)
+        place(run, run.root.baseProject)
+        box = baseBox
+      }
+    }
     if (!box?.running) {
       const next = generationProject(run.root.baseProject, run.deps.image)
       if (next && next !== run.deps.config.project) {
@@ -568,6 +613,17 @@ async function ensure(run: Run): Promise<ApiTarget> {
         const ours = await inspectBox(run.deps.exec, INSPECT_ENV, next)
         const running = await runningProjects(run, known.filter((project) => project !== next))
         if (ours?.running || running.length >= GENERATION_CAP) return beside(run, made, next)
+      }
+      // #160: when an existing sandbox container exited, log its exit code and OOMKilled flag before
+      // `docker compose up -d` replaces the stopped container.
+      if (box) {
+        run.note("warn", "replacing stopped sandbox", {
+          container: run.container,
+          exitCode: box.exitCode ?? undefined,
+          oomKilled: box.oomKilled,
+          finishedAt: box.finishedAt ?? undefined,
+          error: box.error ?? undefined,
+        })
       }
       const target = await start(run, made)
       await finishGeneration(run)

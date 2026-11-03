@@ -95,14 +95,20 @@ export async function requireDocker(exec: Exec): Promise<string> {
 }
 
 export type BoxInspect = {
+  exists: boolean
   running: boolean
   health: "healthy" | "unhealthy" | "starting" | "none"
   startedAt?: string
+  exitCode: number | null
+  oomKilled: boolean
+  finishedAt: string | null
+  error: string | null
   labels: Record<string, string>
   image: string
   /** Only the variables asked for; the rest of the container env is discarded unread. */
   env: Record<string, string>
 }
+export type BoxInspection = BoxInspect
 
 const NOT_FOUND = /No such (container|object)/i
 
@@ -120,7 +126,20 @@ export async function inspectBox(exec: Exec, wanted: string[], name = BOX_CONTAI
   )
 }
 
-type RawInspect = { state?: { Running?: boolean; StartedAt?: string; Health?: { Status?: string } }; labels?: Record<string, string> | null; env?: string[] | null; image?: string }
+type RawInspect = {
+  state?: {
+    Running?: boolean
+    StartedAt?: string
+    ExitCode?: number | null
+    OOMKilled?: boolean
+    FinishedAt?: string | null
+    Error?: string | null
+    Health?: { Status?: string }
+  }
+  labels?: Record<string, string> | null
+  env?: string[] | null
+  image?: string
+}
 
 export function parseInspect(stdout: string, wanted: string[]): BoxInspect | undefined {
   let raw: RawInspect
@@ -138,7 +157,11 @@ export function parseInspect(stdout: string, wanted: string[]): BoxInspect | und
   const status = raw.state?.Health?.Status
   const health = status === "healthy" || status === "unhealthy" || status === "starting" ? status : "none"
   const startedAt = typeof raw.state?.StartedAt === "string" && raw.state.StartedAt ? raw.state.StartedAt : undefined
-  return { running: raw.state?.Running === true, health, ...(startedAt ? { startedAt } : {}), labels: raw.labels ?? {}, image: raw.image ?? "", env }
+  const exitCode = typeof raw.state?.ExitCode === "number" ? raw.state.ExitCode : null
+  const oomKilled = raw.state?.OOMKilled === true
+  const finishedAt = typeof raw.state?.FinishedAt === "string" && raw.state.FinishedAt ? raw.state.FinishedAt : null
+  const error = typeof raw.state?.Error === "string" && raw.state.Error ? raw.state.Error : null
+  return { exists: true, running: raw.state?.Running === true, health, ...(startedAt ? { startedAt } : {}), exitCode, oomKilled, finishedAt, error, labels: raw.labels ?? {}, image: raw.image ?? "", env }
 }
 
 export async function imageExists(exec: Exec, tag: string): Promise<boolean> {

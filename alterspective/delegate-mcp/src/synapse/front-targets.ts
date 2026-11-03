@@ -21,7 +21,10 @@ const isDir = (dir: string) => stat(dir).then((s) => s.isDirectory(), () => fals
  * @param own the front this bridge is bound to
  * @returns the targets, `own` first, each container once
  */
-export async function frontTargets(home: string, base: string, own: FrontTarget): Promise<FrontTarget[]> {
+export async function frontTargets(home: string, base: string, own: FrontTarget): Promise<FrontTarget[]>
+export async function frontTargets(home: string, base: string, ownFrontDir: string, ownFrontContainer: string): Promise<FrontTarget[]>
+export async function frontTargets(home: string, base: string, ownOrDir: FrontTarget | string, ownFrontContainer?: string): Promise<FrontTarget[]> {
+  const own: FrontTarget = typeof ownOrDir === "string" ? { frontDir: ownOrDir, frontContainer: ownFrontContainer ?? `${base}-front` } : ownOrDir
   const projects = [base, ...(await readGenerations(home))]
   const targets: FrontTarget[] = [own]
   for (const project of projects) {

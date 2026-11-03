@@ -11,7 +11,7 @@
 // any other value; front's baked `front-reload` (docker/front/front-reload.sh, review M1) and its
 // entrypoint refuse any file of another shape, and oc_doctor checks the copy `nginx -T` shows against
 // the same strict shape, so the include cannot be used to change anything else in front. Token values are never logged or returned.
-import { chmod, mkdir, readFile, readdir, writeFile } from "node:fs/promises"
+import { chmod, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { CONNECTION_ID } from "../shared/keystone.ts"
 import { renameWithRetry } from "./fs-retry.ts"
@@ -110,11 +110,12 @@ export async function ensureAuthConf(frontDir: string): Promise<void> {
 }
 
 /**
- * #67 combined review L4: a connection that left the chosen set keeps no bearer on disk. Every
- * ks-auth-<id>.conf whose id is not chosen is rewritten empty (call under the shared lock, before
- * the sandbox start that loads the new set). Returns the ids emptied (ids only, never a token).
+ * #67 combined review L4 / #180 item 6: a connection that left the chosen set keeps no bearer on
+ * disk. Every ks-auth-<id>.conf whose id is not chosen is removed (call under the shared lock,
+ * before the sandbox start that loads the new set). When `options.unlink` is false, the file is
+ * rewritten empty instead. Returns the ids emptied/removed (ids only, never a token).
  */
-export async function emptyUnchosenKsAuthConf(frontDir: string, chosen: readonly string[]): Promise<string[]> {
+export async function emptyUnchosenKsAuthConf(frontDir: string, chosen: readonly string[], options?: { unlink?: boolean }): Promise<string[]> {
   let names: string[]
   try {
     names = await readdir(frontDir)
@@ -126,6 +127,11 @@ export async function emptyUnchosenKsAuthConf(frontDir: string, chosen: readonly
     const id = /^ks-auth-([a-z0-9][a-z0-9-]{0,62})\.conf$/.exec(name)?.[1]
     if (id === undefined || chosen.includes(id)) continue
     const file = ksAuthConfPath(frontDir, id)
+    if (options?.unlink) {
+      await rm(file, { force: true })
+      emptied.push(id)
+      continue
+    }
     let text: string | undefined
     try {
       text = await readFile(file, "utf8")

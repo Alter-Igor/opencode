@@ -71,8 +71,8 @@ services:
       com.alterspective.opencode-delegate.image: ${OCD_IMAGE}
     networks: [sealed]
     pids_limit: 512
-    mem_limit: 4g
-    memswap_limit: 4g
+    mem_limit: ${OCD_BOX_MEM_LIMIT:-8g}
+    memswap_limit: ${OCD_BOX_MEM_LIMIT:-8g}
     cpus: 4
     tmpfs:
       # /tmp cannot run programs; /home/agent can (bun/npm/pip keep caches and bins there).

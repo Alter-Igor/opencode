@@ -8,19 +8,30 @@
 //   (POST /mcp/<entry>/connect) when it is not connected. That call runs after publish returns
 //   its promise, outside the manager's work, and a failure is logged, never thrown into it.
 // Never logged or returned here: the token. Only the connection id, the credential kind and states.
-import { stat } from "node:fs/promises"
+import { readFile, stat } from "node:fs/promises"
+import path from "node:path"
+import { FRONT_SERVERS_NAME } from "../guard/egress.ts"
 import { DelegateError } from "../shared/errors.ts"
 import { entryName, idOfEntry } from "../shared/keystone.ts"
 import { safeLog, type Logger } from "../shared/log.ts"
 import type { McpStatus, OpencodeApi } from "../shared/opencode-api.ts"
-import { ksAuthConfPath, writeKsAuthConf } from "../synapse/auth-conf.ts"
+import { ksAuthConfPath, ksAuthFileName, writeKsAuthConf } from "../synapse/auth-conf.ts"
 import type { Reload } from "../synapse/token-manager.ts"
 import type { Publish } from "./manager.ts"
 import type { KsStatus } from "./report.ts"
 
 const COMPONENT = "keystone-auth"
-/** #178: whether a box's front folder already holds this connection's include. */
-const hasInclude = (dir: string, id: string) => stat(ksAuthConfPath(dir, id)).then((s) => s.isFile(), () => false)
+/**
+ * #178 / #180 item 6: whether a box's front folder already holds this connection's include AND
+ * still chooses it in `servers.conf` (when `servers.conf` exists). An emptied `ks-auth-<id>.conf`
+ * left behind after a box dropped the connection from its `servers.conf` is skipped.
+ */
+async function hasInclude(dir: string, id: string): Promise<boolean> {
+  const exists = await stat(ksAuthConfPath(dir, id)).then((s) => s.isFile(), () => false)
+  if (!exists) return false
+  const servers = await readFile(path.join(dir, FRONT_SERVERS_NAME), "utf8").catch(() => undefined)
+  return servers === undefined || servers.includes(ksAuthFileName(id))
+}
 /** The instance directory the bridge's box calls use. */
 const DIRECTORY = "/sessions"
 

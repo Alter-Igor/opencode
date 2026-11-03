@@ -40,14 +40,16 @@ export function createSynapseAuth(config: Pick<BridgeConfig, "home" | "keystoneO
     throw error
   }))
   const lockFile = synapseLockFile(config.home)
+  // #206: capture the root project name before place() can mutate config.project to a generation.
+  const baseProject = config.project
   let startedAt: Promise<number> | undefined
   const deps: SynapseDeps = {
     home: config.home,
     frontDir: frontDir(config),
     origin: config.keystoneOrigin,
     frontContainer: `${config.project}-front`,
-    // #178: every box this home runs gets each renewed include, the bound one first.
-    targets: () => frontTargets(config.home, config.project, { frontDir: deps.frontDir, frontContainer: deps.frontContainer }),
+    // #178 / #206: every box this home runs gets each renewed include, the bound one first, and always the base project.
+    targets: () => frontTargets(config.home, baseProject, { frontDir: deps.frontDir, frontContainer: deps.frontContainer }),
     store: dpapiStore(refreshStoreFile(config.home)),
     memory: { id: `${process.pid}-${randomUUID()}` },
     secrets: loadSecrets,

@@ -5,7 +5,7 @@ import type { Exec } from "../supervisor/docker.ts"
 import { readFrontGeneration } from "../supervisor/front-generation.ts"
 import { SYNAPSE_HOST, authConfHasToken, authConfPath, isAuthConf } from "./auth-conf.ts"
 import { expectedSynapseLocations, locationLines } from "./front-routes.ts"
-import { readState, refreshAt, type Reload, type SynapseDeps } from "./token-manager.ts"
+import { readState, refreshAt, isFrontRunning, type Reload, type SynapseDeps } from "./token-manager.ts"
 
 export type LiveAuth =
   | {
@@ -17,6 +17,14 @@ export type LiveAuth =
       routesOk: boolean
     }
   | { unavailable: string }
+
+export type OtherFrontReport = {
+  container: string
+  hostFile: { shapeOk: boolean; hasToken: boolean }
+  loadedSinceWrite: boolean
+  live: LiveAuth
+  ok: boolean
+}
 
 export type SynapseReport = {
   /**
@@ -47,7 +55,32 @@ export type SynapseReport = {
    */
   loadedSinceWrite: boolean
   live: LiveAuth
+  /** #180 item 1: other running fronts in this home when two box generations run at once. */
+  otherFronts?: OtherFrontReport[]
   ok: boolean
+}
+
+const isLiveOk = (live: LiveAuth) => !("unavailable" in live) && live.shapeOk && live.hasToken && live.matchesHost && live.routesOk
+
+async function checkOtherFronts(deps: SynapseDeps, exec: Exec, signedIn: boolean): Promise<OtherFrontReport[]> {
+  const targets = deps.targets ? await deps.targets().catch(() => []) : []
+  const others = targets.filter((t) => t.frontContainer !== deps.frontContainer && t.frontDir !== deps.frontDir)
+  const out: OtherFrontReport[] = []
+  for (const other of others) {
+    if (!(await isFrontRunning(exec, other.frontContainer))) continue
+    const conf = await readFile(authConfPath(other.frontDir), "utf8").catch(() => "")
+    const hostFile = { shapeOk: isAuthConf(conf), hasToken: authConfHasToken(conf) }
+    const live = await liveAuth(exec, other.frontContainer, conf)
+    const loadedSinceWrite = conf !== "" && !("unavailable" in live) && live.matchesHost
+    out.push({
+      container: other.frontContainer,
+      hostFile,
+      loadedSinceWrite,
+      live,
+      ok: signedIn && hostFile.shapeOk && hostFile.hasToken && isLiveOk(live) && loadedSinceWrite,
+    })
+  }
+  return out
 }
 
 export async function synapseReport(deps: SynapseDeps, exec: Exec): Promise<SynapseReport> {
@@ -59,8 +92,10 @@ export async function synapseReport(deps: SynapseDeps, exec: Exec): Promise<Syna
   const needsSignIn = !state || state.needsSignIn === true || (!stored && !pendingSave)
   const kind = needsSignIn ? "needs_sign_in" : deps.now() >= state.expiresAt ? "expired" : !hostFile.hasToken ? "include_empty" : "signed_in"
   const live = await liveAuth(exec, deps.frontContainer, conf)
-  const liveOk = !("unavailable" in live) && live.shapeOk && live.hasToken && live.matchesHost && live.routesOk
+  const liveOk = isLiveOk(live)
   const loadedSinceWrite = conf !== "" && !("unavailable" in live) && live.matchesHost
+  const otherFronts = await checkOtherFronts(deps, exec, kind === "signed_in")
+  const othersOk = otherFronts.every((o) => o.ok)
   return {
     state: kind,
     ...(state?.user ? { user: state.user } : {}),
@@ -75,7 +110,8 @@ export async function synapseReport(deps: SynapseDeps, exec: Exec): Promise<Syna
     ...(state?.lastReload ? { lastReload: { result: state.lastReload.result, at: new Date(state.lastReload.at).toISOString() } } : {}),
     loadedSinceWrite,
     live,
-    ok: kind === "signed_in" && hostFile.shapeOk && liveOk && loadedSinceWrite,
+    ...(otherFronts.length > 0 ? { otherFronts } : {}),
+    ok: kind === "signed_in" && hostFile.shapeOk && liveOk && loadedSinceWrite && othersOk,
   }
 }
 
