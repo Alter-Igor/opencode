@@ -7,6 +7,7 @@ import type { Message, Part } from "@opencode-ai/sdk"
 import { Global } from "@opencode-ai/core/global"
 import { Shell } from "@opencode-ai/core/shell"
 import { Filesystem } from "@/util/filesystem"
+import { childTickStatus, factsLine, shouldSendTick, skipToast } from "./tick-guard"
 
 // Fork-only (#84, #243): `/goal` and the `goal_loop` tool keep a session or
 // subagent working until a check command passes or a portable record reaches a
@@ -607,6 +608,20 @@ export async function GoalLoopPlugin(
       .catch(() => undefined)
   }
 
+  const tickChildren = async (sessionID: string) => {
+    const session = input.client.session
+    const statusResult = "status" in session && session.status ? await session.status().catch(() => undefined) : undefined
+    const childrenResult =
+      "children" in session && session.children
+        ? await session.children({ path: { id: sessionID } }).catch(() => undefined)
+        : undefined
+    const statusMap = statusResult?.data ?? {}
+    return (childrenResult?.data ?? []).map((child) => ({
+      id: child.id,
+      status: childTickStatus(statusMap[child.id]),
+    }))
+  }
+
   const onIdle = async (sessionID: string) => {
     const started = await load(sessionID)
     if (!started || started.status !== "active") return
@@ -623,12 +638,24 @@ export async function GoalLoopPlugin(
     })
     if (outcome.kind !== "continue") return
 
+    // This hook runs because the session went idle.
+    const children = await tickChildren(sessionID)
+    const decision = shouldSendTick({ status: "idle", messages: messages.data ?? [] })
+    if (!decision.send) {
+      await input.client.tui
+        .showToast({
+          body: { title: "Goal loop", message: skipToast(decision.reason, children), variant: "warning" },
+        })
+        .catch(() => undefined)
+      return
+    }
+
     const user = messages.data?.findLast((m) => m.info.role === "user")?.info
     await input.client.session.promptAsync({
       path: { id: sessionID },
       body: {
         ...(user?.role === "user" ? { agent: user.agent, model: user.model } : {}),
-        parts: [{ type: "text", text: outcome.prompt }],
+        parts: [{ type: "text", text: `${factsLine({ status: "idle", children })}\n${outcome.prompt}` }],
       },
     })
   }
