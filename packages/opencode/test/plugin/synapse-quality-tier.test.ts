@@ -19,7 +19,12 @@ const pluginInput = {
 
 type Call = { href: string; headers: Headers }
 
-async function capture(model: string, headers?: Record<string, string>, replies?: Response[]): Promise<Call[]> {
+async function capture(
+  model: string,
+  headers?: Record<string, string>,
+  replies?: Response[],
+  privacyTier?: "local-only" | "cloud-ok",
+): Promise<Call[]> {
   const previousFetch = globalThis.fetch
   const calls: Call[] = []
   const pending = [...(replies ?? [])]
@@ -32,7 +37,7 @@ async function capture(model: string, headers?: Record<string, string>, replies?
   }
   globalThis.fetch = Object.assign(stub, { preconnect: previousFetch.preconnect })
   try {
-    const hooks = await SynapseAuthPlugin(pluginInput, { inferenceUrl: BASE })
+    const hooks = await SynapseAuthPlugin(pluginInput, { inferenceUrl: BASE, ...(privacyTier ? { privacyTier } : {}) })
     const stored = { type: "api", key: API_KEY }
     const loaded = await hooks.auth?.loader?.(async () => stored as never, {} as never)
     const chatFetch = loaded?.fetch as (u: string, i: RequestInit) => Promise<Response>
@@ -91,6 +96,7 @@ describe("outgoing x-quality-tier (#258)", () => {
         new Response("failure", { status: 503 }),
         Response.json({ choices: [{ message: { role: "assistant", content: "ok" } }] }),
       ],
+      "cloud-ok",
     )
     expect(calls.map((call) => call.headers.get("x-quality-tier"))).toEqual(["economy", "economy", "balanced"])
   })
