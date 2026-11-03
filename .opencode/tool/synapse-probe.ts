@@ -12,7 +12,7 @@ import {
 } from "./cas-bridge-lib"
 
 export default tool({
-  description: `Probe the Synapse AI gateway. Default live=true runs a tiny paid chat (~10–20 tokens) and reports x-synapse-served-model, rate limits, latency, usage. Pass live=false for free /health only. Requires SYNAPSE_API_KEY or GPAAS_API_KEY for live probes (not CAS OAuth; not SYNAPSE_MCP_BEARER_TOKEN).`,
+  description: `Workspace .opencode CAS/direct env-key probe (tool id: synapse-probe; distinct from the built-in synapse_probe provider telemetry tool). Default live=true runs a tiny paid chat (~10–20 tokens) and reports x-synapse-served-model, rate limits, latency, usage. Pass live=false for free /health only. Requires SYNAPSE_API_KEY or GPAAS_API_KEY in the environment for live probes (not CAS OAuth; not SYNAPSE_MCP_BEARER_TOKEN).`,
   args: {
     live: tool.schema
       .boolean()
@@ -53,13 +53,13 @@ export default tool({
         ].join("\n")
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
-        return `synapse_probe health error: ${redactSecrets(message)}`
+        return `synapse-probe health error: ${redactSecrets(message)}`
       }
     }
 
     if (!synapseKeyPresent()) {
       return [
-        "synapse_probe: no Synapse inference API key for live chat.",
+        "synapse-probe: no Synapse inference API key for live chat.",
         "Set SYNAPSE_API_KEY or GPAAS_API_KEY (named gpaas_/gpapp_ PAT from Keystone / vault).",
         "CAS OAuth alone is not enough. SYNAPSE_MCP_BEARER_TOKEN is MCP-scoped and is not used for chat.",
         `Current key source: ${synapseKeySource()}`,
@@ -69,11 +69,11 @@ export default tool({
 
     const quality = args.qualityTier?.trim()
     if (quality && !["economy", "balanced", "premium"].includes(quality)) {
-      return "synapse_probe refused: qualityTier must be economy | balanced | premium"
+      return "synapse-probe refused: qualityTier must be economy | balanced | premium"
     }
     const privacy = args.privacyTier?.trim()
     if (privacy && !["cloud-ok", "local-only"].includes(privacy)) {
-      return "synapse_probe refused: privacyTier must be cloud-ok | local-only"
+      return "synapse-probe refused: privacyTier must be cloud-ok | local-only"
     }
 
     try {
@@ -88,7 +88,7 @@ export default tool({
       return formatSynapseProbe(result)
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
-      return `synapse_probe error: ${redactSecrets(message)}`
+      return `synapse-probe error: ${redactSecrets(message)}`
     }
   },
 })

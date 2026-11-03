@@ -6,6 +6,8 @@ import {
   SYNAPSE_DEFAULT_OUTPUT,
   SYNAPSE_MODELS_TIMEOUT_MS,
   createSynapseModelsFailureLogger,
+  defaultAutoModel,
+  ensureSynapseProviderConfig,
   fileSynapseModelsCache,
   loadSynapseModels,
   parseSynapseModelList,
@@ -748,5 +750,32 @@ describe("Synapse credential refresh (chat only; startup never refreshes)", () =
     } finally {
       h.restore()
     }
+  })
+})
+
+describe("#248: ensureSynapseProviderConfig pre-auth seeding", () => {
+  test("seeds cfg.provider.synapse.models with auto when provider block is absent", () => {
+    const cfg: Config = {}
+    const synapse = ensureSynapseProviderConfig(cfg, BASE)
+    expect(synapse?.npm).toBe("@ai-sdk/openai-compatible")
+    expect(synapse?.options?.baseURL).toBe(BASE)
+    expect(synapse?.models?.[SYNAPSE_AUTO_MODEL]).toEqual(defaultAutoModel())
+    expect(() => Object.entries(cfg.provider!.synapse!.models!)).not.toThrow()
+  })
+
+  test("SynapseAuthPlugin.config seeds provider.synapse.models.auto before sign-in", async () => {
+    const cfg: Config = {}
+    const hooks = await SynapseAuthPlugin({
+      client: {} as never,
+      project: {} as never,
+      directory: "",
+      worktree: "",
+      experimental_workspace: { register() {} },
+      serverUrl: new URL("https://example.com"),
+      $: {} as never,
+    })
+    await hooks.config?.(cfg)
+    expect(cfg.provider?.synapse?.models?.[SYNAPSE_AUTO_MODEL]).toBeDefined()
+    expect(Object.entries(cfg.provider!.synapse!.models!).length).toBeGreaterThanOrEqual(1)
   })
 })

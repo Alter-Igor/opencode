@@ -58,6 +58,7 @@ import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
+import { containsToolCallMarkup, takePendingMarkupRepair, TOOL_CALL_MARKUP_REPAIR_PROMPT } from "@/plugin/synapse"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -1087,6 +1088,7 @@ const layer = Layer.effect(
         const ctx = yield* InstanceState.context
         let structured: unknown
         let step = 0
+        const repairedUserIds = new Set<string>()
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
 
         while (true) {
@@ -1111,11 +1113,27 @@ const layer = Layer.effect(
             lastAssistantMsg?.parts.some(
               (part) => part.type === "tool" && !part.metadata?.providerExecuted && !isOrphanedInterruptedTool(part),
             ) ?? false
+          const hasUnparsedToolMarkup =
+            !hasToolCalls &&
+            (lastAssistantMsg?.parts.some((part) => part.type === "text" && containsToolCallMarkup(part.text)) ?? false)
+          const pendingPluginRepair = lastAssistant ? takePendingMarkupRepair(sessionID, lastAssistant.id) : false
+          const needsMarkupRepair =
+            !repairedUserIds.has(lastUser.id) &&
+            lastAssistant?.parentID === lastUser.id &&
+            (pendingPluginRepair || hasUnparsedToolMarkup)
+          if (needsMarkupRepair) {
+            repairedUserIds.add(lastUser.id)
+            yield* Effect.logWarning("detected unparsed tool-call markup; scheduling bounded 1-shot repair", {
+              "session.id": sessionID,
+              messageID: lastAssistant?.id,
+            })
+          }
 
           if (
             lastAssistant?.finish &&
             !["tool-calls", "unknown"].includes(lastAssistant.finish) &&
             !hasToolCalls &&
+            !needsMarkupRepair &&
             lastAssistant.parentID === lastUser.id
           ) {
             const orphan = lastAssistantMsg?.parts.find(
@@ -1282,6 +1300,7 @@ const layer = Layer.effect(
               system,
               messages: [
                 ...modelMsgs,
+                ...(needsMarkupRepair ? [{ role: "user" as const, content: TOOL_CALL_MARKUP_REPAIR_PROMPT }] : []),
                 ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : []),
               ],
               tools,
