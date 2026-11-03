@@ -10,7 +10,7 @@ export const MESSAGE =
   "SYNAPSE_OUTAGE Synapse is offline (transport timeout). This session waited 5s, 15s, 45s, 2m, and 5m. Do not immediately resend the same large task."
 
 // The sentence names every wait, so it is only for the give-up after all five.
-export function haltError(error: Err, waits: number) {
+export function haltError<T extends Err>(error: T, waits: number) {
   if (waits !== RETRY_MAX_RETRIES || !usesLongLadder(error)) return error
   return withOutageDetail(error)
 }
