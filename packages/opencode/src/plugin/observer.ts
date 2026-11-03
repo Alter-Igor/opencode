@@ -384,11 +384,9 @@ class SessionObserverManager {
     }
 
     // Save locally (#50: store under ~/.local/share/opencode/retrospectives instead of <workspaceDir>/.system_generated)
-    if (workspaceDir) {
+    const retroDir = workspaceDir ? retrospectivesDir() : undefined
+    if (retroDir) {
       try {
-        const retroDir =
-          process.env.OPENCODE_RETROSPECTIVES_DIR?.trim() ||
-          path.join(observerHome(), ".local", "share", "opencode", "retrospectives")
         await fs.mkdir(retroDir, { recursive: true })
         const filePath = path.join(retroDir, `retro-${sessionId}-${Date.now()}.json`)
         await fs.writeFile(filePath, JSON.stringify(retro, null, 2), "utf8")
@@ -403,14 +401,7 @@ class SessionObserverManager {
 
   private async dispatchAuditTelemetry(retro: SessionRetrospective) {
     const auditUrl = process.env.OPENCODE_RETROSPECTIVE_AUDIT_URL?.trim()
-    if (!auditUrl) return
-    if (
-      !auditUrl.startsWith("https://") &&
-      !auditUrl.startsWith("http://127.0.0.1") &&
-      !auditUrl.startsWith("http://localhost")
-    ) {
-      return
-    }
+    if (!auditUrl || !isAllowedAuditUrl(auditUrl)) return
     await fetch(auditUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -496,9 +487,12 @@ class SessionObserverManager {
       }
       // Project rules first: a committed, reviewed repo rule outranks an ad-hoc
       // global note (AIMETH-008 - shared repo facts win). One entry per rule text.
+      // #211: filter out legacy auto-mirrored rows from global when workspaceDir is provided.
+      const projectRows = await read(paths.project)
+      const globalRows = (await read(paths.global)).filter((r) => isGlobalRuleEligibleForWorkspace(r, workspaceDir))
       const seen = new Set<string>()
       const merged: SessionLearning[] = []
-      for (const rule of [...(await read(paths.project)), ...(await read(paths.global))].filter(isLive)) {
+      for (const rule of [...projectRows, ...globalRows].filter(isLive)) {
         const key = learningKey(rule)
         if (seen.has(key)) continue
         seen.add(key)
@@ -730,6 +724,26 @@ export function defaultDiagnosticsLogDir(): string | undefined {
 /** The home the observer writes under: OPENCODE_TEST_HOME first, as in core's Global.Path.home. */
 function observerHome(): string {
   return process.env.OPENCODE_TEST_HOME || process.env.USERPROFILE || process.env.HOME || ""
+}
+
+function retrospectivesDir(): string | undefined {
+  const configured = process.env.OPENCODE_RETROSPECTIVES_DIR?.trim()
+  if (configured) return configured
+  const home = observerHome()
+  return home ? path.join(home, ".local", "share", "opencode", "retrospectives") : undefined
+}
+
+function isAllowedAuditUrl(raw: string): boolean {
+  if (!URL.canParse(raw)) return false
+  const u = new URL(raw)
+  if (u.username || u.password) return false
+  if (u.protocol === "https:") return true
+  return u.protocol === "http:" && (u.hostname === "localhost" || u.hostname === "127.0.0.1")
+}
+
+function isGlobalRuleEligibleForWorkspace(rule: SessionLearning, workspaceDir?: string): boolean {
+  if (!workspaceDir) return true
+  return rule.source !== "buddy_review" && rule.source !== "auto_correction" && rule.source !== "session_retro"
 }
 
 /**

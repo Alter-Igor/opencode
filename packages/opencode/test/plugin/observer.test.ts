@@ -74,11 +74,17 @@ describe("session retrospective profile", () => {
         }),
       )
 
-      telemetry.mockClear()
-      process.env.OPENCODE_RETROSPECTIVE_AUDIT_URL = "http://example.com/insecure-audit"
-      sessionObserver.onToolBefore("obs-audit-insecure", "read-1", "read", {})
-      await sessionObserver.finalizeSessionRetrospective("obs-audit-insecure", ws.path)
-      expect(telemetry).not.toHaveBeenCalled()
+      for (const rejected of [
+        "http://example.com/insecure-audit",
+        "http://localhost.example.com/audit",
+        "http://localhost@example.com/audit",
+      ]) {
+        telemetry.mockClear()
+        process.env.OPENCODE_RETROSPECTIVE_AUDIT_URL = rejected
+        sessionObserver.onToolBefore(`obs-audit-rejected-${rejected}`, "read-1", "read", {})
+        await sessionObserver.finalizeSessionRetrospective(`obs-audit-rejected-${rejected}`, ws.path)
+        expect(telemetry).not.toHaveBeenCalled()
+      }
     } finally {
       restoreTestHome(prevHome)
       if (prevAudit === undefined) delete process.env.OPENCODE_RETROSPECTIVE_AUDIT_URL
@@ -362,6 +368,25 @@ describe("rule visibility", () => {
       const listB = await sessionObserver.listLearnings(wsB.path)
       expect(listB).toEqual([])
       await expect(fs.readFile(learningStorePaths().global!, "utf8")).rejects.toThrow()
+
+      // Even if a legacy global store already contains a pre-#211 buddy_review row,
+      // getRecentLearnings for another workspace excludes it from prompt injection.
+      const globalFile = learningStorePaths().global!
+      await fs.mkdir(path.dirname(globalFile), { recursive: true })
+      await fs.writeFile(
+        globalFile,
+        JSON.stringify([
+          {
+            id: "legacy-buddy-1",
+            timestamp: "2026-10-01T00:00:00.000Z",
+            lesson: "Legacy buddy review snippet from another repo",
+            source: "buddy_review",
+            scope: "global",
+          },
+        ]),
+        "utf8",
+      )
+      expect(await sessionObserver.getRecentLearnings(5, wsB.path)).toEqual([])
     } finally {
       restoreTestHome(prev)
     }
