@@ -83,13 +83,13 @@ export const dockerArgs = {
 
 /** Docker CLI missing or daemon not running → sandbox_unavailable. There is no fallback (edge case 11). */
 export async function requireDocker(exec: Exec): Promise<string> {
-  const result = await exec(dockerArgs.serverVersion(), { timeoutMs: 20_000 })
+  const result = await exec(dockerArgs.serverVersion(), { timeoutMs: 5_000 })
   const version = result.stdout.trim()
   if (result.code === 0 && version) return version
   throw new DelegateError(
     "sandbox_unavailable",
     "Docker is not available, so the sandbox cannot start.",
-    "Start Docker Desktop and retry. The bridge never runs OpenCode outside the sandbox.",
+    "Start Docker Desktop, then run code_doctor { start: true } (or oc_doctor { start: true }) and retry. The bridge never runs OpenCode outside the sandbox.",
     `exit ${result.code}: ${result.stderr.trim().slice(0, 300)}`,
   )
 }

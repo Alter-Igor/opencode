@@ -347,6 +347,39 @@ describe("wave 2 review fixes (state)", () => {
     expect(table.get("ses_1")?.state).toBe("error")
   })
 
+  test("#256: sendStarting -> error -> idle -> markSent -> startTimeout preserves error state and detail instead of overwriting to starting -> not_started", () => {
+    const { table, tick } = upTable()
+    tick(60_000)
+    table.status("ses_1", "idle")
+    table.sendStarting("ses_1")
+    table.error("ses_1", "APIError", false)
+    table.status("ses_1", "idle")
+    expect(table.get("ses_1")).toMatchObject({ state: "error", detail: "APIError", lastError: "APIError" })
+    expect(table.markSent("ses_1")).toEqual([])
+    expect(table.awaitingStart("ses_1")).toBe(false)
+    expect(table.get("ses_1")).toMatchObject({ state: "error", detail: "APIError", lastError: "APIError" })
+    tick(10_000)
+    expect(table.startTimeout("ses_1")).toEqual([])
+    expect(table.get("ses_1")).toMatchObject({ state: "error", detail: "APIError", lastError: "APIError" })
+  })
+
+  test("#255: a second turn sent within 2 s of the prior turn's busy still transitions to starting and arms the start watchdog", () => {
+    const { table, tick } = upTable(0)
+    tick(1_000) // t = 1000: Turn 1 goes busy
+    table.status("ses_1", "busy")
+    tick(500) // t = 1500: Turn 1 goes idle
+    table.status("ses_1", "idle")
+    tick(700) // t = 2200 (1200 ms < SENT_SLACK_MS from t = 1000): Turn 2 sends
+    table.sendStarting("ses_1")
+    const changes = table.markSent("ses_1")
+    expect(changes[0]?.state).toBe("starting")
+    expect(table.get("ses_1")?.state).toBe("starting")
+    expect(table.awaitingStart("ses_1")).toBe(true)
+    tick(10_000)
+    expect(table.startTimeout("ses_1")[0]?.state).toBe("not_started")
+    expect(table.get("ses_1")?.state).toBe("not_started")
+  })
+
   test("W2A-25: only busy/retry count as activity (an error does not swallow the next send)", () => {
     const { table } = upTable()
     table.error("ses_1", "APIError", false)

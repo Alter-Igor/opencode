@@ -66,7 +66,7 @@ export function boxFailure(what: string, stderr: string, timedOut: boolean | und
 /** directory_invalid with an action that names the configured roots (review A-22). */
 export function invalidFolder(roots: readonly string[], message: string, detail?: string): DelegateError {
   const where = roots.length > 0 ? roots.join("; ") : "(none configured: set OPENCODE_DELEGATE_ROOTS)"
-  return new DelegateError("directory_invalid", message, `Pass a git repository folder under an allowed root: ${where}.`, detail)
+  return new DelegateError("directory_invalid", message, `Pass a git repository folder under an allowed root: ${where}. To allow a secondary drive or worktree root, add it to OPENCODE_DELEGATE_ROOTS.`, detail)
 }
 
 function applySubst(p: string, subst: Record<string, string>): string {

@@ -6,6 +6,7 @@ import { DelegateError } from "../shared/errors.ts"
 import { defineTool } from "./define.ts"
 import { ok, untrusted } from "./shape.ts"
 import { startSessionTool } from "./sessions.ts"
+import { closeSessionTool } from "./close-session.ts"
 import { sendTool, MAX_MESSAGE_CHARS } from "./send.ts"
 import { waitTool } from "./wait.ts"
 import { collectTool } from "./collect.ts"
@@ -82,16 +83,26 @@ export const delegateTaskTool = defineTool({
     const base = startRes.structuredContent?.base as string
     const hostRepo = startRes.structuredContent?.hostRepo as string
 
-    // 2. Send Prompt
-    const sendRes = await sendTool.run(
-      {
-        sessionID,
-        message: args.prompt,
-        model: args.model,
-      },
-      ctx,
-      correlationId,
-    )
+    // 2. Send Prompt (#263: clean up the newly created session if send fails before running)
+    let sendRes: Awaited<ReturnType<typeof sendTool.run>>
+    try {
+      sendRes = await sendTool.run(
+        {
+          sessionID,
+          message: args.prompt,
+          model: args.model,
+        },
+        ctx,
+        correlationId,
+      )
+    } catch (error) {
+      if (sessionID) {
+        await closeSessionTool
+          .run({ sessionID, abort: true, discardWork: true, deleteBranch: true }, ctx, correlationId)
+          .catch(() => undefined)
+      }
+      throw error
+    }
 
     let cursor = sendRes.structuredContent?.cursor as string | undefined
 

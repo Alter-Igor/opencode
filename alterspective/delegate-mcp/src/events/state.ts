@@ -56,6 +56,10 @@ type Entry = {
   awaitingStart: boolean
   sentAt?: number
   lastActiveAt?: number
+  /** #255: table event order when the session last went busy/retry. */
+  lastActiveOrder?: number
+  /** #256: table event order when a turn settled on idle (including error/abort + idle). */
+  lastSettledOrder?: number
   /** Last session.error; `armed` until a busy shows the run carried on. `order` is when it arrived. */
   lastError?: { label: string; aborted: boolean; armed: boolean; order: number }
   /** #252: when the latest send began (before its POST), on the table's event order. */
@@ -151,8 +155,23 @@ export class SessionTable {
   markSent(sessionID: string): Change[] {
     const e = this.entries.get(sessionID)
     if (!e) return []
+    const started = e.sendStartedOrder
+    e.sendStartedOrder = undefined
     if (e.base === "busy" || e.base === "retry" || e.pending.size > 0) return []
-    if (e.lastActiveAt !== undefined && this.now() - e.lastActiveAt <= SENT_SLACK_MS) return []
+    // #256: if the prompt sent after sendStartedOrder already errored/aborted and went idle before
+    // HTTP 204 returned, preserve the settled error/aborted state instead of overwriting with `starting`.
+    if (started !== undefined && e.lastSettledOrder !== undefined && e.lastSettledOrder > started && (e.base === "error" || e.base === "aborted")) {
+      e.awaitingStart = false
+      return this.refresh(e)
+    }
+    // #255: when sendStarting was called for this turn, only skip arming the start watchdog if
+    // busy/retry arrived after sendStarting. Use wall-clock SENT_SLACK_MS only when sendStartedOrder
+    // was not recorded (legacy/direct markSent callers).
+    const activeSinceSend =
+      started !== undefined
+        ? e.lastActiveOrder !== undefined && e.lastActiveOrder > started
+        : e.lastActiveAt !== undefined && this.now() - e.lastActiveAt <= SENT_SLACK_MS
+    if (activeSinceSend) return []
     e.base = "starting"
     e.detail = undefined
     e.awaitingStart = true
@@ -160,9 +179,7 @@ export class SessionTable {
     // #252: an error armed before this send began belongs to the earlier prompt, so it is not this
     // prompt's outcome. An error after the send began (it can beat the 204) stays armed. With no
     // recorded start (a caller that never called sendStarting) nothing is disarmed.
-    const started = e.sendStartedOrder
     if (e.lastError && started !== undefined && e.lastError.order < started) e.lastError.armed = false
-    e.sendStartedOrder = undefined
     return this.refresh(e)
   }
 
@@ -317,10 +334,12 @@ export class SessionTable {
       e.base = err.aborted ? "aborted" : "error"
       e.detail = err.label
       err.armed = false
+      e.lastSettledOrder = ++this.order
     } else if (e.base !== "error" && e.base !== "aborted") {
       // error/aborted stay visible through repeated idles; only a new run (busy) clears them.
       e.base = "idle"
       e.detail = undefined
+      e.lastSettledOrder = ++this.order
     }
     return this.refresh(e)
   }
@@ -329,6 +348,7 @@ export class SessionTable {
   private running(e: Entry): void {
     e.awaitingStart = false
     e.lastActiveAt = this.now()
+    e.lastActiveOrder = ++this.order
     if (e.lastError) e.lastError.armed = false
   }
 
