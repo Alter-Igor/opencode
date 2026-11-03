@@ -1,12 +1,25 @@
 // #53: API deletion does not mean the clone is gone. Keep its host recovery record until both are absent.
-import { linkSync, lstatSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs"
+import { existsSync, linkSync, lstatSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs"
 import path from "node:path"
 import { randomUUID } from "node:crypto"
+import { hasLeaseTracking, isSupervisorActive, sweepAllLeases } from "./leases.ts"
 import { parseHostState, SESSION_KEY, SUPERVISOR_RE, type HostSessionState } from "./workspaces-state.ts"
 import type { Exec } from "./workspaces-exec.ts"
 
 export type BoundHostState = HostSessionState & { sessionID: string }
 export type MissingSession = (state: BoundHostState, timeoutMs: number) => Promise<boolean>
+
+export type PruneOptions = {
+  /** Live supervisor/bridge IDs from `sweepAllLeases`. Records of dead supervisors become eligible. */
+  activeSupervisors?: ReadonlySet<string>
+  /** Active turn check: never prune a session with an active turn. */
+  hasActiveTurn?: (sessionID: string) => boolean
+  /** Live session IDs in the box: never prune if still present here. */
+  liveSessionIds?: ReadonlySet<string>
+  /** Check whether a non-current generation box container is still running. */
+  isBoxRunning?: (boxProject: string) => Promise<boolean> | boolean
+}
+
 const PAGE_NAMES = 100
 const PAGE_SESSIONS = 20
 const PAGE_MS = 5_000
@@ -91,13 +104,56 @@ function readCursor(file: string): string {
   }
 }
 
+export type SessionPrunerDeps = {
+  stateDir: string
+  boxSessions: string
+  box: Exec
+  host?: Exec
+  home?: string
+  boxProject: string
+  timeoutMs: number
+  isBoxRunning?: (boxProject: string) => Promise<boolean> | boolean
+}
+
+async function defaultBoxRunning(deps: SessionPrunerDeps, project: string): Promise<boolean> {
+  if (deps.isBoxRunning) return deps.isBoxRunning(project)
+  if (!deps.host) return true
+  const res = await deps.host(["docker", "inspect", "-f", "{{.State.Running}}", project], { timeoutMs: PROBE_MS }).catch(() => undefined)
+  if (!res) return true
+  if (res.code !== 0 && /no such object|no such container/i.test(res.stderr)) return false
+  if (res.code === 0 && res.stdout.trim() === "false") return false
+  return true
+}
+
 /** Each page reads <=100 records and checks <=20 sessions; a persisted filename cursor reaches old records. */
-export function createSessionPruner(options: { stateDir: string; boxSessions: string; box: Exec; boxProject: string; timeoutMs: number }) {
+export function createSessionPruner(options: SessionPrunerDeps) {
   const pending = new Map<string, Promise<string[]>>()
-  async function sweep(supervisor: string, missing: MissingSession, tracked: (sessionID: string) => boolean): Promise<string[]> {
+  async function sweep(
+    supervisor: string,
+    missing: MissingSession,
+    tracked: (sessionID: string) => boolean,
+    pruneOptions?: PruneOptions,
+  ): Promise<string[]> {
     if (!SUPERVISOR_RE.test(supervisor)) return []
     const names = readdirSync(options.stateDir).filter((name) => name.endsWith(".json") && SESSION_KEY.test(name.slice(0, -5))).sort()
     if (!names.length) return []
+
+    const home = options.home ?? path.dirname(options.stateDir)
+    let activeSupervisors = pruneOptions?.activeSupervisors
+    if (activeSupervisors === undefined && hasLeaseTracking(home)) {
+      const swept = await sweepAllLeases(home).catch(() => undefined)
+      activeSupervisors = swept?.activeSupervisors
+    }
+    const orphanSweepEnabled = activeSupervisors !== undefined || pruneOptions !== undefined
+    const boxRunningCache = new Map<string, boolean>()
+    const checkBoxRunning = async (project: string): Promise<boolean> => {
+      const cached = boxRunningCache.get(project)
+      if (cached !== undefined) return cached
+      const running = pruneOptions?.isBoxRunning ? await pruneOptions.isBoxRunning(project) : await defaultBoxRunning(options, project)
+      boxRunningCache.set(project, running)
+      return running
+    }
+
     const cursorFile = path.join(options.stateDir, `.prune-${supervisor.slice("supervisor:".length)}.cursor`)
     const cursor = readCursor(cursorFile)
     const start = names.findIndex((name) => name > cursor)
@@ -106,6 +162,8 @@ export function createSessionPruner(options: { stateDir: string; boxSessions: st
     const deadline = Date.now() + PAGE_MS
     let checked = 0
     let last = cursor
+    const currentBoxProject = options.boxProject
+
     for (const name of ordered.slice(0, PAGE_NAMES)) {
       if (checked >= PAGE_SESSIONS || Date.now() >= deadline) break
       last = name
@@ -114,16 +172,46 @@ export function createSessionPruner(options: { stateDir: string; boxSessions: st
         const before = snapshotRecord(file)
         if (!before) continue
         const state = parseHostState(before.raw, name.slice(0, -5))
-        if (!state?.sessionID || state.supervisor !== supervisor) continue
-        // Another box's 404 and absent clone prove nothing about this record; a record with no box
-        // (older bridges) is kept. A session this bridge still tracks in memory is never touched.
-        if (state.boxProject !== options.boxProject || tracked(state.sessionID)) continue
+        if (!state?.sessionID) continue
+
+        const isOwnSupervisor = state.supervisor === supervisor
+        const isOrphanSupervisor =
+          orphanSweepEnabled &&
+          (!state.supervisor || (activeSupervisors !== undefined && !isSupervisorActive(state.supervisor, activeSupervisors)))
+        if (!isOwnSupervisor && !isOrphanSupervisor) continue
+
+        const isCurrentBox = state.boxProject === currentBoxProject
+        const isLegacyBox = orphanSweepEnabled && !state.boxProject
+        let isRetiredBox = false
+        if (!isCurrentBox && !isLegacyBox && orphanSweepEnabled && state.boxProject) {
+          isRetiredBox = !(await checkBoxRunning(state.boxProject))
+        }
+        if (!isCurrentBox && !isLegacyBox && !isRetiredBox) continue
+
+        const liveId = state.boxSessionID ?? state.sessionID
+        const isProtected =
+          tracked(state.sessionID) ||
+          pruneOptions?.hasActiveTurn?.(state.sessionID) === true ||
+          pruneOptions?.liveSessionIds?.has(state.sessionID) === true ||
+          pruneOptions?.liveSessionIds?.has(liveId) === true
+        if (isProtected) continue
+
         checked++
         if (!(await missing({ ...state, sessionID: state.sessionID }, Math.max(1, Math.min(PROBE_MS, deadline - Date.now()))))) continue
         if (Date.now() >= deadline) continue
-        const result = await options.box(["sh", "-c", ABSENT_CLONE_PROBE, "sh", `${options.boxSessions}/${state.sessionKey}`, options.boxSessions], { timeoutMs: Math.max(1, Math.min(options.timeoutMs, PROBE_MS, deadline - Date.now())) })
-        if (result.timedOut || result.code !== PROBE_ABSENT || result.stdout.trim() || result.stderr.trim()) continue
-        if (tracked(state.sessionID)) continue
+
+        let cloneConfirmedGone = false
+        if (isRetiredBox && !existsSync(state.hostRepo)) {
+          cloneConfirmedGone = true
+        } else {
+          const result = await options.box(["sh", "-c", ABSENT_CLONE_PROBE, "sh", `${options.boxSessions}/${state.sessionKey}`, options.boxSessions], {
+            timeoutMs: Math.max(1, Math.min(options.timeoutMs, PROBE_MS, deadline - Date.now())),
+          })
+          cloneConfirmedGone = !result.timedOut && result.code === PROBE_ABSENT && !result.stdout.trim() && !result.stderr.trim()
+        }
+        if (!cloneConfirmedGone) continue
+
+        if (tracked(state.sessionID) || pruneOptions?.hasActiveTurn?.(state.sessionID) === true) continue
         if (removeUnchanged(file, before)) removed.push(state.sessionKey)
       } catch {
         // A damaged record, uncertain API/box read, or concurrent replacement is left for a later page.
@@ -140,11 +228,18 @@ export function createSessionPruner(options: { stateDir: string; boxSessions: st
     }
     return removed
   }
-  return (supervisor: string, missing: MissingSession, tracked: (sessionID: string) => boolean = () => false): Promise<string[]> => {
+  return (
+    supervisor: string,
+    missing: MissingSession,
+    tracked: (sessionID: string) => boolean = () => false,
+    pruneOptions?: PruneOptions,
+  ): Promise<string[]> => {
     const active = pending.get(supervisor)
     if (active) return active
-    const run = sweep(supervisor, missing, tracked).finally(() => pending.delete(supervisor))
+    const run = sweep(supervisor, missing, tracked, pruneOptions).finally(() => pending.delete(supervisor))
     pending.set(supervisor, run)
     return run
   }
 }
+
+export const pruneDeletedBoxSessions = createSessionPruner

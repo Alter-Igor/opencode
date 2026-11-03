@@ -4,10 +4,13 @@
 // bridge refreshes every minute (review A-18/A-19). A lease is dropped when its PID is dead,
 // or when its heartbeat is old AND the PID now belongs to a different process (PID reuse).
 import { randomBytes } from "node:crypto"
+import { existsSync } from "node:fs"
 import { mkdir, readFile, readdir, rename, rm, stat, utimes, writeFile } from "node:fs/promises"
 import path from "node:path"
+import { PROJECT_RE } from "../shared/config.ts"
 import { DelegateError } from "../shared/errors.ts"
-import { recordGone, type ProcessProbe, type ProcessRecord } from "./process.ts"
+import { readGenerations } from "./generations.ts"
+import { nodeProcessProbe, recordGone, type ProcessProbe, type ProcessRecord } from "./process.ts"
 
 export type LeaseFs = {
   list(dir: string): Promise<string[]>
@@ -35,8 +38,36 @@ export type Leases = {
 export type LeaseOptions = { probe: ProcessProbe; now: () => number; staleMs?: number }
 
 export const LEASE_HEARTBEAT_MS = 60_000
-const LEASE_STALE_MS = 5 * 60_000
+/** #265: a dead-PID or corrupt lease file is unlinked only after its heartbeat/mtime is older than 60s. */
+export const LEASE_STALE_MS = 60_000
+const PID_REUSE_STALE_MS = 5 * 60_000
 const BRIDGE_ID = /^[A-Za-z0-9_-]{1,64}$/
+
+export type SweepLeaseEntry = {
+  id: string
+  bridgeId: string
+  supervisor?: string
+  generation?: string
+  pid?: number
+  alive?: boolean
+  unknown?: boolean
+  heartbeat: string
+  idleSec?: number
+  updatedAt?: string
+}
+
+export type SweepLeasesOptions = {
+  probe?: Pick<ProcessProbe, "alive">
+  now?: () => number
+  staleMs?: number
+  readOnly?: boolean
+}
+
+export type SweepLeasesResult = {
+  leases: SweepLeaseEntry[]
+  activeSupervisors: Set<string>
+  pruned: number
+}
 
 export function assertBridgeId(bridgeId: string): void {
   if (!BRIDGE_ID.test(bridgeId))
@@ -58,7 +89,7 @@ export function parseRecord(text: string | undefined): ProcessRecord | undefined
 
 export function createLeases(fs: LeaseFs, dir: string, options: LeaseOptions): Leases {
   const file = (id: string) => path.join(dir, id)
-  const staleMs = options.staleMs ?? LEASE_STALE_MS
+  const staleMs = options.staleMs ?? PID_REUSE_STALE_MS
   async function isLive(id: string): Promise<boolean> {
     const record = parseRecord(await fs.read(file(id)))
     if (!record || !options.probe.alive(record.pid)) return false
@@ -91,6 +122,148 @@ export function createLeases(fs: LeaseFs, dir: string, options: LeaseOptions): L
       return (await active()).length
     },
   }
+}
+
+type ParsedLeaseFile = {
+  valid: boolean
+  id: string
+  bridgeId: string
+  supervisor?: string
+  pid?: number
+  updatedAt?: string
+}
+
+function parseLeaseFile(text: string, fallbackName: string): ParsedLeaseFile {
+  try {
+    const raw = JSON.parse(text) as unknown
+    if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+      const obj = raw as Record<string, unknown>
+      const pid = typeof obj.pid === "number" && Number.isInteger(obj.pid) && obj.pid > 0 ? obj.pid : undefined
+      if (pid !== undefined) {
+        const id = typeof obj.id === "string" && obj.id ? obj.id : typeof obj.bridgeId === "string" && obj.bridgeId ? obj.bridgeId : fallbackName
+        const bridgeId = typeof obj.bridgeId === "string" && obj.bridgeId ? obj.bridgeId : id
+        const supervisor = typeof obj.supervisor === "string" && obj.supervisor ? obj.supervisor : undefined
+        const updatedAt = typeof obj.updatedAt === "string" && obj.updatedAt ? obj.updatedAt : undefined
+        return { valid: true, id, bridgeId, ...(supervisor ? { supervisor } : {}), pid, ...(updatedAt ? { updatedAt } : {}) }
+      }
+      return { valid: false, id: fallbackName, bridgeId: fallbackName }
+    }
+  } catch {
+    // check legacy format below
+  }
+  const legacy = parseRecord(text)
+  if (legacy) return { valid: true, id: fallbackName, bridgeId: fallbackName, pid: legacy.pid }
+  return { valid: false, id: fallbackName, bridgeId: fallbackName }
+}
+
+async function discoverLeaseDirs(home: string): Promise<Array<{ dir: string; generation?: string }>> {
+  const seen = new Set<string>()
+  const out: Array<{ dir: string; generation?: string }> = []
+  const add = (dir: string, generation?: string) => {
+    const key = path.resolve(dir)
+    if (seen.has(key)) return
+    seen.add(key)
+    out.push({ dir, ...(generation ? { generation } : {}) })
+  }
+  add(path.join(home, "leases"))
+  const recorded = await readGenerations(home)
+  for (const gen of recorded) add(path.join(home, "generations", gen, "leases"), gen)
+  const genBase = path.join(home, "generations")
+  const entries = await readdir(genBase, { withFileTypes: true }).catch(() => [])
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !PROJECT_RE.test(entry.name)) continue
+    add(path.join(genBase, entry.name, "leases"), entry.name)
+  }
+  return out
+}
+
+/**
+ * #265: Enumerate and sweep lease files across `<home>/leases` and all `<home>/generations/<gen>/leases`.
+ * Dead leases (`!probe.alive(pid)`) and corrupt JSON files older than `LEASE_STALE_MS` (60s) are unlinked.
+ * Corrupt JSON that is still fresh (`<= LEASE_STALE_MS`) is kept as `unknown` and never treated as dead.
+ */
+export async function sweepAllLeases(home: string, options: SweepLeasesOptions = {}): Promise<SweepLeasesResult> {
+  const now = (options.now ?? Date.now)()
+  const staleMs = options.staleMs ?? LEASE_STALE_MS
+  const probe = options.probe ?? nodeProcessProbe
+  const dirs = await discoverLeaseDirs(home)
+  const activeLeases: SweepLeaseEntry[] = []
+  let pruned = 0
+
+  for (const { dir, generation } of dirs) {
+    const names = (await readdir(dir).catch(() => []))
+      .filter((name) => BRIDGE_ID.test(name.replace(/\.json$/i, "")))
+      .sort()
+    for (const name of names) {
+      const stem = name.replace(/\.json$/i, "")
+      const file = path.join(dir, name)
+      const [text, st] = await Promise.all([readFile(file, "utf8").catch(() => undefined), stat(file).catch(() => undefined)])
+      if (text === undefined || st === undefined) continue
+      const mtimeMs = st.mtimeMs
+      const parsed = parseLeaseFile(text, stem)
+      if (!parsed.valid || parsed.pid === undefined) {
+        if (now - mtimeMs > staleMs) {
+          if (!options.readOnly) {
+            await rm(file, { force: true })
+            pruned++
+          }
+          continue
+        }
+        activeLeases.push({
+          id: stem,
+          bridgeId: stem,
+          ...(generation ? { generation } : {}),
+          unknown: true,
+          heartbeat: new Date(mtimeMs).toISOString(),
+          idleSec: Math.max(0, Math.floor((now - mtimeMs) / 1000)),
+        })
+        continue
+      }
+      const alive = probe.alive(parsed.pid)
+      const updatedMs = parsed.updatedAt ? Date.parse(parsed.updatedAt) : 0
+      const lastMs = Math.max(Number.isFinite(updatedMs) ? updatedMs : 0, mtimeMs)
+      if (!alive && now - lastMs > staleMs && !options.readOnly) {
+        await rm(file, { force: true })
+        pruned++
+        continue
+      }
+      activeLeases.push({
+        id: parsed.id,
+        bridgeId: parsed.bridgeId,
+        ...(parsed.supervisor ? { supervisor: parsed.supervisor } : {}),
+        ...(generation ? { generation } : {}),
+        pid: parsed.pid,
+        alive,
+        ...(parsed.updatedAt ? { updatedAt: parsed.updatedAt } : {}),
+        heartbeat: new Date(lastMs).toISOString(),
+        idleSec: Math.max(0, Math.floor((now - lastMs) / 1000)),
+      })
+    }
+  }
+
+  activeLeases.sort((a, b) => (a.idleSec ?? Number.MAX_SAFE_INTEGER) - (b.idleSec ?? Number.MAX_SAFE_INTEGER))
+  const activeSupervisors = new Set(activeLeases.filter((l) => l.alive !== false || (l.idleSec ?? 0) * 1000 <= staleMs).map((l) => l.id))
+  return { leases: activeLeases, activeSupervisors, pruned }
+}
+
+export const listAllLeases = sweepAllLeases
+
+/** Whether a session record's `supervisor` (`supervisor:<name>` or `<id>`) matches any live lease in `activeSupervisors`. */
+export function isSupervisorActive(supervisor: string | undefined, activeSupervisors: ReadonlySet<string>): boolean {
+  if (!supervisor) return false
+  if (activeSupervisors.has(supervisor)) return true
+  const short = supervisor.replace(/^supervisor:/, "")
+  if (activeSupervisors.has(short) || activeSupervisors.has(`supervisor:${short}`)) return true
+  for (const raw of activeSupervisors) {
+    const id = raw.replace(/^supervisor:/, "")
+    if (id === short || id.startsWith(`${short}-`)) return true
+  }
+  return false
+}
+
+/** True when `<home>` has a leases folder or generations folder on disk (i.e. lease tracking is present). */
+export function hasLeaseTracking(home: string): boolean {
+  return existsSync(path.join(home, "leases")) || existsSync(path.join(home, "generations")) || existsSync(path.join(home, "generations.json"))
 }
 
 /** A raw rename (fs.promises.rename by default; tests pass a fake). */

@@ -1,15 +1,19 @@
 // #72: oc_close_session and oc_cleanup. Nothing else removes finished delegated work: the box clone
 // (/sessions/<key>), the OpenCode session, the host record and the fetched delegate/<key> branch.
 // Both close only sessions whose host record names this bridge and this box (workspaces-close.ts
-// re-checks that before anything is sent). Two separate opt-ins (review cycle 1): `abort` stops a
-// running session first; `discardWork` allows deleting commits no host branch has, uncommitted
-// files and an unmerged delegate branch. oc_cleanup uses neither. Every close holds the close lock
-// (closing.ts), so oc_send / oc_collect refuse the session meanwhile. Results carry ids, keys, counts.
+// re-checks that before anything is sent), or (#174) records of dead bridge leases across generations.
+// Two separate opt-ins (review cycle 1): `abort` stops a running session first; `discardWork` allows
+// deleting commits no host branch has, uncommitted files and an unmerged delegate branch. oc_cleanup
+// uses neither. Every close holds the close lock (closing.ts), so oc_send / oc_collect refuse the
+// session meanwhile. Results carry ids, keys, counts.
+import { existsSync } from "node:fs"
 import { z } from "zod"
 import { recordClose, recordServed } from "../reporting/hooks.ts"
 import { DelegateError } from "../shared/errors.ts"
 import type { SessionState, SessionView } from "../shared/contracts.ts"
-import type { CloseOutcome, SessionRemoval } from "../supervisor/workspaces.ts"
+import { hasLeaseTracking, isSupervisorActive, sweepAllLeases } from "../supervisor/leases.ts"
+import type { CloseOutcome, CloseOwner, SessionRemoval } from "../supervisor/workspaces.ts"
+import type { HostSessionState } from "../supervisor/workspaces-state.ts"
 import type { Box, ToolContext } from "./context.ts"
 import { whileClosing } from "./closing.ts"
 import { boxPathOf, checkSessionId, hostState, ownedStates, recordFromState, sessionIdSchema, type RemoteSession } from "./core-session.ts"
@@ -42,11 +46,22 @@ type Located = { sessionKey: string; remote?: RemoteSession; live: string }
 const notOurs = (sessionID: string) =>
   new DelegateError("not_found", `Session ${sessionID} is not one of this bridge's sessions.`, "Use oc_list_sessions to see this bridge's sessions.")
 
+async function findReclaimableState(ctx: ToolContext, sessionID: string, activeSupervisors?: ReadonlySet<string>): Promise<(HostSessionState & { sessionID: string }) | undefined> {
+  const direct = (await ownedStates(ctx)).find((state) => state.sessionID === sessionID)
+  if (direct) return direct
+  if (!activeSupervisors) return undefined
+  const all = await ctx.workspaces.listSessionStates().catch((): HostSessionState[] => [])
+  return all.find(
+    (s): s is HostSessionState & { sessionID: string } =>
+      s.sessionID === sessionID && (s.supervisor === ctx.supervisor || !s.supervisor || !isSupervisorActive(s.supervisor, activeSupervisors)),
+  )
+}
+
 /** The key of one of our sessions: tracked, named by the box's metadata, or (box lost it) by a host record. */
-async function locate(ctx: ToolContext, box: Box, sessionID: string, correlationId: string): Promise<Located> {
+async function locate(ctx: ToolContext, box: Box, sessionID: string, correlationId: string, activeSupervisors?: ReadonlySet<string>): Promise<Located> {
   checkSessionId(sessionID)
   const known = ctx.sessions.get(sessionID)
-  const owned = known ? undefined : (await ownedStates(ctx)).find((state) => state.sessionID === sessionID)
+  const owned = known ? undefined : await findReclaimableState(ctx, sessionID, activeSupervisors)
   const live = known?.boxSessionID ?? owned?.boxSessionID ?? sessionID
   const directory = known?.boxPath ?? (owned ? boxPathOf(owned.sessionKey) : undefined)
   const res = await box.api.call<RemoteSession>({ path: `/session/${live}`, directory, correlationId })
@@ -62,8 +77,9 @@ async function locate(ctx: ToolContext, box: Box, sessionID: string, correlation
 }
 
 /** DELETE /session/:id; 404 means the sandbox no longer has it. Anything else throws (nothing else is removed). */
-function sessionDeleter(box: Box, sessionID: string, sessionKey: string, correlationId: string): () => Promise<SessionRemoval> {
+function sessionDeleter(box: Box, sessionID: string | undefined, sessionKey: string, correlationId: string): () => Promise<SessionRemoval> {
   return async () => {
+    if (!sessionID) return "already_gone"
     const res = await box.api.call<unknown>({ method: "DELETE", path: `/session/${sessionID}`, directory: boxPathOf(sessionKey), correlationId })
     if (res.status === 404) return "already_gone"
     if (res.status >= 200 && res.status < 300) return "deleted"
@@ -164,10 +180,15 @@ function closeSummary(o: CloseOutcome): string {
 
 type CloseArgs = { sessionID: string; deleteBranch?: boolean; abort?: boolean; discardWork?: boolean }
 
-async function closeOne(ctx: ToolContext, box: Box, located: Located, args: CloseArgs, correlationId: string) {
+async function closeOne(ctx: ToolContext, box: Box, located: Located, args: CloseArgs, correlationId: string, activeSupervisors?: ReadonlySet<string>, allowLegacyOrNotTracked = false) {
   let aborted = false
   let seen: SessionView | undefined
-  const owner = { supervisor: ctx.supervisor, sessionID: args.sessionID }
+  const owner: CloseOwner & { sessionID: string } = {
+    supervisor: ctx.supervisor,
+    sessionID: args.sessionID,
+    ...(activeSupervisors ? { activeSupervisors } : {}),
+    ...(allowLegacyOrNotTracked ? { allowLegacyBox: true, allowNotTracked: true } : {}),
+  }
   const outcome = await ctx.workspaces.closeSession(located.sessionKey, owner, { discardWork: args.discardWork === true, deleteBranch: args.deleteBranch === true }, {
     stop: async () => {
       const stopped = await stopSession(ctx, box, located, args.sessionID, args.abort === true, correlationId)
@@ -195,6 +216,81 @@ async function closeOne(ctx: ToolContext, box: Box, located: Located, args: Clos
   return ok(closeSummary(outcome), { ...rest, aborted, ...(ignoredExamples.length ? { ignoredExamples: untrusted(ignoredExamples.join("\n"), 2000) } : {}) })
 }
 
+/** #174: sweep stale / not_tracked / dead-bridge session records when oc_close_session({ all: true }) is called. */
+async function sweepAllCloseable(
+  ctx: ToolContext,
+  box: Box,
+  args: { deleteBranch?: boolean; abort?: boolean; discardWork?: boolean },
+  correlationId: string,
+) {
+  const sweptLeases = await sweepAllLeases(ctx.config.home).catch(() => ({ leases: [], activeSupervisors: new Set<string>([ctx.supervisor]), pruned: 0 }))
+  const activeSupervisors = new Set<string>([...sweptLeases.activeSupervisors, ctx.supervisor])
+  const states = await ctx.workspaces.listSessionStates().catch((): HostSessionState[] => [])
+  const closed: string[] = []
+  const kept: Row[] = []
+  const partial: string[] = []
+  const skipped = { recent: 0, active: 0, unknown: 0 }
+
+  for (const state of states) {
+    const ownOrDead = state.supervisor === ctx.supervisor || !state.supervisor || !isSupervisorActive(state.supervisor, activeSupervisors)
+    if (!ownOrDead) continue
+    const sid = state.sessionID
+    if (sid && ctx.sessions.has(sid)) {
+      skipped.active++
+      continue
+    }
+    const live = state.boxSessionID ?? sid
+    let remote: RemoteSession | undefined
+    if (live) {
+      const res = await box.api.call<RemoteSession>({ path: `/session/${live}`, directory: boxPathOf(state.sessionKey), correlationId }).catch(() => undefined)
+      if (res?.status === 200 && res.data?.id === live) {
+        const now = (await box.hub.view(live)).state
+        if (UNVERIFIED.has(now)) {
+          skipped.unknown++
+          continue
+        }
+        if (ACTIVE.has(now) && args.abort !== true) {
+          skipped.active++
+          continue
+        }
+        remote = res.data
+      } else if (res && res.status !== 404) {
+        skipped.unknown++
+        continue
+      }
+    }
+    const owner: CloseOwner & { sessionID: string } = {
+      supervisor: ctx.supervisor,
+      sessionID: sid ?? "",
+      activeSupervisors,
+      allowLegacyBox: true,
+      allowNotTracked: true,
+    }
+    const located: Located = { sessionKey: state.sessionKey, live: live ?? "", ...(remote ? { remote } : {}) }
+    const runClose = () =>
+      ctx.workspaces.closeSession(state.sessionKey, owner, { discardWork: args.discardWork === true, deleteBranch: args.deleteBranch === true }, {
+        stop: async () => {
+          if (sid && remote) await stopSession(ctx, box, located, sid, args.abort === true, correlationId)
+        },
+        deleteSession: sessionDeleter(box, live, state.sessionKey, correlationId),
+      })
+    try {
+      const o = sid ? await whileClosing(ctx, sid, runClose) : await runClose()
+      if (o.closed) {
+        if (sid) ctx.sessions.delete(sid)
+        closed.push(state.sessionKey)
+      } else if (o.refused && o.session === "kept") {
+        keep({ closed, wouldClose: [], kept, partial, skipped }, state.sessionKey, o.refused, o)
+      } else {
+        partial.push(state.sessionKey)
+      }
+    } catch {
+      skipped.unknown++
+    }
+  }
+  return ok(`Closed ${plural(closed.length, "session")}; ${kept.length} kept.`, { closed, kept, partial, skipped, leasesPruned: sweptLeases.pruned })
+}
+
 export const closeSessionTool = defineTool({
   name: "oc_close_session",
   title: "Close a finished session",
@@ -202,7 +298,7 @@ export const closeSessionTool = defineTool({
     "Delete one of this bridge's finished sessions: the OpenCode session, its copy in the sandbox and the bridge's host record. Refused while the session is running or needs input (abort: true stops it first), while its state cannot be read (retry), and while its copy has commits no host branch has, uncommitted files, or git-ignored files other than dependency/cache folders at any depth (node_modules, .cache, .turbo, __pycache__, .pytest_cache, .venv, coverage) such as dist/ or .env (run oc_collect or copy them first; discardWork: true deletes them). Commits only the reflog still holds (replaced by amend or reset) never block and are reported as discardedCommits. " +
     "deleteBranch: true also deletes the host branch delegate/<key>, only when another host branch contains it (discardWork: true deletes it unmerged); a branch checked out anywhere or a symbolic ref is never deleted, and no other branch is touched.",
   input: {
-    sessionID: sessionIdSchema,
+    sessionID: sessionIdSchema.optional(),
     deleteBranch: z.boolean().optional().describe("Also delete the host branch delegate/<key> when another branch contains it (either by commit SHA or patch-equivalent git cherry). Default false."),
     abort: z.boolean().optional().describe("Stop a running session before closing it. Its work is still checked afterwards. Default false."),
     discardWork: z.boolean().optional().describe("Allow deleting commits no host branch has, uncommitted files and an unmerged delegate/<key>. Default false."),
@@ -211,32 +307,53 @@ export const closeSessionTool = defineTool({
   annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
   async run(args, ctx, correlationId) {
     const box = await ctx.box()
-    const located = await locate(ctx, box, args.sessionID, correlationId)
+    const rawArgs = args as typeof args & { all?: boolean }
+    if (rawArgs.all === true || !args.sessionID) {
+      return sweepAllCloseable(ctx, box, args, correlationId)
+    }
+    const sessionID = args.sessionID
+    const leaseTracking = await hasLeaseTracking(ctx.config.home)
+    const swept = leaseTracking || args.force ? await sweepAllLeases(ctx.config.home).catch(() => undefined) : undefined
+    const activeSupervisors = swept ? new Set<string>([...swept.activeSupervisors, ctx.supervisor]) : undefined
+    const located = await locate(ctx, box, sessionID, correlationId, activeSupervisors)
     const state = await hostState(ctx, located.sessionKey)
     if (state?.caller && ctx.caller && state.caller !== ctx.caller && !args.force) {
       throw new DelegateError(
         "policy_violation",
-        `Session ${args.sessionID} belongs to caller "${state.caller}", not "${ctx.caller}".`,
+        `Session ${sessionID} belongs to caller "${state.caller}", not "${ctx.caller}".`,
         "Pass force: true to close another caller's session.",
         `owned by ${state.caller}`,
       )
     }
-    return whileClosing(ctx, args.sessionID, () => closeOne(ctx, box, located, args, correlationId))
+    const missingWorktree = state?.hostRepo ? !existsSync(state.hostRepo) : false
+    const allowLegacyOrNotTracked = Boolean(activeSupervisors || missingWorktree || args.force)
+    return whileClosing(ctx, sessionID, () => closeOne(ctx, box, located, { ...args, sessionID }, correlationId, activeSupervisors, allowLegacyOrNotTracked))
   },
 })
 
 type Row = { sessionKey: string; reason: string; uncollectedCommits: number; uncommittedPaths: number; ignoredPaths: number; discardedCommits: number }
 type Sweep = { closed: string[]; wouldClose: string[]; kept: Row[]; partial: string[]; skipped: { recent: number; active: number; unknown: number } }
-type Candidate = { sessionID: string; sessionKey: string; createdAt: string; boxSessionID?: string }
+type Candidate = { sessionID?: string; sessionKey: string; createdAt: string; boxSessionID?: string }
 
-const liveOf = (state: { sessionID: string; boxSessionID?: string }) => state.boxSessionID ?? state.sessionID
-type SweepRun = { ctx: ToolContext; box: Box; cutoff: number; dryRun: boolean; deleteBranch: boolean; correlationId: string; out: Sweep }
+const liveOf = (state: { sessionID?: string; boxSessionID?: string }) => state.boxSessionID ?? state.sessionID
+type SweepRun = {
+  ctx: ToolContext
+  box: Box
+  cutoff: number
+  dryRun: boolean
+  deleteBranch: boolean
+  correlationId: string
+  out: Sweep
+  activeSupervisors?: ReadonlySet<string>
+  allowExtended?: boolean
+}
 
 /** Last activity: the server's update time when it still has the session, else the record's creation. */
 async function lastActive(run: SweepRun, state: Candidate): Promise<{ at: number; present: boolean } | undefined> {
-  const live = liveOf(state)
-  const res = await run.box.api.call<RemoteSession>({ path: `/session/${live}`, directory: boxPathOf(state.sessionKey), correlationId: run.correlationId }).catch(() => undefined)
   const created = Date.parse(state.createdAt)
+  const live = liveOf(state)
+  if (!live) return { at: created, present: false }
+  const res = await run.box.api.call<RemoteSession>({ path: `/session/${live}`, directory: boxPathOf(state.sessionKey), correlationId: run.correlationId }).catch(() => undefined)
   if (res?.status === 404) return { at: created, present: false }
   if (res?.status !== 200 || res.data?.id !== live) return undefined
   const updated = res.data.time?.updated
@@ -249,7 +366,9 @@ async function staleness(run: SweepRun, state: Candidate): Promise<{ skip: keyof
   if (!last) return { skip: "unknown" }
   if (last.at >= run.cutoff) return { skip: "recent" }
   if (!last.present) return { present: false }
-  const now = (await run.box.hub.view(liveOf(state))).state
+  const live = liveOf(state)
+  if (!live) return { present: false }
+  const now = (await run.box.hub.view(live)).state
   return UNVERIFIED.has(now) ? { skip: "unknown" } : ACTIVE.has(now) ? { skip: "active" } : { present: true }
 }
 
@@ -265,33 +384,39 @@ async function sweepOne(run: SweepRun, state: Candidate): Promise<void> {
     out.skipped[stale.skip]++
     return
   }
-  const owner = { supervisor: ctx.supervisor, sessionID: state.sessionID }
+  const owner: CloseOwner & { sessionID: string } = {
+    supervisor: ctx.supervisor,
+    sessionID: state.sessionID ?? "",
+    ...(run.activeSupervisors ? { activeSupervisors: run.activeSupervisors } : {}),
+    ...(run.allowExtended ? { allowLegacyBox: true, allowNotTracked: true } : {}),
+  }
   if (run.dryRun) {
     const plan = await ctx.workspaces.inspectClose(state.sessionKey, owner, { deleteBranch: run.deleteBranch })
     if (plan.safe) out.wouldClose.push(state.sessionKey)
     else keep(out, state.sessionKey, plan.reason ?? "check_failed", plan)
     return
   }
-  const located: Located = { sessionKey: state.sessionKey, live: liveOf(state), ...(stale.present ? { remote: { id: liveOf(state) } } : {}) }
+  const live = liveOf(state) ?? ""
+  const located: Located = { sessionKey: state.sessionKey, live, ...(stale.present && live ? { remote: { id: live } } : {}) }
   let seen: SessionView | undefined
-  const o = await whileClosing(ctx, state.sessionID, () =>
+  const doClose = () =>
     ctx.workspaces.closeSession(state.sessionKey, owner, { discardWork: false, deleteBranch: run.deleteBranch }, {
       stop: async () => {
-        seen = (await stopSession(ctx, run.box, located, state.sessionID, false, run.correlationId)).view
+        if (state.sessionID) seen = (await stopSession(ctx, run.box, located, state.sessionID, false, run.correlationId)).view
       },
-      deleteSession: sessionDeleter(run.box, located.live, state.sessionKey, run.correlationId),
-    }),
-  )
+      deleteSession: sessionDeleter(run.box, live || undefined, state.sessionKey, run.correlationId),
+    })
+  const o = state.sessionID ? await whileClosing(ctx, state.sessionID, doClose) : await doClose()
   if (o.closed) {
-    ctx.sessions.delete(state.sessionID)
+    if (state.sessionID) ctx.sessions.delete(state.sessionID)
     out.closed.push(state.sessionKey)
     recordClose(ctx, state.sessionKey, "swept", { seen: closeSeen(seen) })
-    recordServed(ctx, state.sessionKey, state.sessionID)
+    if (state.sessionID) recordServed(ctx, state.sessionKey, state.sessionID)
   } else if (o.refused && o.session === "kept") keep(out, state.sessionKey, o.refused, o)
   else {
     // Late refusal (session deleted, copy and host record kept): same handling as oc_close_session.
     out.partial.push(state.sessionKey)
-    if (o.session !== "kept") await keepTracked(ctx, state.sessionID, state.sessionKey)
+    if (o.session !== "kept" && state.sessionID) await keepTracked(ctx, state.sessionID, state.sessionKey)
   }
 }
 
@@ -321,8 +446,23 @@ export const cleanupTool = defineTool({
     // A dry run leaves the sweep cursor where it is, so the real run then sees the same records.
     // The box first: its first bind can move this bridge to a newer box generation (#171), and candidates are chosen by the current box project (#174).
     const box = await ctx.box()
-    const candidates = await ctx.workspaces.closeCandidates(ctx.supervisor, new Date(cutoff), MAX_EXAMINED, { moveCursor: !dryRun })
-    const run: SweepRun = { ctx, box, cutoff, dryRun, deleteBranch: args.deleteBranch === true, correlationId, out }
+    const leaseTracking = await hasLeaseTracking(ctx.config.home)
+    const sweptLeases = leaseTracking ? await sweepAllLeases(ctx.config.home, { readOnly: dryRun }).catch(() => undefined) : undefined
+    const activeSupervisors = sweptLeases ? new Set<string>([...sweptLeases.activeSupervisors, ctx.supervisor]) : undefined
+    const candidates = await ctx.workspaces.closeCandidates(ctx.supervisor, new Date(cutoff), MAX_EXAMINED, {
+      moveCursor: !dryRun,
+      ...(activeSupervisors ? { activeSupervisors, includeLegacy: true, includeNotTracked: true } : {}),
+    })
+    const run: SweepRun = {
+      ctx,
+      box,
+      cutoff,
+      dryRun,
+      deleteBranch: args.deleteBranch === true,
+      correlationId,
+      out,
+      ...(activeSupervisors ? { activeSupervisors, allowExtended: true } : {}),
+    }
     for (const state of candidates.states) {
       if (out.closed.length + out.wouldClose.length >= MAX_CLOSED) break
       try {

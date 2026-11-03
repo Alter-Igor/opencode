@@ -12,10 +12,11 @@
 // The host branch goes only when another host branch contains it (never HEAD alone, never a
 // symbolic ref, never when checked out), unless discardWork; the delete is a --no-deref
 // compare-and-delete of that one ref. Only records of this bridge, this box and this session id.
-import { readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs"
+import { existsSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs"
 import path from "node:path"
 import { randomUUID } from "node:crypto"
 import { DelegateError, isDelegateError } from "../shared/errors.ts"
+import { isSupervisorActive } from "./leases.ts"
 import type { Exec } from "./workspaces-exec.ts"
 import { ABSENT_CLONE_PROBE, PROBE_ABSENT, PROBE_PRESENT, removeUnchanged, snapshotRecord } from "./workspaces-prune.ts"
 import { COMMIT_ID, parseHostState, SESSION_KEY, SUPERVISOR_RE, type HostSessionState } from "./workspaces-state.ts"
@@ -29,7 +30,16 @@ export const IGNORED_ALLOWED: ReadonlySet<string> = new Set(["node_modules", ".c
 /** Ignored paths named in a refusal. */
 const MAX_IGNORED_EXAMPLES = 10
 
-export type CloseOwner = { supervisor: string; sessionID: string }
+export type CloseOwner = {
+  supervisor: string
+  sessionID: string
+  /** #174: live supervisor/bridge IDs across all generations; records of dead bridges may be swept. */
+  activeSupervisors?: ReadonlySet<string>
+  /** #174: non-running generation box project names that are eligible for sweeping. */
+  inactiveBoxes?: ReadonlySet<string>
+  allowLegacyBox?: boolean
+  allowNotTracked?: boolean
+}
 export type CloseOptions = { discardWork: boolean; deleteBranch: boolean }
 /** What deleting the OpenCode session did; a failure is thrown. */
 export type SessionRemoval = "deleted" | "already_gone"
@@ -90,7 +100,7 @@ type BranchState = { plan: BranchPlan; tip?: string; repo?: string }
 const notOurs = (key: string, why: string) =>
   new DelegateError("not_found", "That session is not one of this bridge's sessions in this sandbox.", "Use oc_list_sessions to see this bridge's sessions.", `close refused: ${key} (${why})`)
 
-/** The record, only when it names this session id, this bridge and this box. */
+/** The record, when it belongs to this bridge (or an orphaned dead bridge / legacy / retired generation box when allowed). */
 function owned(deps: CloseDeps, key: string, owner: CloseOwner): Owned {
   if (!SESSION_KEY.test(key)) throw notOurs(key, "bad session key")
   if (!SUPERVISOR_RE.test(owner.supervisor)) throw notOurs(key, "bad supervisor name")
@@ -103,11 +113,26 @@ function owned(deps: CloseDeps, key: string, owner: CloseOwner): Owned {
   }
   const state = snapshot ? parseHostState(snapshot.raw, key) : undefined
   if (!snapshot) throw notOurs(key, "record unreadable or changing")
-  if (!state?.sessionID) throw notOurs(key, "record not valid")
-  if (state.sessionID !== owner.sessionID) throw notOurs(key, "session id differs")
-  if (state.supervisor !== owner.supervisor) throw notOurs(key, "other bridge")
-  if (state.boxProject !== deps.boxProject) throw notOurs(key, "other box")
-  return { state: { ...state, sessionID: state.sessionID }, snapshot, file }
+  if (!state) throw notOurs(key, "record not valid")
+  if (!state.sessionID && !owner.allowNotTracked) throw notOurs(key, "record not valid")
+  const resolvedSessionID = state.sessionID ?? owner.sessionID
+  if (state.sessionID && state.sessionID !== owner.sessionID) throw notOurs(key, "session id differs")
+
+  const sameSupervisor = state.supervisor === owner.supervisor
+  const deadSupervisor =
+    owner.activeSupervisors !== undefined &&
+    (!state.supervisor || !isSupervisorActive(state.supervisor, owner.activeSupervisors))
+  const untrackedSupervisor = owner.allowNotTracked === true && !state.supervisor
+  if (!sameSupervisor && !deadSupervisor && !untrackedSupervisor) throw notOurs(key, "other bridge")
+
+  const sameBox = state.boxProject === deps.boxProject
+  const legacyBox =
+    state.boxProject === undefined &&
+    (owner.allowLegacyBox === true || owner.activeSupervisors !== undefined || owner.allowNotTracked === true)
+  const deadGenBox = state.boxProject !== undefined && owner.inactiveBoxes?.has(state.boxProject) === true
+  if (!sameBox && !legacyBox && !deadGenBox) throw notOurs(key, "other box")
+
+  return { state: { ...state, sessionID: resolvedSessionID }, snapshot, file }
 }
 
 const clonePath = (deps: CloseDeps, key: string) => `${deps.boxSessions}/${key}`
@@ -129,9 +154,11 @@ async function boxGit(deps: CloseDeps, key: string, args: string[]) {
  * live only in its reflog, so they are read from there too and block like any other tip.
  */
 async function cloneTips(deps: CloseDeps, key: string): Promise<string[] | undefined> {
-  const refs = await boxGit(deps, key, ["for-each-ref", "--format=%(objectname) %(*objectname)", "refs/heads", "refs/tags", "refs/stash"])
-  const head = await boxGit(deps, key, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
-  const stash = await boxGit(deps, key, ["rev-parse", "--verify", "--quiet", "refs/stash"])
+  const [refs, head, stash] = await Promise.all([
+    boxGit(deps, key, ["for-each-ref", "--format=%(objectname) %(*objectname)", "refs/heads", "refs/tags", "refs/stash"]),
+    boxGit(deps, key, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]),
+    boxGit(deps, key, ["rev-parse", "--verify", "--quiet", "refs/stash"]),
+  ])
   if (refs.code !== 0 || (head.code !== 0 && head.code !== 1) || (stash.code !== 0 && stash.code !== 1)) return undefined
   let stashes: string[] = []
   if (stash.code === 0) {
@@ -232,36 +259,53 @@ async function splitTips(deps: CloseDeps, repo: string, tips: string[]): Promise
 }
 
 /** What closing would lose from the clone. Reads only (box git and host git). */
-async function inspectClone(deps: CloseDeps, state: HostSessionState): Promise<CloneState> {
+async function inspectClone(deps: CloseDeps, state: HostSessionState, owner?: CloseOwner): Promise<CloneState> {
   const key = state.sessionKey
+  if (state.boxProject && state.boxProject !== deps.boxProject && owner?.inactiveBoxes?.has(state.boxProject) && !existsSync(state.hostRepo)) {
+    return { clone: "absent", uncollectedCommits: 0, discardedCommits: 0, ...NO_TREE }
+  }
   const presence = await probeClone(deps, key)
   if (presence === "absent") return { clone: "absent", uncollectedCommits: 0, discardedCommits: 0, ...NO_TREE }
+
+  let resolvedRepo: string | undefined | null = null
+  const getRepo = async (): Promise<string | undefined> => {
+    if (resolvedRepo !== null) return resolvedRepo
+    resolvedRepo = await deps.resolveRepo(state.hostRepo).catch(() => undefined)
+    return resolvedRepo
+  }
+  const hasHostBranch = async (): Promise<boolean> => {
+    const r = await getRepo()
+    const hostTip = r ? await hostBranchTip(deps, r, key) : undefined
+    return hostTip !== undefined && hostTip !== "absent" && hostTip !== "symbolic" && hostTip !== null
+  }
 
   // #144: Check if host repo and host branch exist. If copy in box is gone or unreadable after a restart,
   // but the host branch delegate/<key> exists on the host, treat the host branch as the source of truth
   // since nothing in the box can be lost.
-  const repo = await deps.resolveRepo(state.hostRepo).catch(() => undefined)
-  const hostTip = repo ? await hostBranchTip(deps, repo, key) : undefined
-  const hostBranchExists = hostTip !== undefined && hostTip !== "absent" && hostTip !== "symbolic" && hostTip !== null
-
   if (presence === "unknown") {
-    if (hostBranchExists) return { clone: "absent", uncollectedCommits: 0, discardedCommits: 0, ...NO_TREE }
+    if (await hasHostBranch()) return { clone: "absent", uncollectedCommits: 0, discardedCommits: 0, ...NO_TREE }
     return failedClone("unknown", NO_TREE, "clone presence probe returned unknown")
   }
 
-  const [tips, tree] = [await cloneTips(deps, key), await worktreeCounts(deps, key)]
+  const [tips, tree, reflogRaw] = await Promise.all([
+    cloneTips(deps, key),
+    worktreeCounts(deps, key),
+    boxGit(deps, key, ["rev-list", "--count", "--reflog", "--not", "--all", "HEAD", state.base]),
+  ])
   if (tips === undefined || tree === undefined) {
-    if (hostBranchExists) return { clone: "absent", uncollectedCommits: 0, discardedCommits: 0, ...NO_TREE }
+    if (await hasHostBranch()) return { clone: "absent", uncollectedCommits: 0, discardedCommits: 0, ...NO_TREE }
     const reason = tips === undefined ? "clone git tips unreadable" : "worktree status unreadable"
     return failedClone("present", tree ?? NO_TREE, reason)
   }
 
-  const reflogOnly = numberOf(await boxGit(deps, key, ["rev-list", "--count", "--reflog", "--not", "--all", "HEAD", state.base]))
+  const reflogOnly = numberOf(reflogRaw)
   if (reflogOnly === undefined) return failedClone("present", tree, "reflog count unreadable")
 
   const candidates = tips.filter((tip) => tip !== state.base)
   if (!candidates.length && reflogOnly === 0) return { clone: "present", uncollectedCommits: 0, discardedCommits: 0, ...tree }
 
+  const repo = await getRepo()
+  if (!candidates.length && !repo) return { clone: "present", uncollectedCommits: 0, discardedCommits: reflogOnly, ...tree }
   if (!repo) return failedClone("present", tree, "host repository could not be resolved")
   const split = await splitTips(deps, repo, candidates)
   if (!split) return failedClone("present", tree, "could not check tips against host repository")
@@ -331,7 +375,7 @@ const countsOf = (c: Counts): Counts => ({ uncollectedCommits: c.uncollectedComm
 /** Read-only: what closing would do and lose. */
 export async function inspectClose(deps: CloseDeps, key: string, owner: CloseOwner, options: Pick<CloseOptions, "deleteBranch">): Promise<ClosePlan> {
   const o = owned(deps, key, owner)
-  const clone = await inspectClone(deps, o.state)
+  const clone = await inspectClone(deps, o.state, owner)
   const branch: BranchPlan = options.deleteBranch ? (await inspectBranch(deps, o.state)).plan : "not_requested"
   const reason = reasonOf(clone)
   return { sessionKey: key, sessionID: o.state.sessionID, clone: clone.clone, ...countsOf(clone), safe: reason === undefined, ...(reason ? { reason } : {}), ...(clone.checkError ? { checkError: clone.checkError } : {}), branch }
@@ -388,16 +432,16 @@ const blocks = (reason: CloseRefusal | undefined, discardWork: boolean | undefin
 
 export async function closeSession(deps: CloseDeps, key: string, owner: CloseOwner, options: CloseOptions, hooks: CloseHooks): Promise<CloseOutcome> {
   const o = owned(deps, key, owner)
-  const first = await inspectClone(deps, o.state)
+  const first = await inspectClone(deps, o.state, owner)
   if (blocks(reasonOf(first), options.discardWork)) return kept(o, first, "kept", reasonOf(first))
   await hook(hooks.stop, "stop the session")
-  const stopped = await inspectClone(deps, o.state)
+  const stopped = await inspectClone(deps, o.state, owner)
   if (blocks(reasonOf(stopped), options.discardWork)) return kept(o, stopped, "kept", reasonOf(stopped))
   const branch: BranchState = options.deleteBranch ? await inspectBranch(deps, o.state) : { plan: "not_requested" }
   const session = await hook(hooks.deleteSession, "delete the session")
   let final = stopped
   if (!options.discardWork && stopped.clone !== "absent") {
-    final = await inspectClone(deps, o.state)
+    final = await inspectClone(deps, o.state, owner)
     if (reasonOf(final)) return kept(o, final, session, reasonOf(final))
   }
   const out: CloseOutcome = { ...kept(o, final, session), clone: "failed" }
@@ -410,7 +454,17 @@ export async function closeSession(deps: CloseDeps, key: string, owner: CloseOwn
 }
 
 /** moveCursor: false reads the same page again next time (oc_cleanup's dry run). Default true. */
-export type CandidateOptions = { moveCursor?: boolean }
+export type CandidateOptions = {
+  moveCursor?: boolean
+  /** #174: live supervisor/bridge IDs across all generations; records of dead bridges become eligible. */
+  activeSupervisors?: ReadonlySet<string>
+  /** #174: non-running generation box project names that are eligible for sweeping. */
+  inactiveBoxes?: ReadonlySet<string>
+  /** #174: include legacy records (`boxProject === undefined`). Default: true when `activeSupervisors` is set. */
+  includeLegacy?: boolean
+  /** #174: include `not_tracked` records (missing `hostRepo` on disk or unbound). Default: true when `activeSupervisors` is set. */
+  includeNotTracked?: boolean
+}
 export type CloseCandidates = { states: Array<HostSessionState & { sessionID: string }>; legacy: number; otherBox: number; otherBridge: number }
 
 function readCursor(file: string): string {
@@ -445,9 +499,9 @@ function readCandidate(dir: string, name: string): HostSessionState | undefined 
 }
 
 /**
- * This bridge's bound records of this box created before `before` (at most `limit`), continuing after
- * the last name a previous call reached (persisted cursor), so kept records never block later ones.
- * Reads records only; writes only its cursor file. Counts legacy, other-box and other-bridge records seen.
+ * This bridge's bound records (plus dead-bridge / legacy / retired-generation / `not_tracked` records
+ * when `activeSupervisors` or orphan options are provided) created before `before` (at most `limit`),
+ * continuing after the last name a previous call reached (persisted cursor).
  */
 export function closeCandidates(deps: Pick<CloseDeps, "stateDir" | "boxProject">, supervisor: string, before: Date, limit: number, options: CandidateOptions = {}): CloseCandidates {
   const out: CloseCandidates = { states: [], legacy: 0, otherBox: 0, otherBridge: 0 }
@@ -458,6 +512,10 @@ export function closeCandidates(deps: Pick<CloseDeps, "stateDir" | "boxProject">
   } catch {
     return out
   }
+  const reclaimOrphans = options.activeSupervisors !== undefined
+  const includeLegacy = options.includeLegacy ?? reclaimOrphans
+  const includeNotTracked = options.includeNotTracked ?? reclaimOrphans
+
   const cursorFile = path.join(deps.stateDir, `.close-${supervisor.slice("supervisor:".length)}.cursor`)
   const cursor = readCursor(cursorFile)
   const start = names.findIndex((name) => name > cursor)
@@ -467,11 +525,32 @@ export function closeCandidates(deps: Pick<CloseDeps, "stateDir" | "boxProject">
     if (out.states.length >= limit) break
     last = name
     const state = readCandidate(deps.stateDir, name)
-    if (!state?.sessionID || !state.supervisor) continue
-    if (state.supervisor !== supervisor) out.otherBridge++
-    else if (state.boxProject === undefined) out.legacy++
-    else if (state.boxProject !== deps.boxProject) out.otherBox++
-    else if (Date.parse(state.createdAt) < before.getTime()) out.states.push({ ...state, sessionID: state.sessionID })
+    if (!state) continue
+    if ((!state.sessionID || !state.supervisor) && !includeNotTracked) continue
+
+    if (state.supervisor && state.supervisor !== supervisor) {
+      if (!options.activeSupervisors || isSupervisorActive(state.supervisor, options.activeSupervisors)) {
+        out.otherBridge++
+        continue
+      }
+    }
+
+    if (state.boxProject === undefined) {
+      if (!includeLegacy) {
+        out.legacy++
+        continue
+      }
+    } else if (state.boxProject !== deps.boxProject) {
+      if (!options.inactiveBoxes?.has(state.boxProject)) {
+        out.otherBox++
+        continue
+      }
+    }
+
+    const missingWorktree = includeNotTracked && !existsSync(state.hostRepo)
+    if (Date.parse(state.createdAt) < before.getTime() || missingWorktree || !state.sessionID) {
+      out.states.push({ ...state, sessionID: state.sessionID ?? state.sessionKey })
+    }
   }
   // A dry run (moveCursor: false) leaves the cursor, so the real run then sees the same records.
   if (last && options.moveCursor !== false) saveCursor(cursorFile, last)
