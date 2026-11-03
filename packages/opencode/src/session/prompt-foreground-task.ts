@@ -3,8 +3,11 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { BackgroundJob } from "@/background/job"
 import { SessionID } from "./schema"
 
-function everyTextPartSynthetic(parts: readonly SessionV1.Part[]) {
-  return parts.every((part) => part.type !== "text" || part.synthetic === true)
+// Reading a file adds synthetic text around the file part. That text is not the user.
+// Skip only when every part is synthetic text. A file, or no parts, is a real check-in.
+function onlySyntheticText(parts: readonly SessionV1.Part[]) {
+  if (parts.length === 0) return false
+  return parts.every((part) => part.type === "text" && part.synthetic === true)
 }
 
 function foregroundTaskJob(job: BackgroundJob.Info, sessionID: string) {
@@ -21,7 +24,7 @@ export const promoteForegroundTask = Effect.fn("SessionPrompt.promoteForegroundT
   sessionID: SessionID,
   parts: readonly SessionV1.Part[],
 ) {
-  if (everyTextPartSynthetic(parts)) return
+  if (onlySyntheticText(parts)) return
   const matches = (yield* jobs.list()).filter((job) => foregroundTaskJob(job, sessionID))
   yield* Effect.forEach(matches, (job) => jobs.promote(job.id), { discard: true })
 })
