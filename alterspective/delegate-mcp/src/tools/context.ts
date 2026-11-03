@@ -44,6 +44,17 @@ export type RestartedBox = Box & { interrupted: number; keystone: string[] }
 export type CommandResult = { code: number; stdout: string; stderr: string; timedOut?: boolean }
 export type CommandRunner = (argv: string[], timeoutMs?: number, cwd?: string) => Promise<CommandResult>
 
+/** Allowlisted read observations, never backend response bodies or execution-policy proof. */
+export type RemoteObservation = {
+  observedAt: string
+  elapsedMs: number
+  outcome: "healthy" | "degraded" | "unhealthy" | "authenticated" | "needs_auth" | "unknown" | "timeout" | "unreachable" | "http_error" | "invalid_json" | "invalid_shape"
+  httpStatus?: number
+  shapeValid?: boolean
+}
+
+export type RemoteReadiness = { health: RemoteObservation; authentication: RemoteObservation }
+
 export type ToolContext = {
   config: BridgeConfig
   /** `supervisor:<name>` — this bridge's inbox address and the value stored in session metadata. */
@@ -65,6 +76,8 @@ export type ToolContext = {
   gate?: GateApprovals
   /** #76: the models Synapse served one session since a time, from front's log; undefined when unreadable. Absent in older test contexts. */
   servedModels?: (sessionID: string, sinceIso: string) => Promise<Record<string, number> | undefined>
+  /** Remote diagnostics only; absent in local mode. This cannot attest execution policy. */
+  remoteReadiness?: () => Promise<RemoteReadiness>
   /** Start or reuse the box and its event hub (idempotent, shared by concurrent calls). */
   box(): Promise<Box>
   /** Additive (Wave 3): the box this bridge already holds, without starting or reusing one. */

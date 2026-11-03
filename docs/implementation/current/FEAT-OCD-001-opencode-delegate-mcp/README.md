@@ -53,4 +53,6 @@ Kill criteria stop the work and come back to you (`plan.md` §5).
 
 ## Files
 
-`plan.md` (sections 1–12) · `technical-design.md` · `requirements.md` · `acceptance-criteria.md` · `impact-analysis.md` · `module-register.md` · `checklist.md` · `issues.md` · `status.md` · `evidence/` · `modules/`
+`plan.md` (sections 1–12) · `technical-design.md` · `requirements.md` · `acceptance-criteria.md` · `impact-analysis.md` · `module-register.md` · `checklist.md` · `issues.md` · `status.md` · [Evidence index](evidence/README.md) · `modules/`
+
+For #241, read the [remote containment review and verification record](evidence/remote-containment-241-prebuild.md).

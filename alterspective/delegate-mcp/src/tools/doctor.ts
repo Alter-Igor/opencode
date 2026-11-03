@@ -279,6 +279,16 @@ export const doctorTool = defineTool({
   input: { start: z.boolean().optional().describe("Start (or reuse) the sandbox first. Default false.") },
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   async run(args, ctx, correlationId) {
+    if (ctx.config.backend === "remote") {
+      const remote = await ctx.remoteReadiness?.()
+      return ok("Remote execution is blocked (policy_unverified). Health and configured-token catalog reads are observations only; remote execution policy is unknown. Use the local Docker backend.", {
+        backend: "remote",
+        verified: false,
+        guard: { ok: false, code: "policy_unverified", reason: "Remote prompt, model, permission, MCP and egress policy have no verified replacement contract (#241)." },
+        remote: remote ?? { unavailable: "Remote diagnostic port is not available." },
+        bridge: { name: ctx.supervisor.replace(/^supervisor:/, ""), version: ctx.version },
+      })
+    }
     const { status, mcp, verdict, live, held } = await inspect(ctx, args.start === true, correlationId)
     const keystone = keystoneReport(ctx.config, mcp && "entries" in mcp ? statusMap(mcp) : undefined)
     const egress = egressFor(ctx, keystone)

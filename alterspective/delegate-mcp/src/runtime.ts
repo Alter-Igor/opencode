@@ -27,7 +27,8 @@ import { keystoneHostAuth } from "./guard/egress-identity.ts"
 import { createKeystoneAuth, type KeystoneAuth } from "./keystone-auth/index.ts"
 import { connectSignedIn, createKsPublisher, ensureEntryConnected, startReconnectLoop } from "./keystone-auth/host-wiring.ts"
 import { cleanEnv, runCommand } from "./supervisor/workspaces-exec.ts"
-import { createRemoteClient, createRemoteHub, createRemoteOpencodeApi, createRemoteWorkspaces } from "./remote/index.ts"
+import { createRemoteClient, createRemoteWorkspaces } from "./remote/index.ts"
+import { REMOTE_POLICY_REASON, refuseRemoteExecution } from "./remote/api.ts"
 import type { Box, CommandRunner, RestartedBox, SessionRecord, ToolContext } from "./tools/context.ts"
 
 export const NAME_RE = /^[a-z0-9-]{1,40}$/
@@ -255,46 +256,14 @@ export async function createRuntime(options: RuntimeOptions = {}): Promise<Runti
       client: remoteClient,
       logger: log,
     })
-    const remoteApi = createRemoteOpencodeApi({
-      client: remoteClient,
-      getSeedPatch: (key) => remoteWorkspaces.getSeedPatch(key),
-    })
-    const remoteHub = createRemoteHub({
-      client: remoteClient,
-    })
-    const remoteBox: Box = {
-      target: { baseUrl: config.remoteUrl, password: "" },
-      api: remoteApi,
-      hub: remoteHub,
-    }
     const synapse = createSynapseAuth(config, env, log)
     const remoteSupervisor: DelegateSupervisor = {
-      ensure: async () => remoteBox.target,
-      status: async () => ({
-        state: "running",
-        target: remoteBox.target,
-        imageTag: "remote-svc-coding-agent",
-        startedBy: "this-bridge",
-        imageMatches: true,
-        policyVerified: true,
-        frontMatches: true,
-        health: "healthy",
-      }),
+      ensure: async () => refuseRemoteExecution(),
+      status: async () => ({ state: "unavailable", reason: REMOTE_POLICY_REASON }),
       release: async () => {},
-      login: async () => "connected",
-      replace: async () => ({
-        target: remoteBox.target,
-        api: remoteApi,
-        hub: remoteHub,
-        interrupted: 0,
-        keystone: [],
-      }),
-      verifyLive: async () => ({
-        ok: true,
-        signIns: { ok: true, names: [], stale: [], unrecognised: 0, removedBefore: [] },
-        front: { ok: true, loadedConfigMatches: true, mountReadOnly: true, boxMountsOk: true, problems: [] },
-        problems: [],
-      }),
+      login: async () => refuseRemoteExecution(),
+      replace: async () => refuseRemoteExecution(),
+      verifyLive: async () => refuseRemoteExecution(),
     }
 
     const ctx: ToolContext = {
@@ -310,19 +279,13 @@ export async function createRuntime(options: RuntimeOptions = {}): Promise<Runti
       inbox: createInbox({ supervisor: `supervisor:${name}`, target: async () => ({ baseUrl: "http://127.0.0.1:0", token: "mock" }) }),
       gate: createGateApprovals({ target: async () => ({ baseUrl: "http://127.0.0.1:0", token: "mock" }) }),
       servedModels: async () => undefined,
-      box: async () => remoteBox,
-      peekBox: () => remoteBox,
-      apiFor: () => remoteApi,
-      restartBox: async () => ({
-        ...remoteBox,
-        interrupted: 0,
-        keystone: [],
-      }),
-      onBox: (listener) => {
-        listener(remoteBox)
-        return () => {}
-      },
-      boxExec: async () => ({ code: 0, stdout: "", stderr: "" }),
+      remoteReadiness: () => remoteClient.readiness(),
+      box: async () => refuseRemoteExecution(),
+      peekBox: () => undefined,
+      apiFor: () => refuseRemoteExecution(),
+      restartBox: async () => refuseRemoteExecution(),
+      onBox: () => () => {},
+      boxExec: async () => refuseRemoteExecution(),
       hostExec: (argv, timeoutMs, cwd) => hostRunner(argv, timeoutMs ?? 60_000, cwd),
       sessions,
       synapse,
@@ -340,7 +303,6 @@ export async function createRuntime(options: RuntimeOptions = {}): Promise<Runti
       ctx,
       versionInfo,
       name,
-      synapse,
       shutdown: async (reason) => {
         log.log("info", "runtime", "remote bridge shutting down", { reason })
       },
