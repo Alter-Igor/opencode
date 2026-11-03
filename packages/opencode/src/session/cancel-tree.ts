@@ -38,6 +38,44 @@ export const idleWhenQuiet =
 /** Cancel a session's run, then every descendant's, before the tree is removed. Idle ones are skipped. */
 export const cancelSessionTree = <ID>(deps: CancelTreeDeps<ID>, sessionID: ID): Effect.Effect<void> =>
   Effect.gen(function* () {
+    if (typeof sessionID === "string") markSessionDeleting(sessionID)
     if (!(yield* deps.isIdle(sessionID))) yield* deps.cancel(sessionID)
     for (const child of yield* deps.children(sessionID)) yield* cancelSessionTree(deps, child.id)
   })
+
+const TOMBSTONE_TTL_MS = 60_000
+const MAX_TOMBSTONES = 2_048
+const deletingSessions = new Map<string, number>()
+
+/**
+ * Mark a session as being deleted so `SessionRunState` refuses to start new runs and `Session`
+ * drops late message/part/title writes from detached background fibers (#214).
+ */
+export function markSessionDeleting(sessionID: string): void {
+  if (!sessionID) return
+  const now = Date.now()
+  if (deletingSessions.size >= MAX_TOMBSTONES) {
+    for (const [key, expiry] of deletingSessions) {
+      if (now > expiry) deletingSessions.delete(key)
+    }
+    if (deletingSessions.size >= MAX_TOMBSTONES) {
+      const oldest = deletingSessions.keys().next().value
+      if (oldest !== undefined) deletingSessions.delete(oldest)
+    }
+  }
+  deletingSessions.set(sessionID, now + TOMBSTONE_TTL_MS)
+}
+
+export function unmarkSessionDeleting(sessionID: string): void {
+  deletingSessions.delete(sessionID)
+}
+
+export function isSessionDeleting(sessionID: string): boolean {
+  const expiry = deletingSessions.get(sessionID)
+  if (expiry === undefined) return false
+  if (Date.now() > expiry) {
+    deletingSessions.delete(sessionID)
+    return false
+  }
+  return true
+}

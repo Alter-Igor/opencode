@@ -22,21 +22,24 @@ import { getAdapter, registeredAdapters } from "./adapters"
 import { type Target, type WorkspaceInfo, WorkspaceInfo as WorkspaceInfoSchema } from "./types"
 import { WorkspaceV2 } from "@opencode-ai/core/workspace"
 import { Session } from "@/session/session"
-import { SessionPrompt } from "@/session/prompt"
 import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
-import { cancelSessionTree, idleWhenQuiet } from "@/session/cancel-tree"
+import { cancelSessionTree, idleWhenQuiet, markSessionDeleting } from "@/session/cancel-tree"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionID } from "@/session/schema"
 import { NotFoundError } from "@/storage/storage"
 import { errorData } from "@/util/error"
 import { waitEvent } from "./util"
-import { WorkspaceRef } from "@/effect/instance-ref"
+import { InstanceRef, WorkspaceRef } from "@/effect/instance-ref"
 import { Vcs } from "@/project/vcs"
+import { InstanceBootstrap } from "@/project/bootstrap-service"
 import { InstanceStore } from "@/project/instance-store"
 import { WorkspaceAdapterRuntime } from "./workspace-adapter-runtime"
+import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { AppNodeBuilderV1 } from "@/effect/app-node-builder-v1"
 import { WorkspaceEvent } from "@opencode-ai/schema/workspace-event"
+
+const noopBootstrap = Layer.succeed(InstanceBootstrap.Service, InstanceBootstrap.Service.of({ run: Effect.void }))
 
 export const Info = Schema.Struct({
   ...WorkspaceInfoSchema.fields,
@@ -158,12 +161,11 @@ const layer = Layer.effect(
   Effect.gen(function* () {
     const auth = yield* Auth.Service
     const session = yield* Session.Service
-    const prompt = yield* SessionPrompt.Service
     // Fork (#214): what Workspace.remove needs to stop its sessions' runs (with the two node deps below).
     const statusSvc = yield* SessionStatus.Service
     const runState = yield* SessionRunState.Service
     const cancelDeps = {
-      cancel: (id: SessionID) => prompt.cancel(id),
+      cancel: (id: SessionID) => runState.cancel(id),
       children: (id: SessionID) => session.children(id),
       isIdle: idleWhenQuiet(
         (id: SessionID) => statusSvc.get(id),
@@ -595,7 +597,7 @@ const layer = Layer.effect(
                 ),
               )
             } else {
-              yield* prompt.cancel(input.sessionID)
+              yield* runState.cancel(input.sessionID)
             }
 
             // "claim" this session so any future events coming from
@@ -805,6 +807,7 @@ const layer = Layer.effect(
         .all()
         .pipe(Effect.orDie)
       const sessionIDs = new Set(sessions.map((sessionInfo) => sessionInfo.id))
+      for (const sessionInfo of sessions) markSessionDeleting(sessionInfo.id)
       const roots = sessions.filter((sessionInfo) => !sessionInfo.parentID || !sessionIDs.has(sessionInfo.parentID))
       // Fork (#214): stop each session's running reply, and its sub-sessions', before they are removed.
       // A local workspace's prompts are routed to its own folder, so its runs and statuses live in
@@ -820,12 +823,22 @@ const layer = Layer.effect(
         : undefined
       // A folder whose instance cannot start (a broken config or plugin) must not stop the removal:
       // remove keeps going when the adapter fails too (architect on #229).
-      if (target?.type === "local")
+      if (target?.type === "local") {
+        const currentCtx = yield* InstanceRef
         yield* Effect.gen(function* () {
           const store = yield* InstanceStore.Service
-          yield* store.provide({ directory: target.directory }, cancelRoots)
+          yield* store
+            .provide(
+              {
+                directory: target.directory,
+                worktree: currentCtx?.worktree,
+                project: currentCtx?.project,
+              },
+              cancelRoots,
+            )
+            .pipe(Effect.timeout("5 seconds"))
         }).pipe(
-          Effect.provide(AppNodeBuilderV1.build(InstanceStore.node)),
+          Effect.provide(AppNodeBuilder.build(InstanceStore.node, [[InstanceStore.bootstrapNode, noopBootstrap]])),
           Effect.catchCause((cause) =>
             Effect.logWarning("could not stop runs in the workspace folder before removing it", {
               workspaceID: id,
@@ -833,6 +846,7 @@ const layer = Layer.effect(
             }),
           ),
         )
+      }
       yield* cancelRoots
       yield* Effect.forEach(
         roots,
@@ -996,7 +1010,6 @@ export const node = LayerNode.make({
   deps: [
     Auth.node,
     Session.node,
-    SessionPrompt.node,
     // Fork (#214): Workspace.remove cancels its sessions' runs.
     SessionStatus.node,
     SessionRunState.node,

@@ -37,6 +37,7 @@ import { SessionProcessor } from "../../src/session/processor"
 import { SessionPrompt } from "../../src/session/prompt"
 import { TaskTool, type TaskPromptOps } from "../../src/tool/task"
 import { SessionRevert } from "../../src/session/revert"
+import { cancelSessionTree, isSessionDeleting } from "../../src/session/cancel-tree"
 import { SessionRunState } from "../../src/session/run-state"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionStatus } from "../../src/session/status"
@@ -2111,7 +2112,7 @@ unixNoLLMServer(
         const ready = path.join(dir, ".shell-ready")
 
         const sh = yield* prompt
-          .shell({ sessionID: chat.id, agent: "build", command: ": > '.shell-ready'; sleep 30" })
+          .shell({ sessionID: chat.id, agent: "build", command: ": > '.shell-ready'; sleep 5" })
           .pipe(Effect.forkChild)
         yield* pollWithTimeout(
           afs.existsSafe(ready).pipe(Effect.map((exists) => (exists ? (true as const) : undefined))),
@@ -2243,26 +2244,37 @@ unix(
 unixNoLLMServer(
   "cancel interrupts loop queued behind shell",
   () =>
-    Effect.gen(function* () {
-      const { prompt, chat } = yield* boot()
+    withSh(() =>
+      Effect.gen(function* () {
+        const { prompt, chat } = yield* boot()
+        const { directory: dir } = yield* TestInstance
+        const afs = yield* FSUtil.Service
+        const ready = path.join(dir, ".shell-ready")
 
-      const sh = yield* prompt.shell({ sessionID: chat.id, agent: "build", command: "sleep 30" }).pipe(Effect.forkChild)
-      yield* waitForBusy(chat.id)
+        const sh = yield* prompt
+          .shell({ sessionID: chat.id, agent: "build", command: ": > '.shell-ready'; sleep 5" })
+          .pipe(Effect.forkChild)
+        yield* waitForBusy(chat.id)
+        yield* pollWithTimeout(
+          afs.existsSafe(ready).pipe(Effect.map((exists) => (exists ? (true as const) : undefined))),
+          "shell never created readiness marker",
+        )
 
-      const loop = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
-      yield* Effect.sleep(50)
+        const loop = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+        yield* Effect.sleep(50)
 
-      yield* prompt.cancel(chat.id)
+        yield* prompt.cancel(chat.id)
 
-      const exit = yield* Fiber.await(loop)
-      expect(Exit.isSuccess(exit)).toBe(true)
-      if (Exit.isSuccess(exit)) {
-        const tool = completedTool(exit.value.parts)
-        expect(tool?.state.output).toContain("User aborted the command")
-      }
+        const exit = yield* Fiber.await(loop)
+        expect(Exit.isSuccess(exit)).toBe(true)
+        if (Exit.isSuccess(exit)) {
+          const tool = completedTool(exit.value.parts)
+          expect(tool?.state.output).toContain("User aborted the command")
+        }
 
-      yield* Fiber.await(sh)
-    }),
+        yield* Fiber.await(sh)
+      }),
+    ),
   { git: true, config: cfg },
   30_000,
 )
@@ -2273,11 +2285,18 @@ unixNoLLMServer(
     withSh(() =>
       Effect.gen(function* () {
         const { prompt, chat } = yield* boot()
+        const { directory: dir } = yield* TestInstance
+        const afs = yield* FSUtil.Service
+        const ready = path.join(dir, ".shell-ready")
 
         const a = yield* prompt
-          .shell({ sessionID: chat.id, agent: "build", command: "sleep 30" })
+          .shell({ sessionID: chat.id, agent: "build", command: ": > '.shell-ready'; sleep 5" })
           .pipe(Effect.forkChild)
         yield* waitForBusy(chat.id)
+        yield* pollWithTimeout(
+          afs.existsSafe(ready).pipe(Effect.map((exists) => (exists ? (true as const) : undefined))),
+          "shell never created readiness marker",
+        )
 
         const exit = yield* prompt.shell({ sessionID: chat.id, agent: "build", command: "echo hi" }).pipe(Effect.exit)
         expect(Exit.isFailure(exit)).toBe(true)
@@ -2724,3 +2743,78 @@ noLLMServer.instance(
     }),
   30_000,
 )
+
+noLLMServer.instance(
+  "cancelSessionTree and Session.remove reject new runs and drop late writes (#214)",
+  () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const run = yield* SessionRunState.Service
+      const session = yield* sessions.create({})
+
+      expect(isSessionDeleting(session.id)).toBe(false)
+
+      yield* cancelSessionTree(
+        {
+          cancel: (id) => run.cancel(id),
+          children: (id) => sessions.children(id),
+          isIdle: () => Effect.succeed(true),
+        },
+        session.id,
+      )
+      expect(isSessionDeleting(session.id)).toBe(true)
+
+      let started = false
+      const dummyMsg: SessionV1.WithParts = {
+        info: {
+          id: MessageID.ascending(),
+          sessionID: session.id,
+          role: "assistant",
+          parentID: MessageID.ascending(),
+          modelID: ModelV2.ID.make("test"),
+          providerID: ProviderV2.ID.make("test"),
+          mode: "build",
+          agent: "build",
+          path: { cwd: "/", root: "/" },
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+          time: { created: Date.now() },
+        },
+        parts: [],
+      }
+
+      const result = yield* run.ensureRunning(
+        session.id,
+        Effect.succeed(dummyMsg),
+        Effect.sync(() => {
+          started = true
+          return dummyMsg
+        }),
+      )
+      expect(started).toBe(false)
+      expect(result).toBe(dummyMsg)
+
+      const shellExit = yield* run
+        .startShell(session.id, Effect.succeed(dummyMsg), Effect.succeed(dummyMsg))
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(shellExit)).toBe(true)
+
+      yield* sessions.remove(session.id)
+
+      // Late writes from detached fibers (title/message/part) must not resurrect the deleted session.
+      yield* sessions.setTitle({ sessionID: session.id, title: "late-title" })
+      yield* sessions.updateMessage(dummyMsg.info)
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        sessionID: session.id,
+        messageID: dummyMsg.info.id,
+        type: "text",
+        text: "late-part",
+      })
+
+      const fetched = yield* sessions.get(session.id).pipe(Effect.exit)
+      expect(Exit.isFailure(fetched)).toBe(true)
+    }),
+  30_000,
+)
+
