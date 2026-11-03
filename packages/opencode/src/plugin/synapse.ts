@@ -236,7 +236,8 @@ const TOOL_CALL_MARKUP_RE = new RegExp(
  */
 export function containsToolCallMarkup(text: string): boolean {
   if (!text) return false
-  return TOOL_CALL_MARKUP_RE.test(text)
+  const stripped = text.replace(/```[\s\S]*?```/g, "").replace(/`[^`\n]+`/g, "")
+  return TOOL_CALL_MARKUP_RE.test(stripped)
 }
 
 interface MarkupRepairState {
@@ -1215,13 +1216,22 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
     // Core reads cfg.provider after this hook resolves (provider/provider.ts).
     config: async (cfg) => {
       const hadConfiguredSynapse = Boolean(cfg.provider?.synapse)
+      const storedCred = await readStoredSynapseCredential().catch(() => undefined)
+      const staticKey =
+        (typeof cfg.provider?.synapse?.options?.apiKey === "string" && cfg.provider.synapse.options.apiKey.trim()) ||
+        process.env.SYNAPSE_API_KEY?.trim() ||
+        process.env.GPAAS_API_KEY?.trim() ||
+        ""
+      const isModelsCli = process.argv.includes("models")
+      if (!hadConfiguredSynapse && !storedCred && !staticKey && !isModelsCli) {
+        return
+      }
       const seeded = ensureSynapseProviderConfig(cfg, inferenceUrl)
       if (!seeded) return
       // #101: before the model list is read, so that call carries the tier too.
       if (privacyTier) applyPrivacyTierHeader(cfg, privacyTier)
       modelsTarget = synapseModelsTarget(cfg, inferenceUrl)
-      const storedCred = await readStoredSynapseCredential().catch(() => undefined)
-      if (!hadConfiguredSynapse && !storedCred && !options?.inferenceUrl && !process.env.SYNAPSE_BASE_URL) {
+      if (!hadConfiguredSynapse && !storedCred && !staticKey && !options?.inferenceUrl && !process.env.SYNAPSE_BASE_URL) {
         const cached = await fileSynapseModelsCache().read(modelsTarget?.baseURL ?? inferenceUrl)
         if (cached) {
           const current = seeded.models ?? {}
@@ -1568,7 +1578,8 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                     correlationId: mcpCorrelationId,
                   }
                   await recordServedModelSideband(
-                    mcpRes.headers.get("x-synapse-served-model") || servedModel,
+                    mcpRes.headers.get("x-synapse-served-model") ||
+                      (servedModel !== "synapse-auto" ? servedModel : undefined),
                     sidebandSessionKey,
                   )
 

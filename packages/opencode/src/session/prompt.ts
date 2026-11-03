@@ -1113,10 +1113,14 @@ const layer = Layer.effect(
             lastAssistantMsg?.parts.some(
               (part) => part.type === "tool" && !part.metadata?.providerExecuted && !isOrphanedInterruptedTool(part),
             ) ?? false
+          const isSynapseTurn =
+            lastAssistant?.providerID === "synapse" || lastUser.model.providerID === "synapse"
           const hasUnparsedToolMarkup =
+            isSynapseTurn &&
             !hasToolCalls &&
             (lastAssistantMsg?.parts.some((part) => part.type === "text" && containsToolCallMarkup(part.text)) ?? false)
-          const pendingPluginRepair = lastAssistant ? takePendingMarkupRepair(sessionID, lastAssistant.id) : false
+          const pendingPluginRepair =
+            isSynapseTurn && lastAssistant ? takePendingMarkupRepair(sessionID, lastAssistant.id) : false
           const needsMarkupRepair =
             !repairedUserIds.has(lastUser.id) &&
             lastAssistant?.parentID === lastUser.id &&

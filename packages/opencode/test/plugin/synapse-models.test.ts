@@ -763,8 +763,7 @@ describe("#248: ensureSynapseProviderConfig pre-auth seeding", () => {
     expect(() => Object.entries(cfg.provider!.synapse!.models!)).not.toThrow()
   })
 
-  test("SynapseAuthPlugin.config seeds provider.synapse.models.auto before sign-in", async () => {
-    const cfg: Config = {}
+  test("SynapseAuthPlugin.config seeds provider.synapse.models.auto when running opencode models before sign-in, without hijacking unauthenticated non-models runs", async () => {
     const hooks = await SynapseAuthPlugin({
       client: {} as never,
       project: {} as never,
@@ -774,8 +773,26 @@ describe("#248: ensureSynapseProviderConfig pre-auth seeding", () => {
       serverUrl: new URL("https://example.com"),
       $: {} as never,
     })
-    await hooks.config?.(cfg)
-    expect(cfg.provider?.synapse?.models?.[SYNAPSE_AUTO_MODEL]).toBeDefined()
-    expect(Object.entries(cfg.provider!.synapse!.models!).length).toBeGreaterThanOrEqual(1)
+    // 1) When provider.synapse exists with no models block, ensureSynapseProviderConfig seeds auto
+    const configuredEmpty: Config = { provider: { synapse: { options: { baseURL: BASE } } } }
+    const origFetch = globalThis.fetch
+    globalThis.fetch = (async () => new Response(JSON.stringify(LIVE_REPLY), { status: 200 })) as unknown as typeof fetch
+    try {
+      await hooks.config?.(configuredEmpty)
+      expect(configuredEmpty.provider?.synapse?.models?.[SYNAPSE_AUTO_MODEL]).toBeDefined()
+      expect(Object.entries(configuredEmpty.provider!.synapse!.models!).length).toBeGreaterThanOrEqual(1)
+
+      // 2) When running "opencode models" before sign-in with an empty config, provider.synapse.models.auto is seeded
+      const modelsCliCfg: Config = {}
+      process.argv.push("models")
+      try {
+        await hooks.config?.(modelsCliCfg)
+      } finally {
+        process.argv.pop()
+      }
+      expect(modelsCliCfg.provider?.synapse?.models?.[SYNAPSE_AUTO_MODEL]).toBeDefined()
+    } finally {
+      globalThis.fetch = origFetch
+    }
   })
 })

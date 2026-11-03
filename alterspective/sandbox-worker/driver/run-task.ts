@@ -166,6 +166,12 @@ async function main() {
     const started = Date.now()
     const deadline = started + Number(args["timeout-min"]) * 60_000
 
+    const dockerLogs = async () => {
+      const proc = Bun.spawn(["docker", "logs", taskId], { stdout: "pipe", stderr: "pipe" })
+      const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()])
+      await proc.exited
+      return [out.trim(), err.trim()].filter(Boolean).join("\n")
+    }
     let lastHealth = "no response"
     const healthy = async () => {
       while (Date.now() < started + 90_000) {
@@ -180,13 +186,18 @@ async function main() {
           })
         if (res) lastHealth = `HTTP ${res.status}`
         if (res?.ok) return true
+        const running = (await run(["docker", "inspect", "-f", "{{.State.Running}}", taskId]).catch(() => "")).trim()
+        if (running === "false") {
+          lastHealth = "container exited before becoming healthy"
+          return false
+        }
         await Bun.sleep(1000)
       }
       return false
     }
     if (!(await healthy())) {
       log(`server did not become healthy within 90s (last: ${lastHealth})`)
-      console.error(await run(["docker", "logs", taskId]).catch((e) => String(e)))
+      console.error(await dockerLogs().catch((e) => String(e)))
       return 1
     }
 
@@ -312,8 +323,14 @@ async function main() {
     const stat = await git("diff", "--cached", "--no-ext-diff", "--stat", baseSha)
     await Bun.write(path.join(runDir, "change.patch"), patch)
 
-    // #257: read the sideband file of actual x-synapse-served-model responses recorded by the Synapse plugin.
-    const servedSummary = await run(["docker", "exec", taskId, "cat", DEFAULT_SERVED_MODELS_FILE])
+    // #102, #257: read supervisor state first so we use its resolved servedModelsFile path and modelPolicy.
+    const supervisorState = await run(["docker", "exec", taskId, "cat", "/run/sbxw/state.json"])
+      .then((text) => ({ ok: true as const, data: JSON.parse(text) as { modelPolicy?: unknown; servedModelsFile?: string } }))
+      .catch((error: unknown) => ({ ok: false as const, error: String(error) }))
+    const servedModelsPath =
+      (supervisorState.ok && typeof supervisorState.data.servedModelsFile === "string" && supervisorState.data.servedModelsFile.trim()) ||
+      DEFAULT_SERVED_MODELS_FILE
+    const servedSummary = await run(["docker", "exec", taskId, "cat", servedModelsPath])
       .then((text) => parseServedModelsSideband(text, session.id))
       .catch(() => ({ servedModel: null, servedModels: {}, bySession: {} }))
 
@@ -331,10 +348,7 @@ async function main() {
       envScrub,
       decisions,
       errors,
-      // #102: the policy the supervisor actually applied (models, version or fallback reason).
-      modelPolicy: await run(["docker", "exec", taskId, "cat", "/run/sbxw/state.json"])
-        .then((text) => JSON.parse(text).modelPolicy ?? null)
-        .catch((error: unknown) => ({ unreadable: String(error) })),
+      modelPolicy: supervisorState.ok ? (supervisorState.data.modelPolicy ?? null) : { unreadable: supervisorState.error },
     }
     await Bun.write(path.join(runDir, "result.json"), JSON.stringify(result, null, 2))
     console.log(JSON.stringify(result, null, 2))

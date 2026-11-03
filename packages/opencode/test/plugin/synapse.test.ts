@@ -335,7 +335,10 @@ describe("#257: recordServedModelSideband", () => {
     delete process.env[SERVED_MODELS_FILE_ENV]
     try {
       await expect(recordServedModelSideband("qwen/qwen3.6-35b-a3b", "sess-1", "")).resolves.toBeUndefined()
-      await expect(recordServedModelSideband("", "sess-1", "/nonexistent/\0/bad.json")).resolves.toBeUndefined()
+      await expect(recordServedModelSideband("", "sess-1", "/tmp/unused.json")).resolves.toBeUndefined()
+      await expect(
+        recordServedModelSideband("qwen/qwen3.6-35b-a3b", "sess-1", "/nonexistent/\0/bad.json"),
+      ).resolves.toBeUndefined()
     } finally {
       if (prev !== undefined) process.env[SERVED_MODELS_FILE_ENV] = prev
     }
@@ -356,9 +359,7 @@ describe("#248: public-client PKCE fallback and concrete error reporting", () =>
 
   test("falls back to public-client PKCE flow when OPENCODE_KEYSTONE_BROKER_KEY is unset, and surfaces concrete errors via TUI toast", async () => {
     const prevBroker = process.env.OPENCODE_KEYSTONE_BROKER_KEY
-    const prevPort = process.env.OPENCODE_KEYSTONE_CALLBACK_PORT
     delete process.env.OPENCODE_KEYSTONE_BROKER_KEY
-    process.env.OPENCODE_KEYSTONE_CALLBACK_PORT = "19459"
 
     const toasts: Array<{ title?: string; message?: string; variant?: string }> = []
     const origFetch = globalThis.fetch
@@ -375,21 +376,26 @@ describe("#248: public-client PKCE fallback and concrete error reporting", () =>
       return new Response("not found", { status: 404 })
     }) as typeof fetch
 
-    try {
-      const hooks = await SynapseAuthPlugin({
-        client: {
-          tui: {
-            showToast: async (opts: { body: { title?: string; message?: string; variant?: string } }) => {
-              toasts.push(opts.body)
-            },
+    const pluginInput = {
+      client: {
+        tui: {
+          showToast: async (opts: { body: { title?: string; message?: string; variant?: string } }) => {
+            toasts.push(opts.body)
           },
-        } as never,
-        project: {} as never,
-        directory: "",
-        worktree: "",
-        experimental_workspace: { register() {} },
-        serverUrl: new URL("https://example.com"),
-        $: {} as never,
+        },
+      } as never,
+      project: {} as never,
+      directory: "",
+      worktree: "",
+      experimental_workspace: { register() {} },
+      serverUrl: new URL("https://example.com"),
+      $: {} as never,
+    }
+
+    try {
+      const hooks = await SynapseAuthPlugin(pluginInput, {
+        oauthPort: 19459,
+        openBrowser: async () => undefined,
       })
 
       const oauthMethod = hooks.auth?.methods[0]
@@ -412,8 +418,13 @@ describe("#248: public-client PKCE fallback and concrete error reporting", () =>
       expect(toasts[0]?.variant).toBe("error")
 
       // 2) When DCR fails during PKCE fallback, authorize logs + shows toast and callback returns { type: "failed" }
-      process.env.OPENCODE_KEYSTONE_CALLBACK_PORT = "19460"
-      const failedStart = await oauthMethod.authorize()
+      const hooks2 = await SynapseAuthPlugin(pluginInput, {
+        oauthPort: 19460,
+        openBrowser: async () => undefined,
+      })
+      const oauthMethod2 = hooks2.auth?.methods[0]
+      if (!oauthMethod2 || oauthMethod2.type !== "oauth") throw new Error("missing oauth method")
+      const failedStart = await oauthMethod2.authorize()
       const failedCallback = await (failedStart.callback as () => Promise<{ type: string }>)()
       expect(failedCallback).toEqual({ type: "failed" })
       expect(toasts.some((t) => (t.message ?? "").includes("502"))).toBe(true)
@@ -421,8 +432,6 @@ describe("#248: public-client PKCE fallback and concrete error reporting", () =>
       globalThis.fetch = origFetch
       if (prevBroker === undefined) delete process.env.OPENCODE_KEYSTONE_BROKER_KEY
       else process.env.OPENCODE_KEYSTONE_BROKER_KEY = prevBroker
-      if (prevPort === undefined) delete process.env.OPENCODE_KEYSTONE_CALLBACK_PORT
-      else process.env.OPENCODE_KEYSTONE_CALLBACK_PORT = prevPort
     }
   })
 })
@@ -434,6 +443,9 @@ describe("#20: containsToolCallMarkup and experimental.text.complete bounded 1-s
     expect(containsToolCallMarkup(`Here is the call: ${open}{"name":"bash"}${close}`)).toBe(true)
     expect(containsToolCallMarkup("<function=read><parameter=filePath>a.ts</parameter></function>")).toBe(true)
     expect(containsToolCallMarkup("Normal response without any markup tags.")).toBe(false)
+    expect(containsToolCallMarkup(`Quoted inline: \`${open}{"name":"bash"}${close}\` in prose`)).toBe(false)
+    expect(containsToolCallMarkup(`\`\`\`xml\n${open}{"name":"bash"}${close}\n\`\`\`` )).toBe(false)
+    expect(containsToolCallMarkup("<|DSML|tool_calls>")).toBe(true)
     expect(containsToolCallMarkup("")).toBe(false)
   })
 
