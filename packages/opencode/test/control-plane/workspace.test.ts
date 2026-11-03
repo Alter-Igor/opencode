@@ -839,7 +839,8 @@ describe("workspace CRUD", () => {
         yield* attachSessionToWorkspace(quiet.id, info.id)
         // A workspace session's prompts run in the workspace folder's instance (QA on #229), so its
         // busy status lives there, not in the instance that calls remove.
-        const inFolder = <A, E, R>(effect: Effect.Effect<A, E, R>) => store.provide({ directory: folder }, effect)
+        const inFolder = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+          store.provide({ directory: folder, worktree: instance.worktree, project: instance.project }, effect)
         yield* inFolder(status.set(busy.id, { type: "busy" }))
         expect((yield* status.get(busy.id)).type).toBe("idle")
         const captured = captureGlobalEvents()
@@ -857,7 +858,6 @@ describe("workspace CRUD", () => {
           captured.dispose()
         }
       }),
-    { git: true },
   )
 
   it.instance(
