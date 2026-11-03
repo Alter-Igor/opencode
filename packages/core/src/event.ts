@@ -8,8 +8,11 @@ import { Database } from "./database/database"
 import { EventSequenceTable, EventTable } from "./event/sql"
 import { Location } from "./location"
 import { makeGlobalNode } from "./effect/app-node"
+
+
 import { isDeepStrictEqual } from "node:util"
 import { Durable } from "@opencode-ai/schema/durable-event-manifest"
+import { redactedDurableEventData } from "./util/secret-redaction"
 
 export const ID = Event.ID
 export type ID = import("@opencode-ai/schema/event").ID
@@ -247,6 +250,7 @@ export const layerWith = (options?: LayerOptions) =>
                             .get()
                             .pipe(Effect.orDie)
                           const latest = row?.seq ?? -1
+                          ;(event as { data: unknown }).data = redactedDurableEventData(event.type, event.data)
                           const encoded = Schema.encodeUnknownSync(definition.data)(event.data) as Record<
                             string,
                             unknown

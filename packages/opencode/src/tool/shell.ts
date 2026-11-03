@@ -21,6 +21,8 @@ import { ChildProcess } from "effect/unstable/process"
 import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
 import { ShellPrompt, type Parameters } from "./shell/prompt"
 import { BashArity } from "@/permission/arity"
+import { redactSecretsInText } from "../../../core/src/util/secret-redaction"
+import { scrubShellEnv } from "./shell-env-filter"
 
 export { Parameters } from "./shell/prompt"
 
@@ -217,7 +219,8 @@ function pathArgs(list: Part[], ps: boolean, cmd = false) {
   return out
 }
 
-function preview(text: string) {
+export function preview(text: string) {
+  text = redactSecretsInText(text)
   if (text.length <= MAX_METADATA_LENGTH) return text
   return "...\n\n" + text.slice(-MAX_METADATA_LENGTH)
 }
@@ -420,8 +423,8 @@ export const ShellTool = Tool.define(
         { env: {} },
       )
       return {
-        ...process.env,
-        ...extra.env,
+        ...scrubShellEnv({ ...process.env, ...extra.env }),
+
       }
     })
 

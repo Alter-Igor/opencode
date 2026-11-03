@@ -256,6 +256,72 @@ export function redactToolPart(part: { type?: unknown; state?: unknown } | undef
  * #207: the part to store, for the projector. A tool part comes back as a redacted copy; the event's
  * own part (other listeners read it too) is never changed. Any other part is returned as it is.
  */
+export const redactSecretsInText = redactSecrets
+
+/** Redact every string in `value` in place (arrays and plain writable objects) and return `value`. */
+export function redactSecretsInValue<T>(value: T): T {
+  return scrubber().scrub(value) as T
+}
+
+const REDACTED_PLACEHOLDER = /\[REDACTED:([a-z0-9_-]+)\]/gi
+
+/**
+ * #205: return the first `[REDACTED:<kind>]` placeholder token whose count in `nextText` exceeds
+ * its count in `previousText`, or `undefined` when no new placeholder is introduced.
+ */
+export function introducesRedactedPlaceholder(nextText: string, previousText = ""): string | undefined {
+  const nextMatches = Array.from(nextText.matchAll(REDACTED_PLACEHOLDER), (m) => m[0])
+  if (nextMatches.length === 0) return undefined
+  const prevCounts = new Map<string, number>()
+  for (const match of previousText.matchAll(REDACTED_PLACEHOLDER)) {
+    const token = match[0]
+    prevCounts.set(token, (prevCounts.get(token) ?? 0) + 1)
+  }
+  const seenCounts = new Map<string, number>()
+  for (const token of nextMatches) {
+    const nextCount = (seenCounts.get(token) ?? 0) + 1
+    seenCounts.set(token, nextCount)
+    if (nextCount > (prevCounts.get(token) ?? 0)) return token
+  }
+  return undefined
+}
+
+/**
+ * #207: redact durable event payloads (tool parts in `message.part.updated` and tool/shell fields in
+ * `session.next.tool.*` / `session.next.shell.*`) without mutating the caller's object references.
+ */
+export function redactedDurableEventData<T>(type: string, data: T): T {
+  if (!data || typeof data !== "object") return data
+  if (type === "message.part.updated" || type === "session.part.updated") {
+    const record = data as Record<string, unknown>
+    if (record.part && typeof record.part === "object") {
+      return { ...record, part: redactedToolPart(record.part as { type?: unknown }) } as T
+    }
+    return data
+  }
+  if (type.startsWith("session.next.tool.") || type.startsWith("session.next.shell.")) {
+    const next = { ...(data as Record<string, unknown>) }
+    for (const field of ["command", "output", "text", "title"]) {
+      if (typeof next[field] === "string") next[field] = redactSecrets(next[field] as string)
+    }
+    for (const field of ["input", "structured", "metadata", "error", "result"]) {
+      if (next[field] !== undefined) next[field] = redactedCopy(next[field])
+    }
+    if (Array.isArray(next.content)) {
+      next.content = next.content.map((item: unknown) => {
+        if (!item || typeof item !== "object" || Object.isFrozen(item)) return item
+        const entry = item as { type?: unknown; text?: unknown }
+        if (entry.type === "text" && typeof entry.text === "string") {
+          return { ...item, text: redactSecrets(entry.text) }
+        }
+        return item
+      })
+    }
+    return next as T
+  }
+  return data
+}
+
 export function redactedToolPart<T extends { type?: unknown }>(part: T): T {
   if (part.type !== "tool") return part
   const copy = structuredClone(part)

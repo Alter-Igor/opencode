@@ -14,7 +14,7 @@ import { SessionInput } from "./input"
 import { WorkspaceV2 } from "../workspace"
 import { MessageTable, PartTable, SessionInputTable, SessionMessageTable, SessionTable } from "./sql"
 import type { DeepMutable } from "../schema"
-import { redactedToolPart } from "../util/secret-redaction"
+import { redactedDurableEventData, redactedToolPart } from "../util/secret-redaction"
 
 type DatabaseService = Database.Interface["db"]
 
@@ -186,7 +186,8 @@ function run(db: DatabaseService, event: SessionEvent.Event) {
       updateShell: updateMessage,
       appendMessage,
     }
-    yield* SessionMessageUpdater.update(adapter, event)
+    const redacted = { ...event, data: redactedDurableEventData(event.type, event.data) } as SessionEvent.Event
+    yield* SessionMessageUpdater.update(adapter, redacted)
   })
 }
 

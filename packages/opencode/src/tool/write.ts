@@ -13,6 +13,7 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import { InstanceState } from "@/effect/instance-state"
 import { trimDiff } from "./edit"
 import { assertExternalDirectoryEffect } from "./external-directory"
+import { introducesRedactedPlaceholder } from "../../../core/src/util/secret-redaction"
 import * as Bom from "@/util/bom"
 
 const MAX_PROJECT_DIAGNOSTICS_FILES = 5
@@ -49,6 +50,12 @@ export const WriteTool = Tool.define(
           const desiredBom = source.bom || next.bom
           const contentOld = source.text
           const contentNew = next.text
+          const placeholder = introducesRedactedPlaceholder(contentNew, contentOld)
+          if (placeholder) {
+            throw new Error(
+              `Refusing to write redacted placeholder ${placeholder} to ${filepath}. Re-read or supply the real value or an environment variable reference instead of a redacted placeholder.`,
+            )
+          }
 
           const diff = trimDiff(createTwoFilesPatch(filepath, filepath, contentOld, contentNew))
           yield* ctx.ask({

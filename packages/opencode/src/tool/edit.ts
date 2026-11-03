@@ -16,6 +16,7 @@ import { Format } from "../format"
 import { InstanceState } from "@/effect/instance-state"
 import { Snapshot } from "@/snapshot"
 import { assertExternalDirectoryEffect } from "./external-directory"
+import { introducesRedactedPlaceholder } from "../../../core/src/util/secret-redaction"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import * as Bom from "@/util/bom"
 
@@ -97,6 +98,12 @@ export const EditTool = Tool.define(
                 const next = Bom.split(params.newString)
                 const desiredBom = next.bom
                 contentOld = ""
+                const placeholder = introducesRedactedPlaceholder(next.text, contentOld)
+                if (placeholder) {
+                  throw new Error(
+                    `Refusing to write redacted placeholder ${placeholder} to ${filePath}. Supply the real value or an environment variable reference instead of a redacted placeholder.`,
+                  )
+                }
                 contentNew = next.text
                 diff = trimDiff(createTwoFilesPatch(filePath, filePath, contentOld, contentNew))
                 yield* ctx.ask({
@@ -130,8 +137,20 @@ export const EditTool = Tool.define(
               const old = convertToLineEnding(normalizeLineEndings(params.oldString), ending)
               const replacement = convertToLineEnding(normalizeLineEndings(params.newString), ending)
 
+              const paramPlaceholder = introducesRedactedPlaceholder(params.newString, params.oldString)
+              if (paramPlaceholder) {
+                throw new Error(
+                  `Refusing to write redacted placeholder ${paramPlaceholder} to ${filePath}. Supply the real value or an environment variable reference instead of a redacted placeholder.`,
+                )
+              }
               const next = Bom.split(replace(contentOld, old, replacement, params.replaceAll))
               const desiredBom = source.bom || next.bom
+              const placeholder = introducesRedactedPlaceholder(next.text, contentOld)
+              if (placeholder) {
+                throw new Error(
+                  `Refusing to write redacted placeholder ${placeholder} to ${filePath}. Supply the real value or an environment variable reference instead of a redacted placeholder.`,
+                )
+              }
               contentNew = next.text
 
               diff = trimDiff(
