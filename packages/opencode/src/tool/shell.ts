@@ -219,9 +219,19 @@ function pathArgs(list: Part[], ps: boolean, cmd = false) {
   return out
 }
 
+const MAX_RAW_PREVIEW_TAIL = MAX_METADATA_LENGTH + 4096
+
+export function keepRawTail(text: string) {
+  if (text.length <= MAX_RAW_PREVIEW_TAIL) return text
+  return "...\n\n" + text.slice(-MAX_RAW_PREVIEW_TAIL)
+}
+
 export function preview(text: string) {
-  text = redactSecretsInText(text)
-  if (text.length <= MAX_METADATA_LENGTH) return text
+  const preTruncated = text.startsWith("...\n\n")
+  const body = preTruncated ? text.slice(5) : text
+  text = redactSecretsInText(body)
+
+  if (!preTruncated && text.length <= MAX_METADATA_LENGTH) return text
   return "...\n\n" + text.slice(-MAX_METADATA_LENGTH)
 }
 
@@ -441,6 +451,7 @@ export const ShellTool = Tool.define(
       const limits = yield* trunc.limits()
       const keep = limits.maxBytes * 2
       let full = ""
+      let rawTail = ""
       let last = ""
       const list: Chunk[] = []
       let used = 0
@@ -498,7 +509,8 @@ export const ShellTool = Tool.define(
                 cut = true
               }
 
-              last = preview(last + chunk)
+              rawTail = keepRawTail(rawTail + chunk)
+              last = preview(rawTail)
 
               if (file) {
                 sink?.write(chunk)

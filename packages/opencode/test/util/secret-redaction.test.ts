@@ -18,7 +18,7 @@ import {
 } from "../../../core/src/util/secret-redaction"
 import { WriteTool } from "../../src/tool/write"
 import { EditTool } from "../../src/tool/edit"
-import { preview } from "../../src/tool/shell"
+import { keepRawTail, preview } from "../../src/tool/shell"
 import { LSP } from "@/lsp/lsp"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { EventV2Bridge } from "../../src/event-v2-bridge"
@@ -254,6 +254,29 @@ describe("shell preview boundary redaction (#207)", () => {
     expect(out).not.toContain(key)
     expect(out).not.toContain(key.slice(-20))
     expect(out).toStartWith("...\n\n")
+  })
+
+  test("redacts a split sk-or-v1- key across two streamed chunks without leaking the second chunk's tail (#207)", () => {
+    const chunk1 = `KEY=sk-${"or-v1-"}${"5a5f0c".repeat(6)}`
+    const chunk2 = `${"5a5f0c".repeat(5)}\n`
+    let rawTail = ""
+    rawTail = keepRawTail(rawTail + chunk1)
+    expect(preview(rawTail)).toBe("KEY=[REDACTED:openrouter]")
+    rawTail = keepRawTail(rawTail + chunk2)
+    const finalPreview = preview(rawTail)
+    expect(finalPreview).toBe("KEY=[REDACTED:openrouter]\n")
+    expect(finalPreview).not.toContain("5a5f0c")
+  })
+
+  test("redactedDurableEventData redacts nested provider metadata on tool events (#207)", () => {
+    const redacted = redactedDurableEventData("session.next.tool.success", {
+      provider: {
+        executed: true,
+        metadata: { custom: { secret: KEYS.openrouter } },
+      },
+    })
+    expect(JSON.stringify(redacted)).not.toContain(KEYS.openrouter)
+    expect(JSON.stringify(redacted)).toContain("[REDACTED:openrouter]")
   })
 
   test("redactSecretsInText and redactSecretsInValue scrub strings and nested objects", () => {

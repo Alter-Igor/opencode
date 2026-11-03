@@ -304,7 +304,7 @@ export function redactedDurableEventData<T>(type: string, data: T): T {
     for (const field of ["command", "output", "text", "title"]) {
       if (typeof next[field] === "string") next[field] = redactSecrets(next[field] as string)
     }
-    for (const field of ["input", "structured", "metadata", "error", "result"]) {
+    for (const field of ["input", "structured", "metadata", "error", "result", "provider"]) {
       if (next[field] !== undefined) next[field] = redactedCopy(next[field])
     }
     if (Array.isArray(next.content)) {

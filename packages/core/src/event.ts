@@ -273,8 +273,23 @@ export const layerWith = (options?: LayerOptions) =>
                             if (
                               stored?.id === event.id &&
                               stored.type === versionedType(definition.type, durable.version) &&
-                              isDeepStrictEqual(stored.data, encoded)
+                              isDeepStrictEqual(redactedDurableEventData(event.type, stored.data), encoded)
                             ) {
+                              if (!isDeepStrictEqual(stored.data, encoded)) {
+                                const committed = {
+                                  ...event,
+                                  durable: { aggregateID, seq: input.seq, version: durable.version },
+                                } as Payload
+                                for (const projector of list) {
+                                  yield* projector(committed)
+                                }
+                                yield* db
+                                  .update(EventTable)
+                                  .set({ data: encoded })
+                                  .where(and(eq(EventTable.aggregate_id, aggregateID), eq(EventTable.seq, input.seq)))
+                                  .run()
+                                  .pipe(Effect.orDie)
+                              }
                               if (input.ownerID && row?.ownerID == null) {
                                 yield* db
                                   .update(EventSequenceTable)
