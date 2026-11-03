@@ -22,6 +22,26 @@ async function waitFor(check: () => boolean | Promise<boolean>, timeoutMs = 5_00
   throw new Error("waitFor timed out")
 }
 
+const IDLE_TICK = "[tick] status=idle children=0 working, 0 idle, 0 failed"
+
+function userRow(text = "hello") {
+  return {
+    info: {
+      role: "user",
+      agent: "general",
+      model: { providerID: "synapse", modelID: "auto" },
+    } as unknown as Message,
+    parts: [{ type: "text", text }] as unknown as Part[],
+  }
+}
+
+function assistantRow() {
+  return {
+    info: { role: "assistant" } as unknown as Message,
+    parts: [{ type: "text", text: "done" }] as unknown as Part[],
+  }
+}
+
 function toolCtx(sessionID = SESSION): ToolContext {
   return {
     sessionID,
@@ -76,24 +96,27 @@ describe("SchedulePlugin", () => {
   let dir = ""
   let clock = 1_700_000_000_000
   let prompts: { sessionID: string; body: Record<string, unknown> }[] = []
+  let rows = [userRow(), assistantRow()]
+  let statuses: Record<string, { type: string; error?: string }> = {}
+  let children: { id: string }[] = []
+  let toasts: { title?: string; message?: string }[] = []
+  let holdPrompt: Promise<void> | undefined
   let activeHooks: Awaited<ReturnType<typeof SchedulePlugin>> | undefined
 
   const client = {
+    tui: {
+      showToast: async (req: { body?: { title?: string; message?: string } }) => {
+        toasts.push({ title: req.body?.title, message: req.body?.message })
+        return { data: true }
+      },
+    },
     session: {
-      messages: async () => ({
-        data: [
-          {
-            info: {
-              role: "user",
-              agent: "general",
-              model: { providerID: "synapse", modelID: "auto" },
-            } as unknown as Message,
-            parts: [] as Part[],
-          },
-        ],
-      }),
+      messages: async () => ({ data: rows }),
+      status: async () => ({ data: statuses }),
+      children: async () => ({ data: children }),
       promptAsync: async (req: { path: { id: string }; body: Record<string, unknown> }) => {
         prompts.push({ sessionID: req.path.id, body: req.body })
+        if (holdPrompt) await holdPrompt
         return { data: undefined }
       },
     },
@@ -112,6 +135,11 @@ describe("SchedulePlugin", () => {
     dir = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-schedule-"))
     clock = 1_700_000_000_000
     prompts = []
+    rows = [userRow(), assistantRow()]
+    statuses = {}
+    children = []
+    toasts = []
+    holdPrompt = undefined
     activeHooks = undefined
   })
 
@@ -181,7 +209,8 @@ describe("SchedulePlugin", () => {
     expect(prompts).toHaveLength(1)
     expect(prompts[0].sessionID).toBe(SESSION)
     expect(prompts[0].body.agent).toBe("general")
-    expect(prompts[0].body.parts).toEqual([{ type: "text", text: "ping once" }])
+    expect(prompts[0].body.parts).toEqual([{ type: "text", text: `${IDLE_TICK}\nping once` }])
+    expect(String((prompts[0].body.parts as { text: string }[])[0].text).startsWith("[tick]")).toBe(true)
 
     await waitFor(async () => {
       const parsed = JSON.parse(String(await listTool.execute({}, toolCtx()))) as {
@@ -201,7 +230,7 @@ describe("SchedulePlugin", () => {
     await waitFor(() => prompts.length >= 1)
 
     expect(prompts.length).toBeGreaterThanOrEqual(1)
-    expect(prompts[0].body.parts).toEqual([{ type: "text", text: "poll status" }])
+    expect(prompts[0].body.parts).toEqual([{ type: "text", text: `${IDLE_TICK}\npoll status` }])
 
     await waitFor(async () => {
       const afterFirst = JSON.parse(String(await listTool.execute({}, toolCtx()))) as {
@@ -242,5 +271,98 @@ describe("SchedulePlugin", () => {
       schedules: unknown[]
     }
     expect(remaining.schedules).toHaveLength(0)
+  })
+
+  test("does not prompt when the session is busy or retrying", async () => {
+    const hooks = await plugin()
+    const createTool = hooks.tool!.schedule_create
+    const listTool = hooks.tool!.schedule_list
+    children = [{ id: "ses_child" }]
+
+    for (const type of ["busy", "retry"]) {
+      prompts = []
+      toasts = []
+      statuses = { [SESSION]: { type }, ses_child: { type: "busy" } }
+      const before = clock
+      await createTool.execute(
+        { prompt: "poll status", every: "15m", at: new Date(clock + 20).toISOString() },
+        toolCtx(),
+      )
+      clock += 25
+      await waitFor(() => toasts.length === 1)
+      expect(prompts).toHaveLength(0)
+      expect(toasts[0]).toEqual({
+        title: "Schedule",
+        message: "Tick skipped, session busy. Children: 1 working, 0 idle, 0 failed.",
+      })
+      await waitFor(async () => {
+        const listed = JSON.parse(String(await listTool.execute({}, toolCtx()))) as {
+          schedules: { next: string }[]
+        }
+        return listed.schedules.length === 1 && Date.parse(listed.schedules[0].next) > before + 25
+      })
+      await hooks.tool!.schedule_cancel.execute({ id: "all" }, toolCtx())
+    }
+  })
+
+  test("does not prompt when the last real user message has no assistant after it", async () => {
+    const hooks = await plugin()
+    rows = [userRow("still waiting")]
+    children = [{ id: "ses_child" }]
+    await hooks.tool!.schedule_create.execute({ prompt: "ping once", at: new Date(clock + 20).toISOString() }, toolCtx())
+    clock += 25
+    await waitFor(() => toasts.length === 1)
+    expect(prompts).toHaveLength(0)
+    expect(toasts[0]).toEqual({
+      title: "Schedule",
+      message: "Tick skipped, a message is still waiting. Children: 0 working, 1 idle, 0 failed.",
+    })
+    await waitFor(async () => {
+      const listed = JSON.parse(String(await hooks.tool!.schedule_list.execute({}, toolCtx()))) as {
+        schedules: { next: string }[]
+      }
+      return listed.schedules.length === 1 && Date.parse(listed.schedules[0].next) >= clock + 30_000
+    })
+  })
+
+  test("a second fire while the first is in flight does not prompt again", async () => {
+    const original = globalThis.setTimeout
+    let doubled = false
+    let release: (() => void) | undefined
+    holdPrompt = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    globalThis.setTimeout = ((fn: TimerHandler, delay?: number) => {
+      if (!doubled && typeof fn === "function" && delay === 20) {
+        doubled = true
+        return original(() => {
+          fn()
+          fn()
+        }, delay)
+      }
+      return original(fn, delay)
+    }) as typeof setTimeout
+
+    try {
+      const hooks = await plugin()
+      await hooks.tool!.schedule_create.execute(
+        { prompt: "ping once", at: new Date(clock + 20).toISOString() },
+        toolCtx(),
+      )
+      clock += 25
+      await waitFor(() => prompts.length === 1)
+      const names = (await fs.readdir(dir)).filter((name) => name.endsWith(".json"))
+      const saved = JSON.parse(await fs.readFile(path.join(dir, names[0]), "utf8")) as { createdAt: number }
+      await fs.writeFile(path.join(dir, names[0]), JSON.stringify({ ...saved, createdAt: saved.createdAt + 1 }))
+      release?.()
+      release = undefined
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      expect(prompts).toHaveLength(1)
+      expect(String((prompts[0].body.parts as { text: string }[])[0].text).startsWith("[tick]")).toBe(true)
+    } finally {
+      globalThis.setTimeout = original
+      release?.()
+      holdPrompt = undefined
+    }
   })
 })

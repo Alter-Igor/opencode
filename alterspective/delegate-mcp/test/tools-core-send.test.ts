@@ -41,6 +41,18 @@ describe("oc_send", () => {
     expect(relevant).toEqual(["cursor", `POST /session/${SID}/prompt_async`, "markSent"])
   })
 
+  test("#252: records the send boundary (sendStarting) just before the prompt_async POST", async () => {
+    const f = fakeContext()
+    ready(f)
+    await send(f)
+    expect(f.hub.starting).toHaveLength(1)
+    const [start] = f.hub.starting
+    expect(start?.sessionID).toBe(SID)
+    // The next thing recorded after sendStarting is the POST itself, and markSent comes after it.
+    expect(f.order[start?.at ?? -1]).toBe(`POST /session/${SID}/prompt_async`)
+    expect(f.order.indexOf("markSent")).toBeGreaterThan(start?.at ?? Infinity)
+  })
+
   test("never sends the deprecated tools field; sends the text part, model and directory", async () => {
     const f = fakeContext()
     ready(f)

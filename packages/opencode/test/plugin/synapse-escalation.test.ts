@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test"
 import {
+  baseQualityTier,
   bumpTier,
+  callerQualityTier,
   classifyFailure,
   declaredTier,
   EscalationTracker,
@@ -22,6 +24,44 @@ describe("declaredTier", () => {
   test("unknown and auto models have no declared tier", () => {
     expect(declaredTier("auto")).toBeUndefined()
     expect(declaredTier(undefined)).toBeUndefined()
+  })
+})
+
+describe("callerQualityTier (#258)", () => {
+  test("keeps only the three words", () => {
+    expect(callerQualityTier("economy")).toBe("economy")
+    expect(callerQualityTier("balanced")).toBe("balanced")
+    expect(callerQualityTier("premium")).toBe("premium")
+  })
+
+  test("drops a missing, blank, or lookalike value", () => {
+    expect(callerQualityTier(undefined)).toBeUndefined()
+    expect(callerQualityTier(null)).toBeUndefined()
+    expect(callerQualityTier("")).toBeUndefined()
+    expect(callerQualityTier("Premium")).toBeUndefined()
+    expect(callerQualityTier(" premium")).toBeUndefined()
+    expect(callerQualityTier("gold")).toBeUndefined()
+  })
+})
+
+describe("baseQualityTier (#258)", () => {
+  test("a caller tier wins over the model's declared tier", () => {
+    expect(baseQualityTier("economy", "anthropic/claude-opus-5")).toBe("economy")
+    expect(baseQualityTier("premium", "auto")).toBe("premium")
+  })
+
+  test("a missing header uses the declared tier, then balanced", () => {
+    expect(baseQualityTier(undefined, "anthropic/claude-opus-5")).toBe("premium")
+    expect(baseQualityTier(null, "z-ai/glm-5.3")).toBe("economy")
+    expect(baseQualityTier(undefined, "auto")).toBe("balanced")
+    expect(baseQualityTier("gold", "auto")).toBe("balanced")
+  })
+
+  test("escalation still bumps a caller tier", () => {
+    const t = new EscalationTracker()
+    t.recordFailure("s1", "provider-error")
+    t.recordFailure("s1", "provider-error")
+    expect(t.resolveTier("s1", baseQualityTier("economy", "auto"))).toBe("balanced")
   })
 })
 

@@ -134,6 +134,12 @@ export interface EventHub {
    * oc_wait, so events that beat the 204 are not missed.
    */
   markSent(sessionID: string): void
+  /**
+   * #252, optional: call just before prompt_async. An error that arrives after this call is the
+   * new prompt's; one from before it is not blamed on the new prompt. Without it, markSent keeps
+   * every armed error.
+   */
+  sendStarting?(sessionID: string): void
   /** Additive: the current head cursor (events after it are the ones not seen yet). */
   cursor(): Cursor
   /** Current state; resolves absent data by reading the server (idle vs not_found). */

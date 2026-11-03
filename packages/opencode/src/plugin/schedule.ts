@@ -3,23 +3,14 @@ import path from "path"
 import { tool, type Hooks, type PluginInput } from "@opencode-ai/plugin"
 import { Global } from "@opencode-ai/core/global"
 import { Filesystem } from "@/util/filesystem"
+import { SCHEDULE_COMMAND, SCHEDULE_USAGE, describeSchedules, formatInterval, parseInterval, parseScheduleArgs } from "./schedule-args"
+import { childTickStatus, factsLine, shouldSendTick, skipToast } from "./tick-guard"
 
-// Fork-ported from upstream session-schedule (705c3ab746): `/schedule` and the
-// `schedule_create`, `schedule_list`, `schedule_cancel` tools let sessions and
-// subagents schedule recurring or one-shot prompts.
+export { SCHEDULE_COMMAND, parseInterval, parseScheduleArgs }
 
-export const SCHEDULE_COMMAND = "schedule"
-export const SCHEDULE_USAGE =
-  "/schedule <30s|15m|2h|1d> <prompt>  |  /schedule status  |  /schedule off"
+// Fork-ported from upstream session-schedule (705c3ab746).
 
 const MAX_TIMEOUT_MS = 2_147_483_647
-
-const UNITS: Record<string, number> = {
-  s: 1_000,
-  m: 60 * 1_000,
-  h: 60 * 60 * 1_000,
-  d: 24 * 60 * 60 * 1_000,
-}
 
 export type ScheduleInfo = {
   version: 1
@@ -32,73 +23,11 @@ export type ScheduleInfo = {
   createdAt: number
 }
 
-export type ScheduleCommandArgs =
-  | { action: "status" }
-  | { action: "off" }
-  | { action: "create"; interval: string; every: number; prompt: string }
-  | { action: "error"; message: string }
-
 let counter = 0
 
 function createScheduleID(now: number) {
   counter = (counter + 1) % 1_000_000
   return `sch_${now.toString(36)}_${counter.toString(36).padStart(4, "0")}`
-}
-
-export function parseInterval(input: string): number | undefined {
-  const match = input.trim().match(/^(\d+)([smhd])$/)
-  if (!match) return undefined
-  const value = Number(match[1])
-  if (!Number.isInteger(value) || value <= 0) return undefined
-  const unit = UNITS[match[2]]
-  if (!unit) return undefined
-  return value * unit
-}
-
-export function parseScheduleArgs(text: string): ScheduleCommandArgs {
-  const trimmed = text.trim()
-  if (!trimmed) return { action: "status" }
-  const lower = trimmed.toLowerCase()
-  if (lower === "status" || lower === "list") return { action: "status" }
-  if (lower === "off" || lower === "stop" || lower === "cancel") return { action: "off" }
-
-  const match = trimmed.match(/^(\S+)(?:\s+([\s\S]*))?$/)
-  if (!match) return { action: "error", message: `Expected ${SCHEDULE_USAGE}` }
-  const interval = match[1]
-  const every = parseInterval(interval)
-  if (!every) {
-    return {
-      action: "error",
-      message: `Invalid schedule interval "${interval}". Use formats like 30s, 15m, 2h, or 1d, or /schedule off.`,
-    }
-  }
-  const prompt = (match[2] ?? "").trim()
-  if (!prompt) {
-    return {
-      action: "error",
-      message: `Give a prompt after ${interval}. Usage: ${SCHEDULE_USAGE}`,
-    }
-  }
-  return { action: "create", interval, every, prompt }
-}
-
-export function describeSchedules(schedules: ScheduleInfo[], now: number) {
-  if (!schedules.length) return "No schedules are active in this session."
-  return [
-    `Active schedules (${schedules.length}) at ${new Date(now).toISOString()}:`,
-    ...schedules.map(
-      (item) =>
-        `- ${item.id}: next at ${new Date(item.next).toISOString()}${item.every ? ` (every ${formatInterval(item.every)})` : " (one-shot)"} — ${item.prompt}`,
-    ),
-  ].join("\n")
-}
-
-function formatInterval(ms: number) {
-  if (ms % UNITS.d === 0) return `${ms / UNITS.d}d`
-  if (ms % UNITS.h === 0) return `${ms / UNITS.h}h`
-  if (ms % UNITS.m === 0) return `${ms / UNITS.m}m`
-  if (ms % UNITS.s === 0) return `${ms / UNITS.s}s`
-  return `${ms}ms`
 }
 
 export async function SchedulePlugin(
@@ -109,6 +38,8 @@ export async function SchedulePlugin(
   const now = options?.now ?? Date.now
   const timers = new Map<string, ReturnType<typeof setTimeout>>()
   const locks = new Map<string, Promise<unknown>>()
+  // exclusive() would run a second fire after this one and write another user row.
+  const firing = new Set<string>()
   let owned = false
   let disposed = false
 
@@ -167,8 +98,10 @@ export async function SchedulePlugin(
     timers.set(info.id, timer)
   }
 
-  const fire = (id: string) =>
-    exclusive(id, async () => {
+  const fire = (id: string) => {
+    if (firing.has(id)) return
+    firing.add(id)
+    return exclusive(id, async () => {
       if (disposed) return
       const current = await load(id)
       if (!current) return
@@ -177,22 +110,45 @@ export async function SchedulePlugin(
         return
       }
 
-      const messages = await input.client.session
-        .messages({ path: { id: current.sessionID } })
-        .catch(() => undefined)
-      const user = messages?.data?.findLast((m) => m.info.role === "user")?.info
-      const delivered = await input.client.session
-        .promptAsync({
-          path: { id: current.sessionID },
-          body: {
-            ...(user?.role === "user" ? { agent: user.agent, model: user.model } : {}),
-            parts: [{ type: "text", text: current.prompt }],
-          },
-        })
-        .then(
-          (res) => !res || !("error" in res) || !res.error,
-          () => false,
-        )
+      const [loaded, statusResult, childrenResult] = await Promise.all([
+        input.client.session.messages({ path: { id: current.sessionID } }).catch(() => undefined),
+        input.client.session.status().catch(() => undefined),
+        input.client.session.children({ path: { id: current.sessionID } }).catch(() => undefined),
+      ])
+      const statusMap = statusResult?.data ?? {}
+      const raw = statusMap[current.sessionID]
+      const status = raw?.type === "busy" ? "busy" : raw?.type === "retry" ? "retry" : "idle"
+      const children = (childrenResult?.data ?? []).map((child) => ({
+        id: child.id,
+        status: childTickStatus(statusMap[child.id]),
+      }))
+      const decision = shouldSendTick({ status, messages: loaded?.data ?? [] })
+      if (!decision.send && input.client.tui?.showToast) {
+        await input.client.tui
+          .showToast({
+            body: {
+              title: "Schedule",
+              message: skipToast(decision.reason, children),
+              variant: "warning",
+            },
+          })
+          .catch(() => undefined)
+      }
+      const user = loaded?.data?.findLast((message) => message.info.role === "user")?.info
+      const delivered = decision.send
+        ? await input.client.session
+            .promptAsync({
+              path: { id: current.sessionID },
+              body: {
+                ...(user?.role === "user" ? { agent: user.agent, model: user.model } : {}),
+                parts: [{ type: "text", text: `${factsLine({ status, children })}\n${current.prompt}` }],
+              },
+            })
+            .then(
+              (res) => !res || !("error" in res) || !res.error,
+              () => false,
+            )
+        : false
 
       if (disposed) return
       const latest = await load(id)
@@ -216,7 +172,10 @@ export async function SchedulePlugin(
       }
       await save(updated)
       arm(updated)
+    }).finally(() => {
+      firing.delete(id)
     })
+  }
 
   const create = async (params: {
     sessionID: string

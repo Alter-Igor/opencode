@@ -8,7 +8,7 @@ It provides:
 - **Backend selection:**
   1. **Local Docker Sandbox (`OPENCODE_DELEGATE_BACKEND=local`, default):** Runs an OpenCode agent inside a locked Docker container on your machine with network egress strictly constrained to Keystone, Synapse, and read-only package caches.
   2. **Remote (`OPENCODE_DELEGATE_BACKEND=remote`): temporarily blocked (#241).** Session creation, sending and one-step delegation return `policy_unverified` before workspace capture or remote scheduling. The service cannot yet represent and verify this bridge's prompt, model and permission/read-only contract. Use the local Docker backend for delegation.
-- **Multi-Engine Execution:** Choose between `auto`, `deepseek`, or `opencode` engines.
+- **Model choice:** `delegate_task` runs the sandbox's default OpenCode agent; pick any Synapse model with `model`. `engine: "deepseek"` is refused: there is no DeepSeek harness (#252).
 - **3-Tier Coding & Learning Architecture:**
   - **Tier 1 (GPU Micro-Task):** `synapse-coder` (`coder_generate`, `coder_fix`, `coder_report_correction`) on Synapse (GPU-accelerated) for syntax/LSP fix loops.
   - **Tier 2 (Workstation Delegation Bridge):** `code-delegate` (`delegate_task`, task scorecards, and local dashboard).
@@ -428,7 +428,7 @@ The bridge keeps one small record per task on your PC, at `<home>/workspaces/rep
 | Error code | What it means | What to do |
 |---|---|---|
 | `sandbox_unavailable` | Docker Desktop is not running, or Docker cannot be reached. There is no fallback to your own account. | Start Docker Desktop, then run `oc_doctor`. |
-| `profile_changed` | The running box was started with a different profile, image, policy or Keystone set than this bridge expects. | A committed image starts a second box beside the one that is running. An idle task moves onto it when no bridge still holds the old box. A dirty checkout does not start a second box. A third box waits. Run `oc_server_restart` only when you mean to stop the running box. Do not call it while a task is running. Your sign-in is kept. |
+| `profile_changed` | The running box was started with a different profile, image, policy or Keystone set than this bridge expects. | A committed image starts a second box beside the one that is running. An idle task moves onto it when no bridge still holds the old box. A dirty checkout does not start a second box. A third box waits. A box that will not answer, and that no bridge holds, stops after 15 minutes. Its disk is kept. Run `oc_server_restart` only when you mean to stop the running box. Do not call it while a task is running. Your sign-in is kept. |
 | `needs_auth` | The Keystone sign-in is missing or expired. | Run `oc_login`. |
 | `port_busy` | Port 19876 (the sign-in callback), or 1459 for `{server: "synapse"}`, is in use, often by an OpenCode sign-in in another window. | Finish or close the other sign-in, then retry `oc_login`. |
 | `policy_violation` | Something broke the rules: a non-Keystone MCP entry, changed permission rules, a wake for a session that is not yours, or an `always` answer. Nothing was sent. | Read the message. Run `oc_doctor`. Answer with `once` or `reject`. |

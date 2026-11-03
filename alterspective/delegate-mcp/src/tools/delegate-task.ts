@@ -1,7 +1,8 @@
 // delegate_task (FEAT-CD-001): 1-step autonomous task delegation.
 // Orchestrates start -> send -> wait (long poll) -> collect -> result in a single call.
-// Local Docker is supported; remote execution is blocked pending a verified contract (#241).
+// Works across both local Docker and remote svc-coding-agent cloud microVM backends.
 import { z } from "zod"
+import { DelegateError } from "../shared/errors.ts"
 import { defineTool } from "./define.ts"
 import { ok, untrusted } from "./shape.ts"
 import { startSessionTool } from "./sessions.ts"
@@ -9,6 +10,9 @@ import { sendTool, MAX_MESSAGE_CHARS } from "./send.ts"
 import { waitTool } from "./wait.ts"
 import { collectTool } from "./collect.ts"
 import { resultTool } from "./result.ts"
+
+/** #252: settled states that mean the task did not complete (never "timed out, still running"). */
+const FAILED_STATES = new Set(["error", "aborted", "not_started", "not_found"])
 
 export const delegateTaskInput = {
   directory: z
@@ -24,7 +28,7 @@ export const delegateTaskInput = {
   engine: z
     .enum(["auto", "deepseek", "opencode"])
     .optional()
-    .describe("Execution engine: 'auto' (default model router), 'deepseek' (DeepSeek harness), or 'opencode' (OpenCode agent). Default: 'auto'."),
+    .describe("Execution engine: 'auto' (default) or 'opencode' both run the sandbox's default OpenCode agent. 'deepseek' is refused: there is no DeepSeek harness; pass a DeepSeek model as `model` instead."),
   model: z
     .string()
     .optional()
@@ -43,28 +47,30 @@ export const delegateTaskTool = defineTool({
   title: "Delegate a complete coding task in one step",
   description:
     "Autonomous 1-step delegation: starts a session on your repository, sends the task prompt, waits for completion, " +
-    "and collects the finished work into local branch delegate/<key>. Supports 'auto', 'deepseek', or 'opencode' engines " +
-    "in local Docker. Remote execution is temporarily blocked with policy_unverified pending a verified replacement contract (#241).",
+    "and collects the finished work into local branch delegate/<key>. Engine 'auto' or 'opencode' runs the sandbox's default " +
+    "agent across local Docker and cloud backends; 'deepseek' is refused (pass a DeepSeek model as `model`).",
   input: delegateTaskInput,
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   async run(args, ctx, correlationId) {
     const startedAt = Date.now()
     const timeoutMs = args.timeoutMs ?? 300_000
 
-    // Resolve engine to agent/model parameters
-    let agent: string | undefined
-    if (args.engine === "deepseek") {
-      agent = "deepseek"
-    } else if (args.engine === "opencode") {
-      agent = "opencode"
-    }
+    // #252: `engine` never names an agent. The box's agents are build/explore/general/plan;
+    // sending "opencode" or "deepseek" made the prompt fail with "Agent not found". `auto` and
+    // `opencode` run the box's default agent. There is no DeepSeek harness, so `deepseek` is
+    // refused before a session (and a host branch) is created; pick a deepseek model with `model`.
+    if (args.engine === "deepseek")
+      throw new DelegateError(
+        "invalid_input",
+        "There is no DeepSeek engine in this sandbox.",
+        "Leave engine unset (or 'auto') and pass a DeepSeek model as `model`, e.g. one from code_list_models.",
+      )
 
     // 1. Start Session (allowShared: true to avoid blocking on concurrent runs)
     const startRes = await startSessionTool.run(
       {
         directory: args.directory,
         allowShared: true,
-        agent,
         model: args.model,
       },
       ctx,
@@ -81,7 +87,6 @@ export const delegateTaskTool = defineTool({
       {
         sessionID,
         message: args.prompt,
-        agent,
         model: args.model,
       },
       ctx,
@@ -93,6 +98,8 @@ export const delegateTaskTool = defineTool({
     // 3. Polling Wait Loop with chunked timeouts
     let finalState = "busy"
     let lastViews: Array<{ sessionID: string; state: string; lastError?: string; detail?: string }> = []
+    // The state event that set finalState when the wait returned no view (its summary is bridge words only).
+    let stateFromEvent: { summary?: string; code?: string } | undefined
 
     while (Date.now() - startedAt < timeoutMs) {
       const elapsed = Date.now() - startedAt
@@ -113,20 +120,22 @@ export const delegateTaskTool = defineTool({
       }
 
       const views = (waitRes.structuredContent?.views ?? []) as typeof lastViews
-      const events = (waitRes.structuredContent?.events ?? []) as Array<{ sessionID?: string; state?: string }>
+      const events = (waitRes.structuredContent?.events ?? []) as Array<{ sessionID?: string; state?: string; summary?: string; code?: string }>
 
       if (views.length > 0 && views[0]) {
         lastViews = views
+        stateFromEvent = undefined
         const matched = views.find((v) => v.sessionID === sessionID) ?? views[0]
         finalState = matched.state
       } else {
         const stateEvent = [...events].reverse().find((e) => e.sessionID === sessionID && e.state)
         if (stateEvent?.state) {
           finalState = stateEvent.state
+          stateFromEvent = stateEvent
         }
       }
 
-      if (finalState === "idle" || finalState === "needs_input" || finalState === "error" || finalState === "aborted") {
+      if (finalState === "idle" || finalState === "needs_input" || FAILED_STATES.has(finalState)) {
         break
       }
 
@@ -149,9 +158,11 @@ export const delegateTaskTool = defineTool({
       )
     }
 
-    if (finalState === "error" || finalState === "aborted") {
-      const matched = lastViews.find((v) => v.sessionID === sessionID)
-      const detail = matched?.lastError ?? matched?.detail ?? "Task failed"
+    if (FAILED_STATES.has(finalState)) {
+      // #252: a view older than the state event that ended the wait describes an earlier state.
+      const matched = stateFromEvent ? undefined : lastViews.find((v) => v.sessionID === sessionID)
+      const fromEvent = stateFromEvent?.code ?? stateFromEvent?.summary
+      const detail = matched?.lastError ?? matched?.detail ?? (fromEvent || "Task failed")
       return ok(`Task ended in state '${finalState}': ${detail}`, {
         status: "failed",
         sessionID,

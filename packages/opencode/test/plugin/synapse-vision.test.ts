@@ -256,6 +256,47 @@ describe("synapse_vision (#193)", () => {
     expect(parts[1].text).toContain("synapse_vision")
   })
 
+  test("a screenshot kept inside a tool result is swapped for a note (#235)", async () => {
+    const model = { providerID: "anthropic", capabilities: { input: { image: false } } } as any
+    const cfg = { provider: { synapse: {} } }
+    const msgs = [
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "c1",
+            toolName: "browser_take_screenshot",
+            output: {
+              type: "content",
+              value: [
+                { type: "text", text: "Took a screenshot" },
+                { type: "media", mediaType: "image/png", data: PNG_BASE64 },
+                { type: "image-data", mediaType: "image/png", data: PNG_BASE64 },
+                { type: "file-data", mediaType: "application/pdf", data: "JVBERi0=" },
+              ],
+            },
+          },
+        ],
+      },
+    ] as unknown as ModelMessage[]
+    const result = await proxyUnsupportedImages(msgs, model, undefined, undefined, cfg, ["synapse_vision"])
+    const value = (result[0] as any).content[0].output.value
+    expect(value[0]).toEqual({ type: "text", text: "Took a screenshot" })
+    expect(value[1].type).toBe("text")
+    expect(value[1].text).toContain("synapse_vision")
+    expect(value[2].type).toBe("text")
+    expect(value[2].text).toContain("synapse_vision")
+    // Not an image: left for the provider (and its own error handling).
+    expect(value[3]).toEqual({ type: "file-data", mediaType: "application/pdf", data: "JVBERi0=" })
+    // A tool result with no image is passed through untouched.
+    const plain = [
+      { role: "tool", content: [{ type: "tool-result", toolCallId: "c2", toolName: "bash", output: { type: "text", value: "ok" } }] },
+    ] as unknown as ModelMessage[]
+    const same = await proxyUnsupportedImages(plain, model, undefined, undefined, cfg, ["synapse_vision"])
+    expect(same[0]).toBe(plain[0])
+  })
+
   test("a model that can see images, or a setup where the tool cannot run, is left alone", async () => {
     const msgs = [
       { role: "user", content: [{ type: "image", image: new Uint8Array([1, 2, 3]) }] },
@@ -369,6 +410,29 @@ describe("synapse_vision tool permissions (#193)", () => {
     expect(asked).toHaveLength(1)
     expect(asked[0].permission).toBe("external_directory")
     expect(out).toContain("a red banner")
+  })
+
+  test("an image URL asks webfetch first; a refusal stops the tool (#235)", async () => {
+    const asked: any[] = []
+    const tool = await visionTool()
+    const out = await tool.execute(
+      { image: "https://images.example.test/shot.png", question: "what?" },
+      context(project, async (i) => {
+        asked.push(i)
+      }),
+    )
+    expect(asked).toHaveLength(1)
+    expect(asked[0].permission).toBe("webfetch")
+    expect(asked[0].patterns).toEqual(["https://images.example.test/shot.png"])
+    expect(out).toContain("a red banner")
+    await expect(
+      tool.execute(
+        { image: "https://images.example.test/shot.png", question: "what?" },
+        context(project, async () => {
+          throw new Error("rejected by user")
+        }),
+      ),
+    ).rejects.toThrow("rejected by user")
   })
 
   test("a refused permission stops the tool instead of becoming text", async () => {

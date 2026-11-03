@@ -1,4 +1,6 @@
 // Host git helpers for remote delegation.
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import os from "node:os"
 import path from "node:path"
 import { DelegateError } from "../shared/errors.ts"
 import { cleanEnv, runCommand, type ExecResult } from "../supervisor/workspaces-exec.ts"
@@ -60,12 +62,15 @@ export async function applyRemotePatch(
     return { branch, filesChanged: [] }
   }
 
-  const nonce = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-  const gitDir = path.join(hostRepo, ".git")
-  const tempIndex = path.join(gitDir, `delegate-index-${nonce}`)
-  const tempPatch = path.join(gitDir, `delegate-${nonce}.patch`)
+  // In a git worktree `.git` is a file, not a directory, so ask git for the real one and keep
+  // the temp index and patch outside the repository, in a private (0700) folder: in the shared
+  // temp folder another local user could pre-create the index path as a symlink.
+  const gitDir = await resolveGitDir(hostRepo, run)
+  const tempDir = mkdtempSync(path.join(os.tmpdir(), "delegate-"))
+  const tempIndex = path.join(tempDir, "index")
+  const tempPatch = path.join(tempDir, "remote.patch")
 
-  await Bun.write(tempPatch, patch)
+  writeFileSync(tempPatch, patch, { mode: 0o600 })
   const indexEnv = { ...cleanEnv(), GIT_INDEX_FILE: tempIndex }
 
   try {
@@ -110,12 +115,15 @@ export async function applyRemotePatch(
 
     return { branch, filesChanged }
   } finally {
-    try {
-      const { unlinkSync } = await import("node:fs")
-      try { unlinkSync(tempPatch) } catch {}
-      try { unlinkSync(tempIndex) } catch {}
-    } catch {
-      // Ignore cleanup error
-    }
+    // Best effort: a locked temp file must not turn a finished collect (or an earlier git error) into a new failure.
+    try { rmSync(tempDir, { recursive: true, force: true }) } catch {}
   }
+}
+
+async function resolveGitDir(hostRepo: string, run: GitRunner): Promise<string> {
+  const result = await run(["git", "-C", hostRepo, "rev-parse", "--absolute-git-dir"])
+  if (result.code !== 0 || !result.stdout.trim()) {
+    throw new DelegateError("upstream_error", "Failed to locate the git directory of the local repository.", "Ensure directory is a valid git repository.", result.stderr)
+  }
+  return result.stdout.trim()
 }

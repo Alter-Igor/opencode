@@ -23,6 +23,20 @@ export function declaredTier(modelId: string | undefined): QualityTier | undefin
   return DECLARED_TIERS[modelId.replace(/^synapse\//, "")]
 }
 
+/** A caller-set `x-quality-tier` counts only when it is one of the three words. */
+export function callerQualityTier(header: string | null | undefined): QualityTier | undefined {
+  if (header === "economy" || header === "balanced" || header === "premium") return header
+  return undefined
+}
+
+/**
+ * #258: a caller-set tier wins. Otherwise the model's declared tier, or balanced.
+ * Escalation still runs on top of this result.
+ */
+export function baseQualityTier(callerHeader: string | null | undefined, modelId: string | undefined): QualityTier {
+  return callerQualityTier(callerHeader) ?? declaredTier(modelId) ?? "balanced"
+}
+
 export function bumpTier(tier: QualityTier): QualityTier {
   return TIER_ORDER[Math.min(TIER_ORDER.indexOf(tier) + 1, TIER_ORDER.length - 1)]
 }

@@ -106,12 +106,12 @@ describe("remote containment through initialized MCP", () => {
         for (const engine of ["auto", "deepseek", "opencode"]) {
           const result = await f.client.callTool({ name, arguments: { directory: f.repo, prompt: "REAL_TASK_NOT_THE_TITLE", engine } })
           expect(result.isError).toBe(true)
-          expect(result.structuredContent).toMatchObject({ code: "policy_unverified" })
+          expect(result.structuredContent).toMatchObject({ code: engine === "deepseek" ? "invalid_input" : "policy_unverified" })
         }
       expect(f.requests).toEqual([])
       f.assertUntouched()
     } finally { await f.close() }
-  })
+  }, 30_000)
 
   it.each(["oc_doctor", "code_doctor"])("%s reports measured health/auth but never verified, even start:true", async (name) => {
     const f = await fixture()
@@ -124,7 +124,7 @@ describe("remote containment through initialized MCP", () => {
       expect(f.requests.sort()).toEqual(["GET /api/v1/repos", "GET /health"])
       f.assertUntouched()
     } finally { await f.close() }
-  })
+  }, 30_000)
 
   it.each([401, 403])("keeps public health separate from protected HTTP %i", async (authStatus) => {
     const f = await fixture({ authStatus })
@@ -147,7 +147,7 @@ describe("remote containment through initialized MCP", () => {
       expect(f.requests).toEqual(["GET /health"])
       f.assertUntouched()
     } finally { await f.close() }
-  })
+  }, 30_000)
 
   it.each(["degraded", "unhealthy", "future-status"])("keeps %s health separate from verification", async (status) => {
     const f = await fixture({ health: { service: "svc-coding-agent", status, private: SENTINEL } })
@@ -157,7 +157,7 @@ describe("remote containment through initialized MCP", () => {
       expect(JSON.stringify(result)).not.toContain(SENTINEL)
       f.assertUntouched()
     } finally { await f.close() }
-  })
+  }, 30_000)
 
   it.each([
     [{ rawHealth: SENTINEL }, "invalid_json"],

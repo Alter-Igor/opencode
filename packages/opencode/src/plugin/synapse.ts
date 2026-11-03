@@ -10,7 +10,7 @@ import { Flock } from "@opencode-ai/core/util/flock"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { failedToolFromEvent, INJECTED_LEARNINGS_LIMIT, learningStorePaths, sessionObserver, sanitizeJsonSchemaForOpenAI } from "./observer"
 import { redactToolResult } from "./secret-redaction"
-import { EscalationTracker, declaredTier, classifyFailure, malformedToolCallFromEvent } from "./synapse-escalation"
+import { EscalationTracker, baseQualityTier, classifyFailure, malformedToolCallFromEvent } from "./synapse-escalation"
 import {
   PinnedFallbackMemory,
   SYNAPSE_AUTO_ROUTE,
@@ -1546,8 +1546,9 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
             // #101: set last, so no provider or request header can remove or widen it.
             if (privacyTier) headers.set("x-privacy-tier", privacyTier)
 
-            // AIESC-01/02: declared tier per model; observer-owned one-request bump.
-            const baseTier = declaredTier(requestBodyJson?.model) ?? "balanced"
+            // #258: a caller-set tier wins. A missing or junk header falls back to the
+            // model's declared tier, or balanced. Escalation still bumps on top.
+            const baseTier = baseQualityTier(headers.get("x-quality-tier"), requestBodyJson?.model)
             const appliedTier = escalations.resolveTier(sessionKey, baseTier, {
               localOnly: headers.get("x-privacy-tier") === "local-only",
             })
@@ -2223,6 +2224,21 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
           let askFailed = false
           try {
             const directory = context.directory || input.directory
+            // #235: Synapse fetches an http(s) image itself, so ask first, as the webfetch tool does.
+            const url = (args.image || "").trim().replace(/^["']|["']$/g, "")
+            if (/^https?:\/\//i.test(url)) {
+              try {
+                await context.ask({
+                  permission: "webfetch",
+                  patterns: [url],
+                  always: ["*"],
+                  metadata: { url, format: "image" },
+                })
+              } catch (error) {
+                askFailed = true
+                throw error
+              }
+            }
             const image = await resolveVisionImage(args.image || "", directory, async (file) => {
               // Same rule and pattern as src/tool/external-directory.ts (a non-git worktree is "/").
               const win = process.platform === "win32"

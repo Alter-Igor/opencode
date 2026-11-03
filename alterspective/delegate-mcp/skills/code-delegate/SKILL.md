@@ -1,128 +1,58 @@
 ---
 name: code-delegate
-description: "Delegates coding work to autonomous coding agents (local sandboxes or remote svc-coding-agent cloud microVMs) using the code-delegate MCP server. Recommends the 1-step autonomous delegate_task tool, explains when to delegate vs do it locally, engine selection ('auto' | 'deepseek' | 'opencode'), reviewing the resulting branch delegate/<key>, merging, and closing the feedback loop with coder lessons (TRN-KC-04 / coder_teach)."
+description: "Delegates coding work to autonomous coding agents in the local Docker sandbox via the code-delegate MCP server. This file is a pointer: the authoritative skill is OPS-008-00 in the Alterspective-Intelligence KB. Read it before delegating."
 argument-hint: "[repo directory] [task prompt]"
 disable-model-invocation: true
 ---
 
 # ROLE: Delegating Agent (Code Delegate)
 
-**Owner:** Igor Jericevich  
-**Last Updated:** 2026-10-19  
-**Standard:** AIMETH-005, AIMETH-010, TRN-KC-04  
+**Owner:** Igor Jericevich
+**Last Updated:** 2026-11-02
+**Status:** Pointer — do not extend this file. Edit the KB skill instead.
 
-You are the Caller. You delegate focused, heavy, or multi-file coding tasks to an autonomous coding agent (running in an isolated local Docker sandbox or a remote `svc-coding-agent` cloud microVM in Azure). 
+## Authoritative skill
 
-**The Rule:** The delegated agent does the typing and test execution in isolation. You verify the diff and do the judging.
+The full skill lives in the Alterspective-Intelligence KB:
 
----
+- `Skills/Operating/OPS-008-00-delegate-to-opencode.md` (`OPS-008-00`, skill v0.2.0, last modified 2026-11-01)
 
-## 1. The Golden Path (1-Step Autonomous)
+Fetch it with `rag_get_articles` and follow it. This file exists only so clients that load
+skills from this folder never fall back to the stale pre-2026-11 content that used to sit here.
 
-Always prefer the **1-step autonomous tool** `delegate_task`:
+## Corrections vs the old copy (2026-10-19)
 
-```json
-delegate_task({
-  "directory": "C:\\GitHub\\my-repo",
-  "prompt": "Implement user authentication middleware with unit tests. Follow project standards.",
-  "engine": "auto",
-  "timeoutMs": 300000
-})
-```
+The previous version of this file was wrong. If you still see those claims anywhere, treat them
+as false:
 
-*(Note: In environments where tools use prefixes or legacy names, `code_delegate_task` is an identical alias.)*
+1. **Remote backend is implemented.** `OPENCODE_DELEGATE_BACKEND=remote` / `SVC_CODING_AGENT_URL`
+   builds a real remote bridge (`createRemoteClient` / `createRemoteHub` / `createRemoteWorkspaces`
+   in `src/runtime.ts`) on svc-coding-agent; `delegate_task` works across local Docker and remote
+   backends. A remote `delegate_task` starts with a generated session title when none is given
+   (`title: args.title ?? "delegate <sessionKey>"` in `src/tools/sessions.ts`). Repo-scale cloud
+   coding can also go via `svc-coding-agent` through Keystone dynamic MCP (KB-AI-016 § Coding
+   agent via Keystone dynamic MCP) — that is a separate path from this MCP server.
+2. **Engine field exists.** `delegate_task` takes an optional
+   `engine: 'auto' | 'deepseek' | 'opencode'`. `auto` (default) and `opencode` both run the
+   sandbox's default OpenCode agent; `deepseek` is refused before any session is created —
+   pass a DeepSeek model as `model` instead (pick from `code_list_models` / `oc_list_models`).
+3. **The granular path is real.** Besides the fast path `delegate_task` (`code_delegate_task`),
+   the granular path is `code_start_session` → `code_send` → `code_wait` → `code_pending` /
+   `code_answer` → `code_result` → `code_collect` → `oc_close_session` → `oc_cleanup`
+   (`oc_*` names are the originals; `code_*` covers the rest). Use the granular path when you need to
+   approve gated Keystone tool calls mid-task.
+4. **Approvals and safety model.** Pending approvals are answered `once` or `reject` — never
+   `always`. Every approval's tool and arguments are read before answering. `code_collect`
+   returns `hostExecutableChanges`; review every flagged file. The caller (you) runs the tests,
+    typecheck and lint, merges through a reviewed PR, then closes the session and runs
+    `oc_cleanup`. Never leave sessions open.
+5. **Check the bridge first.** Run `code_doctor` / `oc_doctor` once per session before the
+   first start; `verified: true` means go, anything else is fixed per OPS-008-00 § 9 first.
 
-### What `delegate_task` does for you automatically:
-1. **Repository & Seed Patch**: Inspects the local repo, captures uncommitted working tree changes as a seed patch, and preserves your working directory.
-2. **Starts Session**: Launches an isolated session (local Docker sandbox or Azure E2B cloud microVM).
-3. **Dispatches Prompt**: Passes your goal, selected engine, and instructions.
-4. **Autonomous Polling**: Waits through task execution while monitoring active events and states.
-5. **Safe Branch Delivery**: Delivers changes onto an isolated branch `delegate/<sessionKey>` using git plumbing. **Your checked-out working directory on `main` is never touched.**
-6. **Authoritative Git Diff**: Returns the exact list of changed files and commits created.
+## When to delegate (short form)
 
----
-
-## 2. When to Delegate vs. Do It Locally
-
-Delegate a task when:
-- **Scope is clear and testable**: You can specify what "done" looks like in a few sentences.
-- **Heavy typing or multi-file changes**: Refactoring multiple files, writing extensive unit test suites, updating schema mirrors, or boilerplate generation.
-- **Clean environment needed**: Tasks that require executing untrusted package builds or shell scripts in an isolated sandbox.
-
-Do **NOT** delegate:
-- Tasks requiring production vault secrets or raw private credentials (the sandbox holds no credentials).
-- Undefined architecture or tasks where the requirements are not yet settled.
-- Repositories containing sensitive client identifiers or unapproved third-party forks.
-
----
-
-## 3. Engine Selection
-
-The `engine` argument controls which execution harness runs the task:
-
-| Engine | Description | Best For |
-|---|---|---|
-| `'auto'` *(Default)* | Dynamic routing via Synapse model router and task classifier. | General coding, bugfixes, and standard feature additions. |
-| `'deepseek'` | Direct prompt loop with Synapse DeepSeek runner, unprivileged execution, and strict 400-code-line standards enforcement. | Fast refactors, clean algorithmic tasks, and strict standards-compliant code. |
-| `'opencode'` | Full OpenCode multi-tool harness inside the E2B sandbox. | Complex sessions requiring deep sub-tool orchestration or multi-step repairs. |
-
----
-
-## 4. Verification Pass (Mandatory Before Merging)
-
-When `delegate_task` returns `status: "completed"`:
-
-1. **Inspect the Git Diff**:
-   Review the changes directly from the host repository:
-   ```bash
-   git -C <repo> diff <base>..delegate/<sessionKey>
-   ```
-2. **Run Local Checks**:
-   Check out the branch or inspect the code against your project's linters and typecheckers:
-   ```bash
-   bun run typecheck
-   bun test
-   ```
-3. **Merge**:
-   Once satisfied, merge `delegate/<sessionKey>` into your working branch (or create your PR).
-4. **Clean Up Session**:
-   Remove the delegate tracking record and temporary branch:
-   ```json
-   code_close_session({
-     "sessionID": "<sessionID>",
-     "deleteBranch": true
-   })
-   ```
-
----
-
-## 5. Non-Completed States & Recovery
-
-If `delegate_task` returns:
-- `status: "needs_input"`:
-  The agent paused to ask a question or requested tool approval.
-  Call `code_pending { sessionID }` to inspect the question, and `code_answer { sessionID, text }` to reply.
-- `status: "timed_out"`:
-  The task is still running in the background!
-  Resume waiting with: `code_wait { sessionIDs: [sessionID], cursor }`.
-- `status: "failed"`:
-  Inspect the `error` detail. If the failure was due to ambiguous instructions, refine your prompt and retry.
-
----
-
-## 6. Closing the Loop: Coder Lessons & Feedback (TRN-KC-04)
-
-Whenever a delegated task completes — whether it succeeded brilliantly, failed, or needed human correction — you must **close the loop** so the models and team learn from the experience:
-
-### A. Report Correction to Synapse Coder
-If the delegated agent made mistakes that required correction:
-- Call `coder_report_correction` on the `synapse-coder` MCP server with the before/after diff and rationale.
-- Or use `coder_teach` to register a reusable pattern that future agents should follow.
-
-### B. Contribute Knowledge to Alterspective KB
-If the delegation revealed a reusable pattern or common pitfall:
-- Contribute a lesson to `Practice/AI/lessons/` (AILES format) using `rag_contribute`.
-- Include: Context, Problem, Root Cause, Solution, and Prevention rule.
-
-### C. Tool Feedback
-- Use `submit-tool-feedback` on Keystone or `rag_submit_feedback` to report quality, latency, or schema friction.
+Only when all four hold: the task is small and clear with a known "done"; you can review the
+diff and run the tests yourself; it needs no secret or vault value (the box holds none — but
+with the `dynamic` connection it can call your Keystone tools as you, so choose that set for
+the job); and the repo is trusted with no client data. Anything else: do it yourself.
+OPS-008-00 § 1 has the full table and the do-not-delegate list.

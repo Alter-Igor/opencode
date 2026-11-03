@@ -23,7 +23,7 @@ export function resolveServerName(env: NodeJS.ProcessEnv = process.env, requeste
 export const INSTRUCTIONS = `code-delegate runs coding tasks in local Docker sandbox sessions. Remote execution is temporarily blocked with policy_unverified pending a verified replacement contract (#241).
 
 Fastest flow (1-step autonomous):
-  delegate_task { directory, prompt, engine?: 'auto'|'deepseek'|'opencode', timeoutMs? }
+  delegate_task { directory, prompt, model?, timeoutMs? }
   Runs start -> send -> wait -> collect in a single call and returns the summary with changed files.
 
 Step-by-step flow:
@@ -32,7 +32,7 @@ Step-by-step flow:
 
 Models & Engines:
   Models are Synapse only (synapse/<id>; default is synapse/auto; code_list_models lists them).
-  Use engine: 'deepseek' for DeepSeek harness, 'opencode' for OpenCode agent, or 'auto' for default routing.
+  Pick a model with model (e.g. a DeepSeek one); engine 'deepseek' is refused (no such harness).
 
 Inspection & Lifecycle:
   Review and test the collected branch delegate/<key> in your repo, merge it your normal way, then code_close_session {sessionID, deleteBranch: true}.

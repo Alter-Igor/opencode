@@ -686,6 +686,8 @@ describe("tool.task", () => {
 
   it.instance("promotes a running foreground task without restarting it", () =>
     Effect.gen(function* () {
+      const flags = yield* RuntimeFlags.Service
+      expect(flags.experimentalBackgroundSubagents).toBe(false)
       const jobs = yield* BackgroundJob.Service
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
@@ -694,8 +696,12 @@ describe("tool.task", () => {
       const done = yield* Deferred.make<void>()
       const injected = yield* Deferred.make<SessionPrompt.PromptInput>()
       let runs = 0
+      let cancels = 0
       const promptOps: TaskPromptOps = {
-        cancel: () => Effect.void,
+        cancel: () =>
+          Effect.sync(() => {
+            cancels += 1
+          }),
         resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
         prompt: (input) => {
           if (input.sessionID === chat.id) {
@@ -738,9 +744,14 @@ describe("tool.task", () => {
       yield* jobs.promote(job.id)
 
       const result = yield* Fiber.join(fiber)
+      const childID = String(result.metadata.sessionId)
       expect(result.metadata.background).toBe(true)
       expect(result.output).toContain(`state="running"`)
+      expect(result.output).toContain(`Child session ${childID} is running.`)
+      expect(result.output).toContain("The user is waiting. Answer them. Do not start the same task again.")
+      expect(result.output.toLowerCase()).not.toContain("poll")
       expect((yield* jobs.get(result.metadata.sessionId))?.status).toBe("running")
+      expect(cancels).toBe(0)
       expect(runs).toBe(1)
 
       yield* Deferred.succeed(done, undefined)
