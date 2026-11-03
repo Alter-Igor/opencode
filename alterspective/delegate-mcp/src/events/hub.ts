@@ -115,6 +115,10 @@ class Hub implements DelegateHub {
     if (this.table.track(sessionID, directory)) safeLog(this.log, "debug", "events", "tracking session", { sessionID, directory })
   }
 
+  sendStarting(sessionID: string): void {
+    this.table.sendStarting(sessionID)
+  }
+
   markSent(sessionID: string): void {
     this.cancelStart(sessionID)
     this.emitChanges(this.table.markSent(sessionID))

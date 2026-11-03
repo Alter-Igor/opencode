@@ -67,3 +67,14 @@ export async function rememberGeneration(home: string, project: string): Promise
   await writeFile(tmp, JSON.stringify({ projects: [...names].sort() }) + "\n")
   await rename(tmp, file)
 }
+
+/** Forget a generation project. Does nothing when the project is not recorded. */
+export async function forgetGeneration(home: string, project: string): Promise<void> {
+  const names = new Set(await readGenerations(home))
+  if (!names.delete(project)) return
+  const file = path.join(home, REGISTRY)
+  const tmp = `${file}.${process.pid}.tmp`
+  await writeFile(tmp, JSON.stringify({ projects: [...names].sort() }) + "\n")
+  await rename(tmp, file)
+}
+

@@ -62,7 +62,8 @@ async function createSession(ctx: ToolContext, box: Box, args: StartArgs, ws: Op
   const profile = args.profile ?? "standard"
   const metadata: SessionMetadata = { [SESSION_SUPERVISOR_KEY]: ctx.supervisor, sessionKey: ws.sessionKey }
   const body = { title: args.title ?? `delegate ${ws.sessionKey}`, permission: ctx.guard.permissionBaseline(profile, args.keystone), metadata }
-  const created = expectOk(await box.api.call<{ id?: unknown }>({ method: "POST", path: "/session", directory: ws.boxPath, body, correlationId }), "create the session")
+  const res = await box.api.call<{ id?: unknown }>({ method: "POST", path: "/session", directory: ws.boxPath, body, correlationId })
+  const created = expectOk(res, "create the session")
   if (typeof created.id !== "string" || !SESSION_ID_RE.test(created.id))
     throw new DelegateError("upstream_error", "The delegate server returned a session without a valid id.", "Retry oc_start_session; if it repeats, run oc_doctor.")
   return created.id
@@ -117,7 +118,7 @@ export const startSessionTool = defineTool({
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   async run(args, ctx, correlationId) {
     const hostRepo = await ctx.workspaces.resolveRepo(args.directory)
-    const keystone = sessionKeystone(ctx, args.keystone)
+    const keystone = ctx.config.backend === "remote" ? undefined : sessionKeystone(ctx, args.keystone)
     if (!args.allowShared) await refuseBusy(ctx, hostRepo, samePath)
     const box = await ctx.box()
     if (args.model) await requireModel(box.api, args.model, correlationId, ctx)

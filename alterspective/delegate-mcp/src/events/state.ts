@@ -56,8 +56,10 @@ type Entry = {
   awaitingStart: boolean
   sentAt?: number
   lastActiveAt?: number
-  /** Last session.error; `armed` until a busy shows the run carried on. */
-  lastError?: { label: string; aborted: boolean; armed: boolean }
+  /** Last session.error; `armed` until a busy shows the run carried on. `order` is when it arrived. */
+  lastError?: { label: string; aborted: boolean; armed: boolean; order: number }
+  /** #252: when the latest send began (before its POST), on the table's event order. */
+  sendStartedOrder?: number
   /** Per-entry gap (disposed directory, failed rebuild read). */
   gap?: string
   state: Derived
@@ -68,6 +70,8 @@ type Entry = {
 export class SessionTable {
   private readonly entries = new Map<string, Entry>()
   private link: Link = { kind: "gap", detail: "not connected yet" }
+  /** #252: a counter, not a clock, so a send and an error in the same millisecond still have an order. */
+  private order = 0
 
   constructor(
     private readonly now: () => number,
@@ -133,6 +137,16 @@ export class SessionTable {
     return this.link
   }
 
+  /**
+   * #252: a send is about to POST prompt_async. Record when, so `markSent` can tell an error that
+   * came before this send (an earlier prompt's) from one that came after it (this prompt's, e.g. a
+   * fast "Agent not found" that beats the 204).
+   */
+  sendStarting(sessionID: string): void {
+    const e = this.entries.get(sessionID)
+    if (e) e.sendStartedOrder = ++this.order
+  }
+
   /** prompt_async was accepted: expect busy within the window, unless it is already running. */
   markSent(sessionID: string): Change[] {
     const e = this.entries.get(sessionID)
@@ -143,6 +157,12 @@ export class SessionTable {
     e.detail = undefined
     e.awaitingStart = true
     e.sentAt = this.now()
+    // #252: an error armed before this send began belongs to the earlier prompt, so it is not this
+    // prompt's outcome. An error after the send began (it can beat the 204) stays armed. With no
+    // recorded start (a caller that never called sendStarting) nothing is disarmed.
+    const started = e.sendStartedOrder
+    if (e.lastError && started !== undefined && e.lastError.order < started) e.lastError.armed = false
+    e.sendStartedOrder = undefined
     return this.refresh(e)
   }
 
@@ -156,6 +176,14 @@ export class SessionTable {
     if (!e?.awaitingStart || this.link.kind !== "up" || e.gap) return []
     if (this.now() - (e.sentAt ?? 0) < this.notStartedMs) return []
     e.awaitingStart = false
+    const err = e.lastError
+    if (err?.armed) {
+      // #252: the prompt failed before it ran; the error is the outcome, not silence.
+      e.base = "error"
+      e.detail = `${err.label}; the prompt never ran`
+      err.armed = false
+      return this.refresh(e)
+    }
     e.base = "not_started"
     e.detail = `prompt accepted but no busy within ${this.notStartedMs / 1000} s`
     return this.refresh(e)
@@ -186,8 +214,11 @@ export class SessionTable {
   error(sessionID: string, label: string, aborted: boolean): Change[] {
     const e = this.entries.get(sessionID)
     if (!e) return []
-    e.awaitingStart = false
-    e.lastError = { label, aborted, armed: true }
+    // #252: an error before the prompt was seen running (still `starting`) keeps the not-started
+    // watchdog armed. A refused prompt (unknown agent) never goes busy or idle, so clearing the
+    // wait here left the session `starting` forever. A busy that follows still clears it (running()).
+    if (aborted || e.base !== "starting") e.awaitingStart = false
+    e.lastError = { label, aborted, armed: true, order: ++this.order }
     if (!aborted) return []
     e.pending.clear()
     return this.refresh(e)
@@ -251,6 +282,16 @@ export class SessionTable {
       // Finished during the gap, or never started: unknowable, so keep the conservative claim.
       if (this.now() - (e.sentAt ?? 0) < this.notStartedMs) return
       e.awaitingStart = false
+      const early = e.lastError
+      if (early?.armed) {
+        // #252: an error arrived before the prompt was seen running, and the watchdog fired during
+        // the gap. The error is the outcome, not not_started. The gap means a run cannot be ruled out,
+        // so the detail says "not seen running", never "never ran".
+        e.base = "error"
+        e.detail = `${early.label}; the prompt was not seen running; ${GAP_CAVEAT}`
+        early.armed = false
+        return
+      }
       e.base = "not_started"
       e.detail = "idle after a stream gap; the prompt was never seen running"
       return
@@ -272,6 +313,7 @@ export class SessionTable {
     e.gap = undefined
     const err = e.lastError
     if (err?.armed) {
+      e.awaitingStart = false // #252: the error is the outcome; the watchdog must not replace it
       e.base = err.aborted ? "aborted" : "error"
       e.detail = err.label
       err.armed = false
