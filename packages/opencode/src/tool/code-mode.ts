@@ -176,6 +176,21 @@ const invokeChildTool = Effect.fn("CodeMode.invokeChildTool")(function* (input: 
         "message.id": input.ctx.messageID,
       },
     }),
+    Effect.catchCause((cause) => {
+      if (Cause.hasInterruptsOnly(cause)) return Effect.failCause(cause)
+      const err = Cause.squash(cause)
+      const text = err instanceof Error ? err.message : String(err)
+      return input.plugin
+        .trigger(
+          "tool.execute.after",
+          { tool: input.entry.key, sessionID: input.ctx.sessionID, callID: input.callID, args: input.args },
+          { content: [{ type: "text", text }], isError: true },
+        )
+        .pipe(
+          Effect.catchCause(() => Effect.void),
+          Effect.andThen(Effect.failCause(cause)),
+        )
+    }),
   )
   yield* input.plugin.trigger(
     "tool.execute.after",
