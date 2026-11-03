@@ -6,7 +6,7 @@ import { decide, decideWithNarrowing, isVisibleWithNarrowing, parseProfile, tool
 import { adminHandler, frontHandler, type GateConfig } from "../mcp-gate/src/server.ts"
 import { createGateApprovals } from "../src/gate/client.ts"
 import { parseHostState } from "../src/supervisor/workspaces-state.ts"
-import { applyTaskProfile } from "../src/tools/core-session.ts"
+import { applyTaskProfile, withGateProfileLock } from "../src/tools/core-session.ts"
 import { startSessionTool } from "../src/tools/sessions.ts"
 import { OTHER_SID, SID, fakeContext, ours } from "./tools-core-fixture.ts"
 
@@ -423,5 +423,47 @@ describe("session-scoped task profile ownership and overlap rejection (#124)", (
       },
     }
     await expect(applyTaskProfile(f.ctx, f.box, undefined, OTHER_SID)).rejects.toThrow(/gate unreachable on clear/)
+  })
+
+  test("withGateProfileLock serializes concurrent profiled/unprofiled dispatches and applyTaskProfile propagates listSessionStates errors", async () => {
+    const f = fakeContext()
+    const applied: Array<Profile | null> = []
+    f.ctx.gate = {
+      pending: async () => [],
+      decide: async () => {
+        throw new Error("not used")
+      },
+      setTaskProfile: async (profile) => {
+        applied.push(profile)
+      },
+    }
+
+    const profileA: Profile = { allowedToolPatterns: ["github__*"] }
+    ours(f, { sessionID: SID, sessionKey: "s-0000000001", delegationProfile: profileA })
+    ours(f, { sessionID: OTHER_SID, sessionKey: "s-0000000002" })
+    f.hub.views.set(SID, { sessionID: SID, directory: "/sessions/s-0000000001", state: "idle", since: "2026-10-01T00:00:00.000Z" })
+    f.hub.views.set(OTHER_SID, { sessionID: OTHER_SID, directory: "/sessions/s-0000000002", state: "idle", since: "2026-10-01T00:00:00.000Z" })
+
+    // Launch two concurrent operations while both sessions are initially idle:
+    // First operation applies profileA for SID and marks SID as starting before releasing the lock.
+    // Second operation (for OTHER_SID) waits on the lock, then sees SID in "starting" and rejects!
+    const [first, second] = await Promise.allSettled([
+      withGateProfileLock(f.ctx, async () => {
+        await applyTaskProfile(f.ctx, f.box, profileA, SID)
+        f.hub.views.set(SID, { sessionID: SID, directory: "/sessions/s-0000000001", state: "starting", since: "2026-10-01T00:00:00.000Z" })
+      }),
+      withGateProfileLock(f.ctx, async () => {
+        await applyTaskProfile(f.ctx, f.box, undefined, OTHER_SID)
+      }),
+    ])
+    expect(first.status).toBe("fulfilled")
+    expect(second.status).toBe("rejected")
+    expect(applied).toEqual([profileA])
+
+    // Non-ENOENT errors from listSessionStates propagate instead of being swallowed
+    f.ctx.workspaces.listSessionStates = async () => {
+      throw new Error("unreadable state directory")
+    }
+    await expect(applyTaskProfile(f.ctx, f.box, profileA, SID)).rejects.toThrow(/unreadable state directory/)
   })
 })

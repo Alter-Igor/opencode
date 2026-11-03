@@ -396,7 +396,7 @@ async function sync(ctx: Ctx, ws: Workspace, ref: string): Promise<SyncResult> {
     await hostGit(ctx, ["-C", state.hostRepo, "bundle", "create", bundle.hostPath, tempRef], "bundle the sync ref", "long")
     assertRegularFile(bundle.hostPath, "sync bundle")
     await boxRun(ctx, ["git", "-C", wsDir, "fetch", "--quiet", bundle.boxPath, tempRef], "fetch sync bundle")
-    const countBefore = Number((await boxRun(ctx, ["git", "-C", wsDir, "rev-list", "--count", "HEAD"], "count commits before")).trim())
+    const countBefore = Number((await boxRun(ctx, ["-C", wsDir, "rev-list", "--count", "HEAD"], "count commits before")).trim())
     const mergeRes = await ctx.box(["git", "-C", wsDir, "merge", "--no-edit", "FETCH_HEAD"], { timeoutMs: ctx.timeouts.short })
     if (mergeRes.code === 0) {
       const head = (await boxRun(ctx, ["git", "-C", wsDir, "rev-parse", "HEAD"], "read new HEAD")).trim()
@@ -435,8 +435,8 @@ export type DelegateWorkspaces = Omit<Workspaces, "open" | "collect"> & {
   updateSessionState(sessionKey: string, patch: Partial<HostSessionState>): Promise<HostSessionState>
   /** The host record for a session key; undefined when there is none (throws when damaged). */
   sessionState(sessionKey: string): Promise<HostSessionState | undefined>
-  /** Every readable host record, newest first. */
-  listSessionStates(): Promise<HostSessionState[]>
+  /** Every readable host record, newest first (pass limit to override the default display cap). */
+  listSessionStates(limit?: number): Promise<HostSessionState[]>
   /**
    * #53: bounded cleanup of confirmed missing sessions whose clones are also proved absent.
    * Returns removed keys.
@@ -528,7 +528,7 @@ export function createWorkspaces(options: WorkspacesOptions): DelegateWorkspaces
     bindSession: async (key, binding) => bindHostState(ctx.stateDir, key, { ...binding, boxProject: options.config.project }),
     updateSessionState: async (key, patch) => updateHostState(ctx.stateDir, key, patch),
     sessionState: async (key) => readHostState(ctx.stateDir, key),
-    listSessionStates: async () => listHostStates(ctx.stateDir),
+    listSessionStates: async (limit?: number) => listHostStates(ctx.stateDir, limit),
     pruneSessionStates,
     discard: (key) => discard(ctx, key),
     inspectClose: (key, owner, options) => traced(logger, "inspectClose", undefined, { sessionKey: key }, () => inspectClose(closeDeps, key, owner, options), (p) => ({ safe: p.safe, uncollectedCommits: p.uncollectedCommits })),

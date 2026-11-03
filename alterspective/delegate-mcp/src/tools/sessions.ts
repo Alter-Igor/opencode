@@ -28,6 +28,7 @@ import {
   parseDelegationProfile,
   sessionIdSchema,
   webUrl,
+  withGateProfileLock,
   type Profile,
   type SessionMetadata,
 } from "./core-session.ts"
@@ -102,18 +103,24 @@ async function startIn(ctx: ToolContext, box: Box, args: StartArgs, ws: OpenedWo
   const profile = args.profile ?? "standard"
   let sessionID: string | undefined
   try {
-    await applyTaskProfile(ctx, box, args.delegationProfile)
-    sessionID = await createSession(ctx, box, args, ws, correlationId)
-    const extra = {
-      ...(args.model ? { model: args.model } : {}),
-      ...(args.agent ? { agent: args.agent } : {}),
-      ...(args.keystone ? { keystone: args.keystone } : {}),
-      ...(args.delegationProfile ? { delegationProfile: args.delegationProfile } : {}),
-      ...(ctx.caller ? { caller: ctx.caller } : {}),
-    }
-    const state = await ctx.workspaces.bindSession(ws.sessionKey, { sessionID, profile, supervisor: ctx.supervisor, ...extra })
-    return { sessionID, sessionKey: ws.sessionKey, hostRepo: ws.hostRepo, boxPath: ws.boxPath, branch: ws.branch, profile, createdAt: state.createdAt, base: ws.base, ...extra }
+    return await withGateProfileLock(ctx, async () => {
+      await applyTaskProfile(ctx, box, args.delegationProfile)
+      sessionID = await createSession(ctx, box, args, ws, correlationId)
+      const extra = {
+        ...(args.model ? { model: args.model } : {}),
+        ...(args.agent ? { agent: args.agent } : {}),
+        ...(args.keystone ? { keystone: args.keystone } : {}),
+        ...(args.delegationProfile ? { delegationProfile: args.delegationProfile } : {}),
+        ...(ctx.caller ? { caller: ctx.caller } : {}),
+      }
+      const state = await ctx.workspaces.bindSession(ws.sessionKey, { sessionID, profile, supervisor: ctx.supervisor, ...extra })
+      const record: SessionRecord = { sessionID, sessionKey: ws.sessionKey, hostRepo: ws.hostRepo, boxPath: ws.boxPath, branch: ws.branch, profile, createdAt: state.createdAt, base: ws.base, ...extra }
+      ctx.sessions.set(record.sessionID, record)
+      box.hub.track(record.sessionID, ws.boxPath)
+      return record
+    })
   } catch (error) {
+    if (sessionID) ctx.sessions.delete(sessionID)
     await abandon(ctx, box, ws, sessionID, correlationId)
     throw error
   }
@@ -175,8 +182,6 @@ export const startSessionTool = defineTool({
     }
     const ws = await ctx.workspaces.open(hostRepo, newSessionKey())
     const record = await startIn(ctx, box, { ...args, model, keystone, delegationProfile }, ws, correlationId)
-    ctx.sessions.set(record.sessionID, record)
-    box.hub.track(record.sessionID, ws.boxPath)
     recordStart(ctx, record)
     return ok(`Session ${record.sessionID} started on ${ws.branch}. Next: oc_send, then oc_wait.${taskPick && "model" in taskPick ? ` Model for role "${taskPick.role}": ${taskPick.model} (Synapse fit ${taskPick.score.toFixed(2)}).` : ""}`, {
       sessionID: record.sessionID, sessionKey: ws.sessionKey, branch: ws.branch, boxPath: ws.boxPath, hostRepo: ws.hostRepo, profile: record.profile, base: ws.base,

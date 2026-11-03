@@ -20,6 +20,7 @@ export { AGENT_RE, MODEL_RE, SESSION_ID_RE, type Profile, type SessionProfile }
 export const CORRELATION_RE = /^[A-Za-z0-9_.:-]{1,64}$/
 const CURSOR_RE = /^([A-Za-z0-9-]{1,64})\.(\d{1,15})$/
 const BUSY_STATES = new Set(["starting", "busy", "retry", "needs_input", "unknown"])
+const gateProfileLocks = new Map<string, Promise<unknown>>()
 
 export const sessionIdSchema = z.string().regex(SESSION_ID_RE, "a session id such as ses_0123456789abcdef")
 export const modelSchema = z.string().regex(MODEL_RE, "provider/model, for example synapse/auto")
@@ -49,6 +50,34 @@ export function parseDelegationProfile(value: unknown): Profile | undefined {
   }
 }
 
+/**
+ * #124: serialize `[applyTaskProfile -> request acceptance]` across the shared gate identity
+ * (`ctx.config.project`) so two concurrent starts or sends cannot both pass the idle check before
+ * either marks its session active or updates the gate profile.
+ */
+export async function withGateProfileLock<T>(ctx: ToolContext, work: () => Promise<T>): Promise<T> {
+  const key = ctx.config.project || "opencode-delegate"
+  const prev = gateProfileLocks.get(key) ?? Promise.resolve()
+  let release!: () => void
+  const current = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const tail = prev.then(
+    () => current,
+    () => current,
+  )
+  gateProfileLocks.set(key, tail)
+  await prev.catch(() => undefined)
+  try {
+    return await work()
+  } finally {
+    release()
+    if (gateProfileLocks.get(key) === tail) {
+      gateProfileLocks.delete(key)
+    }
+  }
+}
+
 export async function applyTaskProfile(
   ctx: ToolContext,
   box: Box,
@@ -56,7 +85,7 @@ export async function applyTaskProfile(
   currentSessionID?: string,
 ): Promise<void> {
   if (ctx.config.backend === "remote") return
-  const states = await ctx.workspaces.listSessionStates().catch(() => [])
+  const states = typeof ctx.config.home === "string" ? await ctx.workspaces.listSessionStates(Number.MAX_SAFE_INTEGER) : []
   const known = new Map<string, { sessionID: string; boxSessionID?: string; delegationProfile?: Profile }>()
   for (const s of states) {
     if (!s.sessionID) continue
