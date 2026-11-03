@@ -8,8 +8,11 @@ import { Database } from "./database/database"
 import { EventSequenceTable, EventTable } from "./event/sql"
 import { Location } from "./location"
 import { makeGlobalNode } from "./effect/app-node"
+
+
 import { isDeepStrictEqual } from "node:util"
 import { Durable } from "@opencode-ai/schema/durable-event-manifest"
+import { redactedDurableEventData } from "./util/secret-redaction"
 
 export const ID = Event.ID
 export type ID = import("@opencode-ai/schema/event").ID
@@ -247,6 +250,7 @@ export const layerWith = (options?: LayerOptions) =>
                             .get()
                             .pipe(Effect.orDie)
                           const latest = row?.seq ?? -1
+                          ;(event as { data: unknown }).data = redactedDurableEventData(event.type, event.data)
                           const encoded = Schema.encodeUnknownSync(definition.data)(event.data) as Record<
                             string,
                             unknown
@@ -269,8 +273,23 @@ export const layerWith = (options?: LayerOptions) =>
                             if (
                               stored?.id === event.id &&
                               stored.type === versionedType(definition.type, durable.version) &&
-                              isDeepStrictEqual(stored.data, encoded)
+                              isDeepStrictEqual(redactedDurableEventData(event.type, stored.data), encoded)
                             ) {
+                              if (!isDeepStrictEqual(stored.data, encoded)) {
+                                const committed = {
+                                  ...event,
+                                  durable: { aggregateID, seq: input.seq, version: durable.version },
+                                } as Payload
+                                for (const projector of list) {
+                                  yield* projector(committed)
+                                }
+                                yield* db
+                                  .update(EventTable)
+                                  .set({ data: encoded })
+                                  .where(and(eq(EventTable.aggregate_id, aggregateID), eq(EventTable.seq, input.seq)))
+                                  .run()
+                                  .pipe(Effect.orDie)
+                              }
                               if (input.ownerID && row?.ownerID == null) {
                                 yield* db
                                   .update(EventSequenceTable)
