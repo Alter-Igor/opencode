@@ -1,6 +1,7 @@
 // End to end through the real Plugin and Provider services: the Synapse plugin's
 // config hook must run before core reads cfg.provider, so the provider list shows
-// the gateway's models (plus auto) instead of the hand-typed ones.
+// the gateway's models (plus auto) beside the configured ones, and a configured,
+// whitelisted model the gateway's list omits survives to the provider list (svc#366).
 import { expect } from "bun:test"
 import { Effect } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -44,7 +45,7 @@ const withGateway = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   )
 
 it.instance(
-  "the provider list carries the live Synapse models and auto, not the stale config list",
+  "the provider list carries the live Synapse models and auto beside the configured ones",
   () =>
     withGateway(
       Effect.gen(function* () {
@@ -52,7 +53,7 @@ it.instance(
         const providers = yield* provider.list()
         const synapse = providers[SYNAPSE]
         expect(synapse).toBeDefined()
-        expect(Object.keys(synapse.models).sort()).toEqual(["auto", "live-model-1"])
+        expect(Object.keys(synapse.models).sort()).toEqual(["auto", "live-model-1", "stale-model"])
         expect(synapse.models["live-model-1"].limit.context).toBe(200_000)
         expect(synapse.models["live-model-1"].limit.output).toBe(32_000)
       }),
@@ -64,6 +65,33 @@ it.instance(
           npm: "@ai-sdk/openai-compatible",
           options: { baseURL: BASE, apiKey: "test-key" },
           models: { "stale-model": { name: "Stale" } },
+        },
+      },
+    },
+  },
+)
+
+it.instance(
+  "svc#366: a pinned, whitelisted model the gateway's list omits stays in the provider list",
+  () =>
+    withGateway(
+      Effect.gen(function* () {
+        const provider = yield* Provider.Service
+        const providers = yield* provider.list()
+        const synapse = providers[SYNAPSE]
+        expect(synapse).toBeDefined()
+        expect(Object.keys(synapse.models)).toEqual(["pinned-model"])
+      }),
+    ),
+  {
+    config: {
+      model: "synapse/pinned-model",
+      provider: {
+        synapse: {
+          npm: "@ai-sdk/openai-compatible",
+          options: { baseURL: BASE, apiKey: "test-key" },
+          models: { "pinned-model": { name: "pinned-model" } },
+          whitelist: ["pinned-model"],
         },
       },
     },

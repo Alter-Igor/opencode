@@ -24,6 +24,7 @@ import { SynapseAuthPlugin } from "./synapse"
 import { CerebrasPlugin } from "./cerebras"
 import { GoalLoopPlugin } from "./goal-loop"
 import { OpencodealtDocsPlugin } from "./opencodealt-docs"
+import { SchedulePlugin } from "./schedule"
 import { SmallModelDelegationPlugin } from "./small-model-delegation"
 import { SnowflakeCortexAuthPlugin } from "./snowflake-cortex"
 import { Effect, Layer, Context } from "effect"
@@ -96,6 +97,8 @@ export function forkPlugins(): PluginInstance[] {
     SynapseAuthPlugin,
     // Fork-only (#84): inert until a person runs /goal.
     GoalLoopPlugin,
+    // Fork-only (#243): /schedule and schedule_create / schedule_list / schedule_cancel tools.
+    SchedulePlugin,
     // Fork-only (#90): /docs and the "our docs, not upstream's" system line.
     OpencodealtDocsPlugin,
     // Fork-only: small model context preservation via subagent delegation.

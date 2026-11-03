@@ -157,7 +157,7 @@ describe("parseSynapseModelList", () => {
 })
 
 describe("loadSynapseModels", () => {
-  test("success replaces the hand-typed list with the live list and always offers auto", async () => {
+  test("success merges the live list into the configured models and always offers auto", async () => {
     const cfg = configWithStaleModels()
     const calls: Call[] = []
     const logs: SynapseModelsLogEvent[] = []
@@ -166,13 +166,59 @@ describe("loadSynapseModels", () => {
     expect(result).toBe("live")
     const models = cfg.provider?.synapse?.models ?? {}
     expect(Object.keys(models).sort()).toEqual(
-      ["bare-model", "claude-opus-5", "qwen/qwen3.8-flash", SYNAPSE_AUTO_MODEL].sort(),
+      ["bare-model", "claude-opus-5", "qwen/qwen3.8-flash", "stale-model-a", "stale-model-b", SYNAPSE_AUTO_MODEL].sort(),
     )
-    expect(models["stale-model-a"]).toBeUndefined()
     expect(models[SYNAPSE_AUTO_MODEL]).toBeDefined()
     expect(calls).toHaveLength(1)
     expect(calls[0].url).toBe(`${BASE}/models`)
+  })
+
+  test("svc#366: a configured, whitelisted model the live list omits is kept, and the omission is logged", async () => {
+    // The sandbox shape (renderConfig): one pinned model, configured and whitelisted.
+    const cfg: Config = {
+      model: "synapse/qwen3.8-27b-dflash2",
+      provider: {
+        synapse: {
+          npm: "@ai-sdk/openai-compatible",
+          options: { baseURL: BASE },
+          models: { "qwen3.8-27b-dflash2": { name: "qwen3.8-27b-dflash2" } },
+          whitelist: ["qwen3.8-27b-dflash2"],
+        },
+      },
+    }
+    const logs: SynapseModelsLogEvent[] = []
+    const result = await loadSynapseModels(cfg, deps(okFetch(LIVE_REPLY, []), logs, TOKEN))
+
+    expect(result).toBe("live")
+    const synapse = synapseOf(cfg)
+    expect(synapse.models?.["qwen3.8-27b-dflash2"]).toEqual({ name: "qwen3.8-27b-dflash2" })
+    expect(synapse.whitelist).toEqual(["qwen3.8-27b-dflash2"])
+    expect(logs).toHaveLength(1)
+    expect(logs[0]?.reason).toBe("synapse-models-configured-missing")
+    expect(logs[0]?.models).toEqual(["qwen3.8-27b-dflash2"])
+    expect(logs[0]?.error).toContain("qwen3.8-27b-dflash2")
+  })
+
+  test("live metadata wins over a configured entry for the same model; a configured auto is not reported missing", async () => {
+    const cfg = configWithStaleModels()
+    synapseOf(cfg).models = {
+      "claude-opus-5": { name: "hand typed", limit: { context: 1_000, output: 100 } },
+      auto: { name: "Synapse Auto (custom)" },
+    }
+    const logs: SynapseModelsLogEvent[] = []
+    await loadSynapseModels(cfg, deps(okFetch(LIVE_REPLY, []), logs, TOKEN))
+    expect(synapseOf(cfg).models?.["claude-opus-5"]?.limit).toEqual({ context: 1_000_000, output: 128_000 })
     expect(logs).toHaveLength(0)
+  })
+
+  test("models the live list adds are offered beside the configured ones; the cache holds only the live list", async () => {
+    const cfg = configWithStaleModels()
+    const cache = memoryCache()
+    await loadSynapseModels(cfg, deps(okFetch(LIVE_REPLY, []), [], TOKEN, cache))
+    const models = synapseOf(cfg).models ?? {}
+    expect(models["claude-opus-5"]?.limit?.context).toBe(1_000_000)
+    expect(models["stale-model-a"]).toEqual({ name: "Stale A" })
+    expect(Object.keys(cache.store[BASE] ?? {}).sort()).toEqual(["bare-model", "claude-opus-5", "qwen/qwen3.8-flash"])
   })
 
   test("request carries the Synapse auth headers when a token is available", async () => {
@@ -290,6 +336,9 @@ describe("loadSynapseModels", () => {
     expect(Date.now() - started).toBeLessThan(2_000)
     expect(result).toBe("fallback")
     expect(logs[0]?.error).toContain("aborted")
+    expect(Object.keys(cfg.provider?.synapse?.models ?? {}).sort()).toEqual(
+      ["stale-model-a", "stale-model-b", SYNAPSE_AUTO_MODEL].sort(),
+    )
   })
 
   test("success writes the last good list to the cache, without any token", async () => {
@@ -299,12 +348,14 @@ describe("loadSynapseModels", () => {
     expect(JSON.stringify(cache.store)).not.toContain(TOKEN)
   })
 
-  test("failure uses the cached last good list, plus auto, before the configured list", async () => {
+  test("failure merges the cached last good list, plus auto, into the configured list", async () => {
     const cache = memoryCache({ [BASE]: { "cached-model": { name: "cached-model" } } })
     const cfg = configWithStaleModels()
     const result = await loadSynapseModels(cfg, deps(failingFetch([]), [], TOKEN, cache))
     expect(result).toBe("cache")
-    expect(Object.keys(cfg.provider?.synapse?.models ?? {}).sort()).toEqual(["cached-model", SYNAPSE_AUTO_MODEL].sort())
+    expect(Object.keys(cfg.provider?.synapse?.models ?? {}).sort()).toEqual(
+      ["cached-model", "stale-model-a", "stale-model-b", SYNAPSE_AUTO_MODEL].sort(),
+    )
   })
 })
 
@@ -402,7 +453,9 @@ describe("loadSynapseModels with an expired stored token", () => {
     const cache = memoryCache({ [BASE]: { "cached-model": { name: "cached-model" } } })
     expect(await loadSynapseModels(cfg, expiredDeps(calls, cache))).toBe("cache")
     expect(calls).toHaveLength(0)
-    expect(Object.keys(cfg.provider?.synapse?.models ?? {}).sort()).toEqual([SYNAPSE_AUTO_MODEL, "cached-model"])
+    expect(Object.keys(cfg.provider?.synapse?.models ?? {}).sort()).toEqual(
+      [SYNAPSE_AUTO_MODEL, "cached-model", "stale-model-a", "stale-model-b"].sort(),
+    )
   })
 
   test("makes no request and uses the configured list when there is no cache", async () => {

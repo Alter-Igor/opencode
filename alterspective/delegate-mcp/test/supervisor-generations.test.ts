@@ -3,6 +3,7 @@ import { existsSync } from "node:fs"
 import { mkdir, readFile, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { mcpAllowPolicy } from "../src/shared/config.ts"
+import { readGenerations, rememberGeneration } from "../src/supervisor/generations.ts"
 import { SILENT_BOX_WAIT_MS, SILENT_GAP_MS } from "../src/supervisor/lifecycle.ts"
 import { planFor } from "../src/supervisor/plan.ts"
 import { readHostState, writeHostState } from "../src/supervisor/workspaces-state.ts"
@@ -236,11 +237,13 @@ describe("supervisor generations (#171)", () => {
     pin("quiet-key", CALLER, quiet)
     pin("loud-key", "ses_loudsession1", loud)
     const calls: Call[] = []
-    const quietBox: Box = { running: true, labels: {}, env: [] }
+    const quietBox: Box = { running: true, labels: { [L.port]: "4802" }, env: ["OPENCODE_SERVER_PASSWORD=kept"] }
     const loudBox: Box = { running: true, labels: { [L.port]: "4801" }, env: ["OPENCODE_SERVER_PASSWORD=kept"] }
     let now = 1_000
     const fetchOk = (async (input: RequestInfo | URL) => {
-      if (String(input).includes("/session/status")) return Response.json({ ses_loudsession1: { type: "busy" } })
+      const url = String(input)
+      if (url.includes(":4802/")) return new Response("", { status: 503 })
+      if (url.includes("/session/status")) return Response.json({ ses_loudsession1: { type: "busy" } })
       return new Response("", { status: 200 })
     }) as typeof fetch
     const sup = supervisor(
@@ -324,9 +327,11 @@ describe("supervisor generations (#171)", () => {
     const hung: Box = { running: true, labels: { [L.port]: "4899" }, env: ["OPENCODE_SERVER_PASSWORD=kept"] }
     // Only the liveness probe hangs: this test proves its 3 s cap. Other calls to that box (relocation
     // checks with their own timeouts) get a quick 503, so they do not slow the test.
+    let probeEntered = false
     const hangs = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
-      if (url.includes(":4899/path"))
+      if (url.includes(":4899/path")) {
+        probeEntered = true
         return new Promise<Response>((_, reject) => {
           // A real hung socket keeps the process alive; Bun's AbortSignal.timeout timer does not, so
           // hold a timer open the way the socket would, until the probe's own abort fires.
@@ -336,6 +341,7 @@ describe("supervisor generations (#171)", () => {
             reject(new DOMException("timed out", "TimeoutError"))
           })
         })
+      }
       if (url.includes(":4899/")) return new Response("", { status: 503 })
       return new Response("", { status: 200 })
     }) as typeof fetch
@@ -350,6 +356,7 @@ describe("supervisor generations (#171)", () => {
       ).ensure(),
     )
     expect(error.code).toBe("profile_changed")
+    expect(probeEntered).toBe(true)
     expect(Date.now() - started).toBeLessThan(10_000)
     expect(existsSync(path.join(home, "silent", quiet))).toBe(true)
     expect(downOf(calls, quiet)).toHaveLength(0)
@@ -417,6 +424,39 @@ describe("supervisor generations (#171)", () => {
     expect(error.code).toBe("profile_changed")
     expect(downOf(calls, quiet)).toHaveLength(0)
     expect(existsSync(path.join(home, "silent", quiet))).toBe(false)
+  })
+
+  test("a recreated container with a new StartedAt starts its silent wait again", async () => {
+    await writeOwner()
+    const quiet = "opencode-delegate-aaaaaaaaaaaa"
+    await writeFile(path.join(home, "generations.json"), JSON.stringify({ projects: [quiet, "opencode-delegate-cccccccccccc"] }) + "\n")
+    writeHostState(path.join(home, "workspaces"), {
+      sessionKey: "recreated-key",
+      hostRepo: "C:\\GitHub\\demo",
+      base: BASE,
+      createdAt: new Date(0).toISOString(),
+      sessionID: CALLER,
+      supervisor: "supervisor:test",
+      profile: "standard",
+      boxProject: quiet,
+    })
+    await mkdir(path.join(home, "silent"), { recursive: true })
+    await writeFile(path.join(home, "silent", quiet), `0 ${SILENT_BOX_WAIT_MS} 2026-10-17T00:00:00Z\n`)
+    const calls: Call[] = []
+    const replaced: Box = { running: true, labels: {}, env: [], startedAt: "2026-10-17T00:15:10Z" }
+    const now = SILENT_BOX_WAIT_MS + 30_000
+    const error = await fail(
+      supervisor(
+        deps(fakeDocker({ running: false, labels: {}, env: [] }, calls, { projects: { [quiet]: replaced, "opencode-delegate-cccccccccccc": { running: true, labels: {}, env: [] } } }), {
+          image: IMAGE,
+          now: () => now,
+        }),
+      ).ensure(),
+    )
+    expect(error.code).toBe("profile_changed")
+    expect(downOf(calls, quiet)).toHaveLength(0)
+    const stamp = (await readFile(path.join(home, "silent", quiet), "utf8")).trim()
+    expect(stamp).toBe(`${now} ${now} 2026-10-17T00:15:10Z`)
   })
 
   test("a generation that does not match is refused before this bridge rebinds", async () => {
@@ -549,4 +589,24 @@ describe("supervisor generations (#171)", () => {
     expect(readHostState(dir, "old-kept-key")?.boxProject).toBe("opencode-delegate")
     expect(readHostState(dir, "old-kept-key")?.sessionID).toBe(CALLER)
   })
+
+  test("an old project with no lease and no sessions whose main box is stopped but a sibling is running is stopped", async () => {
+    await writeOwner()
+    const oldGen = "opencode-delegate-111111111111"
+    await rememberGeneration(home, oldGen)
+    const calls: Call[] = []
+    const containers = {
+      [`${oldGen}-front`]: {
+        code: 0,
+        stdout: JSON.stringify({ state: { Running: true, Health: { Status: "healthy" } }, labels: { [L.image]: IMAGE }, env: [] }),
+        stderr: "",
+      },
+    }
+    const docker = fakeDocker({ running: false, labels: {}, env: [] }, calls, { containers })
+    await supervisor(deps(docker, { image: IMAGE, fetch: fetchFor({}) })).ensure()
+    const down = downOf(calls, oldGen)
+    expect(down).toHaveLength(1)
+    expect(await readGenerations(home)).toEqual([])
+  })
 })
+

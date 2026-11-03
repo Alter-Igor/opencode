@@ -9,10 +9,11 @@ type SessionError = Extract<Event, { type: "session.error" }>["properties"]["err
 function notify(api: TuiPluginApi, sessionID: string | undefined, message: string, sound: TuiAttentionSoundName) {
   const session = sessionID ? api.state.session.get(sessionID) : undefined
   const isSubagent = session?.parentID !== undefined
+  const outage = message.includes("SYNAPSE_OUTAGE")
   void api.attention.notify({
     title: session?.title,
     message,
-    notification: isSubagent ? false : { when: "blurred" },
+    notification: isSubagent && !outage ? false : { when: "blurred" },
     sound: { name: sound, when: "always" },
   })
 }
@@ -22,6 +23,9 @@ function sessionErrorMessage(error: SessionError) {
   const data = error?.data
   if (data && typeof data === "object" && "message" in data && data.message === "SSE read timed out") {
     return "Model stopped responding"
+  }
+  if (data && typeof data === "object" && "message" in data && typeof data.message === "string") {
+    if (data.message.includes("SYNAPSE_OUTAGE")) return data.message
   }
   return "Session error"
 }

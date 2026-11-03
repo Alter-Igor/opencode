@@ -93,7 +93,8 @@ export function renderConfig(manifest: Manifest, modelIds: string[]) {
         name: "Sandbox model route",
         options: { headers: { ...withoutPrivacyTier(manifest.model.headers), "x-privacy-tier": tier } },
         models: Object.fromEntries(modelIds.map((id) => [id, { name: id }])),
-        // The Synapse plugin swaps in the gateway's live list (#74); keep only the policy's models.
+        // The Synapse plugin merges the gateway's live list in (#74) and keeps these even when
+        // that list omits one (svc#366); the whitelist keeps only the policy's models.
         // A convenience, not the boundary: the gateway enforces the cell server-side (ADR-042).
         whitelist: modelIds,
       },

@@ -1,0 +1,197 @@
+// Tests for delegate_task (FEAT-CD-001): 1-step autonomous task delegation.
+import { describe, expect, test } from "bun:test"
+import { delegateTaskTool } from "../src/tools/delegate-task.ts"
+import type { SessionState } from "../src/shared/contracts.ts"
+import { BASE, SID, data, fakeContext, invoke, remoteSession, type Fake } from "./tools-core-fixture.ts"
+
+function setupWorkingSession(f: Fake, sessionState: SessionState = "idle", assistantReply = "All tasks completed successfully.") {
+  f.api.on("POST /session", { status: 200, data: { id: SID } })
+  f.api.on(`GET /session/${SID}`, { status: 200, data: remoteSession(f) })
+  f.api.on("GET /mcp", { status: 200, data: { "ks-rag-read": { status: "connected" } } })
+  f.api.on(`POST /session/${SID}/prompt_async`, { status: 204 })
+  f.api.on(`GET /session/${SID}/message?limit=8`, {
+    status: 200,
+    data: [
+      {
+        info: { id: "msg_001", role: "assistant" },
+        parts: [{ type: "text", text: assistantReply }],
+      },
+    ],
+  })
+  f.api.on(`GET /session/${SID}/todo`, { status: 200, data: [] })
+
+  f.setHost((argv) => {
+    if (argv.includes("diff")) {
+      return { code: 0, stdout: "src/feature.ts\ntest/feature.test.ts\n", stderr: "" }
+    }
+    return { code: 0, stdout: "", stderr: "" }
+  })
+
+  const view = { sessionID: SID, directory: "/sessions/s-001", state: sessionState, since: "2026-10-19T00:00:00Z" }
+  f.hub.views.set(SID, view)
+  f.hub.waitResult = {
+    events: [],
+    next: { epoch: "ep1", seq: 10 },
+    timedOut: sessionState === "busy",
+    views: [view],
+  }
+}
+
+describe("delegate_task (FEAT-CD-001)", () => {
+  test("happy path: starts, sends, waits until idle, collects, and returns structured summary", async () => {
+    const f = fakeContext()
+    setupWorkingSession(f, "idle", "Implemented the requested feature and added unit tests.")
+
+    const result = await invoke(
+      delegateTaskTool,
+      {
+        directory: "C:\\GitHub\\demo",
+        prompt: "Please implement the new feature",
+        engine: "auto",
+      },
+      f.ctx,
+    )
+
+    expect(result.isError).toBeUndefined()
+    const d = data(result)
+    expect(d.status).toBe("completed")
+    expect(d.sessionID).toBe(SID)
+    expect(String(d.branch)).toMatch(/^delegate\/s-[0-9a-f]{10}$/)
+    expect(d.commits).toBe(1)
+    expect(d.changedFiles).toEqual(["src/feature.ts", "test/feature.test.ts"])
+    expect(d.filesCount).toBe(2)
+    expect(d.summaryOfWork).toMatchObject({
+      text: "Implemented the requested feature and added unit tests.",
+    })
+    expect(String(d.advice)).toContain("git diff")
+    expect(String(d.advice)).toContain("code_close_session")
+  })
+
+  // #252: this test used to assert agent "deepseek" was sent. The box has no such agent (build,
+  // explore, general, plan), so every such task failed with "Agent not found".
+  test("#252: engine opencode sends no agent (the box default), and deepseek is refused before a session", async () => {
+    const f = fakeContext()
+    setupWorkingSession(f, "idle")
+
+    await invoke(delegateTaskTool, { directory: "C:\\GitHub\\demo", prompt: "OpenCode task", engine: "opencode" }, f.ctx)
+    expect(f.ctx.sessions.get(SID)?.agent).toBeUndefined()
+    const send = f.api.find("POST", `/session/${SID}/prompt_async`)
+    expect((send?.body as { agent?: unknown } | undefined)?.agent).toBeUndefined()
+
+    const g = fakeContext()
+    setupWorkingSession(g, "idle")
+    const refused = await invoke(delegateTaskTool, { directory: "C:\\GitHub\\demo", prompt: "DeepSeek task", engine: "deepseek" }, g.ctx)
+    expect(refused.isError).toBe(true)
+    expect(JSON.stringify(refused)).toContain("invalid_input")
+    expect(g.api.find("POST", "/session")).toBeUndefined()
+  })
+
+  test("#252: a session that settles not_started is reported failed, not timed out", async () => {
+    const f = fakeContext()
+    setupWorkingSession(f, "idle")
+    const view = { sessionID: SID, directory: "/sessions/s-001", state: "not_started" as const, detail: "prompt accepted but no busy within 10 s", since: "2026-10-19T00:00:00Z" }
+    f.hub.views.set(SID, view)
+    f.hub.waitResult = { events: [], next: { epoch: "ep1", seq: 10 }, timedOut: false, views: [view] }
+
+    const d = data(await invoke(delegateTaskTool, { directory: "C:\\GitHub\\demo", prompt: "x", timeoutMs: 5000 }, f.ctx))
+    expect(d.status).toBe("failed")
+    expect(d.stillRunning).toBeUndefined()
+  })
+
+  test("#252: a failure seen only as a state event keeps that event's detail, not a stale view's", async () => {
+    const f = fakeContext()
+    setupWorkingSession(f, "idle")
+    f.hub.waitResult = {
+      events: [{ cursor: { epoch: "ep1", seq: 11 }, at: "2026-10-19T00:00:01Z", type: "status", sessionID: SID, state: "error", summary: "session s is error (UnknownError; the prompt never ran)" }],
+      next: { epoch: "ep1", seq: 11 },
+      timedOut: false,
+      views: [],
+    }
+
+    const d = data(await invoke(delegateTaskTool, { directory: "C:\\GitHub\\demo", prompt: "x", timeoutMs: 5000 }, f.ctx))
+    expect(d.status).toBe("failed")
+    expect(String(d.error)).toContain("the prompt never ran")
+  })
+
+  test("handles needs_input state gracefully with advice to use code_pending", async () => {
+    const f = fakeContext()
+    setupWorkingSession(f, "needs_input")
+
+    const result = await invoke(
+      delegateTaskTool,
+      {
+        directory: "C:\\GitHub\\demo",
+        prompt: "Needs input prompt",
+      },
+      f.ctx,
+    )
+
+    expect(result.isError).toBeUndefined()
+    const d = data(result)
+    expect(d.status).toBe("needs_input")
+    expect(d.sessionID).toBe(SID)
+    expect(String(d.advice)).toContain("code_pending")
+    expect(String(d.advice)).toContain("code_answer")
+  })
+
+  test("handles error state with scrubbed error message", async () => {
+    const f = fakeContext()
+    f.api.on("POST /session", { status: 200, data: { id: SID } })
+    f.api.on(`GET /session/${SID}`, { status: 200, data: remoteSession(f) })
+    f.api.on("GET /mcp", { status: 200, data: { "ks-rag-read": { status: "connected" } } })
+    f.api.on(`POST /session/${SID}/prompt_async`, { status: 204 })
+
+    const errorView = {
+      sessionID: SID,
+      directory: "/sessions/s-001",
+      state: "error" as const,
+      lastError: "TypeScript compilation failed with 2 errors",
+      since: "2026-10-19T00:00:00Z",
+    }
+    f.hub.views.set(SID, errorView)
+    f.hub.waitResult = {
+      events: [],
+      next: { epoch: "ep1", seq: 10 },
+      timedOut: false,
+      views: [errorView],
+    }
+
+    const result = await invoke(
+      delegateTaskTool,
+      {
+        directory: "C:\\GitHub\\demo",
+        prompt: "Failing prompt",
+      },
+      f.ctx,
+    )
+
+    expect(result.isError).toBeUndefined()
+    const d = data(result)
+    expect(d.status).toBe("failed")
+    expect(d.sessionID).toBe(SID)
+    expect(d.error).toBe("TypeScript compilation failed with 2 errors")
+  })
+
+  test("handles timeout while still working: keeps session alive and gives continuation advice", async () => {
+    const f = fakeContext()
+    setupWorkingSession(f, "busy")
+
+    const result = await invoke(
+      delegateTaskTool,
+      {
+        directory: "C:\\GitHub\\demo",
+        prompt: "Long running task",
+        timeoutMs: 200,
+      },
+      f.ctx,
+    )
+
+    expect(result.isError).toBeUndefined()
+    const d = data(result)
+    expect(d.status).toBe("timed_out")
+    expect(d.sessionID).toBe(SID)
+    expect(d.stillRunning).toBe(true)
+    expect(String(d.advice)).toContain("code_wait")
+    expect(String(d.advice)).toContain("code_abort")
+  })
+})

@@ -4,6 +4,8 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { z } from "zod"
 import type { ToolContext } from "./context.ts"
 import { fail, type ToolResult } from "./shape.ts"
+import { isDelegateError } from "../shared/errors.ts"
+import { scrub } from "../shared/log.ts"
 
 export type ToolAnnotations = { readOnlyHint?: boolean; destructiveHint?: boolean; idempotentHint?: boolean; openWorldHint?: boolean }
 
@@ -35,7 +37,7 @@ function registerOne(server: McpServer, ctx: ToolContext, spec: ToolSpec<z.ZodRa
       return result
     } catch (error) {
       const result = fail(error)
-      ctx.log.log("warn", "tool", "tool call failed", { tool: spec.name, correlationId, ms: Date.now() - started, code: String(result.structuredContent?.code ?? "") })
+      ctx.log.log("warn", "tool", "tool call failed", { tool: spec.name, correlationId, ms: Date.now() - started, code: String(result.structuredContent?.code ?? ""), detail: failureDetail(error) })
       return result
     }
   })
@@ -43,4 +45,10 @@ function registerOne(server: McpServer, ctx: ToolContext, spec: ToolSpec<z.ZodRa
 
 export function registerTools(server: McpServer, ctx: ToolContext, specs: Array<ToolSpec<z.ZodRawShape>>): void {
   for (const spec of specs) registerOne(server, ctx, spec)
+}
+
+// The caller sees only the safe message (ERR-MSG-03); the operator log keeps the scrubbed cause.
+function failureDetail(error: unknown): string {
+  const detail = isDelegateError(error) ? (error.detail ?? error.message) : String(error)
+  return scrub(detail).slice(0, 500)
 }

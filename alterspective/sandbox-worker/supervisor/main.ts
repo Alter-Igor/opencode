@@ -47,10 +47,12 @@ await Bun.write(path.join(configDir, "opencode.json"), JSON.stringify(config, nu
 // OpenCode writes a .gitignore into each config dir unless one exists (#41 spike finding).
 for (const dir of [configDir, globalConfigDir]) await Bun.write(path.join(dir, ".gitignore"), "node_modules\npackage.json\nbun.lock\n")
 await Bun.write(path.join(configDir, "plugins", "env-scrub.ts"), Bun.file("/opt/sbxw/plugins/env-scrub.ts"))
+// #249: caps the time-out the model asks for on the shell tool (SBXW_SHELL_MAX_TIMEOUT_MS).
+await Bun.write(path.join(configDir, "plugins", "shell-timeout-cap.ts"), Bun.file("/opt/sbxw/plugins/shell-timeout-cap.ts"))
 // #127: the box has no npm registry (egress lockdown, #118). At boot OpenCode installs
 // @opencode-ai/plugin into every WRITABLE config dir and waits for it before loading plugins, so it
-// hung behind the lockdown. A read-only dir is skipped (packages/core/src/npm.ts), and env-scrub.ts
-// imports nothing. So the config dirs are read-only from here on.
+// hung behind the lockdown. A read-only dir is skipped (packages/core/src/npm.ts), and the plugins
+// import nothing. So the config dirs are read-only from here on.
 await $`chmod 555 ${configDir} ${path.join(configDir, "plugins")} ${globalConfigDir}`
 
 // Work inside the box on its own clone; never a bind mount of the host's repository.

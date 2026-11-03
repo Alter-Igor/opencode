@@ -36,6 +36,7 @@ const RETRYABLE_MESSAGE_PATTERNS = [
   /overloaded|service unavailable|service_unavailable|service-unavailable|internal error|internal_error|internal server error|server error|server_error|server-error|provider returned error|provider_returned_error|provider-returned-error/i,
   /terminated|fetch failed|failed to fetch|network[-_\s]error|upstream connect|connection error|connection refused|connection lost|socket connection was closed|socket hang up|reset before headers|getaddrinfo|enotfound|eai_again|econnrefused|econnreset|etimedout/i,
   /^timeout$|\b(?:request|response|connection|network|stream|read) (?:timeout|timed out|time out)\b/i,
+  /synapse_onprem_transport_timeout|no further bytes arrived for \d+ ms/i,
   /try your request again|retry your request|resource exhausted|resource_exhausted/i,
   /\btry again (?:later|in\b)|\b(?:currently|temporarily) at capacity\b/i,
 ]
@@ -158,6 +159,45 @@ function matchesRetryableMessage(value: unknown) {
   return typeof value === "string" && RETRYABLE_MESSAGE_PATTERNS.some((pattern) => pattern.test(value))
 }
 
+const OUTAGE_DELAYS_MS = [5_000, 15_000, 45_000, 120_000, 300_000] as const
+
+const LONG_LADDER_PATTERNS = [
+  /synapse_onprem_transport_timeout/i,
+  /no further bytes arrived for \d+ ms/i,
+  /fetch failed|failed to fetch/i,
+  /\b(?:ECONNRESET|ECONNREFUSED|ENOTFOUND|ETIMEDOUT)\b/i,
+  /^timeout$|\b(?:request|response|connection|network|stream|read) (?:timeout|timed out|time out)\b/i,
+]
+
+const RATE_OR_OVERLOAD = /overloaded|rate[-_ ]?limit|too many requests/i
+
+export function outageDelay(attempt: number) {
+  const index = Math.min(Math.max(attempt, 1), OUTAGE_DELAYS_MS.length) - 1
+  return OUTAGE_DELAYS_MS[index]
+}
+
+export function usesLongLadder(error: Err) {
+  if (SessionV1.ContextOverflowError.isInstance(error)) return false
+  const status = SessionV1.APIError.isInstance(error) ? error.data.statusCode : undefined
+  if (status === 400 || status === 401 || status === 403 || status === 413 || status === 429) return false
+  const texts = errorTexts(error)
+  if (texts.some((value) => RATE_OR_OVERLOAD.test(value))) return false
+  if (status === 502 || status === 503 || status === 504) return true
+  return texts.some((value) => LONG_LADDER_PATTERNS.some((pattern) => pattern.test(value)))
+}
+
+function errorTexts(error: Err) {
+  if (!isRecord(error.data)) return []
+  const texts: string[] = []
+  if (typeof error.data.message === "string") texts.push(error.data.message)
+  if (typeof error.data.responseBody === "string") texts.push(error.data.responseBody)
+  if (!isRecord(error.data.metadata)) return texts
+  for (const value of Object.values(error.data.metadata)) {
+    if (typeof value === "string") texts.push(value)
+  }
+  return texts
+}
+
 function str(value: unknown) {
   if (value === undefined || value === null) return ""
   return String(value)
@@ -183,6 +223,7 @@ function parseJSON(value: unknown) {
 export function policy(opts: {
   provider: string
   parse: (error: unknown) => Err
+  progress?: { toolStarted: boolean }
   set: (input: { attempt: number; message: string; action?: Retryable["action"]; next: number }) => Effect.Effect<void>
 }) {
   return Schedule.fromStepWithMetadata(
@@ -191,8 +232,12 @@ export function policy(opts: {
       const retry = retryable(error, opts.provider)
       if (!retry) return Cause.done(meta.attempt)
       if (meta.attempt > RETRY_MAX_RETRIES) return Cause.done(meta.attempt)
+      const outage = usesLongLadder(error)
+      if (outage && opts.progress?.toolStarted) return Cause.done(meta.attempt)
       return Effect.gen(function* () {
-        const wait = delay(meta.attempt, SessionV1.APIError.isInstance(error) ? error : undefined)
+        const wait = outage
+          ? outageDelay(meta.attempt)
+          : delay(meta.attempt, SessionV1.APIError.isInstance(error) ? error : undefined)
         const now = yield* Clock.currentTimeMillis
         yield* opts.set({
           attempt: meta.attempt,

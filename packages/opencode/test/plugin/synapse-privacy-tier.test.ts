@@ -10,7 +10,8 @@ import {
   setLatestSynapseServing,
 } from "../../src/plugin/synapse"
 
-// #101: the sandbox supervisor forces `x-privacy-tier: local-only` on every Synapse call.
+// #101: the sandbox supervisor forces `x-privacy-tier` on every Synapse call: `local-only` by default,
+// `cloud-ok` only when the manifest says exactly that (#161). The plugin must pass `cloud-ok` through.
 
 const BASE = "https://synapse-privacy.example.test/v1"
 const API_KEY = "sk-test-privacy-tier-0123456789abcdef"
@@ -86,9 +87,14 @@ describe("forcedPrivacyTier (#101)", () => {
     expect(forcedPrivacyTier({ [SYNAPSE_PRIVACY_TIER_ENV]: "local-only" })).toBe("local-only")
   })
 
+  test("cloud-ok passes through, only when it is exactly cloud-ok", () => {
+    expect(forcedPrivacyTier({ [SYNAPSE_PRIVACY_TIER_ENV]: "cloud-ok" })).toBe("cloud-ok")
+  })
+
   test("any other value narrows to local-only, never widens", () => {
-    expect(forcedPrivacyTier({ [SYNAPSE_PRIVACY_TIER_ENV]: "cloud-ok" })).toBe("local-only")
-    expect(forcedPrivacyTier({ [SYNAPSE_PRIVACY_TIER_ENV]: "locla-only" })).toBe("local-only")
+    for (const value of ["locla-only", "Cloud-OK", "CLOUD-OK", " cloud-ok", "cloud-ok ", "cloud-ok\n", "cloud", "cloud_ok", "true", "1", " "]) {
+      expect(forcedPrivacyTier({ [SYNAPSE_PRIVACY_TIER_ENV]: value })).toBe("local-only")
+    }
   })
 })
 
@@ -100,6 +106,12 @@ describe("applyPrivacyTierHeader (#101)", () => {
       baseURL: BASE,
       headers: { "x-privacy-tier": "local-only", "x-task-type": "code" },
     })
+  })
+
+  test("sets cloud-ok over a configured local-only header", () => {
+    const cfg: { provider: Record<string, any> } = { provider: { synapse: { options: { headers: { "x-privacy-tier": "local-only" } } } } }
+    applyPrivacyTierHeader(cfg, "cloud-ok")
+    expect(cfg.provider.synapse.options.headers).toEqual({ "x-privacy-tier": "cloud-ok" })
   })
 
   test("adds options when the provider has none", () => {
@@ -131,6 +143,22 @@ describe("every Synapse call carries the forced tier (#101)", () => {
     expect(calls[0].headers.get("x-privacy-tier")).toBe("local-only")
   })
 
+  test("REST chat: cloud-ok from the environment is sent as cloud-ok, not rewritten to local-only", async () => {
+    const calls = await capture(() => chat({ key: API_KEY }), "cloud-ok")
+    expect(calls).toHaveLength(1)
+    expect(calls[0].headers.get("x-privacy-tier")).toBe("cloud-ok")
+  })
+
+  test("REST chat: a request header cannot move a cloud-ok run to another value either", async () => {
+    const calls = await capture(() => chat({ key: API_KEY, headers: { "x-privacy-tier": "local-only" } }), "cloud-ok")
+    expect(calls[0].headers.get("x-privacy-tier")).toBe("cloud-ok")
+  })
+
+  test("REST chat: a junk value in the environment is sent as local-only", async () => {
+    const calls = await capture(() => chat({ key: API_KEY, headers: { "x-privacy-tier": "cloud-ok" } }), "Cloud-OK")
+    expect(calls[0].headers.get("x-privacy-tier")).toBe("local-only")
+  })
+
   test("REST chat: nothing is added when no tier is forced", async () => {
     const calls = await capture(() => chat({ key: API_KEY }))
     expect(calls).toHaveLength(1)
@@ -149,6 +177,17 @@ describe("every Synapse call carries the forced tier (#101)", () => {
     expect(calls[0].body.params.arguments.privacyTier).toBe("local-only")
   })
 
+  test("MCP bridge chat: a cloud-ok run asks for cloud-ok", async () => {
+    const header = Buffer.from(JSON.stringify({ alg: "none" })).toString("base64url")
+    const payload = Buffer.from(JSON.stringify({ aud: MCP, exp: Math.floor(Date.now() / 1000) + 3600 })).toString("base64url")
+    const calls = await capture(
+      () => chat({ key: `${header}.${payload}.sig`, metadata: { expiresAt: String(Date.now() + 3_600_000) } }),
+      "cloud-ok",
+    )
+    expect(calls).toHaveLength(1)
+    expect(calls[0].body.params.arguments.privacyTier).toBe("cloud-ok")
+  })
+
   test("model list: the config hook puts the tier on the provider before the list is read", async () => {
     const cfg: any = { provider: { synapse: { npm: "@ai-sdk/openai-compatible", options: { baseURL: BASE, apiKey: "k" }, models: {} } } }
     const calls = await capture(async () => {
@@ -159,6 +198,20 @@ describe("every Synapse call carries the forced tier (#101)", () => {
     expect(list).toHaveLength(1)
     expect(list[0].headers.get("x-privacy-tier")).toBe("local-only")
     expect(cfg.provider.synapse.options.headers["x-privacy-tier"]).toBe("local-only")
+  })
+
+  test("model list: cloud-ok is put on the provider, replacing a local-only header", async () => {
+    const cfg: any = {
+      provider: { synapse: { npm: "@ai-sdk/openai-compatible", options: { baseURL: BASE, apiKey: "k", headers: { "x-privacy-tier": "local-only" } }, models: {} } },
+    }
+    const calls = await capture(async () => {
+      const hooks = await SynapseAuthPlugin(pluginInput, { inferenceUrl: BASE })
+      await hooks.config?.(cfg)
+    }, "cloud-ok")
+    const list = calls.filter((c) => c.href === `${BASE}/models`)
+    expect(list).toHaveLength(1)
+    expect(list[0].headers.get("x-privacy-tier")).toBe("cloud-ok")
+    expect(cfg.provider.synapse.options.headers["x-privacy-tier"]).toBe("cloud-ok")
   })
 
   test("synapse_buddy_review: the MCP chat call asks for local-only", async () => {

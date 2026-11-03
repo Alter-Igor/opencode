@@ -21,7 +21,7 @@ import { KEYSTONE_HOST_AUTH_ENV, keystoneHostAuth } from "../guard/egress-identi
 import { SYNAPSE_LOCK_WAIT_MS } from "../synapse/lock.ts"
 import type { RegisteredModels } from "../synapse/models.ts"
 import { INSPECT_ENV, MCP_ALLOW_ENV, PASSWORD_ENV, approvedValues, boxEnvOverride, composeDownEnv, composeEnv, containerName, dynamicProfileFor, paths, siblingContainers } from "./compose-env.ts"
-import { GENERATION_CAP, generationProject, readGenerations, rememberGeneration } from "./generations.ts"
+import { GENERATION_CAP, forgetGeneration, generationProject, readGenerations, rememberGeneration } from "./generations.ts"
 import { LABEL, dockerArgs, imageExists, inspectBox, redactAll, requireDocker, type BoxInspect, type Exec, type ExecResult } from "./docker.ts"
 import { boxAnswers, waitHealthy } from "./health.ts"
 import { pruneSignIns, verifyLive } from "./live.ts"
@@ -367,19 +367,33 @@ async function downProject(run: Run, project: string): Promise<void> {
   }
 }
 
+async function anyProjectContainerRunning(run: Run, project: string): Promise<boolean> {
+  const box = await inspectBox(run.deps.exec, [], project).catch(() => undefined)
+  if (box?.running) return true
+  for (const { container } of siblingContainers({ project })) {
+    const sibling = await inspectBox(run.deps.exec, [], container).catch(() => undefined)
+    if (sibling?.running) return true
+  }
+  return false
+}
+
 async function sweepOthers(run: Run, projects: readonly string[]): Promise<void> {
   const here = run.deps.config.project
   // Every record, not the newest-200 display list: an older session must keep its box up.
   const states = listHostStates(path.join(run.deps.config.home, "workspaces"), Number.POSITIVE_INFINITY)
   for (const project of projects) {
     if (project === here) continue
-    const box = await inspectBox(run.deps.exec, [], project).catch(() => undefined)
-    if (!box?.running) continue
     if ((await heldLeases(run, project)) > 0) continue
     if (states.some((state) => state.boxProject === project)) continue
+    const running = await anyProjectContainerRunning(run, project)
+    if (!running) {
+      await forgetGeneration(run.deps.config.home, project).catch(() => undefined)
+      continue
+    }
     await downProject(run, project).catch((error: unknown) => {
       run.note("warn", "empty sandbox was not stopped", { project, detail: error instanceof Error ? error.message.slice(0, 200) : "unknown" })
     })
+    await forgetGeneration(run.deps.config.home, project).catch(() => undefined)
   }
 }
 
@@ -440,13 +454,13 @@ async function stopSilentBoxes(run: Run): Promise<void> {
     }
     const now = run.deps.now()
     const stamp = await readSilent(home, project)
-    if (stamp === undefined || now - stamp.last > SILENT_GAP_MS) {
-      await writeSilent(home, project, { since: now, last: now })
+    if (stamp === undefined || now - stamp.last > SILENT_GAP_MS || stamp.startedAt !== box.startedAt) {
+      await writeSilent(home, project, { since: now, last: now, startedAt: box.startedAt })
       run.note("info", "old sandbox did not answer; it stays up for now", { project })
       continue
     }
     if (now - stamp.since < SILENT_BOX_WAIT_MS) {
-      await writeSilent(home, project, { since: stamp.since, last: now })
+      await writeSilent(home, project, { since: stamp.since, last: now, startedAt: box.startedAt })
       continue
     }
     const stopped = await downProject(run, project).then(
@@ -467,18 +481,19 @@ function silentPath(home: string, project: string): string | undefined {
   return path.join(home, "silent", project)
 }
 
-/** `<since> <last>`: when the silence began and the last check that found it. A one-number stamp has last = since. */
-type SilentStamp = { since: number; last: number }
+/** `<since> <last>[ <startedAt>]`: when the silence began, the last check, and the container's StartedAt. */
+type SilentStamp = { since: number; last: number; startedAt?: string }
 
 async function readSilent(home: string, project: string): Promise<SilentStamp | undefined> {
   const file = silentPath(home, project)
   if (!file) return undefined
   const raw = await readFile(file, "utf8").catch(() => undefined)
   if (raw === undefined) return undefined
-  const [since, last] = raw.trim().split(/\s+/).map(Number)
-  if (since === undefined || !Number.isFinite(since)) return undefined
-  const seen = last ?? since
-  return Number.isFinite(seen) ? { since, last: seen } : undefined
+  const [sinceRaw, lastRaw, startedAt] = raw.trim().split(/\s+/)
+  const since = sinceRaw === undefined ? Number.NaN : Number(sinceRaw)
+  if (!Number.isFinite(since)) return undefined
+  const seen = lastRaw === undefined ? since : Number(lastRaw)
+  return Number.isFinite(seen) ? { since, last: seen, ...(startedAt ? { startedAt } : {}) } : undefined
 }
 
 async function writeSilent(home: string, project: string, stamp: SilentStamp): Promise<void> {
@@ -486,7 +501,8 @@ async function writeSilent(home: string, project: string, stamp: SilentStamp): P
   if (!file) return
   await mkdir(path.dirname(file), { recursive: true })
   const tmp = `${file}.${process.pid}.tmp`
-  await writeFile(tmp, `${stamp.since} ${stamp.last}\n`)
+  const tail = stamp.startedAt ? ` ${stamp.startedAt}` : ""
+  await writeFile(tmp, `${stamp.since} ${stamp.last}${tail}\n`)
   await rename(tmp, file)
 }
 
