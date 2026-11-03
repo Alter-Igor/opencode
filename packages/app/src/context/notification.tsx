@@ -62,6 +62,14 @@ function pruneNotifications(list: Notification[]) {
   return pruned.slice(pruned.length - MAX_NOTIFICATIONS)
 }
 
+function synapseOutageText(error: EventSessionError["properties"]["error"] | undefined) {
+  if (!error || typeof error !== "object" || !("data" in error)) return undefined
+  const data = error.data
+  if (!data || typeof data !== "object" || !("message" in data)) return undefined
+  if (typeof data.message !== "string" || !data.message.includes("SYNAPSE_OUTAGE")) return undefined
+  return data.message
+}
+
 function createNotificationIndex(): NotificationIndex {
   return {
     session: {
@@ -369,27 +377,30 @@ function createServerNotificationState(input: {
     time: number,
   ) => {
     const sessionID = event.properties.sessionID
+    const error = "error" in event.properties ? event.properties.error : undefined
+    const outage = synapseOutageText(error)
     void lookup(directory, sessionID).then((session) => {
       if (meta.disposed) return
-      if (session?.parentID) return
+      if (session?.parentID && !outage) return
 
       if (settings.sounds.errorsEnabled()) {
         void playSoundById(settings.sounds.errors())
       }
 
-      const error = "error" in event.properties ? event.properties.error : undefined
+      const target = outage && session?.parentID ? session.parentID : sessionID
       append({
         directory,
         time,
-        viewed: viewedInCurrentSession(directory, sessionID),
+        viewed: viewedInCurrentSession(directory, target),
         type: "error",
-        session: sessionID ?? "global",
+        session: target ?? "global",
         error,
       })
       const description =
+        outage ??
         session?.title ??
         (typeof error === "string" ? error : language.t("notification.session.error.fallbackDescription"))
-      const href = sessionID ? `/${base64Encode(directory)}/session/${sessionID}` : `/${base64Encode(directory)}`
+      const href = target ? `/${base64Encode(directory)}/session/${target}` : `/${base64Encode(directory)}`
       if (settings.notifications.errors()) {
         void platform.notify(language.t("notification.session.error.title"), description, () => input.navigate(href))
       }

@@ -264,4 +264,54 @@ describe("internal notifications TUI plugin", () => {
       },
     ])
   })
+
+  test("raises an OS notification when a subagent hits a synapse outage", async () => {
+    const harness = await setup()
+    const message =
+      "SYNAPSE_OUTAGE Synapse is offline (transport timeout). This session waited 5s, 15s, 45s, 2m, and 5m. Do not immediately resend the same large task."
+
+    harness.emit({
+      id: "event-1",
+      type: "session.status",
+      properties: { sessionID: "subagent", status: { type: "busy" } },
+    })
+    harness.emit({
+      id: "event-2",
+      type: "session.error",
+      properties: { sessionID: "subagent", error: { name: "UnknownError", data: { message } } },
+    })
+
+    expect(harness.notifications).toEqual([
+      {
+        title: "Subagent session",
+        message,
+        notification: { when: "blurred" },
+        sound: { name: "error", when: "always" },
+      },
+    ])
+  })
+
+  test("keeps ordinary subagent errors sound-only", async () => {
+    const harness = await setup()
+
+    harness.emit({
+      id: "event-1",
+      type: "session.status",
+      properties: { sessionID: "subagent", status: { type: "busy" } },
+    })
+    harness.emit({
+      id: "event-2",
+      type: "session.error",
+      properties: { sessionID: "subagent", error: { name: "UnknownError", data: { message: "boom" } } },
+    })
+
+    expect(harness.notifications).toEqual([
+      {
+        title: "Subagent session",
+        message: "Session error",
+        notification: false,
+        sound: { name: "error", when: "always" },
+      },
+    ])
+  })
 })

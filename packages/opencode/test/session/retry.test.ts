@@ -4,8 +4,9 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { NamedError } from "@opencode-ai/core/util/error"
 import { APICallError } from "ai"
 import { setTimeout as sleep } from "node:timers/promises"
-import { Effect, Schedule, Schema } from "effect"
+import { Duration, Effect, Exit, Schedule, Schema } from "effect"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { ParentAlert } from "../../src/session/parent-alert"
 import { SessionRetry } from "../../src/session/retry"
 import { MessageV2 } from "../../src/session/message-v2"
 import { ProviderError } from "../../src/provider/error"
@@ -30,6 +31,29 @@ function apiError(headers?: Record<string, string>): SessionV1.APIError {
 
 function wrap(message: unknown): ReturnType<NamedError["toObject"]> {
   return { name: "", data: { message } }
+}
+
+const STALL =
+  "synapse_onprem_transport_timeout: The on-prem lane stopped sending response data mid-stream: no further bytes arrived for 30000 ms"
+
+function statusError(statusCode: number, message: string) {
+  return Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+    new SessionV1.APIError({
+      message,
+      isRetryable: true,
+      statusCode,
+    }).toObject(),
+  )
+}
+
+function stallError(headers?: Record<string, string>) {
+  return Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+    new SessionV1.APIError({
+      message: STALL,
+      isRetryable: true,
+      responseHeaders: headers,
+    }).toObject(),
+  )
 }
 
 describe("session.retry.delay", () => {
@@ -518,4 +542,111 @@ describe("session.message-v2.fromError", () => {
       message: "An error occurred while processing your request.",
     })
   })
+})
+
+describe("session.retry.outage", () => {
+  test("keeps the short delay list", () => {
+    const error = apiError()
+    const delays = Array.from({ length: 10 }, (_, index) => SessionRetry.delay(index + 1, error, 0))
+    expect(delays).toStrictEqual([2000, 4000, 8000, 16000, 30000, 30000, 30000, 30000, 30000, 30000])
+  })
+
+  test("outage delays are 5s, 15s, 45s, 2m, and 5m with no jitter", () => {
+    expect([1, 2, 3, 4, 5, 6].map((attempt) => SessionRetry.outageDelay(attempt))).toStrictEqual([
+      5000, 15000, 45000, 120000, 300000, 300000,
+    ])
+  })
+
+  test("synapse transport stalls and quiet streams use the long ladder", () => {
+    expect(SessionRetry.usesLongLadder(wrap(STALL))).toBe(true)
+    expect(SessionRetry.usesLongLadder(wrap("no further bytes arrived for 30000 ms"))).toBe(true)
+    expect(SessionRetry.retryable(wrap(STALL), retryProvider)).toEqual({ message: STALL })
+    expect(SessionRetry.retryable(wrap("no further bytes arrived for 30000 ms"), retryProvider)).toEqual({
+      message: "no further bytes arrived for 30000 ms",
+    })
+    const gateway = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "Bad gateway",
+        isRetryable: false,
+        statusCode: 502,
+      }).toObject(),
+    )
+    expect(SessionRetry.usesLongLadder(gateway)).toBe(true)
+  })
+
+  test("401, context overflow, and rate-limit text do not use the long ladder", () => {
+    const unauthorized = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "timeout",
+        isRetryable: true,
+        statusCode: 401,
+      }).toObject(),
+    )
+    expect(SessionRetry.usesLongLadder(unauthorized)).toBe(false)
+    expect(SessionRetry.delay(1, unauthorized, 0)).toBe(2000)
+
+    const overflow = new SessionV1.ContextOverflowError({
+      message: STALL,
+    }).toObject()
+    expect(SessionRetry.usesLongLadder(overflow)).toBe(false)
+    expect(SessionRetry.retryable(overflow, retryProvider)).toBeUndefined()
+    expect(SessionRetry.usesLongLadder(wrap("Provider is overloaded"))).toBe(false)
+    expect(SessionRetry.usesLongLadder(wrap("rate limit exceeded, request timeout"))).toBe(false)
+    expect(SessionRetry.usesLongLadder(wrap("fetch failed"))).toBe(true)
+    expect(SessionRetry.usesLongLadder(wrap("connect ETIMEDOUT"))).toBe(true)
+    expect(SessionRetry.usesLongLadder(statusError(500, "Internal Server Error"))).toBe(false)
+    expect(SessionRetry.usesLongLadder(statusError(400, "invalid_prompt"))).toBe(false)
+    expect(SessionRetry.usesLongLadder(statusError(403, "forbidden"))).toBe(false)
+    expect(SessionRetry.usesLongLadder(statusError(413, "payload too large"))).toBe(false)
+    expect(SessionRetry.usesLongLadder(statusError(429, "too many requests"))).toBe(false)
+    expect(SessionRetry.usesLongLadder(statusError(503, "bad gateway"))).toBe(true)
+    expect(SessionRetry.usesLongLadder(statusError(504, "gateway timeout"))).toBe(true)
+  })
+
+  test("the give-up sentence is used only after all five long waits", () => {
+    const stalled = stallError()
+    const gaveUp = ParentAlert.haltError(stalled, 5)
+    if (!SessionV1.APIError.isInstance(gaveUp)) throw new Error("expected APIError")
+    expect(gaveUp.data.message).toBe(ParentAlert.MESSAGE)
+    expect(gaveUp.data.metadata?.detail).toBe(STALL)
+    expect(ParentAlert.haltError(stalled, 4)).toBe(stalled)
+    const overloaded = wrap("Provider is overloaded")
+    expect(ParentAlert.haltError(overloaded, 5)).toBe(overloaded)
+  })
+
+  it.instance("policy waits on the long ladder and ignores retry-after", () =>
+    Effect.gen(function* () {
+      const step = yield* Schedule.toStep(
+        SessionRetry.policy({
+          provider: "test",
+          parse: Schema.decodeUnknownSync(SessionV1.APIError.Schema),
+          set: () => Effect.void,
+        }),
+      )
+      const delays = yield* Effect.forEach([1, 2, 3, 4, 5], () =>
+        step(0, stallError({ "retry-after-ms": "1" })).pipe(Effect.map((pair) => Duration.toMillis(pair[1]))),
+      )
+      expect(delays).toStrictEqual([5000, 15000, 45000, 120000, 300000])
+    }),
+  )
+
+  it.instance("toolStarted stops the long ladder", () =>
+    Effect.gen(function* () {
+      const attempts: number[] = []
+      const step = yield* Schedule.toStep(
+        SessionRetry.policy({
+          provider: "test",
+          parse: Schema.decodeUnknownSync(SessionV1.APIError.Schema),
+          progress: { toolStarted: true },
+          set: (info) =>
+            Effect.sync(() => {
+              attempts.push(info.attempt)
+            }),
+        }),
+      )
+      const exit = yield* Effect.exit(step(0, stallError()))
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(attempts).toStrictEqual([])
+    }),
+  )
 })
