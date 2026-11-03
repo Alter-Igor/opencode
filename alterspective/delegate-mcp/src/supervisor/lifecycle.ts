@@ -32,7 +32,7 @@ import { planFor, withSynapseModels, type Plan } from "./plan.ts"
 import { fsFailure, writeProfile, type PermissionRule, type ProfileFs } from "./profile.ts"
 import { createContext, lockOptions, traced, withLease, type Run } from "./run.ts"
 import { withStartLock, type Every } from "./start-lock.ts"
-import { place, statusOf, targetOf, type DelegateSupervisor, type ReplaceOptions, type ReplaceResult } from "./status.ts"
+import { place, releaseOwnLease, statusOf, targetOf, type DelegateSupervisor, type ReplaceOptions, type ReplaceResult } from "./status.ts"
 import { listHostStates } from "./workspaces-state.ts"
 
 export { FORWARDER_SIBLING_SERVICES, PASSWORD_ENV, boxEnvOverride, composeDownEnv, composeEnv, forwarderSiblingContainers, paths, siblingContainers } from "./compose-env.ts"
@@ -553,14 +553,6 @@ async function finishGeneration(run: Run): Promise<void> {
     run.note("warn", "idle sessions were not moved", { detail: error instanceof Error ? error.message.slice(0, 200) : "unknown" })
   })
   await sweepOthers(run, known)
-}
-
-/** Drop this bridge's lease file only. Do not stop the box: other sessions may still be on it. */
-async function releaseOwnLease(run: Run): Promise<void> {
-  if (!run.state.leased) return
-  await run.stopHeartbeat()
-  await run.leases.release(run.deps.bridgeId)
-  run.state.leased = false
 }
 
 async function beside(run: Run, made: Plan, next: string): Promise<ApiTarget> {

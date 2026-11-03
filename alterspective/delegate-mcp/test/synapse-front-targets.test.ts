@@ -247,6 +247,14 @@ describe("#206 and #180 follow-ups", () => {
     expect(await refreshIfDue(d)).toEqual({ outcome: "fresh", reload: "reloaded" })
     expect(reloaded).toEqual([base.frontContainer, gen.frontContainer])
     expect((await readState(home))?.lastReloadFailedContainers).toBeUndefined()
+
+    // When a generation is forgotten (others.length === 0), reloadFronts prunes its stale entry.
+    failGen = true
+    await adopt(d, { accessToken: ACCESS, expiresInSec: 1000 })
+    expect((await readState(home))?.lastReloadFailedContainers?.[gen.frontContainer]).toBeDefined()
+    const baseOnly: SynapseDeps = { ...d, targets: async () => [base] }
+    await adopt(baseOnly, { accessToken: ACCESS, expiresInSec: 1000 })
+    expect((await readState(home))?.lastReloadFailedContainers).toBeUndefined()
   })
 
   test("#180 item 1 & #187: synapseReport checks other running fronts and sets ok:false when a secondary running front is empty", async () => {

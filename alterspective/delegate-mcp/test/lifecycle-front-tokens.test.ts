@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { mkdirSync, readFileSync } from "node:fs"
+import { existsSync, mkdirSync, readFileSync } from "node:fs"
 import path from "node:path"
 import { defaultConfig, mcpAllowPolicy } from "../src/shared/config.ts"
 import { BOX_MEM_LIMIT_ENV, FORWARDER_SIBLING_SERVICES, composeEnv, forwarderSiblingContainers } from "../src/supervisor/compose-env.ts"
@@ -54,7 +54,21 @@ describe("#187 and #206: re-binding active running box in statusOf and ensure", 
     expect(d.config.project).toBe("opencode-delegate")
     expect(bound).toEqual([NEXT, "opencode-delegate"])
 
-    // 3. Place back onto NEXT via statusOf, then stop NEXT and start base -> ensure() re-binds to base.
+    // 3. Acquire a lease on NEXT via ensure(), then stop NEXT and start base -> status() releases NEXT's lease and re-binds to base.
+    baseBox.running = false
+    projects[NEXT]!.running = true
+    await sup.ensure()
+    expect(d.config.project).toBe(NEXT)
+    const nextLease = path.join(home, "generations", NEXT, "leases", "bridge-a")
+    expect(existsSync(nextLease)).toBe(true)
+
+    projects[NEXT]!.running = false
+    baseBox.running = true
+    await sup.status()
+    expect(d.config.project).toBe("opencode-delegate")
+    expect(existsSync(nextLease)).toBe(false)
+
+    // 4. Place back onto NEXT via statusOf, then stop NEXT and start base -> ensure() re-binds to base.
     baseBox.running = false
     projects[NEXT]!.running = true
     await sup.status()
@@ -64,7 +78,7 @@ describe("#187 and #206: re-binding active running box in statusOf and ensure", 
     baseBox.running = true
     await sup.ensure()
     expect(d.config.project).toBe("opencode-delegate")
-    expect(bound).toEqual([NEXT, "opencode-delegate", NEXT, "opencode-delegate"])
+    expect(bound).toEqual([NEXT, "opencode-delegate", NEXT, "opencode-delegate", NEXT, "opencode-delegate"])
   })
 })
 

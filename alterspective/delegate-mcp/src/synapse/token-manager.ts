@@ -181,11 +181,17 @@ export async function publishAuthConf(deps: Pick<SynapseDeps, "targets" | "front
 export async function reloadFronts(deps: Pick<SynapseDeps, "targets" | "frontDir" | "exec" | "frontContainer" | "home" | "now" | "log">, options: { record?: boolean; component?: string } = {}): Promise<Reload> {
   const own = await reloadFront(deps, options)
   const others = await otherFronts(deps)
-  if (others.length === 0) return own
   const state = options.record === false ? undefined : await readState(deps.home)
   const failed: Record<string, { result: Reload; at: number; failures: number }> = { ...(state?.lastReloadFailedContainers ?? {}) }
-  delete failed[deps.frontContainer]
-  let changed = state?.lastReloadFailedContainers?.[deps.frontContainer] !== undefined
+  const live = new Set(others.map((o) => o.frontContainer))
+  let changed = false
+  for (const name of Object.keys(failed)) {
+    if (!live.has(name)) {
+      delete failed[name]
+      changed = true
+    }
+  }
+  if (others.length === 0 && !changed) return own
   for (const other of others) {
     if (!(await isFrontRunning(deps.exec, other.frontContainer))) {
       if (failed[other.frontContainer] !== undefined) {

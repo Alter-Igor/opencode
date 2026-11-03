@@ -102,6 +102,14 @@ export function place(run: Run, project: string): void {
   ctx.deps.onBound?.(project)
 }
 
+/** Drop this bridge's lease file only. Do not stop the box: other sessions may still be on it. */
+export async function releaseOwnLease(run: Run): Promise<void> {
+  if (!run.state.leased) return
+  await run.stopHeartbeat()
+  await run.leases.release(run.deps.bridgeId)
+  run.state.leased = false
+}
+
 /**
  * #187 / #206: when the bound project is not running, check whether the base project or a known
  * generation IS running (preferring the generation that matches this bridge's image, then the base
@@ -117,6 +125,7 @@ async function resolveRunningBox(run: Run): Promise<BoxInspect | undefined> {
   for (const candidate of candidates) {
     const box = await inspectBox(deps.exec, INSPECT_ENV, candidate)
     if (box?.running) {
+      await releaseOwnLease(run)
       place(run, candidate)
       return box
     }
