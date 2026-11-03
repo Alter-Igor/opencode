@@ -70,7 +70,7 @@ describe("unsetEnvReferences (#24)", () => {
     }
   })
 
-  test("ignores inline // trailing comments and /* ... */ block comments outside strings", () => {
+  test("ignores inline // trailing comments, CR-only line endings, and /* ... */ block comments outside strings", () => {
     delete process.env[MISSING]
     delete process.env[MISSING_COMMENT]
     const text = [
@@ -84,6 +84,9 @@ describe("unsetEnvReferences (#24)", () => {
       "}",
     ].join("\n")
     expect(unsetEnvReferences(text)).toEqual([MISSING])
+
+    const crOnly = `{\r  // commented "{env:${MISSING_COMMENT}}"\r  "active": "{env:${MISSING}}"\r}`
+    expect(unsetEnvReferences(crOnly)).toEqual([MISSING])
   })
 
   test("preserves URLs and comment-like tokens inside string literals including escaped quotes", () => {
@@ -172,9 +175,9 @@ describe("unsetEnvReferences (#24)", () => {
             ])
             const invalidExit = yield* Config.use.getGlobal().pipe(Effect.provide(errorLogger), Effect.exit)
             expect(Exit.isFailure(invalidExit)).toBe(true)
-            if (Exit.isFailure(invalidExit)) {
-              expect((Cause.squash(invalidExit.cause) as { name?: string })?.name).toBe("ConfigJsonError")
-            }
+            expect(
+              Exit.isFailure(invalidExit) ? (Cause.squash(invalidExit.cause) as { name?: string })?.name : undefined,
+            ).toBe("ConfigJsonError")
             expect(
               errorMessages.some(
                 (item) =>

@@ -32,14 +32,14 @@ export function stripJsonComments(text: string): string {
     }
     if (ch === "/" && text[i + 1] === "/") {
       i += 2
-      while (i < text.length && text[i] !== "\n") i += 1
-      if (i < text.length) out += "\n"
+      while (i < text.length && text[i] !== "\n" && text[i] !== "\r") i += 1
+      if (i < text.length) out += text[i]
       continue
     }
     if (ch === "/" && text[i + 1] === "*") {
       i += 2
       while (i < text.length && !(text[i] === "*" && text[i + 1] === "/")) {
-        if (text[i] === "\n") out += "\n"
+        if (text[i] === "\n" || text[i] === "\r") out += text[i]
         i += 1
       }
       if (i < text.length) i += 1
