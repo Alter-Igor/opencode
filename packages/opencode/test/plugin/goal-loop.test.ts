@@ -4,7 +4,7 @@ import type { Event, Message, Part } from "@opencode-ai/sdk"
 import fs from "fs/promises"
 import os from "os"
 import path from "path"
-import { GOAL_DEFAULTS, GoalLoopPlugin, type CheckResult } from "../../src/plugin/goal-loop"
+import { GOAL_DEFAULTS, GoalLoopPlugin, type CheckResult, type GoalState } from "../../src/plugin/goal-loop"
 
 const SESSION = "ses_goal_test"
 

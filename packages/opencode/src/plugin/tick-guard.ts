@@ -14,7 +14,8 @@ export type TickMessage = {
     role: string
     synthetic?: boolean
   }
-  parts?: { synthetic?: boolean }[]
+  // Optional `type` overlaps real message parts, so Part[] assigns here.
+  parts?: { type?: string; synthetic?: boolean }[]
 }
 
 export type TickDecision = { send: true } | { send: false; reason: "busy" | "unanswered" }
