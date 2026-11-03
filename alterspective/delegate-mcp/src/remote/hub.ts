@@ -170,6 +170,10 @@ export function createRemoteHub(options: RemoteHubOptions): DelegateHub {
         state: "starting",
         summary: `Remote task ${sessionID} is starting`,
       })
+      if (!info.timer) {
+        info.timer = setInterval(() => void pollSession(sessionID), pollIntervalMs)
+        void pollSession(sessionID)
+      }
       info.watchdogCancel = timers.setTimeout(() => {
         info.watchdogCancel = undefined
         if (info.startedSinceSend || (info.cachedState !== "starting" && info.cachedState !== "idle")) {

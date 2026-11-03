@@ -103,4 +103,41 @@ describe("independent remote adapter containment", () => {
       await hub.stop()
     }
   })
+
+  it("restarts polling on markSent after a settled idle session stopped its timer (#254)", async () => {
+    const sessionID = "ses_0123456789abcdef"
+    let remoteState: RemoteTaskState = "done"
+    const client: RemoteCodingAgentClient = {
+      health: async () => ({ healthy: true }),
+      readiness: async () => { throw new Error("unused") },
+      startTask: async () => { throw new Error("unused") },
+      getTask: async () => stubTask(remoteState),
+      getPatch: async () => "",
+      cancelTask: async () => ({ cancelled: true }),
+    }
+    const hub = createRemoteHub({ client, startWatchdogMs: 60, pollIntervalMs: 15 })
+    const observed: HubEvent[] = []
+    const unsubscribe = hub.subscribe((ev) => observed.push(ev))
+    try {
+      const firstCursor = hub.cursor()
+      hub.track(sessionID, "/sessions/s-1234567890")
+      const firstWait = await hub.wait({ sessionIDs: [sessionID], until: ["idle"], timeoutMs: 500, cursor: firstCursor })
+      expect(firstWait.timedOut).toBe(false)
+      expect((await hub.view(sessionID)).state).toBe("idle")
+
+      observed.length = 0
+      hub.sendStarting?.(sessionID)
+      hub.markSent(sessionID)
+      expect((await hub.view(sessionID)).state).toBe("starting")
+
+      remoteState = "running"
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      expect(observed.some((e) => e.state === "busy")).toBe(true)
+      expect(observed.some((e) => e.state === "not_started")).toBe(false)
+      expect((await hub.view(sessionID)).state).toBe("busy")
+    } finally {
+      unsubscribe()
+      await hub.stop()
+    }
+  })
 })
