@@ -303,16 +303,23 @@ describe("REST stream fallback (#80 follow-up)", () => {
 
 describe("diagnostics log isolation (#80 follow-up)", () => {
   test("under test the diagnostics log goes to the test home, never the real home", async () => {
-    const testHome = process.env.OPENCODE_TEST_HOME
-    expect(testHome).toBeTruthy()
-    const dir = diagnosticsLogDir()
-    expect(dir?.startsWith(testHome!)).toBe(true)
-    const marker = `isolation-${Date.now()}-${Math.random().toString(36).slice(2)}`
-    sessionObserver.logDiagnostic({ timestamp: new Date().toISOString(), type: "AUTH_EVENT", details: { marker } })
-    await new Promise((r) => setTimeout(r, 100))
-    expect(await fs.readFile(path.join(dir!, "diagnostics.log"), "utf8")).toContain(marker)
-    const real = path.join(os.homedir(), ".local", "share", "opencode", "log", "diagnostics.log")
-    expect(await fs.readFile(real, "utf8").catch(() => "")).not.toContain(marker)
+    const prevTestHome = process.env.OPENCODE_TEST_HOME
+    expect(prevTestHome).toBeTruthy()
+    const isolatedHome = await fs.mkdtemp(path.join(prevTestHome!, "diag-home-"))
+    process.env.OPENCODE_TEST_HOME = isolatedHome
+    try {
+      const dir = diagnosticsLogDir()
+      expect(dir?.startsWith(isolatedHome)).toBe(true)
+      const marker = `isolation-${Date.now()}-${Math.random().toString(36).slice(2)}`
+      sessionObserver.logDiagnostic({ timestamp: new Date().toISOString(), type: "AUTH_EVENT", details: { marker } })
+      await new Promise((r) => setTimeout(r, 100))
+      expect(await fs.readFile(path.join(dir!, "diagnostics.log"), "utf8")).toContain(marker)
+      const real = path.join(os.homedir(), ".local", "share", "opencode", "log", "diagnostics.log")
+      expect(await fs.readFile(real, "utf8").catch(() => "")).not.toContain(marker)
+    } finally {
+      process.env.OPENCODE_TEST_HOME = prevTestHome
+      await fs.rm(isolatedHome, { recursive: true, force: true })
+    }
   })
 })
 
