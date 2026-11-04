@@ -49,6 +49,9 @@ export function sourceVersion(root = fileURLToPath(new URL("../../../..", import
 }
 
 export const InstallationVersion =
-  typeof OPENCODE_VERSION === "string" && OPENCODE_VERSION !== "local" ? OPENCODE_VERSION : sourceVersion()
-export const InstallationChannel = typeof OPENCODE_CHANNEL === "string" ? OPENCODE_CHANNEL : "alterspective"
+  typeof OPENCODE_VERSION === "string" && OPENCODE_VERSION !== "local"
+    ? OPENCODE_VERSION
+    : process.env.OPENCODE_VERSION?.trim() || sourceVersion()
+export const InstallationChannel =
+  typeof OPENCODE_CHANNEL === "string" ? OPENCODE_CHANNEL : process.env.OPENCODE_CHANNEL?.trim() || "alterspective"
 export const InstallationLocal = InstallationChannel === "local"

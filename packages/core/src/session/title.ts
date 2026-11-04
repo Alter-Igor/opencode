@@ -16,6 +16,7 @@ import type { SessionRunnerModel } from "./runner/model.js"
 import { SessionSchema } from "./schema.js"
 import { SessionUsage } from "./usage.js"
 import { SessionStore } from "./store.js"
+import { isDeletingSession } from "./deleting.js"
 
 const MAX_LENGTH = 100
 const MAX_CONTEXT_LENGTH = 8_000
@@ -59,15 +60,14 @@ export const layer = Layer.effect(
       const chunks: string[] = []
       let failed = false
       let usage: SessionUsage.Recorded | undefined
-      const recordUsage = Effect.suspend(() =>
-        usage
-          ? bus.publish(SessionEvent.UsageRecorded, {
-              sessionID: input.session.id,
-              source: "title",
-              ...usage,
-            })
-          : Effect.void,
-      )
+      const recordUsage = Effect.gen(function* () {
+        if (!usage || isDeletingSession(input.session.id) || !(yield* store.get(input.session.id))) return
+        yield* bus.publish(SessionEvent.UsageRecorded, {
+          sessionID: input.session.id,
+          source: "title",
+          ...usage,
+        })
+      })
       const prepared = yield* context.request.title({
         session: input.session,
         agent: input.agent.id,
@@ -139,7 +139,7 @@ export const layer = Layer.effect(
       if (!title) return
       const expectedSequence = (yield* Bus.latestSequence(db, sessionID)) + 1
       const current = yield* store.get(sessionID)
-      if (!current || current.title !== session.title || current.title === truncate(title)) return
+      if (!current || isDeletingSession(sessionID) || current.title !== session.title || current.title === truncate(title)) return
       yield* bus
         .publish(
           SessionEvent.Renamed,

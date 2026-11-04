@@ -7,7 +7,7 @@ export function smallModelDelegationPrompt(limit?: number): string {
   const limitClause = limit ? ` (${limit} tokens)` : ""
   return [
     `CRITICAL CONTEXT LIMIT: Your active model has a small context window${limitClause}.`,
-    "To prevent context overflow and degraded performance, you MUST delegate heavy exploration, multi-file reading, and wide searches to subagents using the task tool (e.g. subagent_type: 'explore').",
+    "To prevent context overflow and degraded performance, you MUST delegate heavy exploration, multi-file reading, and wide searches to subagents using the subagent tool (agent: 'explore') or task tool (e.g. subagent_type: 'explore').",
     "Do not read large files or run open-ended searches directly in this main session.",
     "Always instruct the subagent to return only a concise 3-5 bullet point summary of its findings.",
   ].join(" ")
@@ -16,8 +16,8 @@ export function smallModelDelegationPrompt(limit?: number): string {
 export function toolRestrictedMessage(tool: string): string {
   return [
     `Context limit protection: Direct "${tool}" is restricted in the main session for this model to conserve context.`,
-    `You MUST call the task tool with subagent_type: 'explore' to search or inspect files.`,
-    `Example: { "subagent_type": "explore", "description": "Search codebase", "prompt": "Find target code and return file:line citations and a short summary." }`,
+    `You MUST call the subagent tool (agent: 'explore') or task tool with subagent_type: 'explore' to search or inspect files.`,
+    `Example: { "agent": "explore", "description": "Search codebase", "prompt": "Find target code and return file:line citations and a short summary." } (or { "subagent_type": "explore", ... })`,
   ].join(" ")
 }
 
@@ -81,6 +81,12 @@ export async function SmallModelDelegationPlugin(_input: PluginInput): Promise<H
       if (!RESTRICTED_TOOLS.has(input.tool)) return
 
       throw new Error(toolRestrictedMessage(input.tool))
+    },
+    event: async ({ event }) => {
+      if (event.type === "session.deleted") {
+        const id = (event.properties as any)?.sessionID || (event.properties as any)?.info?.id || (event.properties as any)?.id
+        if (typeof id === "string") activeSessions.delete(id)
+      }
     },
   }
 }

@@ -10,27 +10,42 @@ const REFRESH_REUSE_MS = 60_000
 type SharedResponse = { status: number; statusText: string; headers: [string, string][]; body: string }
 const refreshes = new Map<string, Promise<SharedResponse>>()
 
-export const refreshSingleFlightFetch: FetchLike = (url: string | URL, init?: RequestInit) => {
-  const params = init?.method === "POST" && init.body instanceof URLSearchParams ? init.body : undefined
-  const token = params?.get("grant_type") === "refresh_token" ? params.get("refresh_token") : null
-  if (!token) return fetch(url, init)
-  const key = `${String(url)} ${createHash("sha256").update(token).digest("hex")}`
-  let shared = refreshes.get(key)
-  if (!shared) {
-    shared = fetch(url, init).then(async (res) => ({
-      status: res.status,
-      statusText: res.statusText,
-      headers: [...res.headers],
-      body: await res.text(),
-    }))
-    refreshes.set(key, shared)
-    shared.then(
-      () => setTimeout(() => refreshes.delete(key), REFRESH_REUSE_MS).unref(),
-      () => refreshes.delete(key),
-    )
+export function makeRefreshSingleFlightFetch(baseFetch: FetchLike = fetch): FetchLike {
+  return (url: string | URL, init?: RequestInit) => {
+    const params = init?.body instanceof URLSearchParams ? init.body : undefined
+    const token = params?.get("grant_type") === "refresh_token" ? params.get("refresh_token") : null
+    if (!token) return baseFetch(url, init)
+    const clientId = params?.get("client_id") ?? ""
+    const key = `${String(url)}\u0000${clientId}\u0000${createHash("sha256").update(token).digest("hex")}`
+    let shared = refreshes.get(key)
+    if (!shared) {
+      shared = baseFetch(url, init).then(async (res) => ({
+        status: res.status,
+        statusText: res.statusText,
+        headers: [...res.headers],
+        body: await res.text(),
+      }))
+      refreshes.set(key, shared)
+      shared.then(
+        (r) => {
+          if (r.status >= 200 && r.status < 300) {
+            setTimeout(() => {
+              if (refreshes.get(key) === shared) refreshes.delete(key)
+            }, REFRESH_REUSE_MS).unref()
+          } else if (refreshes.get(key) === shared) {
+            refreshes.delete(key)
+          }
+        },
+        () => {
+          if (refreshes.get(key) === shared) refreshes.delete(key)
+        },
+      )
+    }
+    return shared.then((r) => new Response(r.body, { status: r.status, statusText: r.statusText, headers: r.headers }))
   }
-  return shared.then((r) => new Response(r.body, { status: r.status, statusText: r.statusText, headers: r.headers }))
 }
+
+export const refreshSingleFlightFetch: FetchLike = makeRefreshSingleFlightFetch(fetch)
 
 export function parseRedirectUri(redirectUri?: string): { port: number; path: string } {
   if (!redirectUri) {

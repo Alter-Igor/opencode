@@ -92,7 +92,7 @@ const decodeSerializedEvent = (event: SerializedEvent): Event.Payload => {
     created: event.created ?? 0,
     type: definition.type,
     durable: envelope(event.aggregateID, event.seq, definition.durable.version),
-    data: decodeStoredData(definition, event.data),
+    data: redactedDurableEventData(definition.type, decodeStoredData(definition, event.data)),
   }
 }
 
@@ -348,7 +348,13 @@ export function configured(options?: Options) {
                             stored.type === versionedType(definition.type, durable.version) &&
                             stored.created === (event.created ?? 0) &&
                             // Rows written before a payload rename compare in their upgraded shape.
-                            isDeepStrictEqual(SessionLegacy.event(definition.type, stored.data), encode())
+                            isDeepStrictEqual(
+                              redactedDurableEventData(
+                                definition.type,
+                                SessionLegacy.event(definition.type, stored.data),
+                              ),
+                              encode(),
+                            )
                           ) {
                             if (input.ownerID && row?.ownerID == null) {
                               yield* db
@@ -523,7 +529,7 @@ export function configured(options?: Options) {
               ...(options?.metadata ? { metadata: options.metadata } : {}),
               type: definition.type,
               ...(location ? { location } : {}),
-              data: definition.durable ? redactedDurableEventData(definition.type, data) : data,
+              data: redactedDurableEventData(definition.type, data),
             } as Event.Payload
           })
 
@@ -667,7 +673,7 @@ export function configured(options?: Options) {
                   id: event.id,
                   created: event.created ?? 0,
                   type: definition.type,
-                  data: decodeStoredData(definition, event.data),
+                  data: redactedDurableEventData(definition.type, decodeStoredData(definition, event.data)),
                 } as Event.Payload
                 const committed = yield* commitDurableEvent(definition, payload, {
                   seq: event.seq,

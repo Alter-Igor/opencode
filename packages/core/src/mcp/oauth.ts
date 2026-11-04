@@ -26,35 +26,15 @@ import { OauthCallbackPage } from "../oauth/page.js"
 import type { Integration } from "../integration.js"
 import { ErrorSummary } from "../util/error-summary.js"
 import { McpAllow } from "./allowlist.js"
+import { makeRefreshSingleFlightFetch } from "./oauth-provider.js"
 
 /** Client ID Metadata Document: servers that support CIMD accept this URL as the client_id without registration. */
 export const CLIENT_METADATA_URL = "https://opencode.ai/oauth/opencode/client.json"
 
 // Refresh tokens rotate, so concurrent refreshes of the same token share one request or the second gets invalid_grant.
-const refreshes = new Map<string, ReturnType<FetchLike>>()
-
-const refreshKey = (url: string | URL, init: RequestInit | undefined) => {
-  if (!(init?.body instanceof URLSearchParams) || init.body.get("grant_type") !== "refresh_token") return undefined
-  return [String(url), init.body.get("client_id") ?? "", init.body.get("refresh_token") ?? ""].join("\u0000")
-}
-
-// Bun's and Node's fetch types both apply here and the SDK's FetchLike wants Bun's Response, so the
-// overload is picked by annotation and clone() is pinned to the type it was called on. A tool call
-// can stay silent for minutes, so Bun's idle deadline is off; the MCP execution timeout still applies.
+// Keep the resolved response cached for 60s so callers that read the old token right before it rotated also share it (#41).
 const base: FetchLike = noTimeoutFetch
-const share = (pending: ReturnType<FetchLike>) => pending.then((response) => response.clone() as typeof response)
-
-const send: FetchLike = (url, init) => {
-  const key = refreshKey(url, init)
-  if (key === undefined) return base(url, init)
-  const current = refreshes.get(key)
-  if (current) return share(current)
-  const pending = base(url, init).finally(() => {
-    if (refreshes.get(key) === pending) refreshes.delete(key)
-  })
-  refreshes.set(key, pending)
-  return share(pending)
-}
+const send: FetchLike = makeRefreshSingleFlightFetch(base as any) as unknown as FetchLike
 
 export const loggedFetch = (fields: { readonly server: string; readonly directory?: string }) =>
   Effect.gen(function* () {
@@ -277,6 +257,7 @@ export const connectProvider = Effect.fnUntraced(function* (input: {
   readonly config: typeof ConfigMCP.Remote.Type
   readonly integrationID: Integration.ID
 }) {
+  if (input.config.oauth === false) return provider({ config: input.config, store: memoryStore() })
   const credentials = yield* Credential.Service
   const run = Effect.runPromiseWith(yield* Effect.context())
   const found = (yield* credentials.list(input.integrationID)).at(-1)
@@ -341,6 +322,9 @@ export const authorize = (input: {
     const allowed = McpAllow.check(input.name, input.config as McpAllow.ConfigMCPV1.Info)
     if (!allowed.ok) {
       return yield* Effect.fail(new Error(McpAllow.blockedMessage(allowed.reason)))
+    }
+    if (input.config.oauth === false) {
+      return yield* Effect.fail(new Error(`MCP server "${input.name}" has OAuth explicitly disabled`))
     }
     const fields = { server: input.name, methodID: input.methodID, oauthAttemptID: crypto.randomUUID() }
     const context = yield* Effect.context()

@@ -679,6 +679,7 @@ export function createData(config: CreateDataInput) {
     activeUpdates?.set(sessionID, undefined)
     store.session.pending[sessionID]?.forEach((item) => outbox.delete(item.id))
     messageIndex.delete(sessionID)
+    messageLoads.delete(sessionID)
     sync.invalidate(`session:${sessionID}`)
     sync.invalidate(`session.family:${sessionID}`)
     sync.invalidate(`session.pending:${sessionID}`)
@@ -716,9 +717,13 @@ export function createData(config: CreateDataInput) {
             .then((active) => {
               if (activeUpdates !== updates) return
               // Lifecycle events received during hydration supersede the snapshot.
-              const snapshot = new Map<string, DataSessionStatus>(Object.keys(active).map((id) => [id, "running"]))
+              const snapshot = new Map<string, DataSessionStatus>(
+                Object.keys(active)
+                  .filter((id) => !deletedAt.has(id))
+                  .map((id) => [id, "running"]),
+              )
               updates.forEach((status, id) => {
-                if (status === undefined) return snapshot.delete(id)
+                if (status === undefined || deletedAt.has(id)) return snapshot.delete(id)
                 snapshot.set(id, status)
               })
               activeUpdates = undefined
@@ -809,6 +814,7 @@ export function createData(config: CreateDataInput) {
         return
       }
       case "session.renamed": {
+        if (deletedAt.has(event.data.sessionID)) return
         // Preserve the live title when it races the session's initial read.
         refresh(() => {
           const family = sync.pending(`session.family:${event.data.sessionID}`)
@@ -1152,6 +1158,7 @@ export function createData(config: CreateDataInput) {
         })
         return
       case "session.execution.started":
+        if (deletedAt.has(event.data.sessionID)) return
         setSessionActive(event.data.sessionID, "running")
         // Revalidate so `time.busy` follows the projected execution start.
         if (!store.session.info[event.data.sessionID] && !sync.has(`session:${event.data.sessionID}`)) return
@@ -1173,6 +1180,7 @@ export function createData(config: CreateDataInput) {
       case "session.execution.succeeded":
       case "session.execution.failed":
       case "session.execution.interrupted":
+        if (deletedAt.has(event.data.sessionID)) return
         setSessionActive(event.data.sessionID, "idle")
         message.update(event.data.sessionID, (draft) => {
           const currentAssistant = message.activeAssistant(draft)
@@ -1211,6 +1219,7 @@ export function createData(config: CreateDataInput) {
         refresh(() => result.session.sync(event.data.sessionID))
         return
       case "session.viewed":
+        if (deletedAt.has(event.data.sessionID)) return
         if (!store.session.info[event.data.sessionID] && !sync.has(`session:${event.data.sessionID}`)) return
         result.session.invalidate(event.data.sessionID)
         refresh(() => result.session.sync(event.data.sessionID))
@@ -1224,6 +1233,7 @@ export function createData(config: CreateDataInput) {
           setStore("session", "info", event.data.sessionID, "revert", undefined)
         return
       case "session.revert.committed":
+        if (deletedAt.has(event.data.sessionID)) return
         if (store.session.info[event.data.sessionID]) {
           setStore("session", "info", event.data.sessionID, "revert", undefined)
         }
@@ -1600,7 +1610,7 @@ export function createData(config: CreateDataInput) {
             pendingUpdates.set(sessionID, updates)
             try {
               const snapshot = await api().session.inbox.list({ sessionID }).catch(evictMissing)
-              if ((deletedAt.get(sessionID) ?? 0) > started) return
+              if (deletedAt.has(sessionID) || (deletedAt.get(sessionID) ?? 0) > started) return
               // Events can overtake this HTTP response on a remote connection.
               // Reconcile them before an older snapshot can resurrect delivered input.
               const current = new Map(snapshot.map((item) => [item.id, item]))
@@ -1794,7 +1804,9 @@ export function createData(config: CreateDataInput) {
             api().session.get({ sessionID }).catch(evictMissing),
             options?.children ? listChildren({ parentID: sessionID, order: "desc", limit: CHILD_PAGE }) : [],
           ])
-          const sessions = [info, ...children].filter((session) => (deletedAt.get(session.id) ?? 0) <= started)
+          const sessions = [info, ...children].filter(
+            (session) => !deletedAt.has(session.id) && (deletedAt.get(session.id) ?? 0) <= started,
+          )
           batch(() => {
             setStore(
               "session",
@@ -1804,7 +1816,6 @@ export function createData(config: CreateDataInput) {
               }),
             )
             for (const session of sessions) {
-              clearDeleted(session.id)
               sync.complete(`session:${session.id}`)
               registerSession(session.id)
             }
@@ -1833,7 +1844,7 @@ export function createData(config: CreateDataInput) {
                 order: "desc",
               })
               .catch(evictMissing)
-            if ((deletedAt.get(sessionID) ?? 0) > started) return
+            if (deletedAt.has(sessionID) || (deletedAt.get(sessionID) ?? 0) > started) return
             const fetched = response.data.toReversed().map(stored)
             // Same protection as the pending sync: a re-fetch racing an
             // admission must not wipe its local transcript row.
@@ -1887,7 +1898,8 @@ export function createData(config: CreateDataInput) {
             if ((!options?.all && published) || signal?.aborted) return
           }
           const cursor = store.session.messageCursor[sessionID]
-          if (!cursor || signal?.aborted) return
+          if (!cursor || signal?.aborted || deletedAt.has(sessionID)) return
+          const started = deletionEpoch
           setStore("session", "messageLoading", sessionID, true)
           const request = (async () => {
             const fetched: SessionMessageInfo[] = []
@@ -1901,11 +1913,12 @@ export function createData(config: CreateDataInput) {
                 },
                 { signal },
               )
-              if (signal?.aborted) return
+              if (signal?.aborted || deletedAt.has(sessionID) || (deletedAt.get(sessionID) ?? 0) > started) return
               fetched.push(...response.data.map(stored))
               next = response.cursor.next ?? undefined
               if (!options?.all) break
             } while (next)
+            if (deletedAt.has(sessionID) || (deletedAt.get(sessionID) ?? 0) > started) return
             // A jump through history publishes once, not once per page of offscreen messages.
             const existing = store.session.message[sessionID] ?? []
             const ids = new Set(existing.map((item) => item.id))
@@ -1921,7 +1934,10 @@ export function createData(config: CreateDataInput) {
             .catch((error) => {
               if (!signal?.aborted) throw error
             })
-            .finally(() => setStore("session", "messageLoading", sessionID, false))
+            .finally(() => {
+              if (!deletedAt.has(sessionID) && (deletedAt.get(sessionID) ?? 0) <= started)
+                setStore("session", "messageLoading", sessionID, false)
+            })
           track(messageLoads, sessionID, request)
           await request
         },
@@ -1942,7 +1958,7 @@ export function createData(config: CreateDataInput) {
           return sync.run(`session.permission:${sessionID}`, async () => {
             const started = deletionEpoch
             const list = await api().permission.list({ sessionID }).catch(evictMissing)
-            if ((deletedAt.get(sessionID) ?? 0) > started) return
+            if (deletedAt.has(sessionID) || (deletedAt.get(sessionID) ?? 0) > started) return
             setStore("session", "permission", sessionID, list)
           })
         },
@@ -1992,7 +2008,7 @@ export function createData(config: CreateDataInput) {
             }
             const started = deletionEpoch
             const list = await api().session.form.list({ sessionID }).catch(evictMissing)
-            if ((deletedAt.get(sessionID) ?? 0) > started) return
+            if (deletedAt.has(sessionID) || (deletedAt.get(sessionID) ?? 0) > started) return
             setStore("session", "form", sessionID, list)
           })
         },

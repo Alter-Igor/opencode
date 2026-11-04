@@ -27,11 +27,13 @@ import { Snapshot } from "../../snapshot.js"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
 import { llmClient } from "../../effect/app-node-platform.js"
 import { StepFailedError } from "../error.js"
+import { ParentAlert } from "../parent-alert.js"
 import { SessionRunnerRetry } from "./retry.js"
 import { SessionStep } from "./step.js"
 import { ToolOutput } from "../../tool-output.js"
 import { Plugin } from "../../plugin.js"
 import { PluginHooks } from "../../plugin/hooks.js"
+import { TOOL_CALL_MARKUP_REPAIR_PROMPT, takePendingMarkupRepair } from "../../plugin/synapse.js"
 import { MAX_STEPS_PROMPT } from "./max-steps.js"
 
 const CONTINUE_AFTER_INCOMPLETE_STREAM =
@@ -311,9 +313,30 @@ const layer = Layer.effect(
                   .pipe(Effect.map((result) => result.status === "completed"))
               : Effect.succeed(false),
           ),
-        })
+        }).pipe(
+          Effect.tapErrorTag("Session.StepFailedError", (err) =>
+            loaded.model.ref.providerID === "synapse" &&
+            loaded.session.parentID &&
+            (err.error.message === ParentAlert.MESSAGE || ParentAlert.usesLongLadder(err.error))
+              ? bus
+                  .publish(SessionEvent.Synthetic, {
+                    sessionID: loaded.session.parentID,
+                    text: ParentAlert.MESSAGE,
+                  })
+                  .pipe(Effect.ignore)
+              : Effect.void,
+          ),
+        )
         const completed = yield* SessionStep.Outcome.$match(outcome, {
           Completed: Effect.fnUntraced(function* (outcome) {
+            if (!outcome.needsContinuation && !stepLimitReached && loaded.model.ref.providerID === "synapse") {
+              yield* Effect.promise(() => Promise.resolve())
+              if (takePendingMarkupRepair(sessionID, assistantMessageID)) {
+                yield* bus.publish(SessionEvent.Synthetic, { sessionID, text: TOOL_CALL_MARKUP_REPAIR_PROMPT })
+                assistantMessageID = SessionMessage.ID.create()
+                return true
+              }
+            }
             // The Session is about to go idle, which leaves the background summary time to finish.
             if (!outcome.needsContinuation)
               yield* compaction.precompute(

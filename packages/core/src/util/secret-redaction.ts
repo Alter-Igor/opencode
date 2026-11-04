@@ -213,8 +213,9 @@ export function redactToolResult(
   if (!result) return 0
   const { scrub, changed } = scrubber()
   if (typeof result.output === "string") result.output = scrub(result.output)
+  else if (result.output && typeof result.output === "object") result.output = scrub(result.output)
   if (typeof result.title === "string") result.title = scrub(result.title)
-  if (result.metadata && typeof result.metadata === "object") scrub(result.metadata)
+  if (result.metadata && typeof result.metadata === "object") result.metadata = scrub(result.metadata)
   // An MCP tool's hook payload is the raw MCP result: core builds the stored text from its text
   // items and embedded resource text after the hook (architect on #26). Image and blob data are
   // left alone, so a binary payload is never altered.
@@ -264,8 +265,17 @@ export function redactToolPart(part: { type?: unknown; state?: unknown } | undef
   if (Array.isArray(state.content) && !Object.isFrozen(state.content)) {
     for (const item of state.content) {
       if (!item || typeof item !== "object" || Object.isFrozen(item)) continue
-      const entry = item as { type?: unknown; text?: unknown }
+      const entry = item as { type?: unknown; text?: unknown; resource?: { text?: unknown } }
       if (entry.type === "text" && typeof entry.text === "string") entry.text = scrub(entry.text)
+      if (
+        entry.type === "resource" &&
+        entry.resource &&
+        typeof entry.resource === "object" &&
+        !Object.isFrozen(entry.resource) &&
+        typeof entry.resource.text === "string"
+      ) {
+        entry.resource.text = scrub(entry.resource.text)
+      }
     }
   }
   return changed()
@@ -321,6 +331,45 @@ export function redactedDurableEventData<T>(type: string, data: T): T {
     }
     return data
   }
+  if (type === "session.message.content.updated") {
+    const record = data as Record<string, unknown>
+    if (Array.isArray(record.content)) {
+      return {
+        ...record,
+        content: record.content.map((part: unknown) =>
+          part && typeof part === "object" ? redactedToolPart(part as { type?: unknown }) : part,
+        ),
+      } as T
+    }
+    return data
+  }
+  if (type === "session.inbox.enqueued") {
+    const record = data as Record<string, unknown>
+    if (
+      record.item &&
+      typeof record.item === "object" &&
+      (record.item as { type?: unknown }).type === "synthetic"
+    ) {
+      return { ...record, item: redactedCopy(record.item) } as T
+    }
+    return data
+  }
+  if (type === "session.synthetic") {
+    const record = data as Record<string, unknown>
+    const next = { ...record }
+    if (typeof next.text === "string") next.text = redactSecrets(next.text)
+    if (typeof next.description === "string") next.description = redactSecrets(next.description)
+    if (next.metadata !== undefined && typeof next.metadata !== "string") next.metadata = redactedCopy(next.metadata)
+    return next as T
+  }
+  if (type === "message.part.delta") {
+    const record = data as Record<string, unknown>
+    if (typeof record.delta === "string") {
+      const delta = redactSecrets(record.delta)
+      return delta === record.delta ? data : ({ ...record, delta } as T)
+    }
+    return data
+  }
   if (
     type.startsWith("session.tool.") ||
     type.startsWith("session.shell.") ||
@@ -328,7 +377,7 @@ export function redactedDurableEventData<T>(type: string, data: T): T {
     type.startsWith("session.next.shell.")
   ) {
     const next = { ...(data as Record<string, unknown>) }
-    for (const field of ["command", "output", "text", "title"]) {
+    for (const field of ["command", "output", "text", "title", "delta"]) {
       if (typeof next[field] === "string") next[field] = redactSecrets(next[field] as string)
     }
     for (const field of ["input", "structured", "metadata", "error", "result", "provider", "shell", "output"]) {
@@ -337,10 +386,19 @@ export function redactedDurableEventData<T>(type: string, data: T): T {
     if (Array.isArray(next.content)) {
       next.content = next.content.map((item: unknown) => {
         if (!item || typeof item !== "object") return item
-        const entry = item as { type?: unknown; text?: unknown }
+        const entry = item as { type?: unknown; text?: unknown; resource?: { text?: unknown } }
         if (entry.type === "text" && typeof entry.text === "string") {
           const text = redactSecrets(entry.text)
           return text === entry.text ? item : { ...item, text }
+        }
+        if (
+          entry.type === "resource" &&
+          entry.resource &&
+          typeof entry.resource === "object" &&
+          typeof entry.resource.text === "string"
+        ) {
+          const text = redactSecrets(entry.resource.text)
+          return text === entry.resource.text ? item : { ...item, resource: { ...entry.resource, text } }
         }
         return item
       })

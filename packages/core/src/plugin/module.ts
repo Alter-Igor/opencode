@@ -6,13 +6,14 @@ import { GuiBundle, type Source } from "@opencode/schema/plugin"
 import { createPluginSources } from "@opencode/plugin/source"
 import { Hash } from "@opencode/util/hash"
 import { Npm } from "@opencode/util/npm"
-import { Deferred, Effect, FiberSet, PubSub, Schema, Stream } from "effect"
+import { Deferred, Effect, FiberSet, Option, PubSub, Schema, Stream } from "effect"
 import path from "path"
 import { readFile, stat } from "node:fs/promises"
 import { fileURLToPath, pathToFileURL } from "url"
 import type { ConfigPluginSource } from "../config/plugin/source.js"
 import type { Generation } from "../plugin.js"
 import { PluginPromise } from "./promise.js"
+import { fromLegacyV1Plugin, type V1PluginFn } from "./v1-adapter.js"
 import { Config } from "../config.js"
 import { ManagedPolicy } from "../managed-policy.js"
 import { Watcher } from "../filesystem/watcher.js"
@@ -173,6 +174,29 @@ const loadServer = Effect.fn("PluginModule.loadServer")(function* (
   const loaded = yield* Effect.promise(() =>
     sources ? sources.read(entrypoint) : Host.load(entrypoint).then((module) => ({ module, version: revision })),
   )
+  const decoded = Schema.decodeUnknownOption(Module)(loaded.module)
+  if (Option.isSome(decoded)) {
+    const value = decoded.value.default
+    return { plugin: "effect" in value ? value : PluginPromise.fromPromise(value), version: loaded.version }
+  }
+  const mod = loaded.module as Record<string, unknown> | undefined
+  if (mod && typeof mod === "object") {
+    const fns =
+      typeof mod.default === "function"
+        ? [mod.default as V1PluginFn]
+        : Object.values(mod).filter((v): v is V1PluginFn => typeof v === "function")
+    if (fns.length > 0) {
+      const id = path.basename(entrypoint).replace(/\.(ts|tsx|js|mjs|cjs)$/, "") || entrypoint
+      const fn: V1PluginFn =
+        fns.length === 1
+          ? fns[0]!
+          : async (input) => {
+              const all = await Promise.all(fns.map((f) => f(input)))
+              return Object.assign({}, ...all)
+            }
+      return { plugin: fromLegacyV1Plugin(id, fn), version: loaded.version }
+    }
+  }
   const value = (yield* Schema.decodeUnknownEffect(Module)(loaded.module).pipe(
     Effect.mapError(
       (cause) =>

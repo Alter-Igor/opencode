@@ -202,7 +202,7 @@ const plugin = async (input: PluginInput): Promise<Hooks & { dispose: () => Prom
         sessionModels.set(hookInput.sessionID, `${hookInput.model.providerID}/${hookInput.model.modelID}`)
       } else {
         try {
-          const result = await input.client.session.get({ path: { id: hookInput.sessionID } })
+          const result = await input.client?.session?.get?.({ path: { id: hookInput.sessionID } })
           const session: any = (result as any)?.data ?? result
           const modelId = session?.modelID ?? "unknown"
           const providerId = session?.providerID ?? "unknown"

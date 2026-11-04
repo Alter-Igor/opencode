@@ -270,13 +270,20 @@ export function createServerNotificationState(input: {
     })
   }
 
-  const handleSessionError = (sessionID: string, eventID: string) => {
+  const handleSessionError = (sessionID: string, eventID: string, errorMessage?: string) => {
     void lookup(sessionID).then((session) => {
       if (disposed.value) return
 
-      if (session?.parentID) return
+      const outage = errorMessage?.includes("SYNAPSE_OUTAGE") ?? false
 
-      const hasOpenTab = sessionIDHasOpenTab(tabs.store, input.key, sessionID)
+      if (session?.parentID && !outage) return
+
+      const targetSessionID =
+        session?.parentID && outage && !sessionIDHasOpenTab(tabs.store, input.key, sessionID)
+          ? input.data.session.root(sessionID)
+          : sessionID
+
+      const hasOpenTab = sessionIDHasOpenTab(tabs.store, input.key, targetSessionID)
 
       if (hasOpenTab && settings.sounds.errorsEnabled()) {
         void input.coordinator.sound(`${input.key}\0${eventID}`, () => playSoundById(settings.sounds.errors()))
@@ -287,7 +294,7 @@ export function createServerNotificationState(input: {
       if (hasOpenTab && settings.notifications.errors()) {
         void input.coordinator.system(`${input.key}\0${eventID}`, () =>
           platform.notify(language.t("notification.session.error.title"), description, () =>
-            openNotificationSession(tabs, input.key, sessionID),
+            openNotificationSession(tabs, input.key, targetSessionID),
           ),
         )
       }
@@ -356,7 +363,7 @@ export function createServerNotificationState(input: {
     }
 
     if (event.type === "session.execution.failed") {
-      handleSessionError(event.data.sessionID, event.id)
+      handleSessionError(event.data.sessionID, event.id, event.data.error?.message)
 
       return
     }

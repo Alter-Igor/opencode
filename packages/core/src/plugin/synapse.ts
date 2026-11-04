@@ -280,6 +280,13 @@ export function resetMarkupRepairState(sessionID?: string): void {
   if (sessionID) {
     pendingMarkupRepairs.delete(sessionID)
     sessionsWithActiveToolCalls.delete(sessionID)
+    for (const key of sessionsWithActiveToolCalls) {
+      if (key.startsWith(`${sessionID}:`)) sessionsWithActiveToolCalls.delete(key)
+    }
+    countedMarkupMessages.delete(sessionID)
+    for (const key of countedMarkupMessages) {
+      if (key.startsWith(`${sessionID}:`)) countedMarkupMessages.delete(key)
+    }
     return
   }
   pendingMarkupRepairs.clear()
@@ -1093,6 +1100,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
           key: cred.token,
           metadata: {
             clientId: cred.clientId ?? "ai-office-cli",
+            ...(cred.clientSecret ? { clientSecret: cred.clientSecret } : {}),
             refreshToken: cred.refreshToken,
             expiresAt: String(cred.expiresAt),
           },
@@ -1224,6 +1232,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
         process.env.GPAAS_API_KEY?.trim() ||
         ""
       const isModelsCli = process.argv.includes("models")
+      modelsTarget = synapseModelsTarget(cfg, inferenceUrl)
       if (!hadConfiguredSynapse && !storedCred && !staticKey && !isModelsCli) {
         return
       }
@@ -1268,13 +1277,14 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
             baseURL: inferenceUrl,
             headers: {
               "x-task-type": "code",
+              ...(privacyTier ? { "x-privacy-tier": privacyTier } : {}),
             },
           }
         }
 
         const resolvedKey = authData.type === "api" ? authData.key : authData.type === "oauth" ? authData.access : ""
         const isJwtToken = resolvedKey.startsWith("eyJ")
-        bridgeMode = isJwtToken
+        bridgeMode = isJwtToken && !audienceIsSynapse(resolvedKey)
 
         return {
           apiKey: isJwtToken ? "oauth-synapse-bearer" : resolvedKey,
@@ -1379,7 +1389,8 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
             // token minted for the MCP resource URI (older logins) falls back to the
             // MCP bridge - which cannot carry tool schemas, so models there can only
             // guess text tool calls.
-            if (activeToken.startsWith("eyJ") && !audienceIsSynapse(activeToken) && rawMessages.length > 0) {
+            bridgeMode = activeToken.startsWith("eyJ") && !audienceIsSynapse(activeToken)
+            if (bridgeMode && rawMessages.length > 0) {
                 // The bridge chat tool has no tier knob; evaluate the tracker so a
                 // persistently failing bridge session still reaches the human gate (AIESC-03).
                 escalations.resolveTier(sessionKey, "premium")
@@ -1777,8 +1788,13 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
               }
             }
 
-            headers.set("authorization", `Bearer ${activeToken}`)
-            headers.set("x-api-key", activeToken)
+            if (activeToken && activeToken !== "synapse-local") {
+              headers.set("authorization", `Bearer ${activeToken}`)
+              headers.set("x-api-key", activeToken)
+            } else {
+              headers.delete("authorization")
+              headers.delete("x-api-key")
+            }
             headers.set("x-task-type", virtualRoute?.taskType ?? "code")
             if (virtualRoute?.role) headers.set("x-synapse-role", virtualRoute.role)
             if (virtualRoute?.qualityTier && !headers.has("x-quality-tier")) {
@@ -2166,16 +2182,24 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                     },
                     fetcher,
                   )
+                  const metadata = {
+                    clientId: HANDOFF_APP_ID,
+                    clientSecret: process.env[CLIENT_SECRET_ENV] || "",
+                    refreshToken: tokens.refresh_token || "",
+                    expiresAt: String(Date.now() + (tokens.expires_in ?? 3600) * 1000),
+                  }
+                  await saveSynapseCredential({
+                    token: tokens.access_token,
+                    refreshToken: metadata.refreshToken,
+                    expiresAt: Number(metadata.expiresAt),
+                    clientId: metadata.clientId,
+                    ...(metadata.clientSecret ? { clientSecret: metadata.clientSecret } : {}),
+                  })
                   return {
                     type: "success" as const,
                     provider: "synapse",
                     key: tokens.access_token,
-                    metadata: {
-                      clientId: HANDOFF_APP_ID,
-                      clientSecret: process.env[CLIENT_SECRET_ENV] || "",
-                      refreshToken: tokens.refresh_token || "",
-                      expiresAt: String(Date.now() + (tokens.expires_in ?? 3600) * 1000),
-                    },
+                    metadata,
                   }
                 } catch (error) {
                   reportAuthFailure(error)
@@ -2201,10 +2225,20 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
     event: async ({ event }) => {
       const sessionID =
         event.type === "session.idle" || event.type === "session.deleted"
-          ? ((event.properties as any)?.sessionID || (event.properties as any)?.id)
+          ? ((event.properties as any)?.sessionID || (event.properties as any)?.info?.id || (event.properties as any)?.id)
           : undefined
       if (sessionID && (event.type === "session.idle" || event.type === "session.deleted")) {
         await sessionObserver.finalizeSessionRetrospective(sessionID, input.directory)
+      }
+      if (sessionID && event.type === "session.idle") {
+        pendingMarkupRepairs.delete(sessionID)
+      }
+      if (event.type === "session.tool.input.started") {
+        const props = (event.properties ?? {}) as { sessionID?: string; assistantMessageID?: string }
+        if (props.sessionID && props.assistantMessageID) {
+          sessionsWithActiveToolCalls.add(`${props.sessionID}:${props.assistantMessageID}`)
+          pendingMarkupRepairs.delete(props.sessionID)
+        }
       }
       // AIESC follow-up (#15): completed sessions free their tracker slot.
       if (sessionID && event.type === "session.deleted") {
@@ -2234,10 +2268,11 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
     "experimental.text.complete": async (textInput, textOutput) => {
       const { sessionID, messageID, partID } = textInput
       const hasMarkup = containsToolCallMarkup(textOutput.text)
-      const hadNativeTools = sessionsWithActiveToolCalls.has(`${sessionID}:${messageID}`)
+      const markupKey = `${sessionID}:${messageID}`
+      const hadNativeTools = sessionsWithActiveToolCalls.has(markupKey)
       if (hasMarkup && !hadNativeTools) {
-        if (!countedMarkupMessages.has(messageID)) {
-          countedMarkupMessages.add(messageID)
+        if (!countedMarkupMessages.has(markupKey)) {
+          countedMarkupMessages.add(markupKey)
           if (countedMarkupMessages.size > 500) {
             const oldest = countedMarkupMessages.values().next().value
             if (oldest !== undefined) countedMarkupMessages.delete(oldest)
@@ -2269,7 +2304,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
         )
         return
       }
-      if (!hasMarkup && textOutput.text.trim().length > 0) {
+      if (!hasMarkup && !countedMarkupMessages.has(markupKey) && textOutput.text.trim().length > 0) {
         escalations.recordSuccess(sessionID)
         pendingMarkupRepairs.delete(sessionID)
       }
@@ -2543,14 +2578,16 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
             codeToReview = codeToReview.slice(0, 50_000) + "\n\n...[Truncated for Review]"
           }
 
-          let token = ""
-          try {
-            // Global.Path.home is os.homedir() unless OPENCODE_TEST_HOME is set (tests).
-            const homedir = Global.Path.home
-            const authPath = path.join(homedir, ".local", "share", "opencode", "auth.json")
-            const authContent = JSON.parse(await fs.readFile(authPath, "utf8"))
-            token = authContent.synapse?.key || authContent.synapse?.access_token || ""
-          } catch {}
+          let token = (await synapseToolToken().catch(() => undefined)) || ""
+          if (!token) {
+            try {
+              // Global.Path.home is os.homedir() unless OPENCODE_TEST_HOME is set (tests).
+              const homedir = Global.Path.home
+              const authPath = path.join(homedir, ".local", "share", "opencode", "auth.json")
+              const authContent = JSON.parse(await fs.readFile(authPath, "utf8"))
+              token = authContent.synapse?.key || authContent.synapse?.access_token || authContent.synapse?.access || ""
+            } catch {}
+          }
 
           if (!token) {
             return "Synapse is not authenticated. Please run /login first."
@@ -2576,6 +2613,7 @@ export async function SynapseAuthPlugin(input: PluginInput, options?: SynapsePlu
                 "Content-Type": "application/json",
                 Accept: "application/json, text/event-stream",
                 Authorization: `Bearer ${token}`,
+                ...(privacyTier ? { "x-privacy-tier": privacyTier } : {}),
               },
               body: JSON.stringify({
                 jsonrpc: "2.0",

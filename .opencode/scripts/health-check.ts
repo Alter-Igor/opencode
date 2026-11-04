@@ -39,6 +39,8 @@ function readOpencodeVersion(): string {
   // Walk up from .opencode/scripts/ to repo root, then packages/opencode/package.json.
   const here = dirname(fileURLToPath(import.meta.url))
   const candidates = [
+    pathResolve(here, "..", "..", "packages", "cli", "package.json"),
+    pathResolve(here, "..", "..", "packages", "core", "package.json"),
     pathResolve(here, "..", "..", "packages", "opencode", "package.json"),
     pathResolve(here, "..", "..", "package.json"),
   ]
@@ -60,9 +62,15 @@ type UpstreamStatus =
   | { ok: false; status: number | null; error: string }
 
 async function probeUpstream(signal: AbortSignal): Promise<UpstreamStatus> {
-  const url = `${OPENCODE_SERVER_URL.replace(/\/$/, "")}/global/health`
+  const baseUrl = OPENCODE_SERVER_URL.replace(/\/$/, "")
   try {
-    const res = await fetch(url, { signal, method: "GET" })
+    const res = await fetch(`${baseUrl}/global/health`, { signal, method: "GET" })
+    if (res.status === 404) {
+      const v2Res = await fetch(`${baseUrl}/api/info`, { signal, method: "GET" })
+      if (!v2Res.ok) return { ok: false, status: v2Res.status, error: `upstream returned ${v2Res.status}` }
+      const v2Body = (await v2Res.json()) as { version?: string }
+      return { ok: true, status: v2Res.status, version: typeof v2Body.version === "string" ? v2Body.version : null }
+    }
     if (!res.ok) return { ok: false, status: res.status, error: `upstream returned ${res.status}` }
     const body = (await res.json()) as { healthy?: boolean; version?: string }
     if (body.healthy !== true) return { ok: false, status: res.status, error: "upstream not healthy" }

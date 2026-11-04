@@ -154,7 +154,7 @@ export function malformedToolCallFromEvent(event: {
   const part = event.properties?.part
   if (!part || part.type !== "tool" || part.state?.status !== "error") return undefined
   const error = typeof part.state.error === "string" ? part.state.error : ""
-  if (!/tried to call unavailable tool|no such tool/i.test(error)) return undefined
+  if (!/tried to call unavailable tool|no such tool|^unknown tool:/i.test(error)) return undefined
   const sessionID = part.sessionID ?? event.properties?.sessionID
   if (!sessionID) return undefined
   return { sessionID, partID: typeof part.id === "string" ? part.id : undefined }

@@ -15,7 +15,10 @@ WORKDIR /src
 COPY . .
 RUN bun install --frozen-lockfile
 # --single builds the native linux-x64 (glibc) binary only; the web UI is not needed headless.
-RUN cd packages/opencode && bun run script/build.ts --single --skip-embed-web-ui
+RUN cd packages/cli && bun run script/build.ts --single --skip-web-ui \
+  && if [ -x dist/cli-linux-x64/bin/opencode ] && [ ! -x dist/opencode-linux-x64/bin/opencode ]; then \
+       mkdir -p dist/opencode-linux-x64/bin && cp dist/cli-linux-x64/bin/opencode dist/opencode-linux-x64/bin/opencode; \
+     fi
 
 FROM oven/bun:1.3.14-slim
 ARG GH_VERSION=2.62.0
@@ -35,7 +38,7 @@ RUN apt-get update \
 # in the first real run the agent spent 39 shell calls working out why (fork issue #47).
 # Copying the node image's /usr/local replaces that shim and leaves bun in place.
 COPY --from=node:22-bookworm-slim /usr/local /usr/local
-COPY --from=build /src/packages/opencode/dist/opencode-linux-x64/bin/opencode /usr/local/bin/opencode
+COPY --from=build /src/packages/cli/dist/opencode-linux-x64/bin/opencode /usr/local/bin/opencode
 COPY alterspective/sandbox-worker/supervisor /opt/sbxw/supervisor
 COPY alterspective/sandbox-worker/plugins /opt/sbxw/plugins
 # #118: the in-sandbox egress lockdown. ROOT runs it before the supervisor and before any agent process (it refuses otherwise):

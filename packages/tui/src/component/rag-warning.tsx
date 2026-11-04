@@ -39,7 +39,7 @@ export function RagWarningBanner() {
         <text fg={theme.text.base}>
           Alterspective RAG is not connected. Canonical operating rules & standards from RAG are unavailable.
         </text>
-        <text fg={theme.text.muted}>(Open /mcp to connect)</text>
+        <text fg={theme.text.muted}>(Open /mcps to connect)</text>
       </box>
     </Show>
   )

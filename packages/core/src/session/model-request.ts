@@ -313,10 +313,17 @@ export const layer = Layer.effect(
       const providerOptions = Object.fromEntries(entries.filter(([k]) => !GENERATION_KEYS.has(k)))
       const affinity = SessionAffinity.get(session)
       const supportsImageInput = model.capabilities.input.some((item) => item.startsWith("image"))
-      const hasSynapseVisionTool = hooked.has("synapse_vision")
+      const hasSynapseVisionTool =
+        hooked.has("synapse_vision") && (shaped as { toolChoice?: { type?: string } }).toolChoice?.type !== "none"
+      const unsavableVisionNote =
+        "[An image was provided but could not be prepared for the synapse_vision tool (empty, an unsupported type such as SVG, or larger than 20 MB). Tell the user; do not guess what it shows.]"
       const visionSwappedMessages =
         !supportsImageInput && hasSynapseVisionTool
           ? yield* Effect.promise(async () => {
+              const swapImage = async (dataUrl: string | undefined, mime: string, name?: string) => {
+                const saved = dataUrl ? await saveImageToVisionTemp(dataUrl, mime).catch(() => undefined) : undefined
+                return saved ? swapMessagePartWithVisionNote(saved, name) : unsavableVisionNote
+              }
               const out: Array<Message> = []
               for (const msg of shaped.messages) {
                 if (msg.role !== "user" && msg.role !== "assistant" && msg.role !== "tool") {
@@ -327,17 +334,39 @@ export const layer = Layer.effect(
                 let changed = false
                 for (const part of msg.content) {
                   if (part.type === "media" && part.media.mediaType.toLowerCase().startsWith("image/")) {
+                    const src = part.media.source
                     const dataUrl =
-                      part.media.source.type === "base64"
-                        ? `data:${part.media.mediaType};base64,${part.media.source.data}`
-                        : undefined
-                    if (dataUrl) {
-                      const saved = await saveImageToVisionTemp(dataUrl, part.media.mediaType).catch(() => undefined)
-                      if (saved) {
-                        changed = true
-                        nextContent.push(Message.text(swapMessagePartWithVisionNote(saved, part.filename)))
-                        continue
+                      src.type === "base64"
+                        ? `data:${part.media.mediaType};base64,${src.data}`
+                        : src.type === "bytes"
+                          ? `data:${part.media.mediaType};base64,${Buffer.from(src.data).toString("base64")}`
+                          : src.type === "url"
+                            ? src.url
+                            : undefined
+                    changed = true
+                    nextContent.push(Message.text(await swapImage(dataUrl, part.media.mediaType, part.filename)))
+                    continue
+                  }
+                  if (part.type === "tool-result" && part.result.type === "content") {
+                    let toolChanged = false
+                    const nextValue: Array<Content> = []
+                    for (const item of part.result.value) {
+                      if (
+                        item.type === "file" &&
+                        item.mime.toLowerCase().startsWith("image/") &&
+                        !item.uri.startsWith("http://") &&
+                        !item.uri.startsWith("https://")
+                      ) {
+                        toolChanged = true
+                        nextValue.push({ type: "text", text: await swapImage(item.uri, item.mime, item.name) })
+                      } else {
+                        nextValue.push(item)
                       }
+                    }
+                    if (toolChanged) {
+                      changed = true
+                      nextContent.push({ ...part, result: { ...part.result, value: nextValue } })
+                      continue
                     }
                   }
                   nextContent.push(part)

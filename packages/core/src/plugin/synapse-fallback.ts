@@ -34,11 +34,14 @@ export function pinnedFallbackEnabled(env: Record<string, string | undefined> = 
   return !(value === "0" || value === "false" || value === "off" || value === "no")
 }
 
-/** A model the caller chose, as opposed to Synapse's own routing (`auto`). */
+import { resolveSynapseVirtualModel } from "./synapse-models.js"
+
+/** A model the caller chose, as opposed to Synapse's own routing (`auto` or virtual tiers/roles). */
 export function isPinnedModel(model: unknown): model is string {
   if (typeof model !== "string") return false
   const id = model.trim().toLowerCase()
-  return id !== "" && id !== SYNAPSE_AUTO_ROUTE && id !== `synapse/${SYNAPSE_AUTO_ROUTE}`
+  if (id === "" || id === SYNAPSE_AUTO_ROUTE || id === `synapse/${SYNAPSE_AUTO_ROUTE}`) return false
+  return resolveSynapseVirtualModel(id) === undefined
 }
 
 const CONTEXT_OR_VALIDATION =

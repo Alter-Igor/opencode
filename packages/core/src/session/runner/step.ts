@@ -18,6 +18,7 @@ import { ToolOutput } from "../../tool-output.js"
 import { QuestionTool } from "../../tool/plugin/question.js"
 import { StepFailedError } from "../error.js"
 import { SessionEvent } from "../event.js"
+import { ParentAlert } from "../parent-alert.js"
 import { SessionMessage } from "../message.js"
 import { SessionModelRequest } from "../model-request.js"
 import { SessionSchema } from "../schema.js"
@@ -213,7 +214,11 @@ export const make = Effect.gen(function* () {
           yield* publisher.startAssistant()
           return Outcome.Retry({ error: llmError, decision: retry })
         }
-        if (llmError) yield* publisher.failAssistant(llmError)
+        const finalLlmError =
+          llmError && input.model.ref.providerID === "synapse" && !retry?.retry && ParentAlert.usesLongLadder(llmError)
+            ? { ...llmError, message: ParentAlert.MESSAGE }
+            : llmError
+        if (finalLlmError) yield* publisher.failAssistant(finalLlmError)
 
         for (const decline of tools.declines)
           yield* publisher.failTool(decline.call.id, {

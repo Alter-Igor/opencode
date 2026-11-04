@@ -93,23 +93,25 @@ export function Home() {
         <box flexGrow={1} minHeight={0} />
         <box height={3} minHeight={0} flexShrink={1} />
         <box
+          width="100%"
+          maxWidth={75}
+          alignItems="flex-start"
+          paddingBottom={1}
           flexShrink={0}
           onSizeChange={function () {
             setLogoWidth(this.width)
           }}
         >
-          <box width="100%" maxWidth={75} alignItems="flex-start" paddingBottom={1}>
           <Logo />
           <box paddingTop={1} flexDirection="row" gap={1}>
-            <text fg={theme.hue.accent[500]}>●</text>
+            <text fg={theme.text.feedback.success.base}>●</text>
             <text fg={theme.text.muted}>v{app.version}</text>
           </box>
         </box>
-        </box>
         <box height={1} flexShrink={0} />
-        <RagWarningBanner />
         <UpdateNotification width={logoWidth()} />
         <box width="100%" maxWidth={75} zIndex={1000} paddingTop={1} flexShrink={0} position="relative">
+          <RagWarningBanner />
           <Prompt ref={bind} placeholders={placeholder} disabled={forms().length > 0} />
         </box>
         <box flexGrow={1} minHeight={0} />

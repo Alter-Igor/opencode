@@ -396,6 +396,7 @@ class Hub implements DelegateHub {
       case "message.role":
         return this.memory.role(raw.messageID, raw.role)
       case "text.final":
+        if (raw.assistant) this.memory.role(raw.messageID, "assistant")
         if (this.memory.shouldReport(raw.messageID, raw.partID)) this.news(raw, id)
         return
       case "todo":

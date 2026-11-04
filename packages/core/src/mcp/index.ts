@@ -19,6 +19,7 @@ import { Location } from "../location.js"
 import { waitForAbort } from "@opencode/util/process"
 import { State } from "../state.js"
 import type { McpClient } from "./client.js"
+import { McpAllow } from "./allowlist.js"
 import { McpConnection } from "./connection.js"
 
 export const ServerName = Schema.String.pipe(Schema.brand("MCP.ServerName"))
@@ -521,6 +522,13 @@ export const layer = (options?: Options) =>
       // fallback for its name; the lock only guards adding the finished connection to the stack.
       const attach = Effect.fnUntraced(function* (name: ServerName, transport: Transport) {
         const { McpClient } = yield* Effect.promise(() => import("./client.js"))
+        const allowed = McpAllow.check(name, { type: "local", command: ["attached"] })
+        if (!allowed.ok) {
+          return yield* new McpClient.ConnectError({
+            server: name,
+            message: McpAllow.blockedMessage(allowed.reason),
+          })
+        }
         const scope = yield* Effect.acquireRelease(Scope.fork(root), (scope) => Scope.close(scope, Exit.void))
         // The client registers its own close only once initialized; closing the scope mid-handshake (caller
         // interruption or Location shutdown) must still close the transport right away.

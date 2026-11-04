@@ -20,7 +20,7 @@ const patterns = [
   /too large for the model'?s configured input limit/i,
   // Cloudflare Workers AI reports this as HTTP 413.
   /exceeded this model context window limit/i,
-  /exceeds the context window/i,
+  /exceeds (?:the )?(?:largest feasible )?context window/i,
   /exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))/i,
   /input token count.*exceeds the maximum/i,
   // Amazon Nova on Bedrock reports this as a mid-stream validationException.
@@ -44,7 +44,7 @@ const patterns = [
   /context window exceeded/i,
   /exceeded model token limit/i,
   /context[_ ]length[_ ]exceeded/i,
-  /\bcontext_overflow\b/i,
+  /"(?:code|reason)"\s*:\s*"context_overflow"/i,
   /context length is only \d+ tokens/i,
   /input length.*exceeds.*context length/i,
   // Z.ai code 1261 arrives as `Prompt too long`, `Prompt exceeds max length` or `Prompt 超长`.

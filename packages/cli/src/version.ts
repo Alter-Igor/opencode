@@ -5,11 +5,14 @@ declare const OPENCODE_CHANNEL: string
 declare const OPENCODE_ARTIFACT: string
 declare const OPENCODE_RELEASE_HIGHLIGHTS: string
 
-const version = typeof OPENCODE_VERSION === "string" ? OPENCODE_VERSION : "local"
+const version =
+  typeof OPENCODE_VERSION === "string"
+    ? OPENCODE_VERSION.trim()
+    : process.env.OPENCODE_VERSION?.trim() || "local"
 const channel =
   typeof OPENCODE_CHANNEL === "string"
-    ? OPENCODE_CHANNEL
-    : process.env.OPENCODE_CHANNEL === "opencodealt"
+    ? OPENCODE_CHANNEL.trim()
+    : process.env.OPENCODE_CHANNEL?.trim() === "opencodealt"
       ? "opencodealt"
       : "local"
 const artifact = typeof OPENCODE_ARTIFACT === "string" ? OPENCODE_ARTIFACT : "cli"

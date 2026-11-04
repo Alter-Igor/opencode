@@ -20,6 +20,7 @@ export function providerCodes(value: unknown) {
     ...awsErrorType(decoded.code),
     decoded.error_type,
     error?.code,
+    error?.reason,
     error?.type,
     error?.status,
     error?.error_type,
