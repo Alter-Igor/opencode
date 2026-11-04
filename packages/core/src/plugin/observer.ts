@@ -34,7 +34,9 @@ function isMcpResult(value: unknown): value is { content: unknown[]; isError?: u
  */
 const NOT_A_FAILURE = [
   "Tool execution aborted",
+  "Tool execution interrupted",
   "The user rejected permission to use this specific tool call",
+  "The user declined this tool call",
   "The user has specified a rule which prevents you from using this specific tool call",
   "The user dismissed this question",
 ]

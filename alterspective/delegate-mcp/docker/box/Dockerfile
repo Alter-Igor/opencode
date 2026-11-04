@@ -20,8 +20,11 @@ ARG OPENCODE_VERSION=0.0.0-alterspective-local
 ENV OPENCODE_CHANNEL=alterspective \
     OPENCODE_VERSION=${OPENCODE_VERSION}
 # build.ts runs a --version smoke test of the produced binary before it returns.
-RUN bun run --cwd packages/opencode script/build.ts --single --skip-embed-web-ui --skip-install \
-    && test -x packages/opencode/dist/opencode-linux-x64/bin/opencode
+RUN bun run --cwd packages/cli script/build.ts --single --skip-web-ui --skip-install \
+    && if [ -x packages/cli/dist/cli-linux-x64/bin/opencode ] && [ ! -x packages/cli/dist/opencode-linux-x64/bin/opencode ]; then \
+         mkdir -p packages/cli/dist/opencode-linux-x64/bin && cp packages/cli/dist/cli-linux-x64/bin/opencode packages/cli/dist/opencode-linux-x64/bin/opencode; \
+       fi \
+    && test -x packages/cli/dist/opencode-linux-x64/bin/opencode
 
 # ---- stage 2: the runtime box ----
 FROM node:22-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d3a30b772c
@@ -34,7 +37,7 @@ RUN apt-get update \
 RUN npm install -g --no-audit --no-fund pnpm@11.28.2 \
     && pnpm --version
 # Root-owned, not writable by the agent user (review N1).
-COPY --from=build --chown=root:root --chmod=0755 /src/packages/opencode/dist/opencode-linux-x64/bin/opencode /usr/local/bin/opencode
+COPY --from=build --chown=root:root --chmod=0755 /src/packages/cli/dist/opencode-linux-x64/bin/opencode /usr/local/bin/opencode
 COPY --from=build --chown=root:root --chmod=0755 /usr/local/bin/bun /usr/local/bin/bun
 RUN useradd -m -u 10001 -s /bin/bash agent \
     && mkdir -p /data /sessions /handoff/in /handoff/out /profile \
@@ -64,4 +67,6 @@ LABEL org.opencontainers.image.title="opencode-delegate-box" \
 USER agent
 WORKDIR /sessions
 EXPOSE 4096
+HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
+    CMD curl -fsS -u "opencode:${OPENCODE_SERVER_PASSWORD:-}" http://127.0.0.1:4096/api/info >/dev/null || curl -fsS http://127.0.0.1:4096/global/health >/dev/null || exit 1
 CMD ["opencode", "serve", "--hostname", "0.0.0.0", "--port", "4096"]

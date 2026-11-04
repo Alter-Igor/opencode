@@ -1,9 +1,10 @@
-﻿export type ModelMessage = { role: string; content: unknown; [key: string]: unknown }
+export type ModelMessage = { role: string; content: unknown; [key: string]: unknown }
 export namespace Provider {
   export type Model = { capabilities: { input: { image?: boolean; [key: string]: unknown } }; [key: string]: unknown }
 }
 import { SYNAPSE_VISION_TOOL, saveImageForVision, visionNote } from "../plugin/synapse-vision.js"
 import { synapseAllowed } from "../plugin/synapse-models.js"
+import { forcedPrivacyTier } from "../plugin/synapse.js"
 
 export interface VisionProxyConfig {
   model: string
@@ -143,11 +144,13 @@ async function describeImage(
     max_tokens: 2000,
   }
 
+  const privacyTier = forcedPrivacyTier()
   const resp = await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${apiKey}`,
+      ...(privacyTier ? { "x-privacy-tier": privacyTier } : {}),
     },
     body: JSON.stringify(body),
   })

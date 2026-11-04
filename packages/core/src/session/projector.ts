@@ -292,7 +292,7 @@ function run(db: DatabaseService, event: MessageEvent) {
             })
             .run()
             .pipe(Effect.orDie)
-        else if (JSON.stringify(current.data) !== JSON.stringify(part))
+        else if (JSON.stringify(current.data) !== JSON.stringify(safePart))
           yield* db
             .update(SessionPartTable)
             .set({ ...columns, time_updated: event.created })
@@ -485,7 +485,7 @@ const encodeStored = (message: SessionMessage.Info | SessionStored.User) => {
       content: message.content.map((part) => (part.type === "tool" ? redactedToolPart(part) : part)),
     })
   }
-  if (message.type === "shell") {
+  if (message.type === "shell" || message.type === "synthetic") {
     return encodeMessage(redactedCopy(message))
   }
   return encodeMessage(message)
@@ -717,11 +717,12 @@ const layer = Layer.effectDiscard(
     )
     yield* bus.project(SessionEvent.InboxEnqueued, (event) =>
       Effect.gen(function* () {
+        const redacted = redactedDurableEventData(event.type, event.data)
         yield* SessionInbox.projectAdmitted(db, {
           enqueuedSeq: event.durable.seq,
-          id: event.data.inboxID,
-          sessionID: event.data.sessionID,
-          item: event.data.item,
+          id: redacted.inboxID,
+          sessionID: redacted.sessionID,
+          item: redacted.item,
           timeCreated: event.created,
         })
         yield* touch(db, event)

@@ -366,7 +366,7 @@ const make = Effect.gen(function* () {
       Effect.flatMap((method) => {
         if (method === "aio" || Opencodealt.enabled(OPENCODE_CHANNEL)) {
           return Effect.tryPromise<string, UpgradeError>({
-            try: () => Opencodealt.latest(OPENCODE_VERSION),
+            try: () => Opencodealt.latest(OPENCODE_VERSION, executable),
             catch: (cause) =>
               new UpgradeError(
                 {
@@ -394,11 +394,13 @@ const make = Effect.gen(function* () {
     if (process.platform !== "win32" || method === "brew") return effect
     // Only the installed binary is at stake; source checkouts run inside bun or node.
     const owned =
-      method === "curl"
-        ? executable === curlBinary
-        : method === "winget"
-          ? installedWinget
-          : installedPackage !== undefined
+      method === "aio"
+        ? Opencodealt.enabled(OPENCODE_CHANNEL) && path.basename(executable).toLowerCase() === "opencodealt.exe"
+        : method === "curl"
+          ? executable === curlBinary
+          : method === "winget"
+            ? installedWinget
+            : installedPackage !== undefined
     if (!owned) return effect
     return Effect.scoped(RetainedImage.retain(directory, "upgrade").pipe(Effect.andThen(effect))).pipe(
       Effect.provideService(FileSystem.FileSystem, fs),
@@ -440,15 +442,23 @@ const make = Effect.gen(function* () {
   }
 
   const upgrade = Effect.fnUntraced(function* (method: Method, input: string) {
-    if (method === "aio" || Opencodealt.enabled(OPENCODE_CHANNEL)) {
-      return yield* runUpgrade({
-        method: "aio",
-        command: Opencodealt.installCommand(),
-        title: "AI Office could not install OpenCode",
-        retry: "Run aio opencode install manually.",
-      }).pipe(Effect.asVoid)
-    }
     if (!parseReleaseVersion(input)) return yield* Effect.fail(new Error(`Invalid version: ${input}`))
+    if (method === "aio" || Opencodealt.enabled(OPENCODE_CHANNEL)) {
+      return yield* Effect.scoped(
+        Effect.gen(function* () {
+          yield* flock.acquire("cli-upgrade", undefined, { timeoutMs: Duration.toMillis("15 minutes") })
+          return yield* retaining(
+            "aio",
+            runUpgrade({
+              method: "aio",
+              command: Opencodealt.installCommand(executable),
+              title: "AI Office could not install OpenCode",
+              retry: "Run aio opencode install manually.",
+            }),
+          )
+        }),
+      ).pipe(Effect.asVoid)
+    }
     const version = input.trim().replace(/^v/, "")
     const packageName =
       method === "winget"

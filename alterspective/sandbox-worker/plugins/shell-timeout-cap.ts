@@ -14,13 +14,13 @@ export const ShellTimeoutCap = async () => {
   return {
     // The tool id is "bash" for every shell (packages/opencode/src/tool/shell/id.ts).
     "tool.definition": async (input: { toolID: string }, output: { description: string }) => {
-      if (input.toolID !== "bash") return
+      if (input.toolID !== "bash" && input.toolID !== "shell") return
       output.description = `${output.description}\n\nIn this sandbox a timeout above ${cap} ms is lowered to ${cap} ms.`
     },
     // Change the timeout in place: the same args object then reaches the tool
     // (packages/opencode/src/session/tools.ts). Replacing output.args would have no effect.
     "tool.execute.before": async (input: { tool: string; callID: string }, output: { args: { timeout?: unknown } }) => {
-      if (input.tool !== "bash") return
+      if (input.tool !== "bash" && input.tool !== "shell") return
       const asked = output.args?.timeout
       if (typeof asked !== "number" || asked <= cap) return
       output.args.timeout = cap

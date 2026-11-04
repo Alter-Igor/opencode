@@ -19,7 +19,7 @@ export type Raw =
   | { kind: "question.asked"; sessionID: string; requestID: string; count: number }
   | { kind: "question.done"; sessionID: string; requestID: string; rejected: boolean }
   | { kind: "message.role"; sessionID: string; messageID: string; role: "user" | "assistant" }
-  | { kind: "text.final"; sessionID: string; messageID: string; partID: string; text: string }
+  | { kind: "text.final"; sessionID: string; messageID: string; partID: string; text: string; assistant?: boolean }
   | { kind: "todo"; sessionID: string; total: number; done: number }
   | { kind: "mcp"; server: string }
   | { kind: "deleted"; sessionID: string }
@@ -31,14 +31,14 @@ export const isObj = (value: unknown): value is Obj => typeof value === "object"
 const str = (value: unknown): string | undefined => (typeof value === "string" && value.length > 0 ? value : undefined)
 const obj = (value: unknown): Obj => (isObj(value) ? value : {})
 
-/** OpenCode permission/question ids (id/id.ts): anything else is dropped, never echoed (W2C-03). */
-export const REQUEST_ID_RE = /^(per|que)_[A-Za-z0-9]{1,36}$/
+/** OpenCode permission/question/form ids (id/id.ts): anything else is dropped, never echoed (W2C-03). */
+export const REQUEST_ID_RE = /^(per|que|frm)_[A-Za-z0-9]{1,36}$/
 const requestId = (value: unknown): string | undefined => {
   const id = str(value)
   return id && REQUEST_ID_RE.test(id) ? id : undefined
 }
 
-/** Parse one SSE data string. Tolerates the per-instance /event shape (a bare payload) too. */
+/** Parse one SSE data string. Tolerates the per-instance /event shape (a bare payload) and V2 /api/event wire shape too. */
 export function unwrap(data: string): Wrapper | undefined {
   let parsed: unknown
   try {
@@ -50,7 +50,9 @@ export function unwrap(data: string): Wrapper | undefined {
   const payload = isObj(parsed.payload) ? parsed.payload : parsed
   const type = str(payload.type)
   if (!type) return undefined
-  return { directory: str(parsed.directory), type, props: obj(payload.properties) }
+  const directory = str(parsed.directory) ?? str(obj(parsed.location).directory)
+  const props = isObj(payload.properties) ? payload.properties : obj(payload.data)
+  return { directory, type, props }
 }
 
 export function sessionOf(raw: Raw): string | undefined {
@@ -77,8 +79,20 @@ function permission(type: string, p: Obj): Raw | undefined {
   if (!sessionID) return undefined
   if (type === "permission.asked") {
     const requestID = requestId(p.id)
-    const patterns = Array.isArray(p.patterns) ? p.patterns.length : 0
-    return requestID ? { kind: "permission.asked", sessionID, requestID, permission: str(p.permission) ?? "unknown", patterns } : undefined
+    const patterns = Array.isArray(p.patterns)
+      ? p.patterns.length
+      : Array.isArray(p.resources)
+        ? p.resources.length
+        : 0
+    return requestID
+      ? {
+          kind: "permission.asked",
+          sessionID,
+          requestID,
+          permission: str(p.permission) ?? str(p.action) ?? "unknown",
+          patterns,
+        }
+      : undefined
   }
   if (type !== "permission.replied") return undefined
   const requestID = requestId(p.requestID)
@@ -130,7 +144,12 @@ function sessionInfo(p: Obj): Raw | undefined {
   const info = obj(p.info)
   const sessionID = str(p.sessionID) ?? str(info.id)
   if (!sessionID) return undefined
-  return { kind: "info", sessionID, parentID: str(info.parentID), directory: str(info.directory) }
+  return {
+    kind: "info",
+    sessionID,
+    parentID: str(info.parentID) ?? str(p.parentID),
+    directory: str(info.directory) ?? str(obj(p.location).directory),
+  }
 }
 
 /** An instance (one directory) or the whole server was disposed: runs may have ended unseen (W2A-10). */
@@ -148,6 +167,84 @@ function other(type: string, p: Obj): Raw | undefined {
   if (type === "session.deleted") {
     const sessionID = str(p.sessionID) ?? str(obj(p.info).id)
     return sessionID ? { kind: "deleted", sessionID } : undefined
+  }
+  if (type === "session.execution.started") {
+    const sessionID = str(p.sessionID)
+    return sessionID ? { kind: "status", sessionID, status: "busy" } : undefined
+  }
+  if (type === "session.execution.succeeded" || type === "session.execution.interrupted") {
+    const sessionID = str(p.sessionID)
+    return sessionID ? { kind: "status", sessionID, status: "idle" } : undefined
+  }
+  if (type === "session.execution.failed") {
+    const err = obj(p.error)
+    const name = str(err.name) ?? str(err.type) ?? "UnknownError"
+    const detail = sessionErrorDetail(p.error)
+    return {
+      kind: "error",
+      sessionID: str(p.sessionID),
+      name,
+      aborted: name === "MessageAbortedError" || err.type === "aborted",
+      code: sessionErrorCode(p.error),
+      ...(detail ? { detail } : {}),
+    }
+  }
+  if (type === "session.retry.scheduled") {
+    const sessionID = str(p.sessionID)
+    return sessionID
+      ? { kind: "status", sessionID, status: "retry", attempt: typeof p.attempt === "number" ? p.attempt : undefined }
+      : undefined
+  }
+  if (type === "session.step.started") {
+    const sessionID = str(p.sessionID)
+    const messageID = str(p.assistantMessageID) ?? str(p.messageID)
+    return sessionID && messageID ? { kind: "message.role", sessionID, messageID, role: "assistant" } : undefined
+  }
+  if (type === "session.text.ended") {
+    const sessionID = str(p.sessionID)
+    const messageID = str(p.assistantMessageID) ?? str(p.messageID)
+    const partID =
+      str(p.id) ??
+      str(p.partID) ??
+      (typeof p.ordinal === "number" && Number.isFinite(p.ordinal) && messageID ? `${messageID}:${p.ordinal}` : undefined)
+    const text = str(p.text)
+    if (!sessionID || !messageID || !partID || !text) return undefined
+    return { kind: "text.final", sessionID, messageID, partID, text, assistant: true }
+  }
+  if (type === "form.created" || type === "form.asked") {
+    const req = isObj(p.form) ? p.form : isObj(p.request) ? p.request : p
+    const sessionID = str(p.sessionID) ?? str(req.sessionID)
+    const reqID = requestId(req.id ?? p.id)
+    if (!sessionID || !reqID) return undefined
+    if (req.kind === "permission" || typeof req.permission === "string" || typeof req.action === "string") {
+      const patterns = Array.isArray(req.patterns)
+        ? req.patterns.length
+        : Array.isArray(req.resources)
+          ? req.resources.length
+          : 0
+      return {
+        kind: "permission.asked",
+        sessionID,
+        requestID: reqID,
+        permission: str(req.permission) ?? str(req.action) ?? "unknown",
+        patterns,
+      }
+    }
+    const items = Array.isArray(req.questions) ? req.questions : Array.isArray(req.fields) ? req.fields : undefined
+    if (req.kind === "question" || items !== undefined || isObj(p.form) || reqID.startsWith("frm_")) {
+      return { kind: "question.asked", sessionID, requestID: reqID, count: items ? items.length : 0 }
+    }
+  }
+  if (type === "form.replied" || type === "form.cancelled") {
+    const form = obj(p.form)
+    const sessionID = str(p.sessionID) ?? str(form.sessionID)
+    const reqID = requestId(p.requestID ?? p.id ?? form.id)
+    if (!sessionID || !reqID) return undefined
+    if (p.kind === "permission" || reqID.startsWith("per_")) {
+      const reply = type === "form.cancelled" ? "reject" : (str(p.decision) ?? str(p.reply) ?? "allow")
+      return { kind: "permission.replied", sessionID, requestID: reqID, reply }
+    }
+    return { kind: "question.done", sessionID, requestID: reqID, rejected: type === "form.cancelled" }
   }
   return undefined
 }

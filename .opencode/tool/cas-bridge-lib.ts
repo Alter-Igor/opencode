@@ -236,7 +236,7 @@ function opencodeDataDir(): string {
     const local = process.env.LOCALAPPDATA ?? path.join(os.homedir(), "AppData", "Local")
     // xdg-basedir on Windows often maps to ~/.local/share
     const xdg = path.join(os.homedir(), ".local", "share", "opencode")
-    if (fs.existsSync(path.join(xdg, "mcp-auth.json"))) return xdg
+    if (fs.existsSync(path.join(xdg, "opencode.db")) || fs.existsSync(path.join(xdg, "mcp-auth.json"))) return xdg
     return path.join(local, "opencode")
   }
   const xdg = process.env.XDG_DATA_HOME ?? path.join(os.homedir(), ".local", "share")
@@ -265,21 +265,48 @@ export function readMcpAuthAccessTokenDetailed(
   mcpName: string,
   serverUrl: string,
 ): { token?: string; expired: boolean } {
+  let sawExpired = false
   try {
     const raw = fs.readFileSync(mcpAuthPath(), "utf8")
     const data = JSON.parse(raw) as Record<string, McpAuthEntry>
     const entry = data[mcpName]
-    if (!entry?.tokens?.accessToken) return { expired: false }
-    if (entry.serverUrl && normalizeUrl(entry.serverUrl) !== normalizeUrl(serverUrl)) {
-      return { expired: false }
+    if (entry?.tokens?.accessToken) {
+      const urlMatches = !entry.serverUrl || normalizeUrl(entry.serverUrl) === normalizeUrl(serverUrl)
+      if (urlMatches) {
+        if (entry.tokens.expiresAt && entry.tokens.expiresAt * 1000 < Date.now()) {
+          sawExpired = true
+        } else {
+          return { token: entry.tokens.accessToken, expired: false }
+        }
+      }
     }
-    if (entry.tokens.expiresAt && entry.tokens.expiresAt * 1000 < Date.now()) {
-      return { expired: true }
+  } catch {}
+  try {
+    const dbPath = path.join(opencodeDataDir(), "opencode.db")
+    if (fs.existsSync(dbPath)) {
+      const { createHash } = require("node:crypto") as typeof import("node:crypto")
+      const { Database } = require("bun:sqlite") as typeof import("bun:sqlite")
+      const integrationId = "mcp_" + createHash("sha1").update(mcpName + "\0" + serverUrl).digest("hex").slice(0, 16)
+      const db = new Database(dbPath, { readonly: true })
+      try {
+        const row = db
+          .query<{ value: string }, [string]>(
+            "SELECT value FROM credential WHERE integration_id = ? ORDER BY active DESC, time_created DESC LIMIT 1",
+          )
+          .get(integrationId)
+        if (row?.value) {
+          const parsed = JSON.parse(row.value) as { access?: string; expires?: number }
+          if (parsed?.access) {
+            if (parsed.expires && parsed.expires < Date.now()) return { expired: true }
+            return { token: parsed.access, expired: false }
+          }
+        }
+      } finally {
+        db.close()
+      }
     }
-    return { token: entry.tokens.accessToken, expired: false }
-  } catch {
-    return { expired: false }
-  }
+  } catch {}
+  return { expired: sawExpired }
 }
 
 function normalizeUrl(url: string): string {

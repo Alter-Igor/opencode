@@ -102,12 +102,12 @@ export const executeSendMessage = Effect.fn("SendMessageTool.execute")(function*
 
     if (mode === "wait_reply") {
       const res = yield* Effect.tryPromise({
-        try: async () => {
+        try: async (effectSignal) => {
           const r = await fetch(recipient, {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify(payload),
-            signal: timeoutSignal,
+            signal: AbortSignal.any([timeoutSignal, effectSignal]),
           })
           const text = await r.text().catch(() => "")
           return { ok: r.ok, status: r.status, text }
@@ -155,7 +155,7 @@ export const executeSendMessage = Effect.fn("SendMessageTool.execute")(function*
       const postUrl = `${inboxUrl}/v1/post`
       const toAddress = recipient.startsWith("supervisor:") ? recipient : "supervisor"
       const res = yield* Effect.tryPromise({
-        try: async () => {
+        try: async (effectSignal) => {
           const r = await fetch(postUrl, {
             method: "POST",
             headers: { "content-type": "application/json" },
@@ -165,7 +165,7 @@ export const executeSendMessage = Effect.fn("SendMessageTool.execute")(function*
               text: params.message,
               correlationId: params.correlation_id,
             }),
-            signal: supervisorTimeoutSignal,
+            signal: AbortSignal.any([supervisorTimeoutSignal, effectSignal]),
           })
           const data = await r.json().catch(() => ({}))
           return { ok: r.ok, status: r.status, data }
@@ -187,7 +187,7 @@ export const executeSendMessage = Effect.fn("SendMessageTool.execute")(function*
 
     if (webhookUrl) {
       const res = yield* Effect.tryPromise({
-        try: async () => {
+        try: async (effectSignal) => {
           const r = await fetch(webhookUrl, {
             method: "POST",
             headers: { "content-type": "application/json" },
@@ -197,7 +197,7 @@ export const executeSendMessage = Effect.fn("SendMessageTool.execute")(function*
               message: params.message,
               correlation_id: params.correlation_id,
             }),
-            signal: supervisorTimeoutSignal,
+            signal: AbortSignal.any([supervisorTimeoutSignal, effectSignal]),
           })
           const text = await r.text().catch(() => "")
           return { ok: r.ok, status: r.status, text }
@@ -242,7 +242,11 @@ export const executeSendMessage = Effect.fn("SendMessageTool.execute")(function*
     targetAgentName = parentSession.agent
   } else if (recipient.startsWith("session:")) {
     const rawId = recipient.slice("session:".length)
-    targetSessionID = SessionSchema.ID.make(rawId)
+    const decoded = Schema.decodeUnknownOption(SessionSchema.ID)(rawId)
+    if (decoded._tag === "None") {
+      return yield* new ToolFailure({ message: `Invalid session ID: ${rawId}` })
+    }
+    targetSessionID = decoded.value
     const targetSession = yield* deps.getSession(targetSessionID).pipe(
       Effect.mapError((error) => new ToolFailure({ message: `Session not found: ${targetSessionID}`, error })),
     )
@@ -257,11 +261,14 @@ export const executeSendMessage = Effect.fn("SendMessageTool.execute")(function*
     if (!targetAgent) {
       return yield* new ToolFailure({ message: `Agent "${agentName}" does not exist.` })
     }
+    const resolvedAgentID = (targetAgent as { id?: string }).id ?? targetAgent.name
 
     const allSessions = deps.listSessions
       ? yield* deps.listSessions().pipe(Effect.orElseSucceed(() => []))
       : []
-    const existing = allSessions.find((c) => c.parentID === sessionID && c.agent === targetAgent.name)
+    const existing = allSessions.find(
+      (c) => c.parentID === sessionID && (c.agent === resolvedAgentID || c.agent === targetAgent.name),
+    )
 
     if (existing) {
       targetSessionID = existing.id
@@ -271,7 +278,7 @@ export const executeSendMessage = Effect.fn("SendMessageTool.execute")(function*
         .createSession({
           parentID: sessionID,
           title: `Subagent @${targetAgent.name}`,
-          agent: targetAgent.name,
+          agent: resolvedAgentID,
         })
         .pipe(Effect.mapError((error) => new ToolFailure({ message: `Failed to create session`, error })))
       targetSessionID = child.id
@@ -280,7 +287,11 @@ export const executeSendMessage = Effect.fn("SendMessageTool.execute")(function*
       return yield* new ToolFailure({ message: `Cannot create session for agent "${agentName}".` })
     }
   } else if (recipient.startsWith("ses_")) {
-    targetSessionID = SessionSchema.ID.make(recipient)
+    const decoded = Schema.decodeUnknownOption(SessionSchema.ID)(recipient)
+    if (decoded._tag === "None") {
+      return yield* new ToolFailure({ message: `Invalid session ID: ${recipient}` })
+    }
+    targetSessionID = decoded.value
     const targetSession = yield* deps.getSession(targetSessionID).pipe(
       Effect.mapError((error) => new ToolFailure({ message: `Session not found: ${targetSessionID}`, error })),
     )
@@ -288,6 +299,12 @@ export const executeSendMessage = Effect.fn("SendMessageTool.execute")(function*
   } else {
     return yield* new ToolFailure({
       message: `Unsupported recipient format: "${recipient}". Supported formats: "parent", "session:<id>", "agent:<name>", "supervisor", or "https://...".`,
+    })
+  }
+
+  if (sessionID === targetSessionID) {
+    return yield* new ToolFailure({
+      message: `Cannot send a message to the current session itself (${sessionID}).`,
     })
   }
 
@@ -307,7 +324,7 @@ export const executeSendMessage = Effect.fn("SendMessageTool.execute")(function*
       const current = yield* deps.getSession(sessionID).pipe(
         Effect.mapError((error) => new ToolFailure({ message: `Session not found: ${sessionID}`, error })),
       )
-      if (recipient === "parent" && current.parentID === targetSessionID) {
+      if (current.parentID === targetSessionID || sessionID === targetSessionID) {
         yield* deps.promptOps
           .prompt({
             sessionID: targetSessionID,
@@ -388,7 +405,7 @@ export const Plugin = {
           execute: (input, context) =>
             executeSendMessage(input, context.sessionID, new AbortController().signal, {
               getSession: (id) => sessions.get(id),
-              listSessions: () => sessions.list().pipe(Effect.map((page) => page.data)),
+              listSessions: () => sessions.list({ parentID: context.sessionID }).pipe(Effect.map((page) => page.data)),
               createSession: (opts) =>
                 sessions.create({
                   parentID: opts.parentID,
@@ -397,6 +414,37 @@ export const Plugin = {
                 }),
               resolveAgent: (agentName) => agents.resolve(agentName),
               promptSession: (opts) => sessions.prompt({ sessionID: opts.sessionID, text: opts.text }),
+              promptOps: {
+                resolvePromptParts: (text) => Effect.succeed([{ type: "text", text }]),
+                prompt: (opts) =>
+                  Effect.gen(function* () {
+                    const text = opts.parts.map((p) => p.text).join("\n")
+                    yield* sessions.prompt({ sessionID: opts.sessionID, text }).pipe(Effect.ignore)
+                    const currentSession = yield* sessions.get(context.sessionID).pipe(Effect.orElseSucceed(() => undefined))
+                    const isParentOrSelf =
+                      input.recipient.trim() === "parent" ||
+                      opts.sessionID === context.sessionID ||
+                      currentSession?.parentID === opts.sessionID
+                    if ((input.mode ?? "fire_and_forget") === "wait_reply" && !isParentOrSelf) {
+                      yield* sessions.wait(opts.sessionID).pipe(Effect.ignore)
+                      const msgs = yield* sessions
+                        .messages({ sessionID: opts.sessionID, limit: 10, order: "desc" })
+                        .pipe(Effect.orElseSucceed(() => []))
+                      const lastAssistant = msgs.find((m) => m.type === "assistant")
+                      const replyParts =
+                        lastAssistant && "content" in lastAssistant && Array.isArray(lastAssistant.content)
+                          ? lastAssistant.content
+                              .filter(
+                                (c): c is { type: "text"; text: string } =>
+                                  c.type === "text" && typeof (c as { text?: unknown }).text === "string",
+                              )
+                              .map((c) => ({ type: "text", text: c.text }))
+                          : []
+                      return { parts: replyParts }
+                    }
+                    return { parts: [] }
+                  }),
+              },
               askWebfetch: (url) =>
                 permission.assert({
                   action: "webfetch",

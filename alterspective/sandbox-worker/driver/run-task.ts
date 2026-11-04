@@ -18,45 +18,107 @@ import path from "path"
 import { chmod, rm } from "fs/promises"
 import { randomBytes } from "crypto"
 function createOpencodeClient(opts: { baseUrl: string; directory: string; headers?: Record<string, string> }): any {
-  const req = async (method: string, route: string, body?: unknown, callOpts?: { throwOnError?: boolean }) => {
-    const res = await fetch(`${opts.baseUrl}${route}`, {
-      method,
-      headers: {
-        ...opts.headers,
-        "x-opencode-directory": opts.directory,
-        ...(body !== undefined ? { "content-type": "application/json" } : {}),
-      },
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-    })
-    const data = await res.json().catch(() => undefined)
-    if (!res.ok) {
-      if (callOpts?.throwOnError) throw new Error(`HTTP ${res.status}: ${JSON.stringify(data)}`)
-      return { data: undefined, error: data ?? { status: res.status } }
+  const req = async (
+    method: string,
+    routes: string | string[],
+    body?: unknown,
+    callOpts?: { throwOnError?: boolean },
+  ) => {
+    const candidates = Array.isArray(routes) ? routes : [routes]
+    let lastStatus = 0
+    let lastData: any = undefined
+    for (const route of candidates) {
+      const res = await fetch(`${opts.baseUrl}${route}`, {
+        method,
+        headers: {
+          ...opts.headers,
+          "x-opencode-directory": opts.directory,
+          ...(body !== undefined ? { "content-type": "application/json" } : {}),
+        },
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+      })
+      const raw = await res.json().catch(() => undefined)
+      lastStatus = res.status
+      lastData = raw
+      if (res.status === 404 && candidates.length > 1 && route !== candidates[candidates.length - 1]) {
+        continue
+      }
+      if (!res.ok) {
+        if (callOpts?.throwOnError) throw new Error(`HTTP ${res.status}: ${JSON.stringify(raw)}`)
+        return { data: undefined, error: raw ?? { status: res.status } }
+      }
+      const data = raw && typeof raw === "object" && "data" in raw && !("id" in raw) ? (raw as any).data : raw
+      return { data, error: undefined }
     }
-    return { data, error: undefined }
+    if (callOpts?.throwOnError) throw new Error(`HTTP ${lastStatus}: ${JSON.stringify(lastData)}`)
+    return { data: undefined, error: lastData ?? { status: lastStatus } }
   }
   return {
     session: {
-      create: (body: any, o?: any) => req("POST", "/session", body, o),
+      create: (body: any, o?: any) => req("POST", ["/session", "/api/session"], body, o),
       shell: (body: { sessionID: string; agent: string; command: string }, o?: any) =>
-        req("POST", `/session/${body.sessionID}/shell`, { agent: body.agent, command: body.command }, o),
-      promptAsync: (body: { sessionID: string; parts: any[] }, o?: any) =>
-        req("POST", `/session/${body.sessionID}/prompt_async`, { parts: body.parts }, o),
-      abort: (body: { sessionID: string }, o?: any) => req("POST", `/session/${body.sessionID}/abort`, {}, o),
-      messages: (body: { sessionID: string }, o?: any) => req("GET", `/session/${body.sessionID}/message`, undefined, o),
+        req(
+          "POST",
+          [`/session/${body.sessionID}/shell`, `/api/session/${body.sessionID}/shell`],
+          { agent: body.agent, command: body.command },
+          o,
+        ),
+      promptAsync: (body: { sessionID: string; parts: any[] }, o?: any) => {
+        const text = body.parts
+          .filter((p) => p?.type === "text" && typeof p.text === "string")
+          .map((p) => p.text)
+          .join("\n")
+        return req(
+          "POST",
+          [`/session/${body.sessionID}/prompt_async`, `/api/session/${body.sessionID}/prompt`],
+          { parts: body.parts, text },
+          o,
+        )
+      },
+      abort: (body: { sessionID: string }, o?: any) =>
+        req("POST", [`/session/${body.sessionID}/abort`, `/api/session/${body.sessionID}/interrupt`], {}, o),
+      messages: (body: { sessionID: string }, o?: any) =>
+        req("GET", [`/session/${body.sessionID}/message`, `/api/session/${body.sessionID}/message`], undefined, o),
     },
     permission: {
-      reply: (body: { requestID: string; reply: string }, o?: any) =>
-        req("POST", `/permission/${body.requestID}/reply`, { reply: body.reply }, o),
+      reply: (body: { requestID: string; sessionID?: string; reply: string }, o?: any) =>
+        req(
+          "POST",
+          [
+            `/permission/${body.requestID}/reply`,
+            ...(body.sessionID ? [`/api/session/${body.sessionID}/permission/${body.requestID}/reply`] : []),
+            `/api/permission/reply`,
+          ],
+          { decision: body.reply, reply: body.reply, requestID: body.requestID, sessionID: body.sessionID },
+          o,
+        ),
     },
     question: {
-      reject: (body: { requestID: string }, o?: any) => req("POST", `/question/${body.requestID}/reject`, {}, o),
+      reject: async (body: { requestID: string; sessionID?: string }, o?: any) => {
+        const first = await req(
+          "POST",
+          [`/question/${body.requestID}/reject`],
+          { id: body.requestID, sessionID: body.sessionID },
+          { throwOnError: false },
+        )
+        if (!first.error) return first
+        if (body.sessionID) {
+          return req("DELETE", [`/api/session/${body.sessionID}/form/${body.requestID}`], undefined, o)
+        }
+        if (o?.throwOnError) throw new Error(`Question reject failed: ${JSON.stringify(first.error)}`)
+        return first
+      },
     },
     event: {
       subscribe: async () => {
-        const res = await fetch(`${opts.baseUrl}/event`, {
+        let res = await fetch(`${opts.baseUrl}/event`, {
           headers: { ...opts.headers, "x-opencode-directory": opts.directory, accept: "text/event-stream" },
         })
+        if (res.status === 404) {
+          res = await fetch(`${opts.baseUrl}/api/event`, {
+            headers: { ...opts.headers, "x-opencode-directory": opts.directory, accept: "text/event-stream" },
+          })
+        }
         if (!res.ok || !res.body) throw new Error(`SSE HTTP ${res.status}`)
         const reader = res.body.getReader()
         const decoder = new TextDecoder()
@@ -240,17 +302,19 @@ async function main() {
     let lastHealth = "no response"
     const healthy = async () => {
       while (Date.now() < started + 90_000) {
-        const res = await fetch(`${baseUrl}/global/health`, {
-          headers: { authorization },
-          signal: AbortSignal.timeout(5000),
-        })
-          .then((r) => r)
-          .catch((e: Error) => {
-            lastHealth = `fetch error: ${e.message}`
-            return undefined
+        for (const route of ["/global/health", "/api/info"]) {
+          const res = await fetch(`${baseUrl}${route}`, {
+            headers: { authorization },
+            signal: AbortSignal.timeout(5000),
           })
-        if (res) lastHealth = `HTTP ${res.status}`
-        if (res?.ok) return true
+            .then((r) => r)
+            .catch((e: Error) => {
+              lastHealth = `fetch error: ${e.message}`
+              return undefined
+            })
+          if (res) lastHealth = `HTTP ${res.status}`
+          if (res?.ok) return true
+        }
         const running = (await run(["docker", "inspect", "-f", "{{.State.Running}}", taskId]).catch(() => "")).trim()
         if (running === "false") {
           lastHealth = "container exited before becoming healthy"
@@ -281,9 +345,31 @@ async function main() {
       },
       { throwOnError: true },
     )
-    const probeOutput = probe.data.parts
-      .map((part) => (part.type === "tool" && part.state.status === "completed" ? part.state.output : ""))
-      .join("")
+    let probeOutput =
+      (probe.data?.parts ?? probe.data?.content ?? [])
+        .map((part: any) =>
+          part.type === "tool" && part.state?.status === "completed"
+            ? part.state.output
+            : typeof part.text === "string"
+              ? part.text
+              : "",
+        )
+        .join("") || (typeof probe.data?.output === "string" ? probe.data.output : "")
+    if (!probeOutput) {
+      const shellMsgsRaw = (await client.session.messages({ sessionID: session.id })).data
+      const shellMsgs = Array.isArray(shellMsgsRaw) ? shellMsgsRaw : (shellMsgsRaw?.data ?? [])
+      probeOutput = shellMsgs
+        .map(
+          (m: any) =>
+            m?.output?.output ??
+            m?.output?.preview ??
+            (typeof m?.output === "string" ? m.output : undefined) ??
+            m?.text ??
+            "",
+        )
+        .filter(Boolean)
+        .join("\n")
+    }
     const envScrub = probeOutput.includes("SCRUB_OK") ? "ok" : probeOutput.includes("SCRUB_FAIL") ? "fail" : "unknown"
     log(`env scrub: ${envScrub}`)
 
@@ -297,30 +383,46 @@ async function main() {
     const connected = new Promise<void>((resolve) => (onConnected = resolve))
     const finished = (async () => {
       for await (const event of events.stream) {
+        const evData = event.properties ?? event.data ?? {}
         if (event.type === "server.connected") onConnected()
-        if (event.type === "permission.asked" && event.properties.sessionID === session.id) {
+        if (event.type === "permission.asked" && evData.sessionID === session.id) {
           // Everything in-box is already `allow`; anything that still asks is refused. Never `always`.
-          await client.permission.reply({ requestID: event.properties.id, reply: "reject" }, { throwOnError: true })
+          await client.permission.reply(
+            { requestID: evData.id, sessionID: session.id, reply: "reject" },
+            { throwOnError: true },
+          )
           decisions.push({
             at: new Date().toISOString(),
             kind: "permission",
-            permission: event.properties.permission,
-            patterns: event.properties.patterns,
+            permission: evData.permission ?? evData.action,
+            patterns: evData.patterns ?? evData.resources,
             reply: "reject",
           })
         }
-        if (event.type === "question.asked" && event.properties.sessionID === session.id) {
+        if (
+          (event.type === "question.asked" || event.type === "form.asked" || event.type === "form.created") &&
+          (evData.sessionID === session.id || evData.form?.sessionID === session.id)
+        ) {
+          const reqId = evData.id ?? evData.form?.id
           // No human in the spike loop. CAS will turn this into an approval card in Phase 3.
-          await client.question.reject({ requestID: event.properties.id }, { throwOnError: true })
+          await client.question.reject({ requestID: reqId, sessionID: session.id }, { throwOnError: true })
           decisions.push({ at: new Date().toISOString(), kind: "question", reply: "reject" })
         }
-        if (event.type === "session.error" && event.properties.sessionID === session.id) {
-          errors.push(JSON.stringify(event.properties.error))
+        if (
+          (event.type === "session.error" ||
+            event.type === "session.execution.failed" ||
+            event.type === "session.step.failed") &&
+          evData.sessionID === session.id
+        ) {
+          errors.push(JSON.stringify(evData.error))
+          if (event.type === "session.execution.failed") return "idle" as const
         }
         if (
-          event.type === "session.status" &&
-          event.properties.sessionID === session.id &&
-          event.properties.status.type === "idle"
+          (event.type === "session.status" &&
+            evData.sessionID === session.id &&
+            evData.status?.type === "idle") ||
+          ((event.type === "session.execution.succeeded" || event.type === "session.execution.interrupted") &&
+            evData.sessionID === session.id)
         )
           return "idle" as const
       }
@@ -350,10 +452,11 @@ async function main() {
     log(`outcome: ${outcome}`)
 
     // Tokens and cost as OpenCode reports them. Phase 2 replaces these with the gateway's ledger.
-    const messages = (await client.session.messages({ sessionID: session.id }, { throwOnError: true })).data
+    const messagesRaw = (await client.session.messages({ sessionID: session.id }, { throwOnError: true })).data
+    const messages = Array.isArray(messagesRaw) ? messagesRaw : (messagesRaw?.data ?? [])
     const usage = messages
-      .map((m) => m.info)
-      .filter((info) => info.role === "assistant")
+      .map((m: any) => m.info ?? m)
+      .filter((info: any) => info.role === "assistant" || info.type === "assistant")
       .reduce(
         (sum, info) => ({
           turns: sum.turns + 1,

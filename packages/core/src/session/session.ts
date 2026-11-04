@@ -29,6 +29,8 @@ import { SessionShell } from "./shell.js"
 import { SessionSkill } from "./skill.js"
 import { SessionSchema } from "./schema.js"
 import { SessionStore } from "./store.js"
+import { isDeletingSession } from "./deleting.js"
+import { redactSecrets } from "../util/secret-redaction.js"
 
 type PromptRequest = SessionPrompt.Input & {
   id?: SessionMessage.ID
@@ -145,6 +147,7 @@ export const make = Effect.fn("Session.make")(function* () {
     sessionID: SessionSchema.ID,
     inboxID: SessionMessage.ID,
   ) {
+    if (isDeletingSession(sessionID)) return yield* new NotFoundError({ sessionID })
     yield* mutatePending(sessionID, inboxID, admission.steer)
     yield* execution.wake(sessionID)
   }, Effect.uninterruptible)
@@ -155,6 +158,7 @@ export const make = Effect.fn("Session.make")(function* () {
   const prompt = Effect.fn("Session.prompt")((sessionID: SessionSchema.ID, input: PromptRequest) =>
     Effect.uninterruptibleMask((restore) =>
       Effect.gen(function* () {
+        if (isDeletingSession(sessionID)) return yield* new NotFoundError({ sessionID })
         const session = yield* get(sessionID)
         const messageID = input.id ?? SessionMessage.ID.create()
         const admitted = yield* Effect.gen(function* () {
@@ -193,6 +197,7 @@ export const make = Effect.fn("Session.make")(function* () {
     sessionID: SessionSchema.ID,
     input: { id?: SessionMessage.ID; command: string },
   ) {
+    if (isDeletingSession(sessionID)) return yield* new NotFoundError({ sessionID })
     const session = yield* get(sessionID)
     // The server owns completion recording even if the submitting client disconnects.
     const running = yield* Effect.gen(function* () {
@@ -200,14 +205,15 @@ export const make = Effect.fn("Session.make")(function* () {
         Effect.provideService(Instance.Service, instances),
         Effect.tapError((error) =>
           synthetic(sessionID, {
-            text: `User shell command failed to start:\n${input.command}\n\n${error.message}`,
-            description: input.command,
+            text: redactSecrets(`User shell command failed to start:\n${input.command}\n\n${error.message}`),
+            description: redactSecrets(input.command),
             metadata: { source: "shell", state: "error" },
             resume: false,
-          }),
+          }).pipe(Effect.catchTag("Session.NotFoundError", () => Effect.void)),
         ),
         Effect.orDie,
       )
+      if (isDeletingSession(sessionID) || !(yield* store.get(sessionID))) return
       yield* bus.publish(
         SessionEvent.Shell.Started,
         {
@@ -218,13 +224,16 @@ export const make = Effect.fn("Session.make")(function* () {
       )
       const terminal = yield* started.result
       const preview = yield* started.output
+      if (isDeletingSession(sessionID) || !(yield* store.get(sessionID))) return
       yield* bus.publish(SessionEvent.Shell.Ended, {
         sessionID,
         shell: terminal.info,
         output: preview,
       })
+      const notif = ShellResult.userNotification(terminal)
       yield* synthetic(sessionID, {
-        ...ShellResult.userNotification(terminal),
+        ...notif,
+        text: redactSecrets(notif.text),
         resume: false,
       }).pipe(
         Effect.catchTag("Session.NotFoundError", () => Effect.void),
@@ -237,6 +246,7 @@ export const make = Effect.fn("Session.make")(function* () {
     sessionID: SessionSchema.ID,
     input: { messageID?: SessionMessage.ID; skill: Skill.ID; resume?: boolean },
   ) {
+    if (isDeletingSession(sessionID)) return yield* new NotFoundError({ sessionID })
     const session = yield* get(sessionID)
     const skill = yield* SessionSkill.get({ session, skill: input.skill }).pipe(
       Effect.provideService(Instance.Service, instances),
@@ -260,6 +270,7 @@ export const make = Effect.fn("Session.make")(function* () {
     sessionID: SessionSchema.ID,
     input: { id?: SessionMessage.ID; delivery?: SessionInbox.Delivery },
   ) {
+    if (isDeletingSession(sessionID)) return yield* new NotFoundError({ sessionID })
     const session = yield* get(sessionID)
     if (session.revert) yield* SessionRevert.commit(bus, session)
     const inputID = input.id ?? SessionMessage.ID.create()
@@ -280,6 +291,7 @@ export const make = Effect.fn("Session.make")(function* () {
     yield* execution.awaitIdle(sessionID)
   })
   const resume = Effect.fn("Session.resume")(function* (sessionID: SessionSchema.ID) {
+    if (isDeletingSession(sessionID)) return yield* new NotFoundError({ sessionID })
     yield* get(sessionID)
     yield* execution.resume(sessionID)
   })
@@ -297,6 +309,7 @@ export const make = Effect.fn("Session.make")(function* () {
     ) =>
       Effect.uninterruptible(
         Effect.gen(function* () {
+          if (isDeletingSession(sessionID)) return yield* new NotFoundError({ sessionID })
           yield* get(sessionID)
           const inputID = input.id ?? SessionMessage.ID.create()
           const admittedInput = {
@@ -342,6 +355,7 @@ export const make = Effect.fn("Session.make")(function* () {
     )
   })
   const clear = Effect.fn("Session.revert.clear")(function* (sessionID: SessionSchema.ID) {
+    if (isDeletingSession(sessionID)) return yield* new NotFoundError({ sessionID })
     const session = yield* get(sessionID)
     if (yield* execution.isActive(sessionID)) return yield* new BusyError({ sessionID })
     yield* SessionRevert.clear(session).pipe(

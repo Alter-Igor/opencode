@@ -17,7 +17,10 @@ async function probeOnce(deps: HealthDeps, target: ApiTarget): Promise<Probe> {
   try {
     // Per-probe timeout: Docker Desktop can accept on the published port before the gate is
     // wired and then hold the connection open (observed live), so one probe must never hang.
-    const res = await deps.fetch(`${target.baseUrl}/path?directory=/sessions`, { headers: { authorization: auth }, signal: AbortSignal.timeout(3000) })
+    let res = await deps.fetch(`${target.baseUrl}/path?directory=/sessions`, { headers: { authorization: auth }, signal: AbortSignal.timeout(3000) })
+    if (res.status === 404) {
+      res = await deps.fetch(`${target.baseUrl}/api/info`, { headers: { authorization: auth }, signal: AbortSignal.timeout(3000) })
+    }
     return { ok: res.status === 200, note: `HTTP ${res.status}` }
   } catch (error) {
     return { ok: false, note: `no answer (${error instanceof Error ? error.name : "error"})` }

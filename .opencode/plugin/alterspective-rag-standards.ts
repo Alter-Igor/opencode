@@ -63,7 +63,10 @@ const plugin: Plugin = async () => {
         if (next) output.system[i] = next
         else output.system.splice(i, 1)
       }
-      output.system.push(`${SKILL_LOOKUP_PROMPT}\n\n${STANDARDS_SYSTEM_PROMPT}`)
+      const block = `${SKILL_LOOKUP_PROMPT}\n\n${STANDARDS_SYSTEM_PROMPT}`
+      if (!output.system.some((s) => s.includes("## Alterspective Standards Awareness"))) {
+        output.system.push(block)
+      }
     },
   }
 }

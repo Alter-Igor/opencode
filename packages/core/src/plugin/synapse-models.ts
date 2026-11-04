@@ -61,6 +61,12 @@ export const SYNAPSE_TIER_MODELS: Record<string, SynapseModelEntry> = {
     reasoning: false,
     limit: { context: SYNAPSE_DEFAULT_CONTEXT, output: SYNAPSE_DEFAULT_OUTPUT },
   },
+  standard: {
+    name: "Synapse Standard (Balanced Tier)",
+    tool_call: true,
+    reasoning: true,
+    limit: { context: SYNAPSE_DEFAULT_CONTEXT, output: SYNAPSE_DEFAULT_OUTPUT },
+  },
   balanced: {
     name: "Synapse Balanced Tier",
     tool_call: true,
@@ -73,63 +79,68 @@ export const SYNAPSE_TIER_MODELS: Record<string, SynapseModelEntry> = {
     reasoning: true,
     limit: { context: SYNAPSE_DEFAULT_CONTEXT, output: SYNAPSE_DEFAULT_OUTPUT },
   },
+  max: {
+    name: "Synapse Max (Premium Tier)",
+    tool_call: true,
+    reasoning: true,
+    limit: { context: SYNAPSE_DEFAULT_CONTEXT, output: SYNAPSE_DEFAULT_OUTPUT },
+  },
 }
 
-export const SYNAPSE_ROLE_MODELS: Record<string, SynapseModelEntry> = {
-  "role:ba": {
-    name: "Synapse Role: Business Analyst (BA)",
-    tool_call: true,
-    reasoning: true,
-    limit: { context: SYNAPSE_DEFAULT_CONTEXT, output: SYNAPSE_DEFAULT_OUTPUT },
-  },
-  "role:developer": {
-    name: "Synapse Role: Developer",
-    tool_call: true,
-    reasoning: true,
-    limit: { context: SYNAPSE_DEFAULT_CONTEXT, output: SYNAPSE_DEFAULT_OUTPUT },
-  },
-  "role:architect": {
-    name: "Synapse Role: Architect",
-    tool_call: true,
-    reasoning: true,
-    limit: { context: SYNAPSE_DEFAULT_CONTEXT, output: SYNAPSE_DEFAULT_OUTPUT },
-  },
-  "role:reviewer": {
-    name: "Synapse Role: Reviewer",
-    tool_call: true,
-    reasoning: true,
-    limit: { context: SYNAPSE_DEFAULT_CONTEXT, output: SYNAPSE_DEFAULT_OUTPUT },
-  },
-  "role:sharedo": {
-    name: "Synapse Role: ShareDo Specialist",
-    tool_call: true,
-    reasoning: true,
-    limit: { context: SYNAPSE_DEFAULT_CONTEXT, output: SYNAPSE_DEFAULT_OUTPUT },
-  },
+const BUILTIN_ROLE_LABELS: Record<string, string> = {
+  ba: "Business Analyst (BA)",
+  developer: "Developer",
+  architect: "Architect",
+  reviewer: "Reviewer",
+  qa: "QA Engineer",
+  planner: "Planner",
+  researcher: "Researcher",
+  summarizer: "Summarizer",
+  sharedo: "ShareDo Specialist",
 }
+
+export const SYNAPSE_ROLE_MODELS: Record<string, SynapseModelEntry> = Object.fromEntries(
+  Object.entries(BUILTIN_ROLE_LABELS).flatMap(([role, label]) => {
+    const entry: SynapseModelEntry = {
+      name: `Synapse Role: ${label}`,
+      tool_call: true,
+      reasoning: true,
+      limit: { context: SYNAPSE_DEFAULT_CONTEXT, output: SYNAPSE_DEFAULT_OUTPUT },
+    }
+    return [
+      [`role:${role}`, entry],
+      [`role/${role}`, entry],
+    ]
+  }),
+)
 
 const ROLE_ROUTING_TABLE: Record<string, { qualityTier: SynapseQualityTierName; taskType: string }> = {
   ba: { qualityTier: "balanced", taskType: "analysis" },
   developer: { qualityTier: "balanced", taskType: "code" },
   architect: { qualityTier: "premium", taskType: "architecture" },
   reviewer: { qualityTier: "premium", taskType: "review" },
+  qa: { qualityTier: "balanced", taskType: "testing" },
+  planner: { qualityTier: "premium", taskType: "planning" },
+  researcher: { qualityTier: "balanced", taskType: "research" },
+  summarizer: { qualityTier: "economy", taskType: "summarization" },
   sharedo: { qualityTier: "balanced", taskType: "code" },
 }
 
 export function resolveSynapseVirtualModel(modelID: unknown): SynapseVirtualModelResolution | undefined {
   if (typeof modelID !== "string" || !modelID) return undefined
-  const trimmed = modelID.trim().toLowerCase()
+  const raw = modelID.trim().toLowerCase()
+  const trimmed = raw.startsWith(`${SYNAPSE_PROVIDER_ID}/`) ? raw.slice(SYNAPSE_PROVIDER_ID.length + 1) : raw
   if (trimmed === "basic" || trimmed === "economy") {
     return { model: SYNAPSE_AUTO_MODEL, qualityTier: "economy" }
   }
-  if (trimmed === "balanced") {
+  if (trimmed === "standard" || trimmed === "balanced") {
     return { model: SYNAPSE_AUTO_MODEL, qualityTier: "balanced" }
   }
-  if (trimmed === "premium") {
+  if (trimmed === "premium" || trimmed === "max") {
     return { model: SYNAPSE_AUTO_MODEL, qualityTier: "premium" }
   }
-  if (trimmed.startsWith("role:")) {
-    const role = trimmed.slice("role:".length).trim()
+  if (trimmed.startsWith("role:") || trimmed.startsWith("role/")) {
+    const role = trimmed.slice(5).trim()
     if (!role) return undefined
     const mapped = ROLE_ROUTING_TABLE[role]
     return {
@@ -153,15 +164,17 @@ export function parseSynapseSuitabilityRoleModels(body: unknown): Record<string,
     for (const key of Object.keys(suitability)) {
       const normalized = key.trim().toLowerCase()
       if (!normalized) continue
-      const id = `role:${normalized}`
-      if (SYNAPSE_ROLE_MODELS[id] || roles[id]) continue
+      const colonId = `role:${normalized}`
+      const slashId = `role/${normalized}`
       const label = normalized.charAt(0).toUpperCase() + normalized.slice(1)
-      roles[id] = {
+      const entry: SynapseModelEntry = {
         name: `Synapse Role: ${label}`,
         tool_call: true,
         reasoning: true,
         limit: { context: SYNAPSE_DEFAULT_CONTEXT, output: SYNAPSE_DEFAULT_OUTPUT },
       }
+      if (!SYNAPSE_ROLE_MODELS[colonId] && !roles[colonId]) roles[colonId] = entry
+      if (!SYNAPSE_ROLE_MODELS[slashId] && !roles[slashId]) roles[slashId] = entry
     }
   }
   return roles

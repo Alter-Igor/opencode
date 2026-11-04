@@ -27,8 +27,8 @@ import path from "path"
 import { SessionRunner } from "./session/runner/index.js"
 import { SessionStore } from "./session/store.js"
 import { cancelSessionTree } from "./session/cancel-tree.js"
-import { beginDeletingSession, isDeletingSession } from "./session/deleting.js"
-export { beginDeletingSession, isDeletingSession }
+import { beginDeletingSession, isDeletingInFlight, isDeletingSession, unmarkSessionDeleting } from "./session/deleting.js"
+export { beginDeletingSession, isDeletingInFlight, isDeletingSession }
 import { SessionExecution } from "./session/execution.js"
 import {
   AttachmentError,
@@ -292,6 +292,9 @@ const layer = Layer.effect(
         if (isDeletingSession(input.parentID)) {
           return yield* new NotFoundError({ sessionID: input.parentID! })
         }
+        if (input.id && isDeletingInFlight(input.id)) {
+          return yield* new NotFoundError({ sessionID: input.id })
+        }
         const sessionID = input.id ?? SessionSchema.ID.create()
         const recorded = yield* store.get(sessionID)
         if (recorded) return recorded
@@ -301,6 +304,9 @@ const layer = Layer.effect(
         if (location === undefined)
           return yield* Effect.die(new Error("Session.create requires either location or an existing parentID"))
         const project = yield* projects.resolve(location.directory)
+        if (isDeletingSession(input.parentID)) {
+          return yield* new NotFoundError({ sessionID: input.parentID! })
+        }
         const projected = yield* bus
           .publish(
             SessionEvent.Created,
@@ -339,6 +345,7 @@ const layer = Layer.effect(
             }),
           )
         if (projected.type === "existing") return projected.session
+        unmarkSessionDeleting(sessionID)
         // TODO: Restore recorded sessions onto replacement synchronized workspaces in a future API slice.
         return yield* result.get(sessionID).pipe(Effect.orDie)
       }),
@@ -395,12 +402,19 @@ const layer = Layer.effect(
       }),
       view: (input) => sessions.forSession(input.sessionID).view(input),
       remove: Effect.fn("Session.remove")(function* (sessionID) {
+        if (isDeletingInFlight(sessionID)) {
+          return yield* new NotFoundError({ sessionID })
+        }
+        yield* result.get(sessionID)
+        if (isDeletingInFlight(sessionID)) {
+          return yield* new NotFoundError({ sessionID })
+        }
         const release = beginDeletingSession(sessionID)
+        let completed = false
         return yield* Effect.gen(function* () {
-          yield* result.get(sessionID)
           yield* cancelSessionTree(
             {
-              cancel: (id) => execution.interrupt(id),
+              cancel: (id) => execution.interrupt(id).pipe(Effect.andThen(execution.awaitIdle(id))),
               children: (id) => store.list({ parentID: id }),
               isIdle: () => Effect.succeed(false),
             },
@@ -410,11 +424,23 @@ const layer = Layer.effect(
           yield* jobs.cancelSession(sessionID)
           yield* transport.close(sessionID)
           const children = yield* store.list({ parentID: sessionID })
-          yield* Effect.forEach(children, (child) => result.remove(child.id), { concurrency: 1, discard: true })
+          yield* Effect.forEach(
+            children,
+            (child) => result.remove(child.id).pipe(Effect.catchTag("Session.NotFoundError", () => Effect.void)),
+            { concurrency: 1, discard: true },
+          )
           yield* environments.clear(sessionID)
           yield* bus.publish(SessionEvent.Deleted, { sessionID })
           yield* bus.remove(sessionID)
-        }).pipe(Effect.ensuring(Effect.sync(release)))
+          completed = true
+        }).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              release()
+              if (!completed && !isDeletingInFlight(sessionID)) unmarkSessionDeleting(sessionID)
+            }),
+          ),
+        )
       }),
       list: Effect.fn("Session.list")(function* (input = {}) {
         const filter =

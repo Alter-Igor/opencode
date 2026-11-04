@@ -42,10 +42,13 @@ function changedFiles(): string[] {
   // When catching up with upstream via a merge commit that brings in >500 upstream files,
   // exclude files that are identical to the upstream merge parent so test:fast only tests fork changes.
   if (committed.length > 500) {
-    const merges = lines(git(["rev-list", "--merges", "-n", "1", `${mergeBase}..HEAD`]))
-    if (merges[0]) {
+    const merges = lines(git(["rev-list", "--merges", "--ancestry-path", `${mergeBase}..HEAD`]))
+    const upstreamMerge = merges.find(
+      (m) => Bun.spawnSync(["git", "merge-base", "--is-ancestor", mergeBase, `${m}^2`], { cwd: root }).exitCode !== 0,
+    )
+    if (upstreamMerge) {
       const upstreamDiff = new Set(
-        lines(git(["diff", "--no-renames", "--name-only", "--diff-filter=ACMR", `${merges[0]}^2`, "HEAD"])),
+        lines(git(["diff", "--no-renames", "--name-only", "--diff-filter=ACMR", `${upstreamMerge}^2`])),
       )
       committed = committed.filter((file) => upstreamDiff.has(file))
     }
@@ -101,8 +104,10 @@ const testsByPackage = new Map<string, string[]>()
 function testsOf(pkg: string): string[] {
   let tests = testsByPackage.get(pkg)
   if (!tests) {
-    tests = walk(path.join(root, pkg, testRootOf(path.join(root, pkg)))).map((abs) =>
-      path.relative(path.join(root, pkg), abs).split(path.sep).join("/"),
+    const pkgDir = path.join(root, pkg)
+    const roots = [testRootOf(pkgDir), ...(existsSync(path.join(pkgDir, "test-browser")) ? ["test-browser"] : [])]
+    tests = roots.flatMap((dir) =>
+      walk(path.join(pkgDir, dir)).map((abs) => path.relative(pkgDir, abs).split(path.sep).join("/")),
     )
     testsByPackage.set(pkg, tests)
   }
@@ -137,8 +142,16 @@ const imports = (source: string, target: string) =>
   IMPORT_EXTS.some((ext) => [`"`, `'`].some((quote) => source.includes(`${target}${ext}${quote}`)))
 
 /** True when `source` imports `src/<module>`; `inner` is the path with an explicit `/index` kept. */
-const importsModule = (source: string, module: string, inner = module) =>
-  imports(source, `src/${module}`) || (inner !== module && imports(source, `src/${inner}`))
+const importsModule = (source: string, module: string, inner = module, pkg?: string, barrelDir?: string) => {
+  if (imports(source, `src/${module}`) || (inner !== module && imports(source, `src/${inner}`))) return true
+  if (barrelDir && imports(source, `src/${barrelDir}`)) return true
+  if (pkg?.startsWith("packages/")) {
+    const pkgShort = path.posix.basename(pkg)
+    if (imports(source, `@opencode/${pkgShort}/${module}`) || imports(source, `@opencode-ai/${pkgShort}/${module}`))
+      return true
+  }
+  return false
+}
 
 const SPECIFIER = /(?:from\s+|import\s*\(\s*|import\s+)["']([^"']+)["']/g
 
@@ -159,7 +172,7 @@ const importsByPath = (source: string, test: string, module: string, inner: stri
 /** True when `source` imports the helper file `abs` by its name, or by its folder for an index file. */
 const importsHelper = (source: string, abs: string) => {
   const name = path.basename(abs).replace(CODE, "")
-  if (name === "fixture" || name === "host") return false
+  if (name === "fixture" || name === "host" || name === "local") return false
   if (imports(source, `/${name}`)) return true
   return name === "index" && imports(source, `/${path.basename(path.dirname(abs))}`)
 }
@@ -168,30 +181,75 @@ const importsHelper = (source: string, abs: string) => {
 function mapToTests(pkg: string, rel: string): string[] {
   if (rel.startsWith("e2e/")) return []
   if (TEST.test(rel)) return [rel]
-  if (!rel.startsWith("src/") || !CODE.test(rel)) return []
+  if (!CODE.test(rel)) return []
+  if (!rel.startsWith("src/") && rel.includes("/src/")) {
+    const [subPkg, subRest] = rel.split("/src/")
+    if (!subPkg || !subRest) return []
+    const subInner = subRest.replace(CODE, "")
+    const subName = path.posix.basename(subInner)
+    return testsOf(pkg).filter((test) => {
+      const testName = path.posix.basename(test)
+      if (testName.startsWith(`${subPkg}.`) || testName.startsWith(`${subPkg}-`) || testName.startsWith(`${subName}.`))
+        return true
+      const source = readFileSync(path.join(root, pkg, test), "utf8")
+      return imports(source, `${subPkg}/src/${subInner}`)
+    })
+  }
+  if (!rel.startsWith("src/")) return []
   const inner = rel.slice("src/".length).replace(CODE, "")
   const dir = path.posix.dirname(inner)
   const name = path.posix.basename(inner)
   const first = dir === "." ? "" : dir.split("/")[0]
   const module = inner.endsWith("/index") ? inner.slice(0, -"/index".length) : inner
-  const helpers = helpersOf(pkg).filter((abs) => importsModule(readFileSync(abs, "utf8"), module, inner))
-  return testsOf(pkg).filter((test) => {
+  const barrelIndex =
+    pkg === "packages/client" && dir !== "." ? path.join(root, pkg, "src", dir, "index.ts") : undefined
+  const barrelDir =
+    barrelIndex && existsSync(barrelIndex) && imports(readFileSync(barrelIndex, "utf8"), `./${name}`) ? dir : undefined
+  const helpers = helpersOf(pkg).filter((abs) =>
+    importsModule(readFileSync(abs, "utf8"), module, inner, pkg, barrelDir),
+  )
+  const byPath: string[] = []
+  const byDirectImport: string[] = []
+  const byHelperImport: string[] = []
+  for (const test of testsOf(pkg)) {
     // #224: a test kept next to the code (src/<dir>/<name>.test.ts) maps from its own folder.
-    if (test.startsWith("src/")) {
-      if (path.posix.dirname(test) === path.posix.dirname(rel) && path.posix.basename(test).startsWith(name)) return true
+    if (test.startsWith("src/") || test.startsWith("test-browser/")) {
+      if (path.posix.dirname(test) === path.posix.dirname(rel) && path.posix.basename(test).startsWith(name)) {
+        byPath.push(test)
+        continue
+      }
       const source = readFileSync(path.join(root, pkg, test), "utf8")
-      return importsModule(source, module, inner) || importsByPath(source, test, module, inner)
+      if (importsModule(source, module, inner, pkg, barrelDir) || importsByPath(source, test, module, inner)) {
+        byDirectImport.push(test)
+      }
+      continue
     }
     const testDir = path.posix.dirname(test.slice("test/".length))
     const testName = path.posix.basename(test)
-    if (testDir === dir && (testName.startsWith(`${name}.`) || testName.startsWith(`${name}-`))) return true
-    if (test.startsWith(`test/${inner}/`)) return true
-    if (testDir === "." && first && name !== "index" && testName.startsWith(`${first}-${name}`)) return true
-    if (testDir === "." && testName.startsWith(`${name}.`)) return true
+    const hasSubdir = dir === "." && existsSync(path.join(root, pkg, "src", name))
+    if (
+      (testDir === dir && (testName.startsWith(`${name}.`) || (!hasSubdir && testName.startsWith(`${name}-`)))) ||
+      test.startsWith(`test/${inner}/`) ||
+      test.startsWith(`test/${module}/`) ||
+      (testDir === "." && first && name !== "index" && testName.startsWith(`${first}-${name}`)) ||
+      (testDir === "." && testName.startsWith(`${name}.`))
+    ) {
+      byPath.push(test)
+      continue
+    }
     // A direct import of the changed module, or of a test helper that imports it.
     const source = readFileSync(path.join(root, pkg, test), "utf8")
-    return importsModule(source, module, inner) || helpers.some((abs) => importsHelper(source, abs))
-  })
+    if (importsModule(source, module, inner, pkg, barrelDir)) {
+      byDirectImport.push(test)
+    } else if (helpers.some((abs) => importsHelper(source, abs))) {
+      byHelperImport.push(test)
+    }
+  }
+  // Hub modules (e.g. packages/core/src/session.ts or mcp/index.ts) are imported by almost every test
+  // in the package; cap import fan-out per file so test:fast stays Tier-1 fast while Tier-2 Linux shards run all.
+  const direct = byDirectImport.length <= 25 ? byDirectImport : []
+  const viaHelpers = byDirectImport.length + byHelperImport.length <= 25 ? byHelperImport : []
+  return [...byPath, ...direct, ...viaHelpers]
 }
 
 const changed = changedFiles()
@@ -260,7 +318,10 @@ for (const [pkg, tests] of plan) {
     const regular = groupFiles.filter((file) => !mocking.includes(file))
     const batches = [...(regular.length > 0 ? [regular] : []), ...mocking.map((file) => [file])]
     for (const batch of batches) {
-      const run = Bun.spawnSync(["bun", "test", "--timeout", "30000", ...extraFlags, ...batch], {
+      const cmd = script.includes("script/test.ts")
+        ? ["bun", "run", "script/test.ts", ...extraFlags, ...batch]
+        : ["bun", "test", "--timeout", "30000", ...extraFlags, ...batch]
+      const run = Bun.spawnSync(cmd, {
         cwd: path.join(root, pkg),
         stdout: "inherit",
         stderr: "inherit",

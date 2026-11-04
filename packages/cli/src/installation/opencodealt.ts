@@ -67,7 +67,7 @@ export const OPENCODEALT_DOCS_URL = "https://aio.alterspective.com.au/app/ai-os/
 export const OPENCODEALT_UPDATE_COMMAND = ["aio", "opencode", "install"]
 
 export function isOpencodealt(channel = InstallationChannel) {
-  return channel === OPENCODEALT_CHANNEL
+  return channel.trim() === OPENCODEALT_CHANNEL
 }
 
 export function opencodealtVersion(tag: string) {
@@ -102,15 +102,15 @@ export function isNewerOpencodealt(candidate: string, current: string) {
   return !!semver.valid(candidate) && !!semver.valid(current) && semver.gt(candidate, current)
 }
 
-export async function latestOpencodealt(currentVersion?: string): Promise<string> {
-  const channel = readOpencodealtChannel()
+export async function latestOpencodealt(currentVersion?: string, execPath = process.execPath): Promise<string> {
+  const channel = readOpencodealtChannel(execPath)
   const headers: Record<string, string> = {
     Accept: "application/vnd.github+json",
     "User-Agent": `opencodealt/${currentVersion || "0.0.0"}`,
   }
   if (channel === "edge") {
     try {
-      const res = await fetch(OPENCODEALT_RELEASES_URL, { headers })
+      const res = await fetch(OPENCODEALT_RELEASES_URL, { headers, signal: AbortSignal.timeout(10_000) })
       if (res.ok) {
         const releases = (await res.json()) as { tag_name: string; draft?: boolean }[]
         const newest = newestOpencodealtVersion(releases)
@@ -120,7 +120,7 @@ export async function latestOpencodealt(currentVersion?: string): Promise<string
       // Fall back to the stable (Latest) check below if the edge releases lookup fails.
     }
   }
-  const res = await fetch(OPENCODEALT_LATEST_RELEASE_URL, { headers })
+  const res = await fetch(OPENCODEALT_LATEST_RELEASE_URL, { headers, signal: AbortSignal.timeout(10_000) })
   if (!res.ok) throw new Error(`GitHub latest release HTTP ${res.status}`)
   const data = (await res.json()) as { tag_name?: string }
   if (!data.tag_name) throw new Error("Latest release missing tag_name")

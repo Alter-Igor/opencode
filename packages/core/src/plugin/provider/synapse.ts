@@ -1,6 +1,9 @@
 import type { IntegrationOAuthMethodRegistration } from "@opencode/plugin/effect/integration"
 import { define } from "@opencode/plugin/effect/plugin"
+import { Global } from "@opencode/util/global"
 import { Effect } from "effect"
+import fs from "fs/promises"
+import path from "path"
 import { Credential } from "../../credential.js"
 import { InstallationVersion } from "../../installation/version.js"
 import { Integration } from "../../integration.js"
@@ -16,10 +19,31 @@ import {
   readStoredSynapseCredential,
   type SynapseModelEntry,
 } from "../synapse-models.js"
+import {
+  SYNAPSE_DEFAULT_INFERENCE_URL,
+  applyPrivacyTierHeader,
+  forcedPrivacyTier,
+  synapseModelsToken,
+} from "../synapse.js"
 
-const DEFAULT_SYNAPSE_URL = "https://synapse.alterspective.com.au/v1"
+const DEFAULT_SYNAPSE_URL = SYNAPSE_DEFAULT_INFERENCE_URL
 const ssoMethodID = Integration.MethodID.make("keystone-sso")
 const integrationID = Integration.ID.make(SYNAPSE_PROVIDER_ID)
+
+async function writeAuthJsonEntry(id: string, body: unknown): Promise<void> {
+  const authFile = path.join(Global.Path.data, "auth.json")
+  let current: Record<string, unknown> = {}
+  try {
+    const raw = await fs.readFile(authFile, "utf8")
+    const parsed = JSON.parse(raw)
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      current = parsed as Record<string, unknown>
+    }
+  } catch {}
+  current[id] = body
+  await fs.mkdir(path.dirname(authFile), { recursive: true })
+  await fs.writeFile(authFile, JSON.stringify(current, null, 2), { mode: 0o600 })
+}
 
 const keystoneOAuth: IntegrationOAuthMethodRegistration = {
   integrationID,
@@ -32,7 +56,19 @@ const keystoneOAuth: IntegrationOAuthMethodRegistration = {
     Effect.tryPromise({
       try: async () => {
         const { SynapseAuthPlugin } = await import("../synapse.js")
-        const hooks = await SynapseAuthPlugin({ directory: process.cwd() } as any)
+        const hooks = await SynapseAuthPlugin({
+          directory: process.cwd(),
+          client: {
+            auth: {
+              set: async (req: { path?: { id?: string }; body?: unknown }) => {
+                await writeAuthJsonEntry(req?.path?.id || SYNAPSE_PROVIDER_ID, req?.body)
+                return {}
+              },
+            },
+            tui: { showToast: async () => ({}) },
+            app: { log: async () => ({}) },
+          },
+        } as any)
         const oauthMethod = hooks.auth?.methods.find((m) => m.type === "oauth")
         if (!oauthMethod || oauthMethod.type !== "oauth") {
           throw new Error("Synapse OAuth method unavailable")
@@ -69,6 +105,7 @@ export const SynapseProviderPlugin: PluginInternal.InternalPlugin = define({
   id: "opencode.provider.synapse",
   effect: Effect.fn(function* (ctx) {
     const baseURL = process.env.SYNAPSE_BASE_URL?.trim() || DEFAULT_SYNAPSE_URL
+    const privacyTier = forcedPrivacyTier()
     const cfg: any = {
       provider: {
         [SYNAPSE_PROVIDER_ID]: {
@@ -79,6 +116,7 @@ export const SynapseProviderPlugin: PluginInternal.InternalPlugin = define({
         },
       },
     }
+    if (privacyTier) applyPrivacyTierHeader(cfg, privacyTier)
 
     const stored = yield* Effect.promise(() => readStoredSynapseCredential().catch(() => undefined))
     const envKey = process.env.SYNAPSE_API_KEY?.trim() || process.env.GPAAS_API_KEY?.trim()
@@ -89,10 +127,7 @@ export const SynapseProviderPlugin: PluginInternal.InternalPlugin = define({
         defaultBaseURL: baseURL,
         userAgent: `opencode/${InstallationVersion}`,
         cache: fileSynapseModelsCache(),
-        resolveToken: async () => ({
-          token: stored?.token || envKey,
-          expired: false,
-        }),
+        resolveToken: async () => (stored ? synapseModelsToken(stored) : { token: envKey, expired: false }),
       }),
     )
 
@@ -125,6 +160,7 @@ export const SynapseProviderPlugin: PluginInternal.InternalPlugin = define({
           baseURL,
           provider: SYNAPSE_PROVIDER_ID,
           apiKey,
+          ...(privacyTier ? { headers: { "x-privacy-tier": privacyTier } } : {}),
         }
         provider.integrationID = integrationID
       })
@@ -136,7 +172,7 @@ export const SynapseProviderPlugin: PluginInternal.InternalPlugin = define({
           model.capabilities = {
             tools: entry.tool_call ?? true,
             input: ["text"],
-            output: ["text"],
+            output: entry.reasoning ? ["text", "reasoning"] : ["text"],
           }
           if (entry.limit?.context) model.limit.context = entry.limit.context
           if (entry.limit?.output) model.limit.output = entry.limit.output

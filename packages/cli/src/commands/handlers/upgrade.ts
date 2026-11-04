@@ -4,7 +4,8 @@ import { Commands } from "../commands"
 import { Runtime } from "../../framework/runtime"
 import { Updater } from "../../services/updater"
 import { handlePromptErrors } from "../../ui/prompt"
-import { OPENCODE_VERSION } from "../../version"
+import { Opencodealt } from "../../installation/opencodealt"
+import { OPENCODE_CHANNEL, OPENCODE_VERSION } from "../../version"
 import { stripVTControlCharacters } from "node:util"
 
 export default Runtime.handler(
@@ -22,7 +23,12 @@ export default Runtime.handler(
       log.info(`Using method: ${method}`)
       const target = Option.getOrUndefined(input.target) ?? (yield* updater.latest(method))
       const version = target.trim().replace(/^v/, "")
-      if (version === OPENCODE_VERSION) {
+      if (
+        version === OPENCODE_VERSION ||
+        (Option.isNone(input.target) &&
+          Opencodealt.enabled(OPENCODE_CHANNEL) &&
+          !Opencodealt.isNewer(version, OPENCODE_VERSION))
+      ) {
         log.warn(`OpenCode upgrade skipped: ${version} is already installed`)
         outro("Done")
         return
