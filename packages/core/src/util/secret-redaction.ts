@@ -261,6 +261,13 @@ export function redactToolPart(part: { type?: unknown; state?: unknown } | undef
   for (const key of ["input", "output", "title", "metadata", "error", "raw"]) {
     if (key in state) state[key] = scrub(state[key])
   }
+  if (Array.isArray(state.content) && !Object.isFrozen(state.content)) {
+    for (const item of state.content) {
+      if (!item || typeof item !== "object" || Object.isFrozen(item)) continue
+      const entry = item as { type?: unknown; text?: unknown }
+      if (entry.type === "text" && typeof entry.text === "string") entry.text = scrub(entry.text)
+    }
+  }
   return changed()
 }
 
@@ -281,7 +288,9 @@ const REDACTED_PLACEHOLDER = /\[REDACTED:([a-z0-9_-]+)\]/gi
  * #205: return the first `[REDACTED:<kind>]` placeholder token whose count in `nextText` exceeds
  * its count in `previousText`, or `undefined` when no new placeholder is introduced.
  */
-export function introducesRedactedPlaceholder(nextText: string, previousText = ""): string | undefined {
+export function introducesRedactedPlaceholder(before: string | undefined, after?: string): string | undefined {
+  const previousText = after === undefined ? "" : (before ?? "")
+  const nextText = after === undefined ? (before ?? "") : after
   const nextMatches = Array.from(nextText.matchAll(REDACTED_PLACEHOLDER), (m) => m[0])
   if (nextMatches.length === 0) return undefined
   const prevCounts = new Map<string, number>()
@@ -300,7 +309,8 @@ export function introducesRedactedPlaceholder(nextText: string, previousText = "
 
 /**
  * #207: redact durable event payloads (tool parts in `message.part.updated` and tool/shell fields in
- * `session.next.tool.*` / `session.next.shell.*`) without mutating the caller's object references.
+ * `session.tool.*` / `session.shell.*` / `session.next.tool.*` / `session.next.shell.*`) without mutating
+ * the caller's object references.
  */
 export function redactedDurableEventData<T>(type: string, data: T): T {
   if (!data || typeof data !== "object") return data
@@ -311,20 +321,26 @@ export function redactedDurableEventData<T>(type: string, data: T): T {
     }
     return data
   }
-  if (type.startsWith("session.next.tool.") || type.startsWith("session.next.shell.")) {
+  if (
+    type.startsWith("session.tool.") ||
+    type.startsWith("session.shell.") ||
+    type.startsWith("session.next.tool.") ||
+    type.startsWith("session.next.shell.")
+  ) {
     const next = { ...(data as Record<string, unknown>) }
     for (const field of ["command", "output", "text", "title"]) {
       if (typeof next[field] === "string") next[field] = redactSecrets(next[field] as string)
     }
-    for (const field of ["input", "structured", "metadata", "error", "result", "provider"]) {
-      if (next[field] !== undefined) next[field] = redactedCopy(next[field])
+    for (const field of ["input", "structured", "metadata", "error", "result", "provider", "shell", "output"]) {
+      if (next[field] !== undefined && typeof next[field] !== "string") next[field] = redactedCopy(next[field])
     }
     if (Array.isArray(next.content)) {
       next.content = next.content.map((item: unknown) => {
-        if (!item || typeof item !== "object" || Object.isFrozen(item)) return item
+        if (!item || typeof item !== "object") return item
         const entry = item as { type?: unknown; text?: unknown }
         if (entry.type === "text" && typeof entry.text === "string") {
-          return { ...item, text: redactSecrets(entry.text) }
+          const text = redactSecrets(entry.text)
+          return text === entry.text ? item : { ...item, text }
         }
         return item
       })

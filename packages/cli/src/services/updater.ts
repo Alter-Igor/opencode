@@ -443,7 +443,7 @@ const make = Effect.gen(function* () {
     if (method === "aio" || Opencodealt.enabled(OPENCODE_CHANNEL)) {
       return yield* runUpgrade({
         method: "aio",
-        command: [...Opencodealt.INSTALL_COMMAND],
+        command: Opencodealt.installCommand(),
         title: "AI Office could not install OpenCode",
         retry: "Run aio opencode install manually.",
       }).pipe(Effect.asVoid)

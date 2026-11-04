@@ -9,6 +9,7 @@ import {
   isOpencodealt,
   latestOpencodealt,
   newestOpencodealtVersion,
+  opencodealtInstallCommand,
   opencodealtVersion,
   readOpencodealtChannel,
 } from "../../src/installation/opencodealt"
@@ -104,5 +105,18 @@ describe("installation (opencodealt #90, #97)", () => {
     expect(opencodealtVersion("opencodealt-v1.18.31-alt.7")).toBe("1.18.31-alt.7")
     expect(opencodealtVersion("v2.0.0")).toBe("2.0.0")
     expect(sourceVersion()).toContain("-alt")
+  })
+
+  test("opencodealtInstallCommand adds --edge when on edge channel", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "oca-cmd-"))
+    const exe = path.join(root, "bin", "opencodealt.exe")
+    expect(opencodealtInstallCommand(exe, {})).toEqual(["aio", "opencode", "install"])
+    expect(opencodealtInstallCommand(exe, { OPENCODEALT_RELEASE_CHANNEL: "edge" })).toEqual([
+      "aio",
+      "opencode",
+      "install",
+      "--edge",
+    ])
+    fs.rmSync(root, { recursive: true, force: true })
   })
 })

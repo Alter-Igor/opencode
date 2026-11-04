@@ -27,7 +27,7 @@ import { AbsolutePath, RelativePath } from "../schema.js"
 import type { SessionSchema } from "./schema.js"
 import { SessionHistory } from "./history.js"
 import { ProjectTable } from "../project/sql.js"
-import { redactedDurableEventData, redactedToolPart } from "../util/secret-redaction.js"
+import { redactedCopy, redactedDurableEventData, redactedToolPart } from "../util/secret-redaction.js"
 
 type DatabaseService = Database.Interface["db"]
 type MessageEvent = Exclude<
@@ -484,6 +484,9 @@ const encodeStored = (message: SessionMessage.Info | SessionStored.User) => {
       ...message,
       content: message.content.map((part) => (part.type === "tool" ? redactedToolPart(part) : part)),
     })
+  }
+  if (message.type === "shell") {
+    return encodeMessage(redactedCopy(message))
   }
   return encodeMessage(message)
 }

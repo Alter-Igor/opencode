@@ -2,7 +2,15 @@
 // Fixtures are assembled at run time so this file never holds a string that looks like a real
 // key to a secret scanner (GitHub push protection, gitleaks).
 import { describe, expect, test } from "bun:test"
-import { redactedCopy, redactedToolPart, redactSecrets, redactToolPart, redactToolResult } from "../../src/plugin/secret-redaction"
+import {
+  introducesRedactedPlaceholder,
+  redactedCopy,
+  redactedDurableEventData,
+  redactedToolPart,
+  redactSecrets,
+  redactToolPart,
+  redactToolResult,
+} from "../../src/plugin/secret-redaction"
 import { redactSensitiveData } from "../../src/plugin/observer"
 import { SynapseAuthPlugin } from "../../src/plugin/synapse"
 
@@ -327,5 +335,43 @@ describe("opencode import (#207)", () => {
     expect(copy.state.output).toBe("KEY=[REDACTED:openrouter]")
     expect(copy.state.input.command).toBe("echo [REDACTED:openrouter]")
     expect(part.state.output).toBe(`KEY=${KEYS.openrouter}`)
+  })
+
+  test("redacts V2 tool state.content text items and V2 session.tool.* / session.shell.* durable events", () => {
+    const v2Part = Object.freeze({
+      type: "tool",
+      state: Object.freeze({
+        status: "completed",
+        input: Object.freeze({}),
+        content: Object.freeze([
+          Object.freeze({ type: "text", text: `KEY=${KEYS.openrouter}` }),
+          Object.freeze({ type: "file", mime: "image/png", data: "iVBORw0KGgo" + KEYS.aws }),
+        ]),
+      }),
+    })
+    const copy = redactedToolPart(v2Part)
+    expect(copy.state.content[0]).toEqual({ type: "text", text: "KEY=[REDACTED:openrouter]" })
+    expect(copy.state.content[1]).toEqual({ type: "file", mime: "image/png", data: "iVBORw0KGgo" + KEYS.aws })
+
+    const toolEvent = redactedDurableEventData("session.tool.success", {
+      content: [{ type: "text", text: `KEY=${KEYS.github}` }],
+      metadata: { secret: KEYS.synapse },
+    })
+    expect(toolEvent.content[0].text).toBe("KEY=[REDACTED:github]")
+    expect(toolEvent.metadata.secret).toBe("[REDACTED:synapse]")
+
+    const shellEvent = redactedDurableEventData("session.shell.ended", {
+      shell: { command: `curl -H "x-api-key: ${KEYS.synapse}"` },
+      output: { output: `KEY=${KEYS.openrouter}` },
+    })
+    expect(shellEvent.shell.command).toBe('curl -H "x-api-key: [REDACTED:synapse]"')
+    expect(shellEvent.output.output).toBe("KEY=[REDACTED:openrouter]")
+  })
+
+  test("introducesRedactedPlaceholder(before, after) blocks new placeholders and allows removing existing ones", () => {
+    expect(introducesRedactedPlaceholder("", "token=[REDACTED:openai]")).toBe("[REDACTED:openai]")
+    expect(introducesRedactedPlaceholder("clean", "token=[REDACTED:openai]")).toBe("[REDACTED:openai]")
+    expect(introducesRedactedPlaceholder("token=[REDACTED:openai]", "token=real_value")).toBeUndefined()
+    expect(introducesRedactedPlaceholder("token=[REDACTED:openai]", "token=[REDACTED:openai]")).toBeUndefined()
   })
 })

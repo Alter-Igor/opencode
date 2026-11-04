@@ -127,11 +127,21 @@ export async function latestOpencodealt(currentVersion?: string): Promise<string
   return opencodealtVersion(data.tag_name)
 }
 
+export function opencodealtInstallCommand(
+  execPath = process.execPath,
+  env: Record<string, string | undefined> = process.env,
+) {
+  return readOpencodealtChannel(execPath, env) === "edge"
+    ? [...OPENCODEALT_UPDATE_COMMAND, "--edge"]
+    : [...OPENCODEALT_UPDATE_COMMAND]
+}
+
 export const Opencodealt = {
   CHANNEL: OPENCODEALT_CHANNEL,
   REPO: OPENCODEALT_REPO,
   DOCS_URL: OPENCODEALT_DOCS_URL,
   INSTALL_COMMAND: OPENCODEALT_UPDATE_COMMAND,
+  installCommand: opencodealtInstallCommand,
   enabled: isOpencodealt,
   latest: latestOpencodealt,
   readChannel: readOpencodealtChannel,
