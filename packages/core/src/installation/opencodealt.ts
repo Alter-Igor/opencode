@@ -109,12 +109,16 @@ export async function latestOpencodealt(currentVersion?: string): Promise<string
     "User-Agent": `opencodealt/${currentVersion || "0.0.0"}`,
   }
   if (channel === "edge") {
-    const res = await fetch(OPENCODEALT_RELEASES_URL, { headers })
-    if (!res.ok) throw new Error(`GitHub releases HTTP ${res.status}`)
-    const releases = (await res.json()) as { tag_name: string; draft?: boolean }[]
-    const newest = newestOpencodealtVersion(releases)
-    if (!newest) throw new Error("No opencodealt releases found")
-    return newest
+    try {
+      const res = await fetch(OPENCODEALT_RELEASES_URL, { headers })
+      if (res.ok) {
+        const releases = (await res.json()) as { tag_name: string; draft?: boolean }[]
+        const newest = newestOpencodealtVersion(releases)
+        if (newest) return newest
+      }
+    } catch {
+      // Fall back to the stable (Latest) check below if the edge releases lookup fails.
+    }
   }
   const res = await fetch(OPENCODEALT_LATEST_RELEASE_URL, { headers })
   if (!res.ok) throw new Error(`GitHub latest release HTTP ${res.status}`)

@@ -232,8 +232,19 @@ export function redactToolResult(
 }
 
 /** A redacted deep copy of a value, the same as a stored tool input; the value itself is not changed. */
+function clonePlain<T>(value: T): T {
+  if (Array.isArray(value)) return (Object.isFrozen(value) ? value : value.map(clonePlain)) as T
+  const proto = value && typeof value === "object" ? Object.getPrototypeOf(value) : undefined
+  if ((proto === Object.prototype || proto === null) && !Object.isFrozen(value)) {
+    const out: Record<string, unknown> = proto === null ? Object.create(null) : {}
+    for (const [key, inner] of Object.entries(value as Record<string, unknown>)) out[key] = clonePlain(inner)
+    return out as T
+  }
+  return value
+}
+
 export function redactedCopy<T>(value: T): T {
-  return scrubber().scrub(structuredClone(value)) as T
+  return scrubber().scrub(clonePlain(value)) as T
 }
 
 /**
@@ -324,7 +335,7 @@ export function redactedDurableEventData<T>(type: string, data: T): T {
 
 export function redactedToolPart<T extends { type?: unknown }>(part: T): T {
   if (part.type !== "tool") return part
-  const copy = structuredClone(part)
+  const copy = clonePlain(part)
   redactToolPart(copy as { type?: unknown; state?: unknown })
   return copy
 }

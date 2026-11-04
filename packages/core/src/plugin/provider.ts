@@ -65,5 +65,4 @@ const ALL_PROVIDER_PLUGINS: PluginInternal.InternalPlugin[] = [
   ClaudeAgentPlugin,
 ]
 
-export const ProviderPlugins: PluginInternal.InternalPlugin[] =
-  process.env.OPENCODE_ALLOW_ALL_PROVIDERS === "1" ? ALL_PROVIDER_PLUGINS : [SynapseProviderPlugin]
+export const ProviderPlugins: PluginInternal.InternalPlugin[] = ALL_PROVIDER_PLUGINS

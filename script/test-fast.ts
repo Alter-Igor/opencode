@@ -38,8 +38,20 @@ const lines = (text: string) => text.split(/\r?\n/).map((line) => line.trim()).f
 /** Files changed against the merge base with `base`, plus uncommitted and untracked files. */
 function changedFiles(): string[] {
   const mergeBase = git(["merge-base", base, "HEAD"]).trim()
+  let committed = lines(git(["diff", "--no-renames", "--name-only", "--diff-filter=ACMR", mergeBase]))
+  // When catching up with upstream via a merge commit that brings in >500 upstream files,
+  // exclude files that are identical to the upstream merge parent so test:fast only tests fork changes.
+  if (committed.length > 500) {
+    const merges = lines(git(["rev-list", "--merges", "-n", "1", `${mergeBase}..HEAD`]))
+    if (merges[0]) {
+      const upstreamDiff = new Set(
+        lines(git(["diff", "--no-renames", "--name-only", "--diff-filter=ACMR", `${merges[0]}^2`, "HEAD"])),
+      )
+      committed = committed.filter((file) => upstreamDiff.has(file))
+    }
+  }
   const files = new Set([
-    ...lines(git(["diff", "--name-only", "--diff-filter=ACMR", mergeBase])),
+    ...committed,
     ...lines(git(["ls-files", "--others", "--exclude-standard"])),
   ])
   return [...files].filter((file) => existsSync(path.join(root, file)))
@@ -147,12 +159,14 @@ const importsByPath = (source: string, test: string, module: string, inner: stri
 /** True when `source` imports the helper file `abs` by its name, or by its folder for an index file. */
 const importsHelper = (source: string, abs: string) => {
   const name = path.basename(abs).replace(CODE, "")
+  if (name === "fixture" || name === "host") return false
   if (imports(source, `/${name}`)) return true
   return name === "index" && imports(source, `/${path.basename(path.dirname(abs))}`)
 }
 
 /** Test files (relative to the package) mapped to one changed file (relative to the package). */
 function mapToTests(pkg: string, rel: string): string[] {
+  if (rel.startsWith("e2e/")) return []
   if (TEST.test(rel)) return [rel]
   if (!rel.startsWith("src/") || !CODE.test(rel)) return []
   const inner = rel.slice("src/".length).replace(CODE, "")
@@ -170,10 +184,10 @@ function mapToTests(pkg: string, rel: string): string[] {
     }
     const testDir = path.posix.dirname(test.slice("test/".length))
     const testName = path.posix.basename(test)
-    if (testDir === dir && testName.startsWith(name)) return true
+    if (testDir === dir && (testName.startsWith(`${name}.`) || testName.startsWith(`${name}-`))) return true
     if (test.startsWith(`test/${inner}/`)) return true
-    if (testDir === "." && first && testName.startsWith(`${first}-`)) return true
-    if (testDir === "." && testName.startsWith(name)) return true
+    if (testDir === "." && first && name !== "index" && testName.startsWith(`${first}-${name}`)) return true
+    if (testDir === "." && testName.startsWith(`${name}.`)) return true
     // A direct import of the changed module, or of a test helper that imports it.
     const source = readFileSync(path.join(root, pkg, test), "utf8")
     return importsModule(source, module, inner) || helpers.some((abs) => importsHelper(source, abs))
@@ -217,22 +231,42 @@ if (linting) {
   const lint = Bun.spawnSync(["bun", "x", "oxlint", "--format", "default", ...lintable], { cwd: root, stdout: "inherit", stderr: "inherit" })
   if (lint.exitCode !== 0) failed = true
 }
+function extractTestFlags(script: string): string[] {
+  const flags: string[] = []
+  for (const cond of script.match(/--conditions=\S+/g) ?? []) flags.push(cond)
+  for (const [, preload] of script.matchAll(/--preload\s+(\S+)/g)) flags.push("--preload", preload!)
+  if (/\s--isolate(?:\s|$)/.test(script)) flags.push("--isolate")
+  return flags
+}
+
 for (const [pkg, tests] of plan) {
-  // #224: a package whose test:unit script sets --conditions (packages/app: solid) needs it here too.
-  const script = String(JSON.parse(readFileSync(path.join(root, pkg, "package.json"), "utf8")).scripts?.["test:unit"] ?? "")
-  const conditions = script.match(/--conditions=\S+/g) ?? []
-  const files = [...tests].sort().map((test) => `./${test}`)
-  // #224: a `mock.module` lasts for the whole bun process, so one file's mock (packages/app's
-  // child-store.test.ts replaces @tanstack/solid-query) broke the next file's imports. When any
-  // mapped file mocks a module, each file runs in its own process.
-  const isolate = files.some((file) => readFileSync(path.join(root, pkg, file), "utf8").includes("mock.module("))
-  for (const batch of isolate ? files.map((file) => [file]) : [files]) {
-    const run = Bun.spawnSync(["bun", "test", "--timeout", "30000", ...conditions, ...batch], {
-      cwd: path.join(root, pkg),
-      stdout: "inherit",
-      stderr: "inherit",
-    })
-    if (run.exitCode !== 0) failed = true
+  const scripts = JSON.parse(readFileSync(path.join(root, pkg, "package.json"), "utf8")).scripts ?? {}
+  const unitScript = String(scripts["test:unit"] ?? scripts["test"] ?? "")
+  const browserScript = String(scripts["test:browser"] ?? unitScript)
+  const allTests = [...tests].sort()
+  const browserTests = allTests.filter((t) => t.startsWith("test-browser/")).map((t) => `./${t}`)
+  const unitTests = allTests.filter((t) => !t.startsWith("test-browser/")).map((t) => `./${t}`)
+
+  for (const [groupFiles, script] of [
+    [unitTests, unitScript],
+    [browserTests, browserScript],
+  ] as const) {
+    if (groupFiles.length === 0) continue
+    const extraFlags = extractTestFlags(script)
+    // #224: a `mock.module` lasts for the whole bun process, so one file's mock (packages/app's
+    // child-store.test.ts replaces @tanstack/solid-query) broke the next file's imports. Run files
+    // that call `mock.module(` in their own process and batch all non-mocking files together.
+    const mocking = groupFiles.filter((file) => readFileSync(path.join(root, pkg, file), "utf8").includes("mock.module("))
+    const regular = groupFiles.filter((file) => !mocking.includes(file))
+    const batches = [...(regular.length > 0 ? [regular] : []), ...mocking.map((file) => [file])]
+    for (const batch of batches) {
+      const run = Bun.spawnSync(["bun", "test", "--timeout", "30000", ...extraFlags, ...batch], {
+        cwd: path.join(root, pkg),
+        stdout: "inherit",
+        stderr: "inherit",
+      })
+      if (run.exitCode !== 0) failed = true
+    }
   }
 }
 process.exit(failed ? 1 : 0)

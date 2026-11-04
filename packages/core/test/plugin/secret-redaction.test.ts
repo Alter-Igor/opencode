@@ -295,4 +295,22 @@ describe("opencode import (#207)", () => {
     expect(redactToolPart(part)).toBe(1)
     expect(part.state.output).toBe("KEY=[REDACTED:openrouter]")
   })
+
+  test("redactedToolPart preserves class instances such as Effect DateTime.Utc on part.time.created", () => {
+    class FakeUtc {
+      readonly epochMillis = 1700000000000
+    }
+    const created = new FakeUtc()
+    const part = {
+      type: "tool",
+      time: { created },
+      state: { status: "completed", input: { command: "env" }, output: `KEY=${KEYS.openrouter}` },
+    }
+    const copy = redactedToolPart(part)
+    expect(copy).not.toBe(part)
+    expect(copy.time.created).toBe(created)
+    expect(copy.time.created instanceof FakeUtc).toBe(true)
+    expect(copy.state.output).toBe("KEY=[REDACTED:openrouter]")
+    expect(part.state.output).toBe(`KEY=${KEYS.openrouter}`)
+  })
 })

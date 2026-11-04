@@ -105,6 +105,7 @@ import { GoalPlugin } from "./goal.js"
 import { ModelsDevPlugin } from "./models-dev.js"
 import { McpCodeModeDefaultsPlugin } from "./mcp-codemode-defaults.js"
 import { ProviderPlugins } from "./provider.js"
+import { SynapseProviderPlugin } from "./provider/synapse.js"
 import { DynamicProviderPlugin } from "./provider/dynamic.js"
 import { OpencodePlugin } from "./provider/opencode.js"
 import { WebSearchPlugins } from "./websearch/index.js"
@@ -238,6 +239,11 @@ export const requirements = LayerNode.group([
 
 export type InternalPlugin = Plugin<Requirements | Scope.Scope>
 
+const OpencodeGuardPlaceholder: InternalPlugin = {
+  id: OpencodePlugin.id,
+  effect: () => Effect.void,
+}
+
 const pre = [
   ToolInputRepairPlugin.Plugin,
   ConfigWorktreePlugin.Plugin,
@@ -251,8 +257,9 @@ const pre = [
   GoalPlugin.Plugin,
   SkillPlugin.Plugin,
   VcsHgPlugin.Plugin,
-  ModelsDevPlugin,
-  ...ProviderPlugins,
+  ...(process.env.OPENCODE_ALLOW_ALL_PROVIDERS === "1"
+    ? [ModelsDevPlugin, ...ProviderPlugins]
+    : [SynapseProviderPlugin, OpencodeGuardPlaceholder]),
   ...WebSearchPlugins,
   PatchTool.Plugin,
   // Render model prompts after the patch plugin selects the available editing tools.

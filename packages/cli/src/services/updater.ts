@@ -577,13 +577,17 @@ const make = Effect.gen(function* () {
       current,
       latest: version,
     })
-    const next = action(current, version, policy)
+    const next = Opencodealt.enabled(OPENCODE_CHANNEL)
+      ? Opencodealt.isNewer(version, current)
+        ? "notify"
+        : "none"
+      : action(current, version, policy)
     if (next === "none") {
       yield* Effect.logInfo("update check done", { action: "up-to-date" })
       return undefined
     }
     yield* Effect.logInfo("OpenCode update available", { current, latest: version, action: next })
-    return { policy, version }
+    return { policy: Opencodealt.enabled(OPENCODE_CHANNEL) ? "notify" : policy, version }
   })
 
   const install = Effect.fnUntraced(function* (version: string) {
@@ -624,7 +628,10 @@ const make = Effect.gen(function* () {
     const version = yield* latest(detected)
     if (!parseReleaseVersion(version)) return yield* Effect.fail(new Error(`Invalid version: ${version}`))
     const current = yield* Ref.get(installedVersion)
-    if (action(current, version, "auto") === "none") {
+    const upToDate = Opencodealt.enabled(OPENCODE_CHANNEL)
+      ? !Opencodealt.isNewer(version, current)
+      : action(current, version, "auto") === "none"
+    if (upToDate) {
       // An earlier check may have installed the update while this client is still running.
       return action(OPENCODE_VERSION, current, "auto") === "none"
         ? undefined

@@ -27,6 +27,35 @@ export function fromLegacyV1Plugin(id: string, fn: V1PluginFn): PluginInternal.I
         }),
       ).pipe(Effect.orElseSucceed((): Hooks => ({})))
 
+      if (hooks.config && id === "opencode.fork.opencodealt-docs") {
+        const cfg: { command?: Record<string, { description?: string; template?: string }> } = {}
+        yield* Effect.promise(() => hooks.config!(cfg as any)).pipe(Effect.ignore)
+        const commands = Object.entries(cfg.command ?? {})
+        if (commands.length > 0) {
+          yield* ctx.command.transform((editor) => {
+            for (const [name, cmd] of commands) {
+              if (!cmd?.template) continue
+              const template = cmd.template
+              editor.add({
+                name,
+                description: cmd.description,
+                execute: (input) =>
+                  ctx.session
+                    .prompt({
+                      ...input.prompt,
+                      sessionID: input.sessionID,
+                      text: template.includes("$ARGUMENTS")
+                        ? template.replaceAll("$ARGUMENTS", () => input.prompt.text.trim())
+                        : [template, input.prompt.text.trim()].filter(Boolean).join("\n\n"),
+                      delivery: input.delivery,
+                    })
+                    .pipe(Effect.asVoid),
+              })
+            }
+          })
+        }
+      }
+
       if (hooks["experimental.chat.system.transform"]) {
         const transform = hooks["experimental.chat.system.transform"]
         yield* ctx.session.hook("context", (evt) =>

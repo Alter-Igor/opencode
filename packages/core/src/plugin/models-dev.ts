@@ -33,7 +33,6 @@ const BEDROCK_PROFILE_ONLY_IDS = [
 export const ModelsDevPlugin = define({
   id: "opencode.models.dev",
   effect: Effect.fn(function* (ctx) {
-    if (process.env.OPENCODE_ALLOW_ALL_PROVIDERS !== "1") return
     const modelsDev = yield* ModelsDev.Service
     const bus = yield* Bus.Service
     // Filtering and definition indexes are shared across Locations. Only Model materialization

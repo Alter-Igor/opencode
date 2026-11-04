@@ -5,15 +5,13 @@ declare const OPENCODE_CHANNEL: string
 declare const OPENCODE_ARTIFACT: string
 declare const OPENCODE_RELEASE_HIGHLIGHTS: string
 
-import { InstallationChannel, InstallationVersion } from "./installation/version"
-
-const version =
-  typeof OPENCODE_VERSION === "string"
-    ? OPENCODE_VERSION
-    : InstallationChannel === "opencodealt"
-      ? InstallationVersion
+const version = typeof OPENCODE_VERSION === "string" ? OPENCODE_VERSION : "local"
+const channel =
+  typeof OPENCODE_CHANNEL === "string"
+    ? OPENCODE_CHANNEL
+    : process.env.OPENCODE_CHANNEL === "opencodealt"
+      ? "opencodealt"
       : "local"
-const channel = typeof OPENCODE_CHANNEL === "string" ? OPENCODE_CHANNEL : InstallationChannel
 const artifact = typeof OPENCODE_ARTIFACT === "string" ? OPENCODE_ARTIFACT : "cli"
 // Stable release builds embed the release notes' Highlights; every other build has none.
 const highlights =
