@@ -112,7 +112,6 @@
     // AI Connection so it is reached via keystone-dynamic (BFA-007), not a per-repo PAT.
   },
   "tools": {
-    "github-triage": false,
     "github-pr-search": false,
   },
 }

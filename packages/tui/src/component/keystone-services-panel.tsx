@@ -1,8 +1,8 @@
 import { createMemo, createSignal, For, Show } from "solid-js"
-import { useSync } from "../context/sync"
+import { useData } from "../context/data"
+import { useLocation } from "../context/location"
 import { useTheme } from "../context/theme"
 import { TextAttributes } from "@opentui/core"
-import { useSDK } from "../context/sdk"
 
 export interface ServiceToggle {
   id: string
@@ -13,14 +13,13 @@ export interface ServiceToggle {
   status: "connected" | "needs_auth"
 }
 
-// Global persistent service state for the session
-const [servicesState, setServicesState] = createSignal<Record<string, boolean>>({
+const [servicesState] = createSignal<Record<string, boolean>>({
   m365: true,
   rag: true,
   imprint: true,
   cas: true,
   integrations: true,
-  browser: false, // Default browser scraping off for safety
+  browser: false,
 })
 
 export function isKeystoneServiceEnabled(serviceId: string): boolean {
@@ -28,14 +27,15 @@ export function isKeystoneServiceEnabled(serviceId: string): boolean {
 }
 
 export function KeystoneServicesPanel() {
-  const sync = useSync()
-  const sdk = useSDK()
-  const { theme } = useTheme()
-  const [loading, setLoading] = createSignal<string | null>(null)
+  const data = useData()
+  const location = useLocation()
+  const theme = useTheme()
 
   const services = createMemo((): ServiceToggle[] => {
-    const mcpData = (sync.data.mcp ?? {}) as Record<string, { status?: string } | undefined>
-    const isKdConnected = mcpData["keystone-dynamic"]?.status === "connected"
+    const current = location.ref ?? data.location.default()
+    const servers = data.location.mcp.server.list(current) ?? []
+    const kd = servers.find((s) => s.name === "keystone-dynamic")
+    const isKdConnected = kd?.status.status === "connected"
     const state = servicesState()
 
     return [
@@ -90,20 +90,13 @@ export function KeystoneServicesPanel() {
     ]
   })
 
-  const toggle = (id: string) => {
-    setServicesState((prev) => ({
-      ...prev,
-      [id]: !prev[id],
-    }))
-  }
-
   return (
     <box flexDirection="column" gap={1} marginTop={1} paddingRight={1}>
       <box flexDirection="row" justifyContent="space-between" alignItems="center">
-        <text fg={theme.text} attributes={TextAttributes.BOLD}>
+        <text fg={theme.text.base} attributes={TextAttributes.BOLD}>
           Keystone Governance
         </text>
-        <text fg={theme.textMuted}>
+        <text fg={theme.text.muted}>
           {services().filter((s) => s.enabled).length}/{services().length} active
         </text>
       </box>
@@ -111,7 +104,7 @@ export function KeystoneServicesPanel() {
       <box
         flexDirection="column"
         borderStyle="single"
-        borderColor={theme.border}
+        borderColor={theme.border.base}
         paddingLeft={1}
         paddingRight={1}
         paddingTop={0}
@@ -128,17 +121,15 @@ export function KeystoneServicesPanel() {
               paddingBottom={0}
             >
               <box flexDirection="row" gap={1} alignItems="center">
-                <text fg={theme.text}>{service.icon}</text>
-                <text fg={service.enabled ? theme.text : theme.textMuted}>
-                  {service.name}
-                </text>
+                <text fg={theme.text.base}>{service.icon}</text>
+                <text fg={service.enabled ? theme.text.base : theme.text.muted}>{service.name}</text>
               </box>
               <box flexDirection="row" gap={1} alignItems="center">
                 <Show when={service.status === "needs_auth"}>
-                  <text fg={theme.warning}>⚡</text>
+                  <text fg={theme.text.feedback.warning.base}>⚡</text>
                 </Show>
                 <text
-                  fg={service.enabled ? theme.success : theme.textMuted}
+                  fg={service.enabled ? theme.text.feedback.success.base : theme.text.muted}
                   attributes={service.enabled ? TextAttributes.BOLD : undefined}
                 >
                   {service.enabled ? "[ON]" : "[OFF]"}
@@ -148,9 +139,7 @@ export function KeystoneServicesPanel() {
           )}
         </For>
       </box>
-      <text fg={theme.textMuted}>
-        Turn off any system to strictly block AI access in this session.
-      </text>
+      <text fg={theme.text.muted}>Turn off any system to strictly block AI access in this session.</text>
     </box>
   )
 }

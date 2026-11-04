@@ -232,8 +232,19 @@ export function redactToolResult(
 }
 
 /** A redacted deep copy of a value, the same as a stored tool input; the value itself is not changed. */
+function clonePlain<T>(value: T): T {
+  if (Array.isArray(value)) return value.map(clonePlain) as T
+  const proto = value && typeof value === "object" ? Object.getPrototypeOf(value) : undefined
+  if (proto === Object.prototype || proto === null) {
+    const out: Record<string, unknown> = proto === null ? Object.create(null) : {}
+    for (const [key, inner] of Object.entries(value as Record<string, unknown>)) out[key] = clonePlain(inner)
+    return out as T
+  }
+  return value
+}
+
 export function redactedCopy<T>(value: T): T {
-  return scrubber().scrub(structuredClone(value)) as T
+  return scrubber().scrub(clonePlain(value)) as T
 }
 
 /**
@@ -245,9 +256,17 @@ export function redactedCopy<T>(value: T): T {
 export function redactToolPart(part: { type?: unknown; state?: unknown } | undefined): number {
   if (!part || part.type !== "tool" || !part.state || typeof part.state !== "object") return 0
   const state = part.state as Record<string, unknown>
+  if (Object.isFrozen(state)) return 0
   const { scrub, changed } = scrubber()
   for (const key of ["input", "output", "title", "metadata", "error", "raw"]) {
     if (key in state) state[key] = scrub(state[key])
+  }
+  if (Array.isArray(state.content) && !Object.isFrozen(state.content)) {
+    for (const item of state.content) {
+      if (!item || typeof item !== "object" || Object.isFrozen(item)) continue
+      const entry = item as { type?: unknown; text?: unknown }
+      if (entry.type === "text" && typeof entry.text === "string") entry.text = scrub(entry.text)
+    }
   }
   return changed()
 }
@@ -269,7 +288,9 @@ const REDACTED_PLACEHOLDER = /\[REDACTED:([a-z0-9_-]+)\]/gi
  * #205: return the first `[REDACTED:<kind>]` placeholder token whose count in `nextText` exceeds
  * its count in `previousText`, or `undefined` when no new placeholder is introduced.
  */
-export function introducesRedactedPlaceholder(nextText: string, previousText = ""): string | undefined {
+export function introducesRedactedPlaceholder(before: string | undefined, after?: string): string | undefined {
+  const previousText = after === undefined ? "" : (before ?? "")
+  const nextText = after === undefined ? (before ?? "") : after
   const nextMatches = Array.from(nextText.matchAll(REDACTED_PLACEHOLDER), (m) => m[0])
   if (nextMatches.length === 0) return undefined
   const prevCounts = new Map<string, number>()
@@ -288,7 +309,8 @@ export function introducesRedactedPlaceholder(nextText: string, previousText = "
 
 /**
  * #207: redact durable event payloads (tool parts in `message.part.updated` and tool/shell fields in
- * `session.next.tool.*` / `session.next.shell.*`) without mutating the caller's object references.
+ * `session.tool.*` / `session.shell.*` / `session.next.tool.*` / `session.next.shell.*`) without mutating
+ * the caller's object references.
  */
 export function redactedDurableEventData<T>(type: string, data: T): T {
   if (!data || typeof data !== "object") return data
@@ -299,20 +321,26 @@ export function redactedDurableEventData<T>(type: string, data: T): T {
     }
     return data
   }
-  if (type.startsWith("session.next.tool.") || type.startsWith("session.next.shell.")) {
+  if (
+    type.startsWith("session.tool.") ||
+    type.startsWith("session.shell.") ||
+    type.startsWith("session.next.tool.") ||
+    type.startsWith("session.next.shell.")
+  ) {
     const next = { ...(data as Record<string, unknown>) }
     for (const field of ["command", "output", "text", "title"]) {
       if (typeof next[field] === "string") next[field] = redactSecrets(next[field] as string)
     }
-    for (const field of ["input", "structured", "metadata", "error", "result", "provider"]) {
-      if (next[field] !== undefined) next[field] = redactedCopy(next[field])
+    for (const field of ["input", "structured", "metadata", "error", "result", "provider", "shell", "output"]) {
+      if (next[field] !== undefined && typeof next[field] !== "string") next[field] = redactedCopy(next[field])
     }
     if (Array.isArray(next.content)) {
       next.content = next.content.map((item: unknown) => {
-        if (!item || typeof item !== "object" || Object.isFrozen(item)) return item
+        if (!item || typeof item !== "object") return item
         const entry = item as { type?: unknown; text?: unknown }
         if (entry.type === "text" && typeof entry.text === "string") {
-          return { ...item, text: redactSecrets(entry.text) }
+          const text = redactSecrets(entry.text)
+          return text === entry.text ? item : { ...item, text }
         }
         return item
       })
@@ -324,7 +352,22 @@ export function redactedDurableEventData<T>(type: string, data: T): T {
 
 export function redactedToolPart<T extends { type?: unknown }>(part: T): T {
   if (part.type !== "tool") return part
-  const copy = structuredClone(part)
+  const copy = clonePlain(part)
   redactToolPart(copy as { type?: unknown; state?: unknown })
   return copy
+}
+
+export const REDACTED_PLACEHOLDER_ERROR = "Refusing to write [REDACTED:...] placeholder token into file. Retrieve the real value from its sanctioned source or keep the existing text."
+
+const SENSITIVE_ENV_KEY = /(?:^|_)(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH|PAT|BEARER|COOKIE|PRIVATE_KEY)(?:$|_)/i
+
+export function scrubShellEnv(env: Record<string, string | undefined>): Record<string, string | undefined> {
+  if (process.env.OPENCODE_ALLOW_SENSITIVE_SHELL_ENV === "1") return { ...env }
+  const out: Record<string, string | undefined> = {}
+  for (const [k, v] of Object.entries(env)) {
+    if (v === undefined) continue
+    if (SENSITIVE_ENV_KEY.test(k)) continue
+    out[k] = v
+  }
+  return out
 }

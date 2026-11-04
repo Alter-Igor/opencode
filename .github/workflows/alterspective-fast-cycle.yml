@@ -3,8 +3,8 @@ name: alterspective-fast-cycle
 # Fork-only (#93, KB playbook AIPB-008). The upstream `test` jobs need Blacksmith runners this fork
 # does not have, so they never start. Two tiers on GitHub-hosted Linux instead:
 #   fast — every PR: oxlint plus only the tests mapped to the changed files (script/test-fast.ts),
-#          then the opencode typecheck. Agents wait on this one.
-#   full — every PR and every push to dev: the whole packages/opencode suite on Linux. `integrate`
+#          then the core + cli typecheck. Agents wait on this one.
+#   full — every PR and every push to dev: the whole packages/core suite on Linux. `integrate`
 #          reads this result before a merge instead of a slow, noisy local Windows run.
 #          (#112) The suite runs as 4 shards in parallel (`bun test --shard`, split by file); the job
 #          named `full` passes only when every shard passed. No `--parallel` inside a shard: each
@@ -38,12 +38,14 @@ jobs:
       - name: Setup Bun
         uses: ./.github/actions/setup-bun
 
+      - name: Ensure ripgrep
+        run: command -v rg >/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep)
+
       - name: Fast tier (lint + mapped tests)
         run: bun run test:fast --base origin/${{ github.base_ref }}
 
-      - name: Typecheck opencode
-        working-directory: packages/opencode
-        run: bun run typecheck
+      - name: Typecheck core and cli
+        run: bun run --cwd packages/core typecheck && bun run --cwd packages/cli typecheck
 
   full-shard:
     name: full shard ${{ matrix.shard }}/4
@@ -60,14 +62,17 @@ jobs:
       - name: Setup Bun
         uses: ./.github/actions/setup-bun
 
+      - name: Ensure ripgrep
+        run: command -v rg >/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep)
+
       - name: Configure git identity
         run: |
           git config --global user.email "bot@opencode.ai"
           git config --global user.name "opencode"
 
-      - name: Full opencode suite (shard ${{ matrix.shard }}/4)
-        working-directory: packages/opencode
-        run: bun test --timeout 30000 --only-failures --shard=${{ matrix.shard }}/4
+      - name: Full core suite (shard ${{ matrix.shard }}/4)
+        working-directory: packages/core
+        run: bun run script/test.ts --shard=${{ matrix.shard }}/4
 
   # One result for `integrate` to read. Runs even when a shard fails or is cancelled, and fails then.
   full:

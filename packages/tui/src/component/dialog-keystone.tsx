@@ -1,11 +1,10 @@
-import { createMemo, createSignal, onMount, Show } from "solid-js"
-import { useSync } from "../context/sync"
+import { createMemo } from "solid-js"
+import { useData } from "../context/data"
+import { useLocation } from "../context/location"
+import { useClient } from "../context/client"
 import { DialogSelect, type DialogSelectOption } from "../ui/dialog-select"
-import { useDialog } from "../ui/dialog"
 import { useTheme } from "../context/theme"
 import { TextAttributes } from "@opentui/core"
-import { useSDK } from "../context/sdk"
-
 import { isKeystoneServiceEnabled } from "./keystone-services-panel"
 
 export interface KeystoneToolInfo {
@@ -19,26 +18,19 @@ export interface KeystoneToolInfo {
 }
 
 export function DialogKeystone() {
-  const sync = useSync()
-  const sdk = useSDK()
-  const dialog = useDialog()
-  const { theme } = useTheme()
-  const [loading, setLoading] = createSignal<string | null>(null)
-  const [keystoneConnected, setKeystoneConnected] = createSignal(true)
+  const data = useData()
+  const location = useLocation()
+  const client = useClient()
+  const theme = useTheme().surface("dialog")
+  const current = () => location.ref ?? data.location.default()
 
-  onMount(async () => {
-    try {
-      const status = await sdk.client.mcp.status()
-      if (status.data) {
-        sync.set("mcp", status.data)
-        const kd = (status.data as Record<string, { status?: string } | undefined>)["keystone-dynamic"]
-        setKeystoneConnected(kd?.status === "connected")
-      }
-    } catch {}
+  const keystoneConnected = createMemo(() => {
+    const servers = data.location.mcp.server.list(current()) ?? []
+    const kd = servers.find((s) => s.name === "keystone-dynamic")
+    return kd?.status.status === "connected"
   })
 
   const keystoneTools: KeystoneToolInfo[] = [
-    // Microsoft 365
     {
       name: "mail_search",
       serviceId: "m365",
@@ -95,8 +87,6 @@ export function DialogKeystone() {
       category: "Microsoft 365 (via Keystone)",
       status: "connected",
     },
-
-    // Alterspective Corporate Services
     {
       name: "rag_search",
       serviceId: "rag",
@@ -129,8 +119,6 @@ export function DialogKeystone() {
       category: "Alterspective Services (via Keystone)",
       status: "connected",
     },
-
-    // External Credential Providers
     {
       name: "cred_jira",
       serviceId: "integrations",
@@ -170,60 +158,37 @@ export function DialogKeystone() {
         description: t.description,
         category: t.category,
         footer: !isEnabled ? (
-          <span style={{ fg: theme.textMuted }}>○ Disabled by User</span>
+          <span style={{ fg: theme.text.muted }}>○ Disabled by User</span>
         ) : isKDConnected ? (
-          <span style={{ fg: theme.success, attributes: TextAttributes.BOLD }}>✓ Connected [ON]</span>
+          <span style={{ fg: theme.text.feedback.success.base, attributes: TextAttributes.BOLD }}>✓ Connected [ON]</span>
         ) : (
-          <span style={{ fg: theme.warning, attributes: TextAttributes.BOLD }}>⚡ Needs Sign-In</span>
+          <span style={{ fg: theme.text.feedback.warning.base, attributes: TextAttributes.BOLD }}>⚡ Needs Sign-In</span>
         ),
       }
     })
   })
 
-  const actions = createMemo(() => [
-    {
-      command: "dialog.keystone.reconnect",
-      title: "connect / re-authenticate",
-      onTrigger: async (option: DialogSelectOption<string>) => {
-        setLoading(option.value)
-        try {
-          await sdk.client.mcp.auth.authenticate({ name: "keystone-dynamic" })
-          const status = await sdk.client.mcp.status()
-          if (status.data) {
-            sync.set("mcp", status.data)
-            const kd = (status.data as Record<string, { status?: string } | undefined>)["keystone-dynamic"]
-            setKeystoneConnected(kd?.status === "connected")
-          }
-        } catch (err) {
-          console.error("Failed to authenticate Keystone:", err)
-        } finally {
-          setLoading(null)
-        }
-      },
-    },
-  ])
+  const reconnect = async () => {
+    const target = current()
+    await client.api.experimental.mcp.connect({ server: "keystone-dynamic", location: { directory: target.directory } }).catch(() => {})
+  }
 
   return (
     <DialogSelect
       title="Keystone Dynamic Gateway — Connected Tools & Services"
       options={options()}
-      actions={actions()}
+      actions={[
+        {
+          command: "dialog.keystone.reconnect",
+          title: "connect / re-authenticate",
+          onTrigger: async (_option: DialogSelectOption<string>) => {
+            await reconnect()
+          },
+        },
+      ]}
       onSelect={async (option) => {
         if (!option) return
-        setLoading(option.value)
-        try {
-          await sdk.client.mcp.auth.authenticate({ name: "keystone-dynamic" })
-          const status = await sdk.client.mcp.status()
-          if (status.data) {
-            sync.set("mcp", status.data)
-            const kd = (status.data as Record<string, { status?: string } | undefined>)["keystone-dynamic"]
-            setKeystoneConnected(kd?.status === "connected")
-          }
-        } catch (err) {
-          console.error("Failed to connect via Keystone:", err)
-        } finally {
-          setLoading(null)
-        }
+        await reconnect()
       }}
     />
   )

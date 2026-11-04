@@ -47,7 +47,7 @@ jobs:
         id: version
         shell: bash
         run: |
-          base=$(node -p "require('./packages/opencode/package.json').version")
+          base=$(node -p "require('./packages/cli/package.json').version")
           version="${base}-alt.${GITHUB_RUN_NUMBER}"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
@@ -55,7 +55,7 @@ jobs:
 
       - name: Build
         shell: bash
-        run: bun run --cwd packages/opencode script/build.ts --single --skip-install
+        run: bun run --cwd packages/cli script/build.ts --single --skip-install --skip-web-ui
         env:
           OPENCODE_CHANNEL: opencodealt
           OPENCODE_VERSION: ${{ steps.version.outputs.version }}
@@ -67,7 +67,12 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force release | Out-Null
-          Copy-Item packages/opencode/dist/opencode-windows-x64/bin/opencode.exe release/opencodealt.exe
+          $bin = if (Test-Path packages/cli/dist/cli-windows-x64/bin/opencode.exe) {
+            'packages/cli/dist/cli-windows-x64/bin/opencode.exe'
+          } else {
+            'packages/cli/dist/opencode-windows-x64/bin/opencode.exe'
+          }
+          Copy-Item $bin release/opencodealt.exe
           $reported = (& ./release/opencodealt.exe --version).Trim()
           if ($reported -ne $env:VERSION) { throw "opencodealt.exe reports '$reported', expected '$env:VERSION'" }
           Compress-Archive -Path release/opencodealt.exe -DestinationPath release/opencodealt-windows-x64.zip
