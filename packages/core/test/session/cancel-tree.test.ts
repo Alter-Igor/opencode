@@ -48,11 +48,11 @@ describe("cancelSessionTree (#214)", () => {
     expect(cancelled).toEqual(["busy", "deep"])
   })
 
-  test("the session delete handler cancels the tree before it removes the session", async () => {
-    const source = await Bun.file(new URL("../../src/server/routes/instance/httpapi/handlers/session.ts", import.meta.url)).text()
+  test("Session.remove cancels the tree before it awaits idle and removes children", async () => {
+    const source = await Bun.file(new URL("../../src/session.ts", import.meta.url)).text()
     const cancel = source.indexOf("cancelSessionTree(")
     expect(cancel).toBeGreaterThan(-1)
-    expect(cancel).toBeLessThan(source.indexOf("session.remove(ctx.params.sessionID)"))
+    expect(cancel).toBeLessThan(source.indexOf("execution.awaitIdle(sessionID)"))
   })
 
   test("idleWhenQuiet: idle only when the status is idle and the runner is not busy", async () => {
@@ -70,10 +70,10 @@ describe("cancelSessionTree (#214)", () => {
     expect(await check("idle", true)).toBe(false)
   })
 
-  test("workspace removal cancels each root session's tree before removing it (#214)", async () => {
-    const source = await Bun.file(new URL("../../src/control-plane/workspace.ts", import.meta.url)).text()
-    const cancel = source.indexOf("cancelSessionTree(cancelDeps, sessionInfo.id)")
+  test("Session.remove walks descendant sessions recursively when removing a root session (#214)", async () => {
+    const source = await Bun.file(new URL("../../src/session.ts", import.meta.url)).text()
+    const cancel = source.indexOf("cancelSessionTree(")
     expect(cancel).toBeGreaterThan(-1)
-    expect(cancel).toBeLessThan(source.indexOf("session.remove(sessionInfo.id)"))
+    expect(cancel).toBeLessThan(source.indexOf("result.remove(child.id)"))
   })
 })

@@ -233,9 +233,9 @@ export function redactToolResult(
 
 /** A redacted deep copy of a value, the same as a stored tool input; the value itself is not changed. */
 function clonePlain<T>(value: T): T {
-  if (Array.isArray(value)) return (Object.isFrozen(value) ? value : value.map(clonePlain)) as T
+  if (Array.isArray(value)) return value.map(clonePlain) as T
   const proto = value && typeof value === "object" ? Object.getPrototypeOf(value) : undefined
-  if ((proto === Object.prototype || proto === null) && !Object.isFrozen(value)) {
+  if (proto === Object.prototype || proto === null) {
     const out: Record<string, unknown> = proto === null ? Object.create(null) : {}
     for (const [key, inner] of Object.entries(value as Record<string, unknown>)) out[key] = clonePlain(inner)
     return out as T
@@ -256,6 +256,7 @@ export function redactedCopy<T>(value: T): T {
 export function redactToolPart(part: { type?: unknown; state?: unknown } | undefined): number {
   if (!part || part.type !== "tool" || !part.state || typeof part.state !== "object") return 0
   const state = part.state as Record<string, unknown>
+  if (Object.isFrozen(state)) return 0
   const { scrub, changed } = scrubber()
   for (const key of ["input", "output", "title", "metadata", "error", "raw"]) {
     if (key in state) state[key] = scrub(state[key])

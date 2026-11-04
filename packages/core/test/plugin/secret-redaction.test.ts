@@ -313,4 +313,19 @@ describe("opencode import (#207)", () => {
     expect(copy.state.output).toBe("KEY=[REDACTED:openrouter]")
     expect(part.state.output).toBe(`KEY=${KEYS.openrouter}`)
   })
+
+  test("redactedToolPart redacts Immer-frozen tool parts without throwing on readonly state", () => {
+    const part = Object.freeze({
+      type: "tool",
+      state: Object.freeze({
+        status: "completed",
+        input: Object.freeze({ command: `echo ${KEYS.openrouter}` }),
+        output: `KEY=${KEYS.openrouter}`,
+      }),
+    })
+    const copy = redactedToolPart(part)
+    expect(copy.state.output).toBe("KEY=[REDACTED:openrouter]")
+    expect(copy.state.input.command).toBe("echo [REDACTED:openrouter]")
+    expect(part.state.output).toBe(`KEY=${KEYS.openrouter}`)
+  })
 })

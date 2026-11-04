@@ -26,6 +26,7 @@ import { Slug } from "./util/slug.js"
 import path from "path"
 import { SessionRunner } from "./session/runner/index.js"
 import { SessionStore } from "./session/store.js"
+import { cancelSessionTree } from "./session/cancel-tree.js"
 import { beginDeletingSession, isDeletingSession } from "./session/deleting.js"
 export { beginDeletingSession, isDeletingSession }
 import { SessionExecution } from "./session/execution.js"
@@ -397,7 +398,14 @@ const layer = Layer.effect(
         const release = beginDeletingSession(sessionID)
         return yield* Effect.gen(function* () {
           yield* result.get(sessionID)
-          yield* execution.interrupt(sessionID)
+          yield* cancelSessionTree(
+            {
+              cancel: (id) => execution.interrupt(id),
+              children: (id) => store.list({ parentID: id }),
+              isIdle: () => Effect.succeed(false),
+            },
+            sessionID,
+          )
           yield* execution.awaitIdle(sessionID)
           yield* jobs.cancelSession(sessionID)
           yield* transport.close(sessionID)

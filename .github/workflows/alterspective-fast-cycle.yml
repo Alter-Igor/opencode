@@ -38,6 +38,9 @@ jobs:
       - name: Setup Bun
         uses: ./.github/actions/setup-bun
 
+      - name: Ensure ripgrep
+        run: command -v rg >/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep)
+
       - name: Fast tier (lint + mapped tests)
         run: bun run test:fast --base origin/${{ github.base_ref }}
 
@@ -59,6 +62,9 @@ jobs:
       - name: Setup Bun
         uses: ./.github/actions/setup-bun
 
+      - name: Ensure ripgrep
+        run: command -v rg >/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep)
+
       - name: Configure git identity
         run: |
           git config --global user.email "bot@opencode.ai"
@@ -66,7 +72,7 @@ jobs:
 
       - name: Full core suite (shard ${{ matrix.shard }}/4)
         working-directory: packages/core
-        run: bun test --timeout 30000 --only-failures --shard=${{ matrix.shard }}/4
+        run: bun run script/test.ts --shard=${{ matrix.shard }}/4
 
   # One result for `integrate` to read. Runs even when a shard fails or is cancelled, and fails then.
   full:
