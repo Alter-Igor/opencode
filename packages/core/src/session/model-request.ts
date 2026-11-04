@@ -284,10 +284,12 @@ export const layer = Layer.effect(
       )
       // Hooks see the default output limit and may change or remove it. Titles and generate keep the provider default,
       // because their reasoning is hard to budget.
+      const modelWithLimit = Object.assign(Object.create(Object.getPrototypeOf(model.ref)), model.ref)
+      Object.defineProperty(modelWithLimit, "limit", { value: model.limit, enumerable: false })
       const shaped = yield* shape(
         {
           sessionID: session.id,
-          model: model.ref,
+          model: modelWithLimit,
           system: input.system,
           messages: input.messages,
           options:

@@ -250,7 +250,12 @@ export function fromLegacyV1Plugin(id: string, fn: V1PluginFn) {
               const rawModel = evt.model as any
               const fallbackContext = rawModel?.providerID === SYNAPSE_PROVIDER_ID ? SYNAPSE_DEFAULT_CONTEXT : 0
               let contextLimit: number | undefined = rawModel?.limit?.context
-              if (contextLimit === undefined && rawModel?.providerID && (rawModel?.id || rawModel?.modelID)) {
+              if (
+                contextLimit === undefined &&
+                id === "opencode.fork.small-model-delegation" &&
+                rawModel?.providerID &&
+                (rawModel?.id || rawModel?.modelID)
+              ) {
                 const targetId = rawModel.id ?? rawModel.modelID
                 const modelsRes = yield* ctx.model.list().pipe(Effect.orElseSucceed(() => undefined))
                 const modelsList: readonly any[] = Array.isArray(modelsRes)
