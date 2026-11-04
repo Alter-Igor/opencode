@@ -1,4 +1,4 @@
-import type { Plugin } from "@opencode-ai/plugin"
+import type { Hooks, PluginInput } from "@opencode/plugin/index"
 import path from "node:path"
 
 const LANGUAGE_MAP: Record<string, string> = {
@@ -121,7 +121,7 @@ async function reportToSynapse(payload: ReportPayload): Promise<void> {
   }
 }
 
-const plugin: Plugin = async (input) => {
+const plugin = async (input: PluginInput): Promise<Hooks & { dispose: () => Promise<void> }> => {
   const sessionModels = new Map<string, string>()
   const pending = new Map<string, PendingCorrection>()
   const queuePath = path.join(input.directory, QUEUE_PATH)

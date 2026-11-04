@@ -1,4 +1,4 @@
-import type { Plugin } from "@opencode-ai/plugin"
+import type { Plugin } from "@opencode/plugin/index"
 
 const SKILL_LOOKUP_PROMPT = `
 ## Skills

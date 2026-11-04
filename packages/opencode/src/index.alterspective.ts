@@ -1,6 +1,5 @@
 // Cwd-agnostic entry for machine-local launchers (e.g. opencodealt.bat).
-// Bun only applies bunfig.toml preloads from the process cwd, so register the
-// Solid JSX transform before loading the real CLI when the caller is elsewhere.
+// Forwards to packages/cli/src/index.ts after the packages/opencode -> packages/cli split.
 import "@opentui/solid/preload"
 
-await import("./index.ts")
+await import("../../cli/src/index.ts")

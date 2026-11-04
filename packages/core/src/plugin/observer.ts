@@ -1,0 +1,892 @@
+import * as fs from "node:fs/promises"
+import * as path from "node:path"
+import { createHash } from "node:crypto"
+function truthy(key: string): boolean {
+  const value = process.env[key]?.toLowerCase()
+  return value === "true" || value === "1"
+}
+import { getLatestSynapseServing } from "./synapse"
+import { redactSecrets } from "./secret-redaction"
+import { Flock } from "@opencode/util/flock"
+
+export interface ToolExecutionRecord {
+  callId: string
+  tool: string
+  args: any
+  startTime: number
+  endTime?: number
+  durationMs?: number
+  outputSnippet?: string
+  isError?: boolean
+  errorMessage?: string
+  /** Set when the result had the MCP shape (`content` items); see `isMcpRecord`. */
+  mcp?: boolean
+}
+
+/** A raw MCP `CallToolResult`, which core hands to `tool.execute.after` for MCP tools. */
+function isMcpResult(value: unknown): value is { content: unknown[]; isError?: unknown } {
+  return !!value && typeof value === "object" && Array.isArray((value as { content?: unknown }).content)
+}
+
+/**
+ * #18: error texts core writes when the user stops or refuses a call, or a permission rule blocks
+ * it (`processor.ts` abort, `core/src/v1/permission.ts`, `question/index.ts`).
+ */
+const NOT_A_FAILURE = [
+  "Tool execution aborted",
+  "The user rejected permission to use this specific tool call",
+  "The user has specified a rule which prevents you from using this specific tool call",
+  "The user dismissed this question",
+]
+
+/**
+ * #209: an MCP call stopped by its abort signal (the user stopped the reply) fails with the SDK's
+ * wrapped text, e.g. `MCP error -32001: AbortError: The operation was aborted.` (Bun) or
+ * "... This operation was aborted" (Node). It is matched at the start of the text (optionally after
+ * `Error: `) or right after `AbortError: `, not anywhere: an MCP server's own error that happens to
+ * say "operation was aborted" further in is a real failure. A real timeout reads
+ * `MCP error -32001: Request timed out` and still counts.
+ */
+const ABORTED = /(?:^(?:Error: )?|AbortError: )(?:The|This) operation was aborted/i
+
+/** #18: a `message.part.updated` event for a tool part that failed, as the observer needs it. */
+export function failedToolFromEvent(event: {
+  type: string
+  properties?: any
+}): { sessionID: string; callID: string; tool: string; error: string } | undefined {
+  if (event.type !== "message.part.updated") return undefined
+  const part = event.properties?.part
+  if (!part || part.type !== "tool" || part.state?.status !== "error") return undefined
+  const sessionID = part.sessionID ?? event.properties?.sessionID
+  if (typeof sessionID !== "string" || typeof part.callID !== "string" || typeof part.tool !== "string") return undefined
+  return { sessionID, callID: part.callID, tool: part.tool, error: typeof part.state.error === "string" ? part.state.error : "" }
+}
+
+function mcpText(result: { content: unknown[] }): string {
+  return result.content
+    .flatMap((item) => {
+      const entry = item as { type?: unknown; text?: unknown; resource?: { text?: unknown } }
+      if (entry?.type === "text" && typeof entry.text === "string") return [entry.text]
+      if (entry?.type === "resource" && typeof entry.resource?.text === "string") return [entry.resource.text]
+      return []
+    })
+    .join("\n")
+}
+
+export interface SessionAnomaly {
+  type: "AUDIT_BYPASS_RISK" | "MCP_TOOL_FAILURE" | "AUTH_CHALLENGE" | "RETRY_LOOP" | "INFERENCE_ERROR"
+  severity: "critical" | "high" | "medium" | "low"
+  tool?: string
+  detail: string
+  recommendation: string
+}
+
+export interface SessionRetrospective {
+  sessionId: string
+  workspaceDirectory?: string
+  startTime: number
+  endTime: number
+  durationMs: number
+  totalToolCalls: number
+  toolsUsed: string[]
+  anomalies: SessionAnomaly[]
+  learnings: string[]
+  telemetry?: {
+    servedModel?: string
+    provider?: string
+    costUsd?: string
+    latencyMs?: string
+    correlationId?: string
+  }
+}
+
+export interface DiagnosticLogEntry {
+  timestamp: string
+  type:
+    | "INFERENCE_REQUEST"
+    | "ESCALATION"
+    | "INFERENCE_RESPONSE"
+    | "INFERENCE_ERROR"
+    | "TOOL_EXECUTION"
+    | "AUTH_EVENT"
+    | "FALLBACK_TRIGGERED"
+    | "LEARNING_STORE"
+  sessionId?: string
+  correlationId?: string
+  details: Record<string, any>
+  error?: string
+}
+
+export function redactSensitiveData(data: any): any {
+  if (typeof data === "string") {
+    const masked = data
+      .replace(/Bearer\s+eyJ[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.?[A-Za-z0-9-_.+/=]*/gi, "Bearer [REDACTED_JWT]")
+      // #26: capture the name, so the result reads `token: [REDACTED]` (the group was
+      // non-capturing, so this wrote a literal "$1").
+      .replace(/(key|token|secret|password|authorization)\s*[:=]\s*["']?[A-Za-z0-9-_]{8,}["']?/gi, "$1: [REDACTED]")
+    return redactSecrets(masked)
+  }
+  if (!data || typeof data !== "object") return data
+  if (Array.isArray(data)) return data.map(redactSensitiveData)
+  const redacted: Record<string, any> = {}
+  for (const [key, value] of Object.entries(data)) {
+    const lowerKey = key.toLowerCase()
+    if (
+      lowerKey.includes("token") ||
+      lowerKey.includes("secret") ||
+      lowerKey.includes("password") ||
+      lowerKey.includes("authorization") ||
+      lowerKey.includes("apikey") ||
+      lowerKey.includes("api_key")
+    ) {
+      redacted[key] = "[REDACTED]"
+    } else if (typeof value === "object" && value !== null) {
+      redacted[key] = redactSensitiveData(value)
+    } else {
+      redacted[key] = typeof value === "string" ? redactSensitiveData(value) : value
+    }
+  }
+  return redacted
+}
+
+export function sanitizeJsonSchemaForOpenAI(schema: any): any {
+  if (!schema || typeof schema !== "object") return schema
+  if (Array.isArray(schema)) {
+    return schema.map(sanitizeJsonSchemaForOpenAI)
+  }
+  const clean: Record<string, any> = {}
+  for (const [key, value] of Object.entries(schema)) {
+    if (key === "propertyNames" || key === "$schema" || key === "$defs" || key === "definitions") continue
+    if (typeof value === "object" && value !== null) {
+      clean[key] = sanitizeJsonSchemaForOpenAI(value)
+    } else {
+      clean[key] = value
+    }
+  }
+  return clean
+}
+
+const CORPORATE_AUDITED_DOMAINS = [
+  "outlook.office.com",
+  "outlook.live.com",
+  "login.microsoftonline.com",
+  "mail.google.com",
+  "teams.microsoft.com",
+  "sharepoint.com",
+  "graph.microsoft.com",
+]
+
+class SessionObserverManager {
+  private trajectories = new Map<string, ToolExecutionRecord[]>()
+  private sessionStartTimes = new Map<string, number>()
+  private latestRetrospectives: SessionRetrospective[] = []
+  private diagnosticLogs: DiagnosticLogEntry[] = []
+  private nativeTools = new Set<string>()
+
+  public logDiagnostic(entry: DiagnosticLogEntry, _workspaceDir?: string) {
+    const safeEntry: DiagnosticLogEntry = {
+      ...entry,
+      details: redactSensitiveData(entry.details || {}),
+    }
+    this.diagnosticLogs.unshift(safeEntry)
+    if (this.diagnosticLogs.length > 200) {
+      this.diagnosticLogs.pop()
+    }
+    void this.persistDiagnosticLog(safeEntry)
+  }
+
+  private async persistDiagnosticLog(entry: DiagnosticLogEntry) {
+    const logLine = JSON.stringify(entry) + "\n"
+    // #83: a broken OPENCODE_DIAGNOSTICS_DIR (a file, no permission) used to drop the line
+    // silently; fall back to the default log folder instead.
+    const configured = diagnosticsLogDir()
+    const fallback = defaultDiagnosticsLogDir()
+    for (const dir of configured === fallback ? [configured] : [configured, fallback]) {
+      if (!dir) continue
+      try {
+        await fs.mkdir(dir, { recursive: true })
+        await fs.appendFile(path.join(dir, "diagnostics.log"), logLine, "utf8")
+        return
+      } catch {}
+    }
+  }
+
+  public onToolBefore(sessionId: string, callId: string, tool: string, args: any) {
+    if (!this.sessionStartTimes.has(sessionId)) {
+      this.sessionStartTimes.set(sessionId, Date.now())
+    }
+    const records = this.trajectories.get(sessionId) ?? []
+    records.push({
+      callId,
+      tool,
+      args,
+      startTime: Date.now(),
+    })
+    this.trajectories.set(sessionId, records)
+  }
+
+  /**
+   * #18: opencode names MCP tools `<server>_<tool>` (`alterspective-rag_rag_search`), so a name
+   * check alone misses them. Every native and plugin tool is announced through `tool.definition`
+   * first; MCP tools never are.
+   */
+  public markNativeTool(toolId: string) {
+    this.nativeTools.add(toolId)
+  }
+
+  private isMcpRecord(record: ToolExecutionRecord): boolean {
+    if (record.mcp) return true
+    if (record.tool.startsWith("mcp__") || record.tool.includes("mcp")) return true
+    return this.nativeTools.size > 0 && !this.nativeTools.has(record.tool)
+  }
+
+  /**
+   * #18: a failed tool never reaches `tool.execute.after` (an MCP error result is thrown by core),
+   * so the failure is taken from the stored tool part instead (`message.part.updated`, status error).
+   * Only a call this observer saw start is updated: a fork or compaction re-publishes old failed
+   * parts, which must not be counted again. A call the user stopped, refused or blocked by a rule is
+   * not a service failure (QA on #18).
+   */
+  public onToolFailed(sessionId: string, callId: string, tool: string, error: string) {
+    const record = this.trajectories.get(sessionId)?.find((r) => r.callId === callId && r.tool === tool)
+    if (!record) return
+    record.endTime ??= Date.now()
+    record.durationMs = record.endTime - record.startTime
+    if (NOT_A_FAILURE.some((prefix) => error.startsWith(prefix)) || ABORTED.test(error)) return
+    record.isError = true
+    record.errorMessage = error.slice(0, 200)
+  }
+
+  public onToolAfter(sessionId: string, callId: string, tool: string, output: unknown) {
+    // #18: an MCP result carries its text in `content` items, not in `output`.
+    const raw =
+      !isMcpResult(output) &&
+      !!output &&
+      typeof output === "object" &&
+      isMcpResult((output as { metadata?: unknown }).metadata)
+        ? (output as { metadata: { content: unknown[]; isError?: unknown } }).metadata
+        : output
+    const mcp = isMcpResult(raw)
+    const text = typeof raw === "string" ? raw : mcp ? mcpText(raw) : raw == null ? "" : JSON.stringify(raw) ?? ""
+    const records = this.trajectories.get(sessionId) ?? []
+    const record = records.find((r) => r.callId === callId)
+    if (record && mcp) record.mcp = true
+    if (mcp && raw.isError === true) {
+      if (record) record.outputSnippet = text.slice(0, 300)
+      this.onToolFailed(sessionId, callId, tool, text)
+      return
+    }
+    // A real MCP error result is thrown by core and arrives through onToolFailed; the words in a
+    // successful MCP result (a log or search tool's text) are data, not a failure (QA on #18).
+    const isError = mcp
+      ? false
+      : text.includes("Error:") ||
+      text.includes("error:") ||
+      text.includes("Failed to") ||
+      text.includes("Unauthorized") ||
+      text.includes("timed out")
+
+    if (record) {
+      record.endTime = Date.now()
+      record.durationMs = record.endTime - record.startTime
+      record.outputSnippet = text.slice(0, 300)
+      record.isError = isError
+      if (isError) {
+        record.errorMessage = text.slice(0, 200)
+      }
+    }
+  }
+
+  public async finalizeSessionRetrospective(
+    sessionId: string,
+    workspaceDir?: string,
+  ): Promise<SessionRetrospective | null> {
+    // #55: sandboxes hold no Keystone credential, so they skip the retrospective file and POST. Read per call.
+    if (truthy("OPENCODE_DISABLE_SESSION_RETROSPECTIVES")) {
+      this.trajectories.delete(sessionId)
+      this.sessionStartTimes.delete(sessionId)
+      return null
+    }
+
+    const records = this.trajectories.get(sessionId) ?? []
+    const startTime = this.sessionStartTimes.get(sessionId) ?? Date.now()
+    const endTime = Date.now()
+    // #209: a retrospective covers the calls since the last one. The records used to stay, so every
+    // later idle reported the same failures again, and a long-running server kept every call's
+    // arguments in memory for the life of the process.
+    this.trajectories.delete(sessionId)
+    this.sessionStartTimes.delete(sessionId)
+    // #209: a turn with no tool calls, or a session.deleted right after an idle, has nothing to
+    // report; it used to write a file and POST a retrospective with 0 calls.
+    if (records.length === 0) return null
+
+    const anomalies: SessionAnomaly[] = []
+    const learnings: string[] = []
+    const toolsUsed = Array.from(new Set(records.map((r) => r.tool)))
+
+    // 1. Check for Audit Bypass
+    const playwrightCalls = records.filter((r) => r.tool.includes("playwright") || r.tool.includes("browser"))
+    for (const pCall of playwrightCalls) {
+      const url = pCall.args?.url || pCall.args?.Url || ""
+      const isAuditedDomain = CORPORATE_AUDITED_DOMAINS.some((domain) => url.toLowerCase().includes(domain))
+      if (isAuditedDomain) {
+        anomalies.push({
+          type: "AUDIT_BYPASS_RISK",
+          severity: "high",
+          tool: pCall.tool,
+          detail: `Agent accessed corporate communication interface (${url}) via un-audited browser scraping.`,
+          recommendation: `Ensure keystone-dynamic (ms365 MCP) is authenticated and used for email/calendar retrieval to maintain enterprise access governance.`,
+        })
+        learnings.push(
+          `Bypass Detected: Direct browser automation was used on corporate domain '${url}'. Keystone MCP should be preferred and repaired if failing.`,
+        )
+      }
+    }
+
+    // 2. Check for MCP Tool Failures
+    const mcpFailures = records.filter((r) => this.isMcpRecord(r) && r.isError)
+    for (const failure of mcpFailures) {
+      anomalies.push({
+        type: "MCP_TOOL_FAILURE",
+        severity: "medium",
+        tool: failure.tool,
+        detail: `MCP service returned an error during operation: ${failure.errorMessage ?? "Unknown error"}`,
+        recommendation: `Verify MCP server connectivity, authentication status, and tool schema compatibility.`,
+      })
+      learnings.push(`MCP Error in ${failure.tool}: Verify authentication token and service health.`)
+    }
+
+    const serving = getLatestSynapseServing()
+    const retro: SessionRetrospective = {
+      sessionId,
+      workspaceDirectory: workspaceDir,
+      startTime,
+      endTime,
+      durationMs: Math.max(0, endTime - startTime),
+      totalToolCalls: records.length,
+      toolsUsed,
+      anomalies,
+      learnings:
+        learnings.length > 0
+          ? learnings
+          : ["Session executed normally with all tool calls conforming to Alterspective operating standards."],
+      telemetry: serving
+        ? {
+            servedModel: serving.model,
+            provider: serving.provider,
+            costUsd: serving.costUsd,
+            latencyMs: serving.latencyMs,
+            correlationId: serving.correlationId,
+          }
+        : undefined,
+    }
+
+    this.latestRetrospectives.unshift(retro)
+    if (this.latestRetrospectives.length > 50) {
+      this.latestRetrospectives.pop()
+    }
+
+    // Save locally (#50: store under ~/.local/share/opencode/retrospectives instead of <workspaceDir>/.system_generated)
+    const retroDir = workspaceDir ? retrospectivesDir() : undefined
+    if (retroDir) {
+      try {
+        await fs.mkdir(retroDir, { recursive: true })
+        const filePath = path.join(retroDir, `retro-${sessionId}-${Date.now()}.json`)
+        await fs.writeFile(filePath, JSON.stringify(retro, null, 2), "utf8")
+      } catch {}
+    }
+
+    // Async telemetry dispatch to Keystone / CAS audit endpoint (non-blocking)
+    void this.dispatchAuditTelemetry(retro)
+
+    return retro
+  }
+
+  private async dispatchAuditTelemetry(retro: SessionRetrospective) {
+    const auditUrl = process.env.OPENCODE_RETROSPECTIVE_AUDIT_URL?.trim()
+    if (!auditUrl || !isAllowedAuditUrl(auditUrl)) return
+    await fetch(auditUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(retro),
+      signal: AbortSignal.timeout(5000),
+    }).catch(() => {})
+  }
+
+  /**
+   * Store a rule. With a `workspaceDir`, explicit `user_feedback` rules are written to BOTH stores
+   * (#38): the global copy makes `synapse_record_learning` keep its promise that the rule guides
+   * "all future sessions", in any project; the project copy (`project-learnings/<hash>.json` under
+   * home, #50) keeps it with that workspace. Automatic rules (`buddy_review`, `auto_correction`,
+   * `session_retro`) with a `workspaceDir` are written to the project store only, so one repo's
+   * findings never leak into another repo's prompt (#211). Without a `workspaceDir` only the global
+   * store is written. A store that cannot be read is left alone, never overwritten. `savedTo` names
+   * the stores actually written, so a caller never reports a rule as saved when it was not.
+   */
+  public async recordLearning(
+    learning: Omit<SessionLearning, "id" | "timestamp">,
+    workspaceDir?: string,
+  ): Promise<SessionLearning & { savedTo: Array<"global" | "project"> }> {
+    const normalizedText = learning.lesson.trim().toLowerCase()
+    const paths = learningStorePaths(workspaceDir)
+    const mirrorGlobal = !paths.project || learning.source === "user_feedback"
+    const files = [mirrorGlobal ? paths.global : undefined, paths.project].filter((file): file is string => Boolean(file))
+    const entry: SessionLearning = {
+      id: `learn_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      timestamp: new Date().toISOString(),
+      ...learning,
+    }
+    let stored = entry
+    const savedTo: Array<"global" | "project"> = []
+    await this.mutateStores(workspaceDir, async () => {
+      for (const file of files) {
+        const scope: "global" | "project" = file === paths.project ? "project" : "global"
+        try {
+          await fs.mkdir(path.dirname(file), { recursive: true })
+          // #38: a store we cannot read is left alone. Writing one row over it would drop its
+          // other rules and the tombstones that keep forgotten rules forgotten.
+          const read = await (scope === "project" ? readRuleStoreWithLegacy(file, workspaceDir) : readRuleStore(file))
+          if (read === "unreadable") continue
+          const existing: SessionLearning[] = read ?? []
+          const found = existing.find((e) => e.lesson.trim().toLowerCase() === normalizedText)
+          if (found) {
+            // Re-recording refreshes recency AND moves the rule to the front, so it
+            // re-enters the injection window; it never duplicates. It also clears any
+            // tombstone, which is how a forgotten rule is restored.
+            found.timestamp = new Date().toISOString()
+            found.scope = scope
+            found.deletedAt = undefined
+            found.deletedBy = undefined
+            stored = found
+            await writeJsonAtomic(file, trimRules([found, ...existing.filter((e) => e !== found)]))
+            savedTo.push(scope)
+            continue
+          }
+          await writeJsonAtomic(file, trimRules([{ ...entry, scope }, ...existing]))
+          stored = { ...entry, scope }
+          savedTo.push(scope)
+        } catch {}
+      }
+    })
+    return { ...stored, savedTo }
+  }
+
+  /**
+   * The rules actually selected for injection, in the same order the prompt
+   * builder uses. Shared so the listed `injected` flag cannot drift from reality.
+   */
+  private async selectInjected(limit: number, workspaceDir?: string): Promise<SessionLearning[]> {
+    // Always read from disk, from the right stores for THIS workspace. One process
+    // can serve several projects, so no cached list may be reused across them.
+    return this.mutate(async () => {
+      const paths = learningStorePaths(workspaceDir)
+      // #212: the same row check as a forget, so a malformed row cannot throw in isLive.
+      const read = async (file?: string): Promise<SessionLearning[]> => {
+        const rows = file
+          ? await (file === paths.project ? readRuleStoreWithLegacy(file, workspaceDir) : readRuleStore(file))
+          : undefined
+        if (file) this.noteSkippedStore(file, file === paths.project ? "project" : "global", rows === "unreadable", workspaceDir)
+        return Array.isArray(rows) ? rows : []
+      }
+      // Project rules first: a committed, reviewed repo rule outranks an ad-hoc
+      // global note (AIMETH-008 - shared repo facts win). One entry per rule text.
+      // #211: filter out legacy auto-mirrored rows from global when workspaceDir is provided.
+      const projectRows = await read(paths.project)
+      const globalRows = (await read(paths.global)).filter((r) => isGlobalRuleEligibleForWorkspace(r, workspaceDir))
+      const seen = new Set<string>()
+      const merged: SessionLearning[] = []
+      for (const rule of [...projectRows, ...globalRows].filter(isLive)) {
+        const key = learningKey(rule)
+        if (seen.has(key)) continue
+        seen.add(key)
+        merged.push(rule)
+      }
+      return merged.slice(0, limit)
+    })
+  }
+
+  public async getRecentLearnings(limit = 5, workspaceDir?: string): Promise<SessionLearning[]> {
+    return this.selectInjected(limit, workspaceDir)
+  }
+
+  /** Stores already reported as skipped, so the prompt path writes one line per store, not one per turn. */
+  private skippedStores = new Set<string>()
+
+  /**
+   * #217: injection reads an unreadable store as empty, so its rules stop applying with no trace.
+   * Write one diagnostics line when that starts, and again if it breaks again after a good read.
+   */
+  private noteSkippedStore(file: string, store: "global" | "project", unreadable: boolean, workspaceDir?: string) {
+    if (!unreadable) {
+      this.skippedStores.delete(file)
+      return
+    }
+    if (this.skippedStores.has(file)) return
+    this.skippedStores.add(file)
+    this.logDiagnostic(
+      {
+        timestamp: new Date().toISOString(),
+        type: "LEARNING_STORE",
+        details: { event: "skipped_unreadable", store, file },
+        error: "rule store could not be read; its rules are not injected until it is fixed or removed",
+      },
+      workspaceDir,
+    )
+  }
+
+  private mutation: Promise<unknown> = Promise.resolve()
+
+  /** Serialise file mutations so a record and a forget cannot interleave on one file. */
+  private mutate<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.mutation.then(fn, fn)
+    this.mutation = run.catch(() => {})
+    return run
+  }
+
+  /**
+   * #217: `mutate` serialises one process only, so a TUI and `opencode serve` could both read a
+   * store, and the later write dropped the other's rule (or a forget's put-back overwrote it).
+   * Writes also take a machine-wide lock (the #75 `Flock` pattern) in the global store's folder,
+   * which every writer shares, or the project store's folder when there is no home. If the lock
+   * cannot be taken in time, the write goes ahead under the in-process lock alone, as before
+   * #217, and a diagnostics line says so.
+   */
+  private mutateStores<T>(workspaceDir: string | undefined, fn: () => Promise<T>): Promise<T> {
+    return this.mutate(async () => {
+      const paths = learningStorePaths(workspaceDir)
+      const anchor = paths.global ?? paths.project
+      if (!anchor) return fn()
+      let lease: Flock.Lease | undefined
+      try {
+        lease = await Flock.acquire(`learning-store:${anchor}`, {
+          dir: path.join(path.dirname(anchor), "locks"),
+          timeoutMs: LEARNING_STORE_LOCK_TIMEOUT_MS,
+        })
+      } catch (error) {
+        this.logDiagnostic(
+          {
+            timestamp: new Date().toISOString(),
+            type: "LEARNING_STORE",
+            details: { event: "lock_failed", file: anchor },
+            error: error instanceof Error ? error.message : String(error),
+          },
+          workspaceDir,
+        )
+      }
+      try {
+        return await fn()
+      } finally {
+        await lease?.release().catch(() => {})
+      }
+    })
+  }
+
+  /**
+   * Every persisted rule, tagged with which store it lives in (`global` = whole
+   * machine, `project` = this repo) and whether it is actually injected into a
+   * session's system prompt. This is the honest answer to "what rules is the
+   * agent using?" - a rule outside the injection window is shown as stored.
+   */
+  public async listLearnings(
+    workspaceDir?: string,
+  ): Promise<Array<SessionLearning & { origin: "global" | "project"; injected: boolean }>> {
+    // #212: the same row check as a forget, so a malformed row cannot throw in isLive.
+    const paths = learningStorePaths(workspaceDir)
+    const read = async (file?: string): Promise<SessionLearning[]> => {
+      const rows = file
+        ? await (file === paths.project ? readRuleStoreWithLegacy(file, workspaceDir) : readRuleStore(file))
+        : undefined
+      return Array.isArray(rows) ? rows : []
+    }
+    const global = (await read(paths.global)).filter(isLive)
+    const project = (await read(paths.project)).filter(isLive)
+    const globalKeys = new Set(global.map(learningKey))
+    const merged = [
+      ...global.map((l) => ({ ...l, origin: "global" as const })),
+      ...project
+        .filter((l) => !globalKeys.has(learningKey(l)))
+        .map((l) => ({ ...l, origin: "project" as const })),
+    ].sort((a, b) => (a.timestamp < b.timestamp ? 1 : -1))
+    const injectedKeys = new Set((await this.selectInjected(INJECTED_LEARNINGS_LIMIT, workspaceDir)).map(learningKey))
+    return merged.map((l) => ({ ...l, injected: injectedKeys.has(learningKey(l)) }))
+  }
+
+  /**
+   * #217: the rule stores that exist but cannot be read. List and inject read such a store as
+   * empty, so its rules silently stop applying; synapse_list_rules names it instead.
+   */
+  public async unreadableRuleStores(workspaceDir?: string): Promise<Array<"global" | "project">> {
+    const paths = learningStorePaths(workspaceDir)
+    const out: Array<"global" | "project"> = []
+    if (paths.project && (await readRuleStoreWithLegacy(paths.project, workspaceDir)) === "unreadable") out.push("project")
+    if (paths.global && (await readRuleStore(paths.global)) === "unreadable") out.push("global")
+    return out
+  }
+
+  /**
+   * Forget rules whose text matches (case-insensitive substring): mark them deleted
+   * (tombstone) in both persisted stores. Returns the number of distinct rules newly
+   * forgotten; a rule present in both stores is counted once. A rule recorded in a project
+   * lives in both stores (see `recordLearning`), so one forget from that workspace removes both
+   * copies; from another workspace only the global copy is reached. If any
+   * store cannot be read, nothing is changed and 0 is returned (#38); if a write fails, the stores
+   * already written are put back where possible and 0 is returned (#212).
+   */
+  public async forgetLearning(lessonText: string, workspaceDir?: string): Promise<number> {
+    return (await this.forgetLearningResult(lessonText, workspaceDir)).forgotten
+  }
+
+  /**
+   * `forgetLearning` with the reason a forget was refused (#212): `unreadable` (a store could not
+   * be read; nothing was changed) or `write_failed` (a write failed; stores already written were
+   * put back, best effort: `restored` is false when that put-back failed too, so a rule may be
+   * half forgotten). A refused forget always reports 0 forgotten.
+   */
+  public async forgetLearningResult(
+    lessonText: string,
+    workspaceDir?: string,
+  ): Promise<{ forgotten: number; refused?: "unreadable" | "write_failed"; restored?: boolean }> {
+    const needle = lessonText.trim().toLowerCase()
+    if (!needle) return { forgotten: 0 }
+    const matches = (l: SessionLearning) => String(l.lesson ?? "").toLowerCase().includes(needle)
+    const paths = learningStorePaths(workspaceDir)
+    const files = [paths.global, paths.project].filter((file): file is string => Boolean(file))
+    // One mutation for both stores, so a record cannot interleave between them (in this process or another, #217).
+    return this.mutateStores(workspaceDir, async () => {
+      // #38: read and check every store before writing any. If a store cannot be read, we
+      // cannot claim its copy is gone, so we report nothing AND change nothing: a refused
+      // forget used to tombstone the global copy before it found the project store unreadable.
+      const stores: Array<{ file: string; rows: SessionLearning[]; existed: boolean }> = []
+      for (const file of files) {
+        const isProject = file === paths.project
+        const read = await (isProject ? readRuleStoreWithLegacy(file, workspaceDir) : readRuleStore(file))
+        if (read === "unreadable") return { forgotten: 0, refused: "unreadable" as const }
+        if (read) {
+          const existed = !isProject || (await readRuleStore(file)) !== undefined
+          stores.push({ file, rows: read, existed })
+        }
+      }
+      const forgotten = new Set<string>()
+      const written: Array<{ file: string; before: SessionLearning[]; existed: boolean }> = []
+      for (const store of stores) {
+        const before = structuredClone(store.rows)
+        const keys = markForgotten(store.rows, matches)
+        if (keys.size === 0) continue
+        try {
+          await fs.mkdir(path.dirname(store.file), { recursive: true })
+          await writeJsonAtomic(store.file, trimRules(store.rows))
+        } catch {
+          // #212: one store written and the next not would leave a rule half forgotten; put the
+          // written stores back (best effort) so a refused forget changes nothing here either.
+          let restored = true
+          for (const done of written) {
+            const op = done.existed ? writeJsonAtomic(done.file, done.before) : fs.rm(done.file, { force: true })
+            await op.catch(() => {
+              restored = false
+            })
+          }
+          return { forgotten: 0, refused: "write_failed" as const, restored }
+        }
+        written.push({ file: store.file, before, existed: store.existed })
+        for (const key of keys) forgotten.add(key)
+      }
+      return { forgotten: forgotten.size }
+    })
+  }
+
+  public getLatestRetrospectives(): SessionRetrospective[] {
+    return this.latestRetrospectives
+  }
+
+  public getDiagnosticLogs(): DiagnosticLogEntry[] {
+    return this.diagnosticLogs
+  }
+}
+
+/** How many of the most-recent rules are injected into a session system prompt. */
+export const INJECTED_LEARNINGS_LIMIT = 5
+
+/** How long a rule-store write waits for another process holding the machine-wide store lock (#217). */
+const LEARNING_STORE_LOCK_TIMEOUT_MS = 10_000
+
+/**
+ * Where the machine-wide diagnostics.log goes: OPENCODE_DIAGNOSTICS_DIR, else
+ * <home>/.local/share/opencode/log. OPENCODE_TEST_HOME wins over the real home, as in core's
+ * Global.Path.home, so a test run never writes to the person's real log (#80 follow-up).
+ */
+export function diagnosticsLogDir(): string | undefined {
+  return process.env.OPENCODE_DIAGNOSTICS_DIR || defaultDiagnosticsLogDir()
+}
+
+/** <home>/.local/share/opencode/log: where diagnostics.log goes without OPENCODE_DIAGNOSTICS_DIR. */
+export function defaultDiagnosticsLogDir(): string | undefined {
+  const home = observerHome()
+  return home ? path.join(home, ".local", "share", "opencode", "log") : undefined
+}
+
+/** The home the observer writes under: OPENCODE_TEST_HOME first, as in core's Global.Path.home. */
+function observerHome(): string {
+  return process.env.OPENCODE_TEST_HOME || process.env.USERPROFILE || process.env.HOME || ""
+}
+
+function retrospectivesDir(): string | undefined {
+  const configured = process.env.OPENCODE_RETROSPECTIVES_DIR?.trim()
+  if (configured) return configured
+  const home = observerHome()
+  return home ? path.join(home, ".local", "share", "opencode", "retrospectives") : undefined
+}
+
+function isAllowedAuditUrl(raw: string): boolean {
+  if (!URL.canParse(raw)) return false
+  const u = new URL(raw)
+  if (u.username || u.password) return false
+  if (u.protocol === "https:") return true
+  return u.protocol === "http:" && (u.hostname === "localhost" || u.hostname === "127.0.0.1")
+}
+
+function isGlobalRuleEligibleForWorkspace(rule: SessionLearning, workspaceDir?: string): boolean {
+  if (!workspaceDir) return true
+  return rule.source !== "buddy_review" && rule.source !== "auto_correction" && rule.source !== "session_retro"
+}
+
+/**
+ * The two on-disk rule stores: global (whole machine) and this project. #83: the global store
+ * honours OPENCODE_TEST_HOME too, so a test never writes to the person's real learnings.json.
+ * #50: the project store lives under <home>/.local/share/opencode/project-learnings/<hash>.json
+ * rather than inside the git working tree.
+ */
+export function learningStorePaths(workspaceDir?: string): { global?: string; project?: string } {
+  const homeDir = observerHome()
+  if (!homeDir) return { global: undefined, project: undefined }
+  const hash = workspaceDir
+    ? createHash("sha256").update(path.resolve(workspaceDir)).digest("hex").slice(0, 32)
+    : undefined
+  return {
+    global: path.join(homeDir, ".local", "share", "opencode", "learnings.json"),
+    project: hash ? path.join(homeDir, ".local", "share", "opencode", "project-learnings", `${hash}.json`) : undefined,
+  }
+}
+
+function legacyProjectLearningStorePath(workspaceDir?: string): string | undefined {
+  return workspaceDir ? path.join(workspaceDir, ".system_generated", "logs", "learnings.json") : undefined
+}
+
+async function readRuleStoreWithLegacy(
+  file: string,
+  workspaceDir?: string,
+): Promise<SessionLearning[] | undefined | "unreadable"> {
+  const primary = await readRuleStore(file)
+  if (primary !== undefined) return primary
+  const legacy = legacyProjectLearningStorePath(workspaceDir)
+  if (!legacy || legacy === file) return undefined
+  return readRuleStore(legacy)
+}
+
+const learningKey = (l: SessionLearning) => String(l.lesson ?? "").trim().toLowerCase()
+
+/** A rule is live unless it carries a tombstone. */
+const isLive = (l: SessionLearning) => !l.deletedAt
+
+/**
+ * One rule store's rows. `undefined`: the store does not exist, which is a real absence.
+ * `"unreadable"`: any other read error, bad JSON, JSON that is not an array, or a row that is not
+ * a rule (an object with a string `lesson`); we cannot know what the store holds.
+ */
+async function readRuleStore(file: string): Promise<SessionLearning[] | undefined | "unreadable"> {
+  let raw: string
+  try {
+    raw = await fs.readFile(file, "utf8")
+  } catch (error) {
+    const code = error && typeof error === "object" && "code" in error ? (error as { code?: unknown }).code : undefined
+    return code === "ENOENT" ? undefined : "unreadable"
+  }
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return "unreadable"
+    // A hand-edited or cut-off store can hold `[null]` or `[42]`; such a row would throw half
+    // way through a forget, after another store was already written (CodeRabbit on #38).
+    const valid = parsed.every(
+      (row) => !!row && typeof row === "object" && typeof (row as { lesson?: unknown }).lesson === "string",
+    )
+    return valid ? (parsed as SessionLearning[]) : "unreadable"
+  } catch {
+    return "unreadable"
+  }
+}
+
+/**
+ * Tombstone the matching live rows in place and return their keys. The rows are kept so a later
+ * merge or sync cannot resurrect them.
+ */
+function markForgotten(rows: SessionLearning[], matches: (l: SessionLearning) => boolean): Set<string> {
+  const keys = new Set<string>()
+  for (const row of rows) {
+    if (!isLive(row) || !matches(row)) continue
+    row.deletedAt = new Date().toISOString()
+    row.deletedBy = process.env.USERNAME || process.env.USER || "local"
+    keys.add(learningKey(row))
+  }
+  return keys
+}
+
+const MAX_LIVE_RULES = 100
+const MAX_TOMBSTONES = 100
+
+/**
+ * Bound file size without evicting tombstones: a dropped tombstone would let a
+ * later merge resurrect the rule it records as deleted.
+ */
+function trimRules(rows: SessionLearning[]): SessionLearning[] {
+  return [
+    ...rows.filter(isLive).slice(0, MAX_LIVE_RULES),
+    ...rows.filter((r) => !isLive(r)).slice(0, MAX_TOMBSTONES),
+  ]
+}
+
+/**
+ * #217: on Windows a rename onto a file another handle has open (antivirus, the indexer, a
+ * reader in another process) fails with EPERM, EBUSY or EACCES for a moment; QA's 3-writer
+ * harness lost rules this way (15 bad results in 10 runs, 0 with this retry). Retry those briefly
+ * (EACCES only on Windows, where it means the same; elsewhere it is a real permission error);
+ * anything else, or the last attempt, throws.
+ */
+async function renameWithRetry(from: string, to: string): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fs.rename(from, to)
+    } catch (error) {
+      const code = error && typeof error === "object" && "code" in error ? (error as { code?: unknown }).code : undefined
+      const retry = code === "EPERM" || code === "EBUSY" || (code === "EACCES" && process.platform === "win32")
+      if (attempt >= 5 || !retry) throw error
+      await new Promise((resolve) => setTimeout(resolve, 20 * 2 ** attempt))
+    }
+  }
+}
+
+/** Write a rule store through a temp file and a rename, so a reader never sees a half-written file. Exported for tests (#217). */
+export async function writeJsonAtomic(file: string, rows: SessionLearning[]): Promise<void> {
+  const tmp = `${file}.${process.pid}.${Math.random().toString(36).slice(2, 7)}.tmp`
+  try {
+    await fs.writeFile(tmp, JSON.stringify(rows, null, 2), "utf8")
+    await renameWithRetry(tmp, file)
+  } catch (error) {
+    // #217: a failed rename (Windows EPERM/EBUSY) used to leave learnings.json.*.tmp behind.
+    await fs.rm(tmp, { force: true }).catch(() => {})
+    throw error
+  }
+}
+
+export interface SessionLearning {
+  id: string
+  timestamp: string
+  lesson: string
+  context?: string
+  source: "user_feedback" | "buddy_review" | "auto_correction" | "session_retro"
+  /** Which store this row belongs to. */
+  scope?: "global" | "project"
+  /** Tombstone: set when the rule is forgotten, so a later merge cannot resurrect it. */
+  deletedAt?: string
+  deletedBy?: string
+}
+
+export const sessionObserver = new SessionObserverManager()

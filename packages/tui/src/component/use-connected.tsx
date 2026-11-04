@@ -1,16 +1,12 @@
 import { createMemo } from "solid-js"
-import { useSync } from "../context/sync"
+import { useData } from "../context/data"
+import { hasConnectedProvider } from "../util/connected-provider"
 
 export function useConnected() {
-  const sync = useSync()
-  return createMemo(() => {
-    const hasConfigured = Object.keys(sync.data.config?.provider ?? {}).length > 0
-    return (
-      hasConfigured ||
-      sync.data.provider.some(
-        (provider) =>
-          provider.id !== "opencode" || Object.values(provider.models).some((model) => model.cost?.input !== 0),
-      )
-    )
-  })
+  const data = useData()
+  return createMemo(
+    () =>
+      hasConnectedProvider(data.location.integration.list() ?? []) ||
+      (data.location.model.list() ?? []).some((model) => model.providerID === "synapse"),
+  )
 }

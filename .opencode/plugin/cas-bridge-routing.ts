@@ -1,4 +1,4 @@
-import type { Plugin } from "@opencode-ai/plugin"
+import type { Plugin } from "@opencode/plugin/index"
 import { casTokenPresent } from "../tool/cas-bridge-lib"
 
 export function injectionEnabled(): boolean {

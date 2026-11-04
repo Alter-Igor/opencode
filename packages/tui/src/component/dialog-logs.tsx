@@ -1,9 +1,7 @@
-import { createMemo, createSignal, onMount, Show } from "solid-js"
+import { createMemo, createSignal, Show } from "solid-js"
 import { DialogSelect, type DialogSelectOption } from "../ui/dialog-select"
-import { useDialog } from "../ui/dialog"
 import { useTheme } from "../context/theme"
 import { TextAttributes } from "@opentui/core"
-import { useSDK } from "../context/sdk"
 import { useToast } from "../ui/toast"
 import { useClipboard } from "../context/clipboard"
 
@@ -17,13 +15,11 @@ export interface DiagnosticItem {
 }
 
 export function DialogLogs() {
-  const dialog = useDialog()
-  const sdk = useSDK()
   const toast = useToast()
   const clipboard = useClipboard()
-  const { theme } = useTheme()
+  const theme = useTheme()
   const [selectedDetail, setSelectedDetail] = createSignal<string | null>(null)
-  const [authStatus, setAuthStatus] = createSignal<string>("Authenticated (Keystone SSO)")
+  const [authStatus] = createSignal<string>("Authenticated (Keystone SSO)")
 
   const homeDir = process.env.USERPROFILE || process.env.HOME || "~"
   const logPath = `${homeDir}\\.local\\share\\opencode\\log\\opencode.log`
@@ -37,7 +33,8 @@ export function DialogLogs() {
       description: "Qwen3 Coder / Spark / Nvidia Pro 6000",
       category: "System Health",
       status: "ok",
-      detail: "On-Premises Resilience:\n- GPU Cluster: Active\n- Models: Qwen3 Coder Next, Ornith 35B, Qwen 27B\n- Cost: $0 (unlimited tokens)\n- Auto-Fallback: Enabled on quota/credit limit",
+      detail:
+        "On-Premises Resilience:\n- GPU Cluster: Active\n- Models: Qwen3 Coder Next, Ornith 35B, Qwen 27B\n- Cost: $0 (unlimited tokens)\n- Auto-Fallback: Enabled on quota/credit limit",
     },
     {
       id: "health-synapse",
@@ -53,7 +50,8 @@ export function DialogLogs() {
       description: "Governance broker for M365, RAG, and corporate integrations",
       category: "System Health",
       status: "ok",
-      detail: "Keystone Dynamic MCP:\n- Endpoint: https://identity.alterspective.com.au/mcp/dynamic\n- Auditing: Active\n- Raw Browser Gate: Enforced (raw office.com blocked)",
+      detail:
+        "Keystone Dynamic MCP:\n- Endpoint: https://identity.alterspective.com.au/mcp/dynamic\n- Auditing: Active\n- Raw Browser Gate: Enforced (raw office.com blocked)",
     },
     {
       id: "log-main",
@@ -85,10 +83,10 @@ export function DialogLogs() {
     items().map((item) => {
       const tag =
         item.status === "ok"
-          ? { text: " [OK] ", fg: theme.success, attributes: TextAttributes.BOLD }
+          ? { text: " [OK] ", fg: theme.text.feedback.success.base, attributes: TextAttributes.BOLD }
           : item.status === "error"
-            ? { text: " [FAIL] ", fg: theme.error, attributes: TextAttributes.BOLD }
-            : { text: " [INFO] ", fg: theme.accent, attributes: TextAttributes.BOLD }
+            ? { text: " [FAIL] ", fg: theme.text.feedback.error.base, attributes: TextAttributes.BOLD }
+            : { text: " [INFO] ", fg: theme.hue.accent[500], attributes: TextAttributes.BOLD }
 
       return {
         title: item.title,
@@ -105,11 +103,11 @@ export function DialogLogs() {
       when={!selectedDetail()}
       fallback={
         <box padding={1} flexDirection="column">
-          <text fg={theme.accent}>
+          <text fg={theme.hue.accent[500]}>
             <b>Diagnostic Details</b>
           </text>
-          <text fg={theme.text}>{selectedDetail()}</text>
-          <text fg={theme.textMuted}>Press Escape or Back to return to log list.</text>
+          <text fg={theme.text.base}>{selectedDetail()}</text>
+          <text fg={theme.text.muted}>Press Escape or Back to return to log list.</text>
         </box>
       }
     >
@@ -119,16 +117,16 @@ export function DialogLogs() {
         options={options()}
         onSelect={(opt) => {
           if (opt.value.category === "Log Files") {
-            const path =
+            const targetPath =
               opt.value.id === "log-main"
                 ? logPath
                 : opt.value.id === "log-learnings"
                   ? learningsPath
                   : diagPath
-            void clipboard.write?.(path)
+            void clipboard.write?.(targetPath)
             toast.show({
               title: "Path copied!",
-              message: `Copied ${path} to clipboard`,
+              message: `Copied ${targetPath} to clipboard`,
               variant: "success",
             })
           } else if (opt.value.detail) {

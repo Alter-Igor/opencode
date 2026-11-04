@@ -328,3 +328,18 @@ export function redactedToolPart<T extends { type?: unknown }>(part: T): T {
   redactToolPart(copy as { type?: unknown; state?: unknown })
   return copy
 }
+
+export const REDACTED_PLACEHOLDER_ERROR = "Refusing to write [REDACTED:...] placeholder token into file. Retrieve the real value from its sanctioned source or keep the existing text."
+
+const SENSITIVE_ENV_KEY = /(?:^|_)(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH|PAT|BEARER|COOKIE|PRIVATE_KEY)(?:$|_)/i
+
+export function scrubShellEnv(env: Record<string, string | undefined>): Record<string, string | undefined> {
+  if (process.env.OPENCODE_ALLOW_SENSITIVE_SHELL_ENV === "1") return { ...env }
+  const out: Record<string, string | undefined> = {}
+  for (const [k, v] of Object.entries(env)) {
+    if (v === undefined) continue
+    if (SENSITIVE_ENV_KEY.test(k)) continue
+    out[k] = v
+  }
+  return out
+}

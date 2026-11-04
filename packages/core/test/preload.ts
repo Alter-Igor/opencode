@@ -1,6 +1,9 @@
-import path from "path"
+import fs from "node:fs"
+import os from "node:os"
+import path from "node:path"
 
 process.env.OPENCODE_DB = ":memory:"
 process.env.NPM_CONFIG_AUDIT = "false"
-process.env.OPENCODE_MODELS_PATH = path.join(import.meta.dir, "plugin", "fixtures", "models-dev.json")
-process.env.OPENCODE_DISABLE_MODELS_FETCH = "true"
+if (!process.env.OPENCODE_TEST_HOME) {
+  process.env.OPENCODE_TEST_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-test-home-"))
+}

@@ -17,7 +17,72 @@ import { parseArgs } from "util"
 import path from "path"
 import { chmod, rm } from "fs/promises"
 import { randomBytes } from "crypto"
-import { createOpencodeClient } from "../../../packages/sdk/js/src/v2/client"
+function createOpencodeClient(opts: { baseUrl: string; directory: string; headers?: Record<string, string> }): any {
+  const req = async (method: string, route: string, body?: unknown, callOpts?: { throwOnError?: boolean }) => {
+    const res = await fetch(`${opts.baseUrl}${route}`, {
+      method,
+      headers: {
+        ...opts.headers,
+        "x-opencode-directory": opts.directory,
+        ...(body !== undefined ? { "content-type": "application/json" } : {}),
+      },
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    })
+    const data = await res.json().catch(() => undefined)
+    if (!res.ok) {
+      if (callOpts?.throwOnError) throw new Error(`HTTP ${res.status}: ${JSON.stringify(data)}`)
+      return { data: undefined, error: data ?? { status: res.status } }
+    }
+    return { data, error: undefined }
+  }
+  return {
+    session: {
+      create: (body: any, o?: any) => req("POST", "/session", body, o),
+      shell: (body: { sessionID: string; agent: string; command: string }, o?: any) =>
+        req("POST", `/session/${body.sessionID}/shell`, { agent: body.agent, command: body.command }, o),
+      promptAsync: (body: { sessionID: string; parts: any[] }, o?: any) =>
+        req("POST", `/session/${body.sessionID}/prompt_async`, { parts: body.parts }, o),
+      abort: (body: { sessionID: string }, o?: any) => req("POST", `/session/${body.sessionID}/abort`, {}, o),
+      messages: (body: { sessionID: string }, o?: any) => req("GET", `/session/${body.sessionID}/message`, undefined, o),
+    },
+    permission: {
+      reply: (body: { requestID: string; reply: string }, o?: any) =>
+        req("POST", `/permission/${body.requestID}/reply`, { reply: body.reply }, o),
+    },
+    question: {
+      reject: (body: { requestID: string }, o?: any) => req("POST", `/question/${body.requestID}/reject`, {}, o),
+    },
+    event: {
+      subscribe: async () => {
+        const res = await fetch(`${opts.baseUrl}/event`, {
+          headers: { ...opts.headers, "x-opencode-directory": opts.directory, accept: "text/event-stream" },
+        })
+        if (!res.ok || !res.body) throw new Error(`SSE HTTP ${res.status}`)
+        const reader = res.body.getReader()
+        const decoder = new TextDecoder()
+        const stream = (async function* () {
+          let buf = ""
+          while (true) {
+            const { value, done } = await reader.read()
+            if (done) break
+            buf += decoder.decode(value, { stream: true })
+            const frames = buf.split("\n\n")
+            buf = frames.pop() ?? ""
+            for (const frame of frames) {
+              const dataLine = frame
+                .split("\n")
+                .find((l) => l.startsWith("data:"))
+                ?.slice(5)
+                .trim()
+              if (dataLine) yield JSON.parse(dataLine)
+            }
+          }
+        })()
+        return { stream }
+      },
+    },
+  }
+}
 import { sha256File } from "../supervisor/bundle"
 import { DEFAULT_SERVED_MODELS_FILE, parseServedModelsSideband } from "../supervisor/config"
 
