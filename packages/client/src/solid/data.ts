@@ -1469,7 +1469,7 @@ export function createData(config: CreateDataInput) {
   ) {
     const id = locationKey(location)
     const key = `location.${field}:${id}`
-    if (!watchedLocation.has(key) || store.location[id]?.[field] !== undefined || sync.has(key)) return
+    if (!watchedLocation.has(key) || store.location[id]?.[field] !== undefined) return
     refreshLocation(field, resource, location)
   }
 

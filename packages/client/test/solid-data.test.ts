@@ -942,7 +942,10 @@ test("ignores catalog updates for unloaded locations while refreshing loaded loc
 test("recovers catalog resources on update events after initial sync fails with 503", async () => {
   const listeners = new Set<Parameters<CreateDataInput["event"]["listen"]>[0]>()
   const requests: Array<[string, string | null]> = []
+  const providerStarted = Promise.withResolvers<void>()
+  const providerRelease = Promise.withResolvers<void>()
   let ready = false
+  let providerCalls = 0
   const api = OpenCode.make({
     baseUrl: "http://opencode.local",
     fetch: async (input, init) => {
@@ -950,6 +953,18 @@ test("recovers catalog resources on update events after initial sync fails with 
       const url = new URL(request.url)
       const directory = url.searchParams.get("location[directory]") ?? "/project"
       requests.push([url.pathname, directory])
+      if (url.pathname === "/api/provider" && ++providerCalls === 1) {
+        providerStarted.resolve()
+        await providerRelease.promise
+        return Response.json(
+          {
+            _tag: "ServiceUnavailableError",
+            message: "Location plugins did not finish activating",
+            service: "plugin",
+          },
+          { status: 503 },
+        )
+      }
       if (!ready) {
         return Response.json(
           {
@@ -1006,7 +1021,8 @@ test("recovers catalog resources on update events after initial sync fails with 
   try {
     await expect(setup.data.location.agent.sync(target)).rejects.toThrow()
     await expect(setup.data.location.model.sync(target)).rejects.toThrow()
-    await expect(setup.data.location.provider.sync(target)).rejects.toThrow()
+    const inflightProvider = setup.data.location.provider.sync(target).catch(() => undefined)
+    await providerStarted.promise
     expect(setup.data.location.agent.list(target)).toBeUndefined()
 
     requests.length = 0
@@ -1021,6 +1037,8 @@ test("recovers catalog resources on update events after initial sync fails with 
     await wait(() => setup.data.location.agent.list(target)?.[0]?.id === "build")
 
     emit({ id: "evt_plugin_ready", created: 4, type: "plugin.updated", location: target, data: {} })
+    providerRelease.resolve()
+    await inflightProvider
     await wait(
       () =>
         setup.data.location.model.list(target)?.[0]?.name === "Recovered model" &&
@@ -1032,6 +1050,7 @@ test("recovers catalog resources on update events after initial sync fails with 
       ["/api/provider", "/project"],
     ])
   } finally {
+    providerRelease.resolve()
     setup.dispose()
   }
 })
