@@ -1,10 +1,6 @@
 import type { IntegrationOAuthMethodRegistration } from "@opencode/plugin/effect/integration"
 import { define } from "@opencode/plugin/effect/plugin"
-import { Global } from "@opencode/util/global"
-import { randomUUID } from "crypto"
 import { Effect, Option, Stream } from "effect"
-import fs from "fs/promises"
-import path from "path"
 import { Bus } from "../../bus.js"
 import { Credential } from "../../credential.js"
 import { InstallationVersion } from "../../installation/version.js"
@@ -18,8 +14,10 @@ import {
   SYNAPSE_PROVIDER_ID,
   defaultAutoModel,
   fileSynapseModelsCache,
+  isSynapseRefreshSuccessor,
   loadSynapseModels,
   readStoredSynapseCredential,
+  writeAuthJsonEntry,
   type SynapseModelEntry,
   type SynapseStoredCredential,
 } from "../synapse-models.js"
@@ -33,33 +31,6 @@ import {
 const DEFAULT_SYNAPSE_URL = SYNAPSE_DEFAULT_INFERENCE_URL
 const ssoMethodID = Integration.MethodID.make("keystone-sso")
 const integrationID = Integration.ID.make(SYNAPSE_PROVIDER_ID)
-
-let authJsonQueue: Promise<void> = Promise.resolve()
-
-async function writeAuthJsonEntry(id: string, body: unknown): Promise<void> {
-  const next = authJsonQueue.then(async () => {
-    const authFile = path.join(Global.Path.data, "auth.json")
-    let current: Record<string, unknown> = {}
-    try {
-      const raw = await fs.readFile(authFile, "utf8")
-      const parsed = JSON.parse(raw)
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-        throw new Error(`Invalid auth.json root in ${authFile}`)
-      }
-      current = parsed as Record<string, unknown>
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") throw err
-    }
-    if (body === undefined) delete current[id]
-    else current[id] = body
-    await fs.mkdir(path.dirname(authFile), { recursive: true })
-    const tmpFile = `${authFile}.${randomUUID()}.tmp`
-    await fs.writeFile(tmpFile, JSON.stringify(current, null, 2), { mode: 0o600 })
-    await fs.rename(tmpFile, authFile)
-  })
-  authJsonQueue = next.catch(() => {})
-  return next
-}
 
 const keystoneOAuth: IntegrationOAuthMethodRegistration = {
   integrationID,
@@ -183,7 +154,7 @@ export const SynapseProviderPlugin = define({
           const token = oauthValue.access.trim()
           if (token) {
             const fileCred = yield* Effect.promise(() => readStoredSynapseCredential().catch(() => undefined))
-            if (fileCred?.token && fileCred.expiresAt && fileCred.expiresAt > oauthValue.expires) {
+            if (isSynapseRefreshSuccessor(fileCred, oauthValue)) {
               return fileCred
             }
             if (persistAuthFile && fileCred?.token !== token) {

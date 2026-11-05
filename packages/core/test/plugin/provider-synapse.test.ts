@@ -6,6 +6,7 @@ import { Plugin } from "@opencode/core/plugin"
 import { PluginHost } from "@opencode/core/plugin/host"
 import { ProviderPlugins } from "@opencode/core/plugin/provider"
 import { SynapseProviderPlugin } from "@opencode/core/plugin/provider/synapse"
+import { isSynapseRefreshSuccessor } from "@opencode/core/plugin/synapse-models"
 import { Provider } from "@opencode/core/provider"
 import { testEffect } from "../lib/effect"
 import { PluginTestLayer } from "./fixture"
@@ -23,6 +24,25 @@ describe("SynapseProviderPlugin", () => {
     const ids = ProviderPlugins.map((item) => item.id)
     expect(ids).toContain("opencode.provider.synapse")
     expect(ids.indexOf("opencode.provider.synapse")).toBeGreaterThan(ids.indexOf("opencode.provider.opencode"))
+  })
+
+  test("isSynapseRefreshSuccessor only prefers auth.json when verified as a refresh successor of the active OAuth credential", () => {
+    const activeAccountB = { access: "access-b", refresh: "refresh-b", expires: 1_000 }
+    const unrelatedLaterExpiry = {
+      token: "access-a-rotated",
+      refreshToken: "refresh-a-rotated",
+      expiresAt: 5_000,
+      replacedTokens: ["access-a", "refresh-a"],
+    }
+    expect(isSynapseRefreshSuccessor(unrelatedLaterExpiry, activeAccountB)).toBe(false)
+
+    const verifiedSuccessor = {
+      token: "access-b-rotated",
+      refreshToken: "refresh-b-rotated",
+      expiresAt: 5_000,
+      replacedTokens: ["access-b", "refresh-b"],
+    }
+    expect(isSynapseRefreshSuccessor(verifiedSuccessor, activeAccountB)).toBe(true)
   })
 
   it.effect(

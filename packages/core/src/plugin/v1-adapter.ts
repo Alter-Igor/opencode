@@ -2,45 +2,22 @@ import { SystemPart } from "@opencode/ai/effect"
 import { tool, type Config, type Hooks, type PluginInput } from "@opencode/plugin"
 import { define } from "@opencode/plugin/effect/plugin"
 import { Tool } from "@opencode/schema/tool"
-import { Global } from "@opencode/util/global"
-import { randomUUID } from "crypto"
 import { Cause, Effect, Exit, Option, Scope, Stream } from "effect"
 import fs from "fs/promises"
 import { parse, type ParseError } from "jsonc-parser"
 import path from "path"
 import { Credential } from "../credential.js"
 import { Integration } from "../integration.js"
-import { SYNAPSE_DEFAULT_CONTEXT, SYNAPSE_PROVIDER_ID, readStoredSynapseCredential } from "./synapse-models.js"
+import {
+  SYNAPSE_DEFAULT_CONTEXT,
+  SYNAPSE_PROVIDER_ID,
+  isSynapseRefreshSuccessor,
+  readStoredSynapseCredential,
+  writeAuthJsonEntry,
+} from "./synapse-models.js"
 import { SYNAPSE_DEFAULT_INFERENCE_URL } from "./synapse.js"
 
 export type V1PluginFn = (input: PluginInput) => Promise<Hooks>
-
-let authJsonQueue: Promise<void> = Promise.resolve()
-
-async function writeAuthJsonEntry(id: string, body: unknown): Promise<void> {
-  const next = authJsonQueue.then(async () => {
-    const authFile = path.join(Global.Path.data, "auth.json")
-    let current: Record<string, unknown> = {}
-    try {
-      const raw = await fs.readFile(authFile, "utf8")
-      const parsed = JSON.parse(raw)
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-        throw new Error(`Invalid auth.json root in ${authFile}`)
-      }
-      current = parsed as Record<string, unknown>
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") throw err
-    }
-    if (body === undefined) delete current[id]
-    else current[id] = body
-    await fs.mkdir(path.dirname(authFile), { recursive: true })
-    const tmpFile = `${authFile}.${randomUUID()}.tmp`
-    await fs.writeFile(tmpFile, JSON.stringify(current, null, 2), { mode: 0o600 })
-    await fs.rename(tmpFile, authFile)
-  })
-  authJsonQueue = next.catch(() => {})
-  return next
-}
 
 export function fromLegacyV1Plugin(id: string, fn: V1PluginFn) {
   return define({
@@ -52,7 +29,7 @@ export function fromLegacyV1Plugin(id: string, fn: V1PluginFn) {
         auth: {
           set: async (req: { path?: { id?: string }; body?: unknown }) => {
             const providerId = req?.path?.id || SYNAPSE_PROVIDER_ID
-            await writeAuthJsonEntry(providerId, req?.body)
+            await writeAuthJsonEntry(providerId, req?.body, { fromRefresh: true })
             return {}
           },
         },
@@ -497,7 +474,7 @@ export function fromLegacyV1Plugin(id: string, fn: V1PluginFn) {
               return { type: "api" as const, key: active.key.trim() } as any
             }
             if (active?.type === "oauth" && active.access.trim()) {
-              if (stored?.token && stored.refreshToken && (stored.expiresAt ?? 0) > active.expires) {
+              if (isSynapseRefreshSuccessor(stored, active)) {
                 return {
                   type: "oauth" as const,
                   key: stored.token,
