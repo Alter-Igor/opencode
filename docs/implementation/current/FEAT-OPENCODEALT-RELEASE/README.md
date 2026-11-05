@@ -6,9 +6,11 @@
 
 | Part | Where | What it does |
 |---|---|---|
-| Release workflow | `.github/workflows/opencodealt-release.yml` | Manual run. Builds `opencodealt.exe` (Windows x64) on a Windows runner, checks `--version`, publishes release `opencodealt-v<version>` with `opencodealt-windows-x64.zip` and `opencodealt-windows-x64.zip.sha256`. Version is `<packages/opencode version>-alt.<run number>`. Not code-signed. |
-| Update channel | `packages/opencode/src/installation/opencodealt.ts`, `installation/index.ts` | On channel `opencodealt` the install method is `aio`. It checks `Alter-Igor/opencode` releases, never upstream `opencode-ai`. Auto-update only notifies. "Update now" and `opencodealt upgrade` run `aio opencode install`. |
-| `/docs` | `packages/opencode/src/plugin/opencodealt-docs.ts` | `/docs` links the AI Office guide. `/docs <question>` answers from the knowledge base (alterspective-rag tools when connected). Also adds one system line: opencode.ai/docs is upstream only. |
+| Release workflow | `.github/workflows/opencodealt-release.yml` | Runs on code merge to `dev` and manual `workflow_dispatch`. Builds `opencodealt.exe` (Windows x64) on a Windows runner, checks `--version`, publishes release `opencodealt-v<version>` with `opencodealt-windows-x64.zip` and `opencodealt-windows-x64.zip.sha256`. Version is `<packages/cli version>-alt.<run number>` (for example `2.2.5-alt.93`). Not code-signed. |
+| Update channel | `packages/core/src/installation/opencodealt.ts`, `packages/cli/src/installation/opencodealt.ts` | On channel `opencodealt` the install method is `aio`. It checks `Alter-Igor/opencode` releases, never upstream `opencode-ai`. Auto-update only notifies. "Update now" and `opencodealt upgrade` run `aio opencode install`. |
+| `/docs` | `packages/core/src/plugin/opencodealt-docs.ts` | `/docs` links the AI Office guide (`https://aio.alterspective.com.au/app/ai-os/opencodealt`). `/docs <question>` answers from the knowledge base (alterspective-rag tools when connected). Also adds one system line: `opencode.ai/docs` is upstream only. |
+| Synapse OOB default & `/connect` | `packages/core/src/plugin/provider/synapse.ts`, `packages/core/src/plugin/synapse.ts`, `packages/core/src/model/model.ts` | Built-in `synapse` provider (`Alterspective Synapse`) with `synapse/auto` as the default model out of the box (unconnected `opencode` free models are restricted). Listed first under **Popular** in `/connect` and `opencodealt auth login` (Keystone SSO or API key), while keeping fallback providers selectable in `/connect` if Synapse is offline (#291). |
+| Cold-start catalog retry | `packages/tui/src/feature-plugins/home/model.tsx` | Retries `client.provider.list()` on `server.connected` and `global.disposed` if the background server returned `503` during cold start (#289). |
 
 ## Contract with AI Office (tool-ai-office#499)
 
