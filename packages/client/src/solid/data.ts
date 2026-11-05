@@ -1376,6 +1376,11 @@ export function createData(config: CreateDataInput) {
       case "command.updated":
         refreshLocation("command", result.location.command, location)
         break
+      case "plugin.updated":
+        recoverPluginLocation("agent", result.location.agent, location)
+        recoverPluginLocation("model", result.location.model, location)
+        recoverPluginLocation("provider", result.location.provider, location)
+        break
       case "skill.updated":
         refreshLocation("skill", result.location.skill, location)
         break
@@ -1449,9 +1454,23 @@ export function createData(config: CreateDataInput) {
     }
   }
 
+  const watchedLocation = new Set<string>()
+
   function hasLocation<Field extends keyof LocationData>(field: Field, ref?: LocationRef) {
     const id = locationKey(ref ?? defaultLocation())
-    return store.location[id]?.[field] !== undefined || sync.has(`location.${field}:${id}`)
+    const key = `location.${field}:${id}`
+    return store.location[id]?.[field] !== undefined || sync.has(key) || watchedLocation.has(key)
+  }
+
+  function recoverPluginLocation<Field extends keyof LocationData>(
+    field: Field,
+    resource: { invalidate: (ref?: LocationRef) => void; sync: (ref?: LocationRef) => Promise<void> },
+    location: LocationRef,
+  ) {
+    const id = locationKey(location)
+    const key = `location.${field}:${id}`
+    if (!watchedLocation.has(key) || store.location[id]?.[field] !== undefined) return
+    refreshLocation(field, resource, location)
   }
 
   function refreshLocation<Field extends keyof LocationData>(
@@ -1469,11 +1488,7 @@ export function createData(config: CreateDataInput) {
   // also publishes under the requested key when the two differ.
   // Reloads usage limits only where something has read them, since each load asks OpenCode Console.
   function refreshUsageLimits(location: LocationRef) {
-    const loaded =
-      store.location[locationKey(location)]?.usageLimits !== undefined ||
-      sync.has(`location.usageLimits:${locationKey(location)}`)
-    usageLimits.invalidate(location)
-    if (loaded) refresh(() => usageLimits.sync(location))
+    refreshLocation("usageLimits", usageLimits, location)
   }
 
   function locationResource<Field extends keyof LocationData>(
@@ -1487,9 +1502,12 @@ export function createData(config: CreateDataInput) {
       sync: (ref?: LocationRef) => {
         const location = ref ?? defaultLocation()
         const id = locationKey(location)
-        return sync.run(`location.${field}:${id}`, async () => {
+        const resourceKey = `location.${field}:${id}`
+        watchedLocation.add(resourceKey)
+        return sync.run(resourceKey, async () => {
           const response = await load(locationQuery(location))
           const key = locationKey(response.location)
+          watchedLocation.add(`location.${field}:${key}`)
           publish(key, response.data)
           if (options?.alias && key !== id) publish(id, response.data)
         })
@@ -2152,9 +2170,12 @@ export function createData(config: CreateDataInput) {
           return store.location[locationKey(location ?? defaultLocation())]?.websearch
         },
         async refresh(ref?: LocationRef) {
-          const input = { location: locationQuery(ref ?? defaultLocation()) }
+          const location = ref ?? defaultLocation()
+          watchedLocation.add(`location.websearch:${locationKey(location)}`)
+          const input = { location: locationQuery(location) }
           const providers = await api().websearch.providers(input)
           const key = locationKey(providers.location)
+          watchedLocation.add(`location.websearch:${key}`)
           setStore("location", key, { websearch: providers.data })
         },
       },

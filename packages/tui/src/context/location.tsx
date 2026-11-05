@@ -32,6 +32,7 @@ export function LocationProvider(props: ParentProps) {
     // Only the server's typed LocationNotFoundError proves the folder is gone. Other failures, such as
     // plugins still activating after a restart, are retried and never block the composer.
     void retry(() => (generation === attempt ? data.location.sync(target) : Promise.resolve()), {
+      attempts: 10,
       retryIf: (cause) => generation === attempt && !isLocationNotFoundError(cause),
     }).catch((cause) => {
       const current = ref()

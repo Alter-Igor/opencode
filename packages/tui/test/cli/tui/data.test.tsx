@@ -2155,6 +2155,63 @@ test("refreshes agents after agent updates", async () => {
   }
 })
 
+test("recovers agents on agent.updated after cold-start 503", async () => {
+  const events = createEventStream()
+  let ready = false
+  const calls = createFetch((url) => {
+    if (url.pathname !== "/api/agent") return
+    if (!ready) {
+      return new Response(
+        JSON.stringify({
+          _tag: "ServiceUnavailableError",
+          message: "Location plugins did not finish activating",
+          service: "plugin",
+        }),
+        { status: 503, headers: { "content-type": "application/json" } },
+      )
+    }
+    return json({
+      location: { directory, project: { id: "proj_test", directory } },
+      data: [
+        {
+          id: "build",
+          request: { headers: {}, body: {} },
+          mode: "primary",
+          hidden: false,
+          permissions: [],
+        },
+      ],
+    })
+  }, events)
+  let data!: ReturnType<typeof useData>
+
+  function Probe() {
+    data = useData()
+    return <box />
+  }
+
+  const app = await testRender(() => (
+    <TestTuiContexts>
+      <ClientProvider api={createApi(calls.fetch)}>
+        <ProjectProvider>
+          <DataProvider>
+            <Probe />
+          </DataProvider>
+        </ProjectProvider>
+      </ClientProvider>
+    </TestTuiContexts>
+  ))
+
+  try {
+    await wait(() => data.location.info() !== undefined)
+    ready = true
+    emitEvent(events, { id: "evt_agent_cold", created: 0, type: "agent.updated", data: {} })
+    await wait(() => data.location.agent.list()?.[0]?.id === "build")
+  } finally {
+    app.renderer.destroy()
+  }
+})
+
 test("refreshes references after updates", async () => {
   const events = createEventStream()
   let requests = 0
