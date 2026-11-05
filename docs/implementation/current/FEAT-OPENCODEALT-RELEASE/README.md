@@ -9,14 +9,18 @@
 | Release workflow | `.github/workflows/opencodealt-release.yml` | Runs on code merge to `dev` and manual `workflow_dispatch`. Builds `opencodealt.exe` (Windows x64) on a Windows runner, checks `--version`, publishes release `opencodealt-v<version>` with `opencodealt-windows-x64.zip` and `opencodealt-windows-x64.zip.sha256`. Version is `<packages/cli version>-alt.<run number>` (for example `2.2.5-alt.93`). Not code-signed. |
 | Update channel | `packages/core/src/installation/opencodealt.ts`, `packages/cli/src/installation/opencodealt.ts` | On channel `opencodealt` the install method is `aio`. It checks `Alter-Igor/opencode` releases, never upstream `opencode-ai`. Auto-update only notifies. "Update now" and `opencodealt upgrade` run `aio opencode install`. |
 | `/docs` | `packages/core/src/plugin/opencodealt-docs.ts` | `/docs` links the AI Office guide (`https://aio.alterspective.com.au/app/ai-os/opencodealt`). `/docs <question>` answers from the knowledge base (alterspective-rag tools when connected). Also adds one system line: `opencode.ai/docs` is upstream only. |
-| Synapse OOB default & `/connect` | `packages/core/src/plugin/provider/synapse.ts`, `packages/core/src/plugin/synapse.ts`, `packages/core/src/model/model.ts` | Built-in `synapse` provider (`Alterspective Synapse`) with `synapse/auto` as the default model out of the box (unconnected `opencode` free models are restricted). Listed first under **Popular** in `/connect` and `opencodealt auth login` (Keystone SSO or API key), while keeping fallback providers selectable in `/connect` if Synapse is offline (#291). |
-| Cold-start catalog retry | `packages/tui/src/feature-plugins/home/model.tsx` | Retries `client.provider.list()` on `server.connected` and `global.disposed` if the background server returned `503` during cold start (#289). |
+| Synapse OOB default & `/connect` | `packages/core/src/plugin/provider/synapse.ts`, `packages/core/src/plugin/synapse.ts`, `packages/core/src/plugin/synapse-models.ts`, `packages/app/src/providers/catalog/order.ts` | Built-in `synapse` provider (`Alterspective Synapse`) with `synapse/auto` set as the default model when no default is configured (unconnected `opencode` free models are restricted). Listed first under **Popular** in `/connect` and `opencodealt auth login` (Keystone SSO or API key), while keeping fallback providers selectable in `/connect` if Synapse is offline (#291). |
+| Cold-start catalog retry | `packages/client/src/solid/data.ts`, `packages/app/src/providers/catalog/providers.ts`, `packages/tui/src/context/location.tsx` | Retries `provider.sync` and `model.sync` through `syncWhileBooting` and `location.sync` after the connection status becomes `connected` (`server.connected`, up to 10 attempts excluding `LocationNotFoundError`) for service-unavailable (`503`) errors during cold start (#289). |
 
 ## Contract with AI Office (tool-ai-office#499)
 
 - Latest release: `GET https://api.github.com/repos/Alter-Igor/opencode/releases/latest`.
 - Asset `opencodealt-windows-x64.zip` holds `opencodealt.exe` at the root. The `.sha256` file is `<hex>  opencodealt-windows-x64.zip`.
 - `aio opencode install` must replace a running `opencodealt.exe` (rename it to `.old`, then move the new one in).
+- **3-Tier Documentation Matrix (`DEC-002`)**:
+  - **Tier 1 (Canonical Knowledge Base)**: `Reference/AI/Capabilities/KB-AI-044-Opencodealt-User-Guide.md` and `Reference/AI/Capabilities/KB-AI-036-OpenCode-Alterspective-Fork-And-CAS-Bridge.md` in `Alterspective-IO/Alterspective-Intelligence`.
+  - **Tier 2 (AI Office End-User Portal & CLI Guide)**: `web/views/opencodealt.html` (`/app/ai-os/opencodealt`) and `docs/product/user-guide.md` in `Alterspective-Engine/tool-ai-office`.
+  - **Tier 3 (Fork Developer Reference)**: `AGENTS.md` and `docs/implementation/current/FEAT-OPENCODEALT-RELEASE/README.md` in `Alter-Igor/opencode`.
 
 ## Not in the binary
 
