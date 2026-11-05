@@ -74,7 +74,7 @@ jobs:
           }
           Copy-Item $bin release/opencodealt.exe
           $reported = (& ./release/opencodealt.exe --version).Trim()
-          if ($reported -ne $env:VERSION) { throw "opencodealt.exe reports '$reported', expected '$env:VERSION'" }
+          if ($reported -ne $env:VERSION -and $reported -ne "opencode v$env:VERSION") { throw "opencodealt.exe reports '$reported', expected '$env:VERSION'" }
           Compress-Archive -Path release/opencodealt.exe -DestinationPath release/opencodealt-windows-x64.zip
           $hash = (Get-FileHash release/opencodealt-windows-x64.zip -Algorithm SHA256).Hash.ToLower()
           [IO.File]::WriteAllText("$PWD/release/opencodealt-windows-x64.zip.sha256", "$hash  opencodealt-windows-x64.zip`n")

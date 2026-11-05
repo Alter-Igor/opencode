@@ -89,7 +89,13 @@ export function pluginRuntimeLoaderCode(specifier: string, entries: ReadonlyMap<
       return `() => require(${JSON.stringify(parent)})[${JSON.stringify(member)}]`
     }
   }
-  return `() => require(${JSON.stringify(specifier)})`
+  const target =
+    specifier === "@opencode-ai/plugin"
+      ? "@opencode/plugin"
+      : specifier.startsWith("@opencode-ai/plugin/")
+        ? `@opencode/plugin/${specifier.slice("@opencode-ai/plugin/".length)}`
+        : specifier
+  return `() => require(${JSON.stringify(target)})`
 }
 
 export function createLoader(resolved: string): RuntimeModuleLoader {
