@@ -46,6 +46,7 @@ const context = createSimpleContext({
       // Generic sync failures do not prove the directory is missing; only the server's typed
       // LocationNotFoundError does, and retrying it cannot succeed until the folder changes.
       void retry(() => (stale ? Promise.resolve() : data.location.sync(location)), {
+        attempts: 10,
         retryIf: (error) => !stale && !isLocationNotFoundError(error),
       }).catch((error) => {
         if (stale || !isLocationNotFoundError(error)) return

@@ -939,6 +939,103 @@ test("ignores catalog updates for unloaded locations while refreshing loaded loc
   }
 })
 
+test("recovers catalog resources on update events after initial sync fails with 503", async () => {
+  const listeners = new Set<Parameters<CreateDataInput["event"]["listen"]>[0]>()
+  const requests: Array<[string, string | null]> = []
+  let ready = false
+  const api = OpenCode.make({
+    baseUrl: "http://opencode.local",
+    fetch: async (input, init) => {
+      const request = input instanceof Request ? input : new Request(input, init)
+      const url = new URL(request.url)
+      const directory = url.searchParams.get("location[directory]") ?? "/project"
+      requests.push([url.pathname, directory])
+      if (!ready) {
+        return Response.json(
+          {
+            _tag: "ServiceUnavailableError",
+            message: "Location plugins did not finish activating",
+            service: "plugin",
+          },
+          { status: 503 },
+        )
+      }
+      const location = { directory, project: { id: directory, directory, canonical: directory } }
+      if (url.pathname === "/api/agent")
+        return Response.json({
+          location,
+          data: [
+            {
+              id: "build",
+              name: "build",
+              mode: "primary",
+              hidden: false,
+              request: { headers: {}, body: {} },
+              permissions: [],
+            },
+          ],
+        })
+      if (url.pathname === "/api/model") return Response.json({ location, data: [modelInfo("Recovered model")] })
+      if (url.pathname === "/api/provider")
+        return Response.json({
+          location,
+          data: [{ id: "company", name: "Recovered provider", activation: "enabled", package: "aisdk:@ai-sdk/openai" }],
+        })
+      throw new Error(`Unexpected request: ${request.url}`)
+    },
+  })
+  const setup = createRoot((dispose) => ({
+    data: createData({
+      api: () => api,
+      directory: "/project",
+      event: {
+        on: () => () => {},
+        listen(handler) {
+          listeners.add(handler)
+          return () => listeners.delete(handler)
+        },
+      },
+      connection: { status: () => "connected" },
+    }),
+    dispose,
+  }))
+  const emit = (details: OpenCodeEvent) => listeners.forEach((listener) => listener({ name: details.type, details }))
+  const target = { directory: "/project" }
+  const unloaded = { directory: "/unloaded" }
+
+  try {
+    await expect(setup.data.location.agent.sync(target)).rejects.toThrow()
+    await expect(setup.data.location.model.sync(target)).rejects.toThrow()
+    await expect(setup.data.location.provider.sync(target)).rejects.toThrow()
+    expect(setup.data.location.agent.list(target)).toBeUndefined()
+
+    requests.length = 0
+    ready = true
+
+    emit({ id: "evt_agent_unloaded", created: 1, type: "agent.updated", location: unloaded, data: {} })
+    emit({ id: "evt_plugin_unloaded", created: 2, type: "plugin.updated", location: unloaded, data: {} })
+    await Bun.sleep(20)
+    expect(requests).toEqual([])
+
+    emit({ id: "evt_agent_ready", created: 3, type: "agent.updated", location: target, data: {} })
+    await wait(() => setup.data.location.agent.list(target)?.[0]?.id === "build")
+
+    emit({ id: "evt_plugin_ready", created: 4, type: "plugin.updated", location: target, data: {} })
+    await wait(
+      () =>
+        setup.data.location.model.list(target)?.[0]?.name === "Recovered model" &&
+        setup.data.location.provider.list(target)?.[0]?.name === "Recovered provider",
+    )
+    expect(requests).toEqual([
+      ["/api/agent", "/project"],
+      ["/api/model", "/project"],
+      ["/api/provider", "/project"],
+    ])
+  } finally {
+    setup.dispose()
+  }
+})
+
 test("revalidates model discovery when an update overtakes an in-flight model list", async () => {
   const started = Promise.withResolvers<void>()
   const release = Promise.withResolvers<void>()
