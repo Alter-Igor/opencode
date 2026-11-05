@@ -3,6 +3,7 @@ import { tool, type Config, type Hooks, type PluginInput } from "@opencode/plugi
 import { define } from "@opencode/plugin/effect/plugin"
 import { Tool } from "@opencode/schema/tool"
 import { Global } from "@opencode/util/global"
+import { randomUUID } from "crypto"
 import { Cause, Effect, Exit, Option, Scope, Stream } from "effect"
 import fs from "fs/promises"
 import { parse, type ParseError } from "jsonc-parser"
@@ -14,19 +15,31 @@ import { SYNAPSE_DEFAULT_INFERENCE_URL } from "./synapse.js"
 
 export type V1PluginFn = (input: PluginInput) => Promise<Hooks>
 
+let authJsonQueue: Promise<void> = Promise.resolve()
+
 async function writeAuthJsonEntry(id: string, body: unknown): Promise<void> {
-  const authFile = path.join(Global.Path.data, "auth.json")
-  let current: Record<string, unknown> = {}
-  try {
-    const raw = await fs.readFile(authFile, "utf8")
-    const parsed = JSON.parse(raw)
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+  const next = authJsonQueue.then(async () => {
+    const authFile = path.join(Global.Path.data, "auth.json")
+    let current: Record<string, unknown> = {}
+    try {
+      const raw = await fs.readFile(authFile, "utf8")
+      const parsed = JSON.parse(raw)
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error(`Invalid auth.json root in ${authFile}`)
+      }
       current = parsed as Record<string, unknown>
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") throw err
     }
-  } catch {}
-  current[id] = body
-  await fs.mkdir(path.dirname(authFile), { recursive: true })
-  await fs.writeFile(authFile, JSON.stringify(current, null, 2), { mode: 0o600 })
+    if (body === undefined) delete current[id]
+    else current[id] = body
+    await fs.mkdir(path.dirname(authFile), { recursive: true })
+    const tmpFile = `${authFile}.${randomUUID()}.tmp`
+    await fs.writeFile(tmpFile, JSON.stringify(current, null, 2), { mode: 0o600 })
+    await fs.rename(tmpFile, authFile)
+  })
+  authJsonQueue = next.catch(() => {})
+  return next
 }
 
 export function fromLegacyV1Plugin(id: string, fn: V1PluginFn) {
@@ -475,6 +488,44 @@ export function fromLegacyV1Plugin(id: string, fn: V1PluginFn) {
         const getAuth = async () => {
           const stored = await readStoredSynapseCredential().catch(() => undefined)
           const envKey = process.env.SYNAPSE_API_KEY?.trim() || process.env.GPAAS_API_KEY?.trim()
+          if (authHook.provider === SYNAPSE_PROVIDER_ID && Option.isSome(credentials)) {
+            const saved = await Effect.runPromiseWith(runtime)(
+              credentials.value.list(Integration.ID.make(SYNAPSE_PROVIDER_ID)),
+            ).catch(() => [])
+            const active = saved.at(-1)?.value
+            if (active?.type === "key" && active.key.trim()) {
+              return { type: "api" as const, key: active.key.trim() } as any
+            }
+            if (active?.type === "oauth" && active.access.trim()) {
+              if (stored?.token && stored.refreshToken && (stored.expiresAt ?? 0) > active.expires) {
+                return {
+                  type: "oauth" as const,
+                  key: stored.token,
+                  access: stored.token,
+                  refresh: stored.refreshToken,
+                  expires: stored.expiresAt ?? 0,
+                  metadata: {
+                    refreshToken: stored.refreshToken,
+                    expiresAt: stored.expiresAt ? String(stored.expiresAt) : undefined,
+                    clientId: stored.clientId,
+                    clientSecret: stored.clientSecret,
+                  },
+                } as any
+              }
+              return {
+                type: "oauth" as const,
+                key: active.access.trim(),
+                access: active.access.trim(),
+                refresh: active.refresh,
+                expires: active.expires,
+                metadata: {
+                  refreshToken: active.refresh || undefined,
+                  expiresAt: active.expires ? String(active.expires) : undefined,
+                  ...active.metadata,
+                },
+              } as any
+            }
+          }
           if (stored?.token) {
             return {
               type: (stored.refreshToken ? "oauth" : "api") as "oauth" | "api",
@@ -489,29 +540,6 @@ export function fromLegacyV1Plugin(id: string, fn: V1PluginFn) {
                 clientSecret: stored.clientSecret,
               },
             } as any
-          }
-          if (authHook.provider === SYNAPSE_PROVIDER_ID && Option.isSome(credentials)) {
-            const saved = await Effect.runPromiseWith(runtime)(
-              credentials.value.list(Integration.ID.make(SYNAPSE_PROVIDER_ID)),
-            ).catch(() => [])
-            const active = saved.at(-1)?.value
-            if (active?.type === "key" && active.key.trim()) {
-              return { type: "api" as const, key: active.key.trim() } as any
-            }
-            if (active?.type === "oauth" && active.access.trim()) {
-              return {
-                type: "oauth" as const,
-                key: active.access.trim(),
-                access: active.access.trim(),
-                refresh: active.refresh,
-                expires: active.expires,
-                metadata: {
-                  refreshToken: active.refresh || undefined,
-                  expiresAt: active.expires ? String(active.expires) : undefined,
-                  ...active.metadata,
-                },
-              } as any
-            }
           }
           if (envKey) {
             return { type: "api" as const, key: envKey } as any

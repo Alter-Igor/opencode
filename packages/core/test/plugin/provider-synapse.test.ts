@@ -105,9 +105,12 @@ describe("SynapseProviderPlugin", () => {
           integrationID: Integration.ID.make("synapse"),
           key: "sk-synapse-connected-key",
         })
-        yield* Effect.yieldNow
-        yield* Effect.yieldNow
-        const synapseProvider = yield* providers.get(Provider.ID.make("synapse"))
+        let synapseProvider = yield* providers.get(Provider.ID.make("synapse"))
+        for (let attempt = 0; attempt < 50; attempt++) {
+          if (synapseProvider?.settings?.apiKey === "sk-synapse-connected-key") break
+          yield* Effect.yieldNow
+          synapseProvider = yield* providers.get(Provider.ID.make("synapse"))
+        }
         expect(synapseProvider?.settings?.apiKey).toBe("sk-synapse-connected-key")
       }),
   )
