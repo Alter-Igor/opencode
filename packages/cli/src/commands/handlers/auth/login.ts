@@ -18,6 +18,7 @@ import {
 } from "./shared"
 
 const integrationPriority = new Map([
+  ["synapse", -1],
   ["opencode-go", 0],
   ["opencode", 1],
   ["openai", 2],

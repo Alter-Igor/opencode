@@ -26,6 +26,17 @@ describe("integrationOptions", () => {
       ]).map((item) => item.id),
     ).toEqual(["opencode", "opencode-go", "openai", "anthropic", "mistral", "custom-z"])
   })
+
+  test("puts Alterspective Synapse first ahead of all other integrations in /connect", () => {
+    expect(
+      integrationOptions([
+        integration({ id: "openai", name: "OpenAI" }),
+        integration({ id: "opencode", name: "OpenCode Console" }),
+        integration({ id: "synapse", name: "Alterspective Synapse" }),
+        integration({ id: "anthropic", name: "Anthropic" }),
+      ]).map((item) => item.id),
+    ).toEqual(["synapse", "opencode", "openai", "anthropic"])
+  })
 })
 
 describe("connectMethods", () => {

@@ -3,10 +3,12 @@ import { tool, type Config, type Hooks, type PluginInput } from "@opencode/plugi
 import { define } from "@opencode/plugin/effect/plugin"
 import { Tool } from "@opencode/schema/tool"
 import { Global } from "@opencode/util/global"
-import { Cause, Effect, Exit, Scope, Stream } from "effect"
+import { Cause, Effect, Exit, Option, Scope, Stream } from "effect"
 import fs from "fs/promises"
 import { parse, type ParseError } from "jsonc-parser"
 import path from "path"
+import { Credential } from "../credential.js"
+import { Integration } from "../integration.js"
 import { SYNAPSE_DEFAULT_CONTEXT, SYNAPSE_PROVIDER_ID, readStoredSynapseCredential } from "./synapse-models.js"
 import { SYNAPSE_DEFAULT_INFERENCE_URL } from "./synapse.js"
 
@@ -468,6 +470,7 @@ export function fromLegacyV1Plugin(id: string, fn: V1PluginFn) {
 
       if (hooks.auth?.loader) {
         const authHook = hooks.auth
+        const credentials = yield* Effect.serviceOption(Credential.Service)
         let lastBearerKey: string | undefined
         const getAuth = async () => {
           const stored = await readStoredSynapseCredential().catch(() => undefined)
@@ -486,6 +489,29 @@ export function fromLegacyV1Plugin(id: string, fn: V1PluginFn) {
                 clientSecret: stored.clientSecret,
               },
             } as any
+          }
+          if (authHook.provider === SYNAPSE_PROVIDER_ID && Option.isSome(credentials)) {
+            const saved = await Effect.runPromiseWith(runtime)(
+              credentials.value.list(Integration.ID.make(SYNAPSE_PROVIDER_ID)),
+            ).catch(() => [])
+            const active = saved.at(-1)?.value
+            if (active?.type === "key" && active.key.trim()) {
+              return { type: "api" as const, key: active.key.trim() } as any
+            }
+            if (active?.type === "oauth" && active.access.trim()) {
+              return {
+                type: "oauth" as const,
+                key: active.access.trim(),
+                access: active.access.trim(),
+                refresh: active.refresh,
+                expires: active.expires,
+                metadata: {
+                  refreshToken: active.refresh || undefined,
+                  expiresAt: active.expires ? String(active.expires) : undefined,
+                  ...active.metadata,
+                },
+              } as any
+            }
           }
           if (envKey) {
             return { type: "api" as const, key: envKey } as any

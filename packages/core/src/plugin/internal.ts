@@ -257,9 +257,9 @@ const pre = [
   GoalPlugin.Plugin,
   SkillPlugin.Plugin,
   VcsHgPlugin.Plugin,
-  ...(process.env.OPENCODE_ALLOW_ALL_PROVIDERS === "1"
-    ? [ModelsDevPlugin, ...ProviderPlugins]
-    : [SynapseProviderPlugin, OpencodeGuardPlaceholder]),
+  ...(process.env.OPENCODE_RESTRICT_PROVIDERS === "1"
+    ? [SynapseProviderPlugin, OpencodeGuardPlaceholder]
+    : [ModelsDevPlugin, ...ProviderPlugins]),
   ...WebSearchPlugins,
   PatchTool.Plugin,
   // Render model prompts after the patch plugin selects the available editing tools.

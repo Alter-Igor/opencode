@@ -32,7 +32,6 @@ import { ZenmuxPlugin } from "./provider/zenmux.js"
 import type { PluginInternal } from "./internal.js"
 
 const ALL_PROVIDER_PLUGINS: PluginInternal.InternalPlugin[] = [
-  SynapseProviderPlugin,
   AmazonBedrockPlugin,
   AzurePlugin,
   CerebrasPlugin,
@@ -63,6 +62,7 @@ const ALL_PROVIDER_PLUGINS: PluginInternal.InternalPlugin[] = [
   XAIPlugin,
   ZenmuxPlugin,
   ClaudeAgentPlugin,
+  SynapseProviderPlugin,
 ]
 
 export const ProviderPlugins: PluginInternal.InternalPlugin[] = ALL_PROVIDER_PLUGINS

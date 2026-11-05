@@ -1,4 +1,5 @@
 export const popularProviders = [
+  "synapse",
   "opencode-go",
   "opencode",
   "anthropic",
