@@ -28,6 +28,7 @@
 // This runs from the Synapse plugin's `config` hook. OPENCODE_DISABLE_DEFAULT_PLUGINS
 // turns all internal plugins off, so with it set nothing here runs: no live list and
 // no `auto`, only what the config file lists.
+import { randomUUID } from "crypto"
 import fs from "fs/promises"
 import path from "path"
 import type { Config } from "@opencode/plugin"
@@ -207,6 +208,8 @@ export interface SynapseStoredCredential {
   expiresAt?: number
   clientId?: string
   clientSecret?: string
+  /** Tokens/refresh tokens rotated by in-flight refreshes of the active credential. */
+  replacedTokens?: string[]
 }
 
 export interface SynapseModelsDeps {
@@ -308,6 +311,71 @@ async function readAuthData(file: string): Promise<unknown> {
   }
 }
 
+let authJsonQueue: Promise<void> = Promise.resolve()
+
+/** Serialized, atomic read-modify-write helper for `auth.json` shared across Synapse plugins. */
+export async function writeAuthJsonEntry(
+  id: string,
+  body: unknown,
+  options?: { fromRefresh?: boolean },
+): Promise<void> {
+  const next = authJsonQueue.then(async () => {
+    const authFile = path.join(Global.Path.data, "auth.json")
+    let current: Record<string, unknown> = {}
+    try {
+      const raw = await fs.readFile(authFile, "utf8")
+      const parsed = JSON.parse(raw)
+      if (!isRecord(parsed)) {
+        throw new Error(`Invalid auth.json root in ${authFile}`)
+      }
+      current = parsed
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") throw err
+    }
+    if (body === undefined) {
+      delete current[id]
+    } else if (options?.fromRefresh && isRecord(body)) {
+      const prev = isRecord(current[id]) ? current[id] : undefined
+      const prevMeta = prev && isRecord(prev.metadata) ? prev.metadata : undefined
+      const prevToken = prev ? optionalString(prev.type === "api" ? prev.key : prev.access) : undefined
+      const prevRefresh =
+        (prevMeta ? optionalString(prevMeta.refreshToken) : undefined) ??
+        (prev ? optionalString(prev.refresh) : undefined)
+      const prevReplaced = Array.isArray(prevMeta?.replacedTokens)
+        ? prevMeta.replacedTokens.filter((item): item is string => typeof item === "string" && item !== "")
+        : []
+      const nextMeta = isRecord(body.metadata) ? { ...body.metadata } : {}
+      const replacedTokens = Array.from(
+        new Set([...prevReplaced, ...(prevToken ? [prevToken] : []), ...(prevRefresh ? [prevRefresh] : [])]),
+      )
+      if (replacedTokens.length > 0) nextMeta.replacedTokens = replacedTokens
+      current[id] = { ...body, metadata: nextMeta }
+    } else {
+      current[id] = body
+    }
+    await fs.mkdir(path.dirname(authFile), { recursive: true })
+    const tmpFile = `${authFile}.${randomUUID()}.tmp`
+    await fs.writeFile(tmpFile, JSON.stringify(current, null, 2), { mode: 0o600 })
+    await fs.rename(tmpFile, authFile)
+  })
+  authJsonQueue = next.catch(() => {})
+  return next
+}
+
+/** Verifies whether `stored` in `auth.json` is a rotated refresh successor of `active`. */
+export function isSynapseRefreshSuccessor(
+  stored: SynapseStoredCredential | undefined,
+  active: { access: string; refresh: string; expires: number },
+): stored is SynapseStoredCredential & { refreshToken: string } {
+  if (!stored?.token || !stored.refreshToken) return false
+  if ((stored.expiresAt ?? 0) <= active.expires) return false
+  const replaced = stored.replacedTokens
+  if (!replaced || replaced.length === 0) return false
+  const access = active.access.trim()
+  const refresh = active.refresh.trim()
+  return (access !== "" && replaced.includes(access)) || (refresh !== "" && replaced.includes(refresh))
+}
+
 /** The stored `synapse` credential, read the same way the Auth service reads it. */
 export async function readStoredSynapseCredential(
   file: string = path.join(Global.Path.data, "auth.json"),
@@ -319,12 +387,16 @@ export async function readStoredSynapseCredential(
   const oauth = entry.type === "oauth"
   const token = optionalString(entry.type === "api" ? entry.key : oauth ? entry.access : undefined)
   if (!token) return undefined
+  const replacedTokens = Array.isArray(meta.replacedTokens)
+    ? meta.replacedTokens.filter((item): item is string => typeof item === "string" && item !== "")
+    : undefined
   return {
     token,
     refreshToken: optionalString(meta.refreshToken) ?? (oauth ? optionalString(entry.refresh) : undefined),
     expiresAt: optionalEpochMs(meta.expiresAt) ?? (oauth ? optionalEpochMs(entry.expires) : undefined),
     clientId: optionalString(meta.clientId),
     clientSecret: optionalString(meta.clientSecret),
+    ...(replacedTokens && replacedTokens.length > 0 ? { replacedTokens } : {}),
   }
 }
 

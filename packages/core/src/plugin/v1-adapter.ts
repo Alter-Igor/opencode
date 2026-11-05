@@ -2,30 +2,22 @@ import { SystemPart } from "@opencode/ai/effect"
 import { tool, type Config, type Hooks, type PluginInput } from "@opencode/plugin"
 import { define } from "@opencode/plugin/effect/plugin"
 import { Tool } from "@opencode/schema/tool"
-import { Global } from "@opencode/util/global"
-import { Cause, Effect, Exit, Scope, Stream } from "effect"
+import { Cause, Effect, Exit, Option, Scope, Stream } from "effect"
 import fs from "fs/promises"
 import { parse, type ParseError } from "jsonc-parser"
 import path from "path"
-import { SYNAPSE_DEFAULT_CONTEXT, SYNAPSE_PROVIDER_ID, readStoredSynapseCredential } from "./synapse-models.js"
+import { Credential } from "../credential.js"
+import { Integration } from "../integration.js"
+import {
+  SYNAPSE_DEFAULT_CONTEXT,
+  SYNAPSE_PROVIDER_ID,
+  isSynapseRefreshSuccessor,
+  readStoredSynapseCredential,
+  writeAuthJsonEntry,
+} from "./synapse-models.js"
 import { SYNAPSE_DEFAULT_INFERENCE_URL } from "./synapse.js"
 
 export type V1PluginFn = (input: PluginInput) => Promise<Hooks>
-
-async function writeAuthJsonEntry(id: string, body: unknown): Promise<void> {
-  const authFile = path.join(Global.Path.data, "auth.json")
-  let current: Record<string, unknown> = {}
-  try {
-    const raw = await fs.readFile(authFile, "utf8")
-    const parsed = JSON.parse(raw)
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      current = parsed as Record<string, unknown>
-    }
-  } catch {}
-  current[id] = body
-  await fs.mkdir(path.dirname(authFile), { recursive: true })
-  await fs.writeFile(authFile, JSON.stringify(current, null, 2), { mode: 0o600 })
-}
 
 export function fromLegacyV1Plugin(id: string, fn: V1PluginFn) {
   return define({
@@ -37,7 +29,7 @@ export function fromLegacyV1Plugin(id: string, fn: V1PluginFn) {
         auth: {
           set: async (req: { path?: { id?: string }; body?: unknown }) => {
             const providerId = req?.path?.id || SYNAPSE_PROVIDER_ID
-            await writeAuthJsonEntry(providerId, req?.body)
+            await writeAuthJsonEntry(providerId, req?.body, { fromRefresh: true })
             return {}
           },
         },
@@ -468,10 +460,49 @@ export function fromLegacyV1Plugin(id: string, fn: V1PluginFn) {
 
       if (hooks.auth?.loader) {
         const authHook = hooks.auth
+        const credentials = yield* Effect.serviceOption(Credential.Service)
         let lastBearerKey: string | undefined
         const getAuth = async () => {
           const stored = await readStoredSynapseCredential().catch(() => undefined)
           const envKey = process.env.SYNAPSE_API_KEY?.trim() || process.env.GPAAS_API_KEY?.trim()
+          if (authHook.provider === SYNAPSE_PROVIDER_ID && Option.isSome(credentials)) {
+            const saved = await Effect.runPromiseWith(runtime)(
+              credentials.value.list(Integration.ID.make(SYNAPSE_PROVIDER_ID)),
+            ).catch(() => [])
+            const active = saved.at(-1)?.value
+            if (active?.type === "key" && active.key.trim()) {
+              return { type: "api" as const, key: active.key.trim() } as any
+            }
+            if (active?.type === "oauth" && active.access.trim()) {
+              if (isSynapseRefreshSuccessor(stored, active)) {
+                return {
+                  type: "oauth" as const,
+                  key: stored.token,
+                  access: stored.token,
+                  refresh: stored.refreshToken,
+                  expires: stored.expiresAt ?? 0,
+                  metadata: {
+                    refreshToken: stored.refreshToken,
+                    expiresAt: stored.expiresAt ? String(stored.expiresAt) : undefined,
+                    clientId: stored.clientId,
+                    clientSecret: stored.clientSecret,
+                  },
+                } as any
+              }
+              return {
+                type: "oauth" as const,
+                key: active.access.trim(),
+                access: active.access.trim(),
+                refresh: active.refresh,
+                expires: active.expires,
+                metadata: {
+                  refreshToken: active.refresh || undefined,
+                  expiresAt: active.expires ? String(active.expires) : undefined,
+                  ...active.metadata,
+                },
+              } as any
+            }
+          }
           if (stored?.token) {
             return {
               type: (stored.refreshToken ? "oauth" : "api") as "oauth" | "api",

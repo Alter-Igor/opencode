@@ -28,3 +28,19 @@ test("groups the CLI choices like /connect while keeping stable login IDs", () =
     { value: "mistral", label: "Mistral", category: "Services", connected: false },
   ])
 })
+
+test("puts Alterspective Synapse first in Popular login choices while keeping fallback providers selectable", () => {
+  expect(
+    loginChoices([
+      integration({ id: "openai", name: "OpenAI" }),
+      integration({ id: "opencode", name: "OpenCode Console" }),
+      integration({ id: "synapse", name: "Alterspective Synapse" }),
+      integration({ id: "mistral", name: "Mistral" }),
+    ]),
+  ).toEqual([
+    { value: "synapse", label: "Alterspective Synapse", category: "Popular", connected: false },
+    { value: "opencode", label: "OpenCode Console", category: "Popular", connected: false },
+    { value: "openai", label: "OpenAI", category: "Popular", connected: false },
+    { value: "mistral", label: "Mistral", category: "Services", connected: false },
+  ])
+})
