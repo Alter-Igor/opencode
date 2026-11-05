@@ -2,10 +2,8 @@ import { existsSync, readFileSync, statSync } from "fs"
 import path from "path"
 import { fileURLToPath } from "url"
 
-declare global {
-  const OPENCODE_VERSION: string
-  const OPENCODE_CHANNEL: string
-}
+declare const OPENCODE_VERSION: string
+declare const OPENCODE_CHANNEL: string
 
 // Fork-only (#87): a source run (opencodealt) builds its label from the package version and
 // the checkout's commit, plus when that commit landed in this checkout (from the reflog). It

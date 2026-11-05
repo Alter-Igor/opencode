@@ -1,4 +1,5 @@
 import { Option, Schema } from "effect"
+import { sourceVersion } from "./installation/version"
 
 declare const OPENCODE_VERSION: string
 declare const OPENCODE_CHANNEL: string
@@ -8,7 +9,7 @@ declare const OPENCODE_RELEASE_HIGHLIGHTS: string
 const version =
   typeof OPENCODE_VERSION === "string"
     ? OPENCODE_VERSION.trim()
-    : process.env.OPENCODE_VERSION?.trim() || "local"
+    : process.env.OPENCODE_VERSION?.trim() || sourceVersion()
 const channel =
   typeof OPENCODE_CHANNEL === "string"
     ? OPENCODE_CHANNEL.trim()
