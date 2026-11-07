@@ -1,11 +1,14 @@
 name: opencodealt-release
 
-# Fork-only (#90, #97): builds opencodealt.exe (Windows x64) and publishes it as an EDGE release
-# (a GitHub pre-release) on every code merge to dev. opencodealt-promote.yml later marks a soaked
-# edge release as stable (GitHub "Latest"). AI Office installs stable by default
-# (`aio opencode install`) and the newest edge with `aio opencode install --edge`; both check the .sha256.
-# The build runs on Windows so build.ts can build and smoke-test the native binary (--single).
-# The binary is not code-signed: this fork has no signing certificate.
+# Fork-only (#90, #97): builds opencodealt for Windows x64 and Linux x64 and publishes both as an
+# EDGE release (a GitHub pre-release) on every code merge to dev. opencodealt-promote.yml later
+# marks a soaked edge release as stable (GitHub "Latest"). AI Office installs stable by default
+# (`aio opencode install`) and the newest edge with `aio opencode install --edge`; both check the
+# .sha256.
+#
+# Windows builds on windows-latest; Linux builds on ubuntu-24.04 with the same build.ts --single
+# path the upstream release workflow uses for cli-linux-x64. The binaries are not code-signed:
+# this fork has no signing certificate.
 
 on:
   push:
@@ -20,6 +23,10 @@ on:
         description: "Commit or branch to build"
         required: false
         default: dev
+      dry_run:
+        description: "Build and package only; do not publish a release"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -31,17 +38,16 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release:
-    runs-on: windows-latest
-    timeout-minutes: 60
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      sha: ${{ steps.version.outputs.sha }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ inputs.ref || github.sha }}
-          # The publish step gets GH_TOKEN explicitly; keep the write token away from install/build scripts.
           persist-credentials: false
-
-      - uses: ./.github/actions/setup-bun
 
       - name: Version
         id: version
@@ -53,17 +59,38 @@ jobs:
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "opencodealt $version from $(git rev-parse --short HEAD)"
 
+  build:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset: opencodealt-windows-x64.zip
+          - os: ubuntu-24.04
+            asset: opencodealt-linux-x64.zip
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-bun
+
       - name: Build
         shell: bash
         run: bun run --cwd packages/cli script/build.ts --single --skip-install --skip-web-ui
         env:
           OPENCODE_CHANNEL: opencodealt
-          OPENCODE_VERSION: ${{ steps.version.outputs.version }}
+          OPENCODE_VERSION: ${{ needs.version.outputs.version }}
 
-      - name: Package
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
         shell: pwsh
         env:
-          VERSION: ${{ steps.version.outputs.version }}
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force release | Out-Null
@@ -80,16 +107,62 @@ jobs:
           [IO.File]::WriteAllText("$PWD/release/opencodealt-windows-x64.zip.sha256", "$hash  opencodealt-windows-x64.zip`n")
           Get-Content release/opencodealt-windows-x64.zip.sha256
 
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          command -v zip >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y zip; }
+          mkdir -p release
+          if [ -x packages/cli/dist/cli-linux-x64/bin/opencode ]; then
+            bin=packages/cli/dist/cli-linux-x64/bin/opencode
+          elif [ -x packages/cli/dist/opencode-linux-x64/bin/opencode ]; then
+            bin=packages/cli/dist/opencode-linux-x64/bin/opencode
+          else
+            echo "opencode Linux binary not found" >&2
+            find packages/cli/dist -maxdepth 4 -type f -name 'opencode*' -print >&2 || true
+            exit 1
+          fi
+          cp "$bin" release/opencodealt
+          chmod +x release/opencodealt
+          reported=$(./release/opencodealt --version | tr -d '\r')
+          if [ "$reported" != "$VERSION" ] && [ "$reported" != "opencode v$VERSION" ]; then
+            echo "opencodealt reports '$reported', expected '$VERSION'" >&2
+            exit 1
+          fi
+          (cd release && zip -9 opencodealt-linux-x64.zip opencodealt && sha256sum opencodealt-linux-x64.zip > opencodealt-linux-x64.zip.sha256 && cat opencodealt-linux-x64.zip.sha256)
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.asset }}
+          path: release/${{ matrix.asset }}*
+          if-no-files-found: error
+
+  publish:
+    needs: [version, build]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: release
+          merge-multiple: true
+
       - name: Publish edge release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.version.outputs.version }}
-          SHA: ${{ steps.version.outputs.sha }}
+          VERSION: ${{ needs.version.outputs.version }}
+          SHA: ${{ needs.version.outputs.sha }}
         run: |
+          ls -l release
           gh release create "opencodealt-v${VERSION}" \
             release/opencodealt-windows-x64.zip \
             release/opencodealt-windows-x64.zip.sha256 \
+            release/opencodealt-linux-x64.zip \
+            release/opencodealt-linux-x64.zip.sha256 \
             --repo "$GITHUB_REPOSITORY" \
             --target "$SHA" \
             --title "opencodealt ${VERSION}" \
