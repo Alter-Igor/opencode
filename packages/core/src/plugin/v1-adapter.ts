@@ -186,7 +186,7 @@ export function fromLegacyV1Plugin(id: string, fn: V1PluginFn) {
                         },
                       })
                       if (typeof res === "string") {
-                        return { content: res, output: res }
+                        return { content: res }
                       }
                       const attachments = res.attachments ?? []
                       return {
@@ -202,7 +202,6 @@ export function fromLegacyV1Plugin(id: string, fn: V1PluginFn) {
                                 })),
                               ]
                             : res.output,
-                        output: res.output,
                         metadata: {
                           ...(res.title ? { title: res.title } : {}),
                           ...(res.metadata ?? {}),
